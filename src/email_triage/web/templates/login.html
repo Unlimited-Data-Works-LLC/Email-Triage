@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}Login - Email Triage{% endblock %}
+{% block content %}
+{# Subtle page background — neural-tree circuit image behind the form.
+   Fixed, covers the viewport, low opacity so form text stays readable. #}
+<div aria-hidden="true" style="
+    position:fixed;inset:0;z-index:-1;pointer-events:none;
+    background:url('/static/hero-login.png') center/cover no-repeat;
+    opacity:0.12;
+"></div>
+{# Narrow column for the login only — site stays responsive everywhere else. #}
+<div style="max-width:500px;margin:0 auto;">
+<div style="text-align:center;margin:1rem 0 1.5rem;">
+    <img src="/static/uDataWorks.png" alt="uDataWorks" width="200" height="200"
+         style="max-width:100%;height:auto;border-radius:12px;">
+</div>
+{% if hipaa_mode %}
+<div style="text-align:center;margin:0 0 1rem;">
+    <span style="
+        display:inline-block;padding:0.15rem 0.7rem;
+        font-size:0.75rem;letter-spacing:0.04em;
+        color:var(--pico-muted-color);
+        border:1px solid var(--pico-muted-border-color);
+        border-radius:999px;">
+        HIPAA mode
+    </span>
+</div>
+{% endif %}
+<article style="position:relative;">
+    <header>
+        <h2 style="display:flex;align-items:center;gap:0.4rem;">
+            Sign In
+            {% if hipaa_mode %}
+            <small style="font-size:0.7rem;color:var(--pico-muted-color);font-weight:normal;">
+                🔒 Compliance mode
+            </small>
+            {% endif %}
+        </h2>
+        <p>Passwordless login via email code</p>
+    </header>
+
+    {% if error %}
+    <p class="error" style="color: var(--pico-del-color);">{{ error }}</p>
+    {% endif %}
+
+    {% if step == "email" %}
+    <form method="post" action="/login/email">
+        <label for="email">Email address</label>
+        {# autocomplete="username webauthn" enables passkey
+           conditional UI: the browser's autofill dropdown surfaces
+           registered passkeys when the field is focused. Picking
+           one triggers a silent navigator.credentials.get() that
+           we fire from the inline script below. Falls back to OTP
+           when no passkey is offered. #}
+        <input type="email" id="email" name="email"
+               placeholder="you@example.com" required autofocus
+               autocomplete="username webauthn">
+        <button type="submit">Continue</button>
+    </form>
+    {# Passkey conditional UI -- autofill dropdown will surface any
+       discoverable credential the browser holds for this origin. #}
+    <script>
+    (async () => {
+        if (!("credentials" in navigator) ||
+            !PublicKeyCredential ||
+            !PublicKeyCredential.isConditionalMediationAvailable) {
+            return;  // browser doesn't support conditional UI
+        }
+        try {
+            const ok = await PublicKeyCredential.isConditionalMediationAvailable();
+            if (!ok) return;
+            const r = await fetch("/login/webauthn/passkey/begin", {
+                method: "POST",
+                credentials: "same-origin",
+            });
+            if (!r.ok) return;
+            const body = await r.json();
+            const opts = body.options;
+            // Convert base64url challenge / allowCredentials ids to ArrayBuffer.
+            const b64ToBuf = (s) => Uint8Array.from(
+                atob(s.replace(/-/g, "+").replace(/_/g, "/")
+                       .padEnd(s.length + (4 - s.length % 4) % 4, "=")),
+                c => c.charCodeAt(0)
+            ).buffer;
+            opts.challenge = b64ToBuf(opts.challenge);
+            (opts.allowCredentials || []).forEach(c => {
+                c.id = b64ToBuf(c.id);
+            });
+            const cred = await navigator.credentials.get({
+                publicKey: opts,
+                mediation: "conditional",
+            });
+            if (!cred) return;
+            // Send the assertion back. Encode buffers as base64url.
+            const bufToB64 = (buf) => btoa(
+                String.fromCharCode(...new Uint8Array(buf))
+            ).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            const payload = {
+                response: {
+                    id: cred.id,
+                    rawId: bufToB64(cred.rawId),
+                    type: cred.type,
+                    response: {
+                        clientDataJSON: bufToB64(cred.response.clientDataJSON),
+                        authenticatorData: bufToB64(cred.response.authenticatorData),
+                        signature: bufToB64(cred.response.signature),
+                        userHandle: cred.response.userHandle
+                            ? bufToB64(cred.response.userHandle) : null,
+                    },
+                },
+            };
+            const fr = await fetch("/login/webauthn/passkey/finish", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(payload),
+            });
+            if (fr.ok) {
+                const fb = await fr.json();
+                if (fb.redirect) location.href = fb.redirect;
+            }
+        } catch (e) {
+            // Conditional UI not available / user cancelled / no
+            // registered passkey -- fall through to OTP. Silent.
+        }
+    })();
+    </script>
+    {% elif step == "choose" %}
+    {# #67 — user has a registered hardware key. Default to touch;
+       OTP fallback link reposts to /login/email with otp_fallback=1
+       to skip the picker on the second pass. #}
+    <p>You have a hardware key registered. Touch it to sign in as
+       <strong>{{ email }}</strong>.</p>
+    <button id="hw-login-btn" type="button" autofocus>
+        Touch your security key
+    </button>
+    <p id="hw-login-status" style="margin:0.5rem 0;"></p>
+    <p>
+        <small>
+            <a href="/login/email?otp_fallback=1"
+               onclick="event.preventDefault();
+                        const f = document.createElement('form');
+                        f.method = 'post';
+                        f.action = '/login/email?otp_fallback=1';
+                        const i = document.createElement('input');
+                        i.type = 'hidden'; i.name = 'email'; i.value = {{ email | tojson }};
+                        f.appendChild(i); document.body.appendChild(f); f.submit();">
+                Send OTP instead
+            </a>
+            &middot;
+            <a href="/login">Use a different email</a>
+        </small>
+    </p>
+    <script src="/static/webauthn.js"></script>
+    <script>
+    document.getElementById("hw-login-btn").addEventListener("click", async () => {
+        const status = document.getElementById("hw-login-status");
+        status.textContent = "Touch your key…";
+        status.style.color = "var(--pico-muted-color)";
+        try {
+            const r = await ETWebAuthn.loginWithHardwareKey({{ email | tojson }});
+            location.href = r.redirect || "/dashboard";
+        } catch (e) {
+            status.textContent = "✗ " + (e.message || "Login failed");
+            status.style.color = "var(--pico-del-color)";
+        }
+    });
+    </script>
+    {% elif step == "verify" %}
+    <form method="post" action="/login/verify">
+        <input type="hidden" name="email" value="{{ email }}">
+        <p>A 6-digit code has been sent to <strong>{{ email }}</strong>.</p>
+        <label for="code">Enter code</label>
+        <input type="text" id="code" name="code" placeholder="123456"
+               pattern="[0-9]{6}" maxlength="6" inputmode="numeric" required autofocus>
+        <button type="submit">Verify</button>
+    </form>
+    <p><small><a href="/login">Use a different email</a></small></p>
+    {% endif %}
+
+    {# Subtle dev-keypair access — bottom-right, low-opacity glyph.
+       Reachable from any login step; the icon-only design keeps the
+       primary OTP / hardware-key flow visually uncluttered. #}
+    <a href="/login/dev-keypair"
+       title="Sign in with a dev keypair"
+       aria-label="Sign in with a dev keypair"
+       style="position:absolute;bottom:0.6rem;right:0.9rem;
+              text-decoration:none;font-size:1.1rem;line-height:1;
+              opacity:0.35;color:var(--pico-muted-color);
+              transition:opacity 0.15s ease;"
+       onmouseover="this.style.opacity='0.85'"
+       onmouseout="this.style.opacity='0.35'">🗝️</a>
+</article>
+</div>
+{% endblock %}

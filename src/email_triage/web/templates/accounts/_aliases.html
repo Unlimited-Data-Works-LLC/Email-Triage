@@ -1,0 +1,131 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional. Plain English only.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*).
+     - No protocol jargon (RFC numbers, MX, MX records, etc.).
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state.
+   ─────────────────────────────────────────────────────────── #}
+{# Partial: per-account additional-addresses subsection (#106).
+
+   One physical mailbox can deliver mail at more than one address —
+   for example, a personal address and a work address that both
+   forward to the same inbox, or a shared-mailbox alias added on
+   top of a primary user. This partial lets the owner declare those
+   extra addresses so triage routes + digest delivery work for each.
+
+   HTMX target: ``#aliases-{{ acct.id }}``. Add + remove handlers
+   re-render this same partial back into the target so the surface
+   stays in sync with the storage on every action. #}
+<div id="aliases-{{ acct.id }}" style="margin:0.75rem 0;">
+    <strong style="display:block;margin-bottom:0.25rem;">
+        Additional addresses{{ m.help("Adds another address that delivers to the same inbox. Example: if 'work@example.org' forwards to your personal mailbox, list 'work@example.org' here so triage rules apply to it too. Use this for forwarding setups, mailbox aliases, and shared mailboxes that deliver to one inbox under several addresses.") }}
+    </strong>
+    <p style="font-size:0.85rem;color:var(--pico-muted-color);margin:0 0 0.5rem 0;">
+        The address above is this account's main address. List any
+        other addresses that deliver to the SAME inbox here — for
+        example, a forwarding alias or a shared mailbox. Mail
+        addressed to any address listed here will be triaged as
+        part of this account, and the daily digest will accept
+        delivery at any of these addresses.
+    </p>
+
+    {% if alias_error %}
+    <article style="border-left:3px solid var(--pico-del-color);
+                    padding:0.4rem 0.75rem;margin:0.4rem 0;
+                    font-size:0.9rem;">
+        {{ alias_error }}
+    </article>
+    {% endif %}
+
+    {% set _aliases = acct.get('aliases') or [] %}
+    {% if _aliases %}
+    <table style="font-size:0.9rem;margin:0.4rem 0;">
+        <thead>
+            <tr>
+                <th style="width:18rem;">Address</th>
+                <th>Label</th>
+                <th style="width:6rem;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for entry in _aliases %}
+            <tr>
+                <td><code>{{ entry.address }}</code></td>
+                <td>{{ entry.label or '—' }}</td>
+                <td>
+                    <button type="button"
+                            class="outline secondary"
+                            style="padding:0.15rem 0.5rem;font-size:0.8rem;
+                                   color:var(--pico-del-color);"
+                            hx-post="/accounts/{{ acct.id }}/aliases/remove"
+                            hx-vals='{"address": {{ entry.address|tojson }}}'
+                            hx-target="#aliases-{{ acct.id }}"
+                            hx-swap="outerHTML"
+                            hx-confirm="Remove '{{ entry.address }}' from this account's additional addresses?">
+                        Remove
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="font-size:0.85rem;color:var(--pico-muted-color);
+              margin:0.3rem 0;">
+        No additional addresses yet. Most accounts only need the
+        main address above; add an entry below if mail addressed
+        to another address ends up in this same inbox.
+    </p>
+    {% endif %}
+
+    {# Add-row controls — owner / delegate / admin all allowed (same
+       gate as the main edit form). HTML doesn't allow nested
+       ``<form>`` tags, and this partial renders INSIDE the main
+       account-edit form (which is open from line ~102 to ~585 in
+       _edit.html). Using an HTMX-driven button + ``hx-include`` on
+       the two input fields submits ONLY those two fields — the
+       outer Save button is independent. The wrapping ``<div>`` and
+       the inputs' unique ids let ``hx-include`` target them
+       precisely (a CSS selector instead of a form scope). #}
+    <div id="aliases-add-row-{{ acct.id }}"
+         style="display:flex;flex-wrap:wrap;gap:0.5rem;
+                align-items:flex-end;margin-top:0.5rem;">
+        <label style="margin:0;flex:1 1 16rem;">
+            <small style="color:var(--pico-muted-color);">
+                Address
+            </small>
+            <input type="email"
+                   id="aliases-add-address-{{ acct.id }}"
+                   name="address"
+                   placeholder="alias1@example.com"
+                   form="aliases-noop-form-{{ acct.id }}"
+                   style="font-size:0.9rem;padding:0.35rem 0.5rem;
+                          width:100%;margin:0;">
+        </label>
+        <label style="margin:0;flex:1 1 12rem;">
+            <small style="color:var(--pico-muted-color);">
+                Label (optional)
+            </small>
+            <input type="text"
+                   id="aliases-add-label-{{ acct.id }}"
+                   name="label"
+                   placeholder="e.g. Work alias"
+                   maxlength="80"
+                   form="aliases-noop-form-{{ acct.id }}"
+                   style="font-size:0.9rem;padding:0.35rem 0.5rem;
+                          width:100%;margin:0;">
+        </label>
+        <button type="button"
+                hx-post="/accounts/{{ acct.id }}/aliases/add"
+                hx-include="#aliases-add-address-{{ acct.id }}, #aliases-add-label-{{ acct.id }}"
+                hx-target="#aliases-{{ acct.id }}"
+                hx-swap="outerHTML"
+                style="padding:0.35rem 1rem;font-size:0.9rem;margin:0;">
+            Add
+        </button>
+    </div>
+</div>

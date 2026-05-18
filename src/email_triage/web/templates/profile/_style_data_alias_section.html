@@ -1,0 +1,158 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate). Same as the
+                parent style_data.html page.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Comfortable with email + dashboards;
+                no terminal, no protocol RFCs, no provider internals.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*). Disabled controls
+       speak via their disabled state.
+     - No protocol or framework jargon: no "RFC", "OData", "partition
+       function", "vector embedding". Plain language: "writing-style",
+       "From: address", "alias".
+     - Tooltips lead with a concrete example using generic
+       placeholders (you@example.com, your-domain.example).
+     - Render NOTHING when the account has only one address — alias
+       mode is meaningless in that case.
+   ─────────────────────────────────────────────────────────── #}
+{% if entry.alias_picker_available %}
+
+{# ── Per-alias writing-style toggle + picker ────────────────────
+   AUDIENCE: end-user. Shown only when the account has 2+ addresses
+   (primary + at least one configured alias). The toggle is the entry
+   point; when on, a per-alias picker appears with one row per address.
+   ──────────────────────────────────────────────────────────────── #}
+<section class="et-style-section">
+    <h4>
+        Per-alias writing-style{{ m.help("Build a separate writing-style block for each From: address used on this account. Example: an account that sends from both 'you@personal.example' and 'work@your-domain.example' learns two distinct styles — casual for one, formal for the other. Off by default — single style across all addresses.") }}
+    </h4>
+    <p style="font-size:0.9em;color:var(--pico-muted-color);margin:0 0 0.5rem 0;">
+        This account has more than one address on it. By default, AI
+        builds one writing-style summary for the whole account. Turn
+        on the toggle below to build a separate summary for each From:
+        address you send from — useful when one address is formal
+        (work) and another is casual (personal).
+    </p>
+
+    <form method="post"
+          action="/profile/style-data/toggle-alias-mode?account_id={{ entry.account.id }}"
+          style="margin:0.5rem 0 0 0;">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="alias_mode_submitted" value="1">
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox"
+                   name="style_alias_mode_enabled"
+                   value="1"
+                   {% if entry.alias_mode_enabled and not entry.alias_toggle_disabled %}checked{% endif %}
+                   {% if entry.alias_toggle_disabled %}disabled{% endif %}
+                   onchange="this.form.submit()"
+                   style="margin:0;">
+            <span>Separate learning block per alias{{ m.help("On: AI partitions the writing-style learning by From: address. Off: one writing-style summary for the whole account (the default). Example: with two addresses 'you@personal.example' and 'work@your-domain.example', turning this on gives one casual summary and one formal summary instead of one mixed.") }}</span>
+            {% if entry.alias_toggle_disabled %}
+            <span style="display:inline-block;padding:0.05rem 0.4rem;font-size:0.75em;
+                         border:1px solid var(--pico-muted-border-color);
+                         border-radius:0.5rem;color:var(--pico-muted-color);
+                         margin-left:0.4rem;">
+                HIPAA — opt-in required first
+            </span>
+            {% endif %}
+        </label>
+    </form>
+
+    {% if entry.alias_mode_enabled and not entry.alias_toggle_disabled %}
+    {# ── Per-alias picker ──────────────────────────────────────
+       One row per declared address (primary + configured aliases).
+       Each row shows the current state for that address: whether a
+       descriptor has been built yet, when it was last built, and a
+       short preview. Each row gets its own Preview / Mine button so
+       the operator can refresh one alias without disturbing the
+       others.
+       ──────────────────────────────────────────────────────── #}
+    <p style="font-size:0.9em;color:var(--pico-muted-color);margin:0.75rem 0 0.25rem 0;">
+        Each address gets its own writing-style summary. Use the
+        buttons below to preview (without saving) or mine a single
+        address. Example: refresh just 'work@your-domain.example' after
+        a tone shift without retraining the casual one.
+    </p>
+    <table style="width:100%;font-size:0.9em;margin:0.5rem 0 0 0;
+                  border-collapse:collapse;">
+        <thead>
+            <tr style="border-bottom:1px solid var(--pico-muted-border-color);">
+                <th style="text-align:left;padding:0.3rem 0.4rem;">From: address{{ m.help("The address messages have been sent FROM in the past — for example 'you@personal.example'. AI matches each sent message's From: header to one of your declared addresses and builds a separate writing-style per address.") }}</th>
+                <th style="text-align:left;padding:0.3rem 0.4rem;">Last built</th>
+                <th style="text-align:left;padding:0.3rem 0.4rem;">Messages</th>
+                <th style="text-align:left;padding:0.3rem 0.4rem;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set _alias_entries_by_addr = {} %}
+            {% for ae in entry.alias_entries %}{% set _ = _alias_entries_by_addr.update({ae.from_address: ae}) %}{% endfor %}
+            {% for addr in entry.alias_addresses %}
+            {% set ae = _alias_entries_by_addr.get(addr) %}
+            <tr style="border-bottom:1px solid var(--pico-muted-border-color);">
+                <td style="padding:0.3rem 0.4rem;">
+                    <code>{{ addr }}</code>
+                    {% if loop.first %}
+                    <small style="color:var(--pico-muted-color);">(primary)</small>
+                    {% endif %}
+                </td>
+                <td style="padding:0.3rem 0.4rem;">
+                    {% if ae %}{{ ae.updated_at_short or "(no timestamp)" }}{% else %}<small style="color:var(--pico-muted-color);">never</small>{% endif %}
+                </td>
+                <td style="padding:0.3rem 0.4rem;">
+                    {% if ae %}{{ ae.sample_count }}{% else %}<small style="color:var(--pico-muted-color);">&mdash;</small>{% endif %}
+                </td>
+                <td style="padding:0.3rem 0.4rem;">
+                    <div style="display:flex;gap:0.3rem;flex-wrap:wrap;">
+                        <form hx-post="/profile/style-data/preview?account_id={{ entry.account.id }}&alias_from_address={{ addr|urlencode }}"
+                              hx-target="#mine-result-{{ entry.account.id }}"
+                              hx-swap="innerHTML"
+                              style="margin:0;">
+                            {{ csrf_input(request) }}
+                            <button type="submit" class="outline"
+                                    style="padding:0.15rem 0.5rem;font-size:0.85em;margin:0;"
+                                    {% if entry.mine_button_disabled %}disabled{% endif %}>
+                                Preview{{ m.help("Shows the writing-style summary AI would build for just this From: address, without saving it. Example: preview 'work@your-domain.example' to see whether the formal tone reads right before saving.") }}
+                            </button>
+                        </form>
+                        <form hx-post="/profile/style-data/mine-now?account_id={{ entry.account.id }}&alias_from_address={{ addr|urlencode }}"
+                              hx-target="#mine-result-{{ entry.account.id }}"
+                              hx-swap="innerHTML"
+                              hx-confirm="Build a writing-style summary for this address now? Existing summary for this address will be replaced."
+                              style="margin:0;">
+                            {{ csrf_input(request) }}
+                            <button type="submit"
+                                    style="padding:0.15rem 0.5rem;font-size:0.85em;margin:0;"
+                                    {% if entry.mine_button_disabled %}disabled{% endif %}>
+                                Mine{{ m.help("Pulls your most recent sent messages from this address, asks AI to extract a writing-style summary, and saves it. Example: mine 'you@personal.example' to refresh your casual voice after a tone shift.") }}
+                            </button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% if ae and ae.preview %}
+            <tr>
+                <td colspan="4" style="padding:0 0.4rem 0.5rem 0.4rem;
+                                       color:var(--pico-muted-color);
+                                       font-size:0.85em;">
+                    {{ ae.preview }}
+                    {% if ae.descriptor_full %}
+                    <details style="margin-top:0.3rem;">
+                        <summary style="cursor:pointer;color:var(--pico-muted-color);font-size:0.9em;">
+                            Show full summary for {{ ae.from_address }}
+                            {% if ae.char_count %}
+                            <small>({{ ae.char_count }} characters)</small>
+                            {% endif %}
+                        </summary>
+                        <pre style="white-space:pre-wrap;background:var(--pico-card-background-color);padding:0.5rem;border-radius:4px;font-size:0.85em;max-height:28rem;overflow:auto;margin-top:0.25rem;">{{ ae.descriptor_full }}</pre>
+                    </details>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}{# end alias_mode_enabled #}
+</section>
+{% endif %}{# end alias_picker_available #}

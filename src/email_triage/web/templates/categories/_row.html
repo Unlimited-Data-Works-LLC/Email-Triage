@@ -1,0 +1,43 @@
+<tr id="cat-{{ cat.id }}">
+    <td><code>{{ cat.slug }}</code></td>
+    <td>
+        {% if cat.user_id is none %}
+        <span style="color:var(--pico-ins-color);">System</span>
+        {% else %}
+        {% set _owner = owners_by_id[cat.user_id] or {} %}
+        {% set _name = _owner.get("name") or "" %}
+        {% set _email = _owner.get("email") or ("user #%d" % cat.user_id) %}
+        {{ _name or _email }}
+        {% if _name and _email %}
+        <br><small style="color:var(--pico-muted-color);">{{ _email }}</small>
+        {% endif %}
+        {% endif %}
+    </td>
+    <td>{{ cat.description }}{% if error %} <small style="color:var(--pico-del-color);">&mdash; {{ error }}</small>{% endif %}</td>
+    <td>
+        <div role="group">
+            <button class="secondary outline"
+                    hx-get="/categories/{{ cat.id }}/edit"
+                    hx-target="#cat-{{ cat.id }}"
+                    hx-swap="outerHTML">Edit</button>
+            {% if cat.user_id is not none %}
+            <button class="secondary outline"
+                    hx-post="/categories/{{ cat.id }}/promote"
+                    hx-target="#cat-{{ cat.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Promote '{{ cat.slug }}' (category name) to a system category?">Promote</button>
+            {% else %}
+            <button class="secondary outline"
+                    hx-get="/categories/{{ cat.id }}/demote-form"
+                    hx-target="#cat-{{ cat.id }}"
+                    hx-swap="outerHTML"
+                    title="Move this system category to one user's personal scope">Move</button>
+            {% endif %}
+            <button class="secondary outline"
+                    hx-delete="/categories/{{ cat.id }}"
+                    hx-target="#cat-{{ cat.id }}"
+                    hx-swap="outerHTML swap:0.2s"
+                    hx-confirm="Delete category '{{ cat.slug }}' (category name)? This cannot be undone.">Del</button>
+        </div>
+    </td>
+</tr>

@@ -1,0 +1,716 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (operator running the install).
+   TECH-SKILL:  technical — admin is comfortable with Let's Encrypt
+                semantics, ACME phases, DNS propagation, rate-limit
+                windows. Jargon is OK here ("order", "authorization",
+                "directory_url", "challenge").
+   COPY RULES:
+     - Admin paths (/admin/tls, /config) are fine — this IS one.
+     - LE-side jargon is fine; we link to LE docs where it helps.
+     - Diagnostics surface as-is (raw JSON, raw error text). Don't
+       sanitize — admin needs the wire-level detail to debug.
+     - Confirm-before-destructive on Stop / Delete buttons.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}ACME / TLS status - Email Triage{% endblock %}
+{% block content %}
+
+<h2>ACME / Let's Encrypt status</h2>
+<p>
+    Built-in renewal automation against
+    <code>{{ config.directory_url }}</code>. Cert + key live in
+    <code>{{ cert_dir }}</code>; the HTTPS listener hot-reloads on
+    mtime change.
+</p>
+
+{# #80 -- TLS posture overview. The four supported deploy postures
+   share this one config form; field relevance varies by posture so
+   operators don't waste time filling in DNS-01 fields when the
+   install is on Tailscale-issued LE. #}
+<article style="border-left:3px solid var(--pico-muted-border-color);padding:0.6rem 1rem;margin-bottom:1rem;background:var(--pico-card-background-color);">
+    <strong>Which fields apply to your install?</strong>
+    <ul style="margin:0.4rem 0 0;padding-left:1.2rem;">
+        <li><strong>Built-in ACME automation</strong> (most common — the
+            renewer talks directly to Let's Encrypt). Fill in
+            <em>ACME</em>, <em>DNS-01</em>, and the
+            <em>Public-DNS propagation gate</em> sections. Example
+            account email: <code>tls-admin@example.com</code>.</li>
+        <li><strong>External ACME pipeline</strong> (operator runs
+            acme.sh / lego / certbot on the host and writes
+            <code>server.crt</code> + <code>server.key</code> into
+            <code>cert_dir</code>). Only the <em>Listener mode</em> +
+            <em>cert_dir</em> fields apply; ignore the ACME / DNS-01
+            sections — your external tool handles all of that.</li>
+        <li><strong>Tailscale-issued LE</strong> (Tailnet-only installs;
+            <code>tailscale cert</code> writes the cert). Only
+            <em>Listener mode</em> + <em>cert_dir</em> apply, same as
+            external ACME.</li>
+        <li><strong>Self-signed</strong> (dev / fallback only —
+            browsers warn on every connect, WebAuthn won't work
+            cross-host). Only <em>Listener mode</em> + <em>cert_dir</em>
+            apply. Bootstrap via
+            <code>email-triage tls bootstrap</code>.</li>
+    </ul>
+    <p style="margin:0.5rem 0 0;font-size:0.9em;color:var(--pico-muted-color);">
+        WebAuthn fields apply to all postures — they configure
+        hardware-key authentication, not the cert itself.
+    </p>
+</article>
+
+{% if request.query_params.get("saved") == "1" %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    Settings saved.
+</article>
+{% endif %}
+{% if request.query_params.get("err") %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    {{ request.query_params.get("err") }}
+</article>
+{% endif %}
+{% if listener_restart_pending %}
+{# #81 -- persistent listener-restart-pending chip. Compares
+   ``app.state.tls_boot_mode`` (frozen at process start) to the
+   currently saved ``tls.enabled`` value. uvicorn cannot swap
+   http<->https mid-process; saved config is in memory + YAML but
+   the live socket is unchanged until the service restarts. The
+   chip survives page reloads and only disappears when the actual
+   process restart aligns boot_mode with the saved value. #}
+<article id="listener-restart-pending"
+         style="border-left:3px solid var(--pico-color-amber-500);padding:0.75rem 1rem;margin-bottom:1rem;background:var(--pico-card-background-color);">
+    <strong>⚠ Listener mode change pending — restart email-triage to take effect.</strong>
+    <p style="margin:0.4rem 0 0;">
+        Saved: <strong>{{ "HTTPS" if tls.enabled else "HTTP" }}</strong>.
+        Currently running:
+        <strong>{{ "HTTPS" if listener_boot_mode else "HTTP" }}</strong>.
+        Uvicorn doesn't swap protocols mid-process, so the new
+        listener won't bind until the service restarts.
+    </p>
+    <p style="margin:0.4rem 0 0;font-size:0.9em;">
+        Restart on the host:
+    </p>
+    <pre style="margin:0.4rem 0;padding:0.5rem;background:var(--pico-code-background-color);border-radius:4px;">sudo systemctl restart email-triage    # systemd installs
+sudo podman restart email-triage       # podman installs (no systemd)</pre>
+    <p style="margin:0.4rem 0 0;font-size:0.85em;color:var(--pico-muted-color);">
+        Use whichever command matches your install. The chip
+        clears automatically once the listener binds the new
+        protocol.
+    </p>
+</article>
+{% endif %}
+
+<details {% if not config.domains %}open{% endif %}>
+    <summary role="button" class="outline">Configure ACME / DNS-01 / WebAuthn</summary>
+    <form method="post" action="/admin/acme-status/save">
+        {{ csrf_input(request) }}
+        <h4 style="margin-top:0.75rem;">Listener mode</h4>
+        <p><small style="color:var(--pico-muted-color);">
+            Off (default) = HTTP listener; useful for backend monitoring
+            (Nagios HTTP probes etc.). On = HTTPS listener using the cert
+            in <code>cert_dir</code>. Requires a cert on disk; gated
+            until one is present (ACME issuance, manual CSR + import,
+            or self-signed via the CSR workflow all qualify).
+            {% if not cert_meta.get("present") %}
+            <strong style="color:var(--pico-del-color);">No cert at
+            <code>{{ cert_dir }}/server.crt</code> — HTTPS toggle
+            disabled. Issue Now below mints one via ACME.</strong>
+            {% endif %}
+        </small></p>
+        <div class="grid">
+            <label>
+                <input type="checkbox" name="tls_enabled" value="1"
+                       {% if tls.enabled %}checked{% endif %}
+                       {% if not cert_meta.get("present") %}disabled{% endif %}>
+                Serve HTTPS (terminate TLS in-process){{ m.help("Off = the app speaks plain HTTP and an external proxy (Tailscale serve, nginx, etc.) handles TLS. On = the app loads server.crt / server.key directly. Flipping requires a service restart — the in-flight uvicorn listener doesn't switch protocols mid-process.") }}
+            </label>
+            <label>
+                Cert dir (where ACME writes server.crt / server.key){{ m.help("Filesystem directory the renewer writes server.crt + server.key into. Same dir is read by the HTTPS listener; the hot-reload watcher polls the cert mtime here every 30s.") }}
+                <input type="text" name="tls_cert_dir"
+                       value="{{ tls.cert_dir }}"
+                       placeholder="/app/data/certs">
+            </label>
+        </div>
+        <p style="margin:0.5rem 0 0;">
+            <small style="color:var(--pico-muted-color);">
+                CSRF enforce, session timeout, and HIPAA mode live on
+                <a href="/admin/security">/admin/security</a> — they
+                don't depend on the certificate.
+            </small>
+        </p>
+
+        <h4 style="margin-top:0.75rem;">ACME (Let's Encrypt)</h4>
+        <div class="grid">
+            <label>
+                <input type="checkbox" name="enabled" value="1"
+                       {% if config.enabled %}checked{% endif %}>
+                Enable automated renewal{{ m.help("Background renewer wakes every check-interval to inspect the active cert. When days-remaining drops below the threshold, runs an ACME order automatically. Disable to issue manually only via Issue now below.") }}
+            </label>
+            <label>
+                Directory URL{{ m.help("Staging issues fake certs that browsers reject but never rate-limits — use it for first runs and config changes. Production issues real certs, capped at 5 per domain per week. Always test with staging first to avoid burning the limit.") }}
+                <select name="directory_url">
+                    <option value="https://acme-staging-v02.api.letsencrypt.org/directory"
+                        {% if "staging" in config.directory_url %}selected{% endif %}>
+                        Staging (test — no rate limit)
+                    </option>
+                    <option value="https://acme-v02.api.letsencrypt.org/directory"
+                        {% if "staging" not in config.directory_url %}selected{% endif %}>
+                        Production (5 certs / week / domain)
+                    </option>
+                </select>
+            </label>
+        </div>
+        <div class="grid">
+            <label>
+                Account email (LE notifications){{ m.help("Let's Encrypt sends expiration warnings and ToS-update notices to this address. Required by ACME. Use a monitored mailbox -- you do not want LE-side alerts going unread.") }}
+                <input type="email" name="account_email"
+                       value="{{ config.account_email }}"
+                       placeholder="ops@example.com">
+            </label>
+            <label>
+                Domains (comma-separated; first becomes Subject CN){{ m.help("FQDNs to include in the cert. The first becomes the Subject CN; all become SANs. Browsers match against SANs, so any of the listed names will validate. Wildcards (*.example.com) require DNS-01 (already configured here).") }}
+                <input type="text" name="domains"
+                       value="{{ config.domains | join(', ') }}"
+                       placeholder="triage.example.com">
+            </label>
+        </div>
+        <div class="grid">
+            <label>
+                Renewal threshold (days){{ m.help("Renew when remaining lifetime drops below this many days. LE certs are valid 90 days; 30 is the safe default (60d of buffer for outages on either side).") }}
+                <input type="number" name="renewal_threshold_days"
+                       value="{{ config.renewal_threshold_days }}" min="1" max="89">
+            </label>
+            <label>
+                Check interval (hours){{ m.help("How often the background renewer wakes to inspect the cert. Default 24h is plenty -- LE certs expire over months, not hours. Faster cycles burn no resources but provide no benefit.") }}
+                <input type="number" name="check_interval_hours"
+                       value="{{ config.check_interval_hours }}" min="1" max="168">
+            </label>
+        </div>
+        <h5 style="margin-top:1rem;">LE-side validation resilience</h5>
+        <p><small style="color:var(--pico-muted-color);">
+            After our public-resolver gate passes, LE still queries
+            the record from its own recursive chain. Negative caches
+            and slow downstream resolvers can fail the first try.
+            Match acme.sh: pause briefly to let LE-side caches
+            expire, then retry the full order on ValidationError.
+        </small></p>
+        <div class="grid">
+            <label>
+                Pre-validation grace (seconds){{ m.help("After our public-resolver gate confirms the TXT record is visible, sleep this long before telling LE to validate. Lets LE-side negative caches expire so the first validation attempt isn't a wasted round-trip.") }}
+                <input type="number" name="pre_validation_grace_secs"
+                       value="{{ config.pre_validation_grace_secs }}"
+                       min="0" max="600" step="5">
+            </label>
+            <label>
+                Validation retries (additional attempts){{ m.help("If LE's first validation attempt fails (often a transient negative-cache issue), how many additional attempts to make before giving up. Default 5 is generous; permanent failures (CAA, badCSR) skip retries regardless.") }}
+                <input type="number" name="validation_retries"
+                       value="{{ config.validation_retries }}"
+                       min="0" max="30" step="1">
+            </label>
+            <label>
+                Retry delay (seconds){{ m.help("Seconds to sleep between Let's Encrypt validation retries. Constant interval — every retry waits the same amount.") }}
+                <input type="number" name="validation_retry_delay_secs"
+                       value="{{ config.validation_retry_delay_secs }}"
+                       min="5" max="600" step="5">
+            </label>
+        </div>
+        <label style="margin-top:0.5rem;display:block;">
+            <input type="checkbox" name="caa_enforce" value="1"
+                   {% if config.caa_enforce %}checked{% endif %}>
+            Enforce CAA pre-flight (abort issuance when CAA records
+            forbid letsencrypt.org). Off = warn only — recommended for
+            first runs so you see what would have happened.{{ m.help("CAA DNS records can restrict which CAs are allowed to issue for a domain. If yours forbid letsencrypt.org, every ACME order will fail at validation -- often silently for operators who don't know about CAA. Pre-flight catches this before submitting the order.") }}
+        </label>
+
+        <h4>DNS-01 (RFC-2136 dynamic DNS update){{ m.help("DNS-01 proves domain control by writing a TXT record at _acme-challenge.<domain>. This implementation uses RFC-2136 dynamic update -- the renewer signs an UPDATE message with a TSIG key and sends it directly to the authoritative nameserver. No HTTP-01 (would need port 80 exposed); no DNS-provider plugins (BIND-native).") }}</h4>
+        <input type="hidden" name="dns_provider" value="rfc2136">
+        <input type="hidden" name="challenge" value="dns-01">
+        <div class="grid">
+            <label>
+                Nameserver IP / host{{ m.help("Authoritative nameserver IP or hostname that accepts dynamic updates via the TSIG key. The renewer publishes the _acme-challenge TXT here. Often the same nameserver that hosts the parent zone.") }}
+                <input type="text" name="rfc_nameserver"
+                       value="{{ rfc.nameserver }}"
+                       placeholder="192.168.X.X (e.g. dnshost)">
+            </label>
+            <label>
+                Nameserver port{{ m.help("Standard DNS port is 53. Override only if the authoritative listens elsewhere.") }}
+                <input type="number" name="rfc_nameserver_port"
+                       value="{{ rfc.nameserver_port }}" min="1" max="65535">
+            </label>
+        </div>
+        <div class="grid">
+            <label>
+                TSIG key name (trailing dot){{ m.help("Name of the TSIG key configured on the nameserver. Trailing dot included -- DNS names are absolute. Must match the named.conf 'key' block exactly.") }}
+                <input type="text" name="rfc_tsig_key_name"
+                       value="{{ rfc.tsig_key_name }}"
+                       placeholder="triage-acme.">
+            </label>
+            <label>
+                TSIG algorithm{{ m.help("HMAC algorithm used to sign the dynamic-update message. Must match the algorithm declared on the nameserver's key block. SHA-256 is the modern default; SHA-1 / MD5 are present for legacy interop only.") }}
+                <select name="rfc_tsig_algorithm">
+                    {% for alg in ["hmac-sha256","hmac-sha384","hmac-sha512","hmac-sha1","hmac-md5"] %}
+                    <option value="{{ alg }}" {% if rfc.tsig_algorithm == alg %}selected{% endif %}>{{ alg }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+        </div>
+        <div class="grid">
+            <label>
+                Update zone (where TSIG can write — CNAME-delegation pattern){{ m.help("Zone the TSIG key is authorized to write. Common pattern: a separate sub-zone like 'acme.<domain>' delegated via CNAME from _acme-challenge.<cert-subject>. Limits the blast radius of a leaked TSIG -- compromised key can only forge records in this sub-zone, not the whole apex.") }}
+                <input type="text" name="rfc_update_zone"
+                       value="{{ rfc.update_zone }}"
+                       placeholder="acme.example.com">
+            </label>
+            <label>
+                TSIG secret-store key (name only){{ m.help("Name (not value) of the secret-store entry that holds the TSIG shared secret. The actual secret bytes live encrypted in the secrets store; this is just the lookup key.") }}
+                <input type="text" name="rfc_tsig_secret_ref"
+                       value="{{ rfc.tsig_secret_ref }}">
+            </label>
+        </div>
+        <label>
+            TSIG shared secret (base64) — paste once, stored encrypted; leave blank to keep existing{{ m.help("Base64-encoded shared secret matching the key block on the nameserver. Stored encrypted in the secrets store on save; never written to YAML. Leave blank to preserve the stored value -- saving with this field empty does NOT zero the secret.") }}
+            <input type="password" name="rfc_tsig_secret_value"
+                   placeholder="leave blank if already set"
+                   autocomplete="off">
+            <small style="color:var(--pico-muted-color);">
+                Written to the secrets store under
+                <code>{{ rfc.tsig_secret_ref }}</code>; never persisted to YAML.
+            </small>
+        </label>
+
+        <h5 style="margin-top:1rem;">Public-DNS propagation gate</h5>
+        <p><small style="color:var(--pico-muted-color);">
+            After the TXT is visible on your authoritative server,
+            the renewer waits for these public recursive resolvers
+            to see it before signaling Let's Encrypt. Catches the
+            propagation window between an internal update target
+            and the public-facing nameservers. Matches acme.sh
+            behavior (multi-resolver, long retry).
+        </small></p>
+        <div class="grid">
+            <label>
+                Public resolvers (comma-separated IPs){{ m.help("Public recursive resolvers to query before signaling LE. The renewer waits until ALL of them see the TXT -- guards against the propagation window between authoritative and public DNS. Three is enough; more = slower gate without meaningfully better signal.") }}
+                <input type="text" name="rfc_public_resolvers"
+                       value="{{ rfc.public_resolvers | join(', ') }}"
+                       placeholder="8.8.8.8, 1.1.1.1, 9.9.9.9">
+            </label>
+            <label>
+                Propagation timeout (seconds){{ m.help("Give up the public-DNS gate if not all resolvers see the TXT within this many seconds. Default 600s covers typical propagation; bump for slow zones or large TTLs. Aborts before LE rate-limits the failed orders.") }}
+                <input type="number" name="rfc_public_propagation_timeout_secs"
+                       value="{{ rfc.public_propagation_timeout_secs }}"
+                       min="60" max="14400" step="30">
+            </label>
+            <label>
+                Poll interval (seconds){{ m.help("How often to re-query the public resolvers while waiting for propagation. 2-5s is fine; longer = lighter on resolvers but slower to signal LE once propagation completes.") }}
+                <input type="number" name="rfc_public_propagation_interval_secs"
+                       value="{{ rfc.public_propagation_interval_secs }}"
+                       min="2" max="300" step="1">
+            </label>
+        </div>
+
+        <h4>WebAuthn / FIDO2{{ m.help("Hardware-key authentication (YubiKey, FIDO2, platform passkeys). Settings here scope every credential users register -- changing them invalidates the existing registrations.") }}</h4>
+        <div class="grid">
+            <label>
+                rp_id (must match cert SAN; permanent — changing
+                invalidates registered keys){{ m.help("Hardware-key 'relying party' ID -- the domain credentials are bound to. Must match a SAN on the active cert. Permanent: changing it invalidates every registered hardware key. Use the bare hostname (no scheme, no port).") }}
+                <input type="text" name="webauthn_rp_id"
+                       value="{{ webauthn.rp_id }}"
+                       placeholder="triage.example.com">
+            </label>
+            <label>
+                Origin (full HTTPS URL){{ m.help("Full HTTPS URL the browser sees, including port if non-standard. Used by WebAuthn to scope credentials. Must include scheme (https://) and match cert hostname.") }}
+                <input type="text" name="webauthn_origin"
+                       value="{{ webauthn.origin }}"
+                       placeholder="https://triage.example.com">
+            </label>
+        </div>
+        <label>
+            rp_name (shown to users at touch){{ m.help("Human-readable name shown on the security key (or platform prompt) when the user touches to authenticate. Example: 'Email Triage — Production'. Cosmetic only; no security impact.") }}
+            <input type="text" name="webauthn_rp_name"
+                   value="{{ webauthn.rp_name }}">
+        </label>
+
+        <button type="submit" style="margin-top:0.75rem;">Save configuration</button>
+    </form>
+</details>
+
+<section>
+    <h3>Current certificate</h3>
+    {% if cert_meta.present %}
+    <table>
+        <tbody>
+            <tr><th>Subject CN</th><td>{{ cert_meta.subject_cn }}</td></tr>
+            <tr><th>SANs</th><td>{{ cert_meta.sans | join(", ") }}</td></tr>
+            <tr><th>Not before</th><td>{{ cert_meta.not_before }}</td></tr>
+            <tr><th>Not after</th><td>{{ cert_meta.not_after }}</td></tr>
+            <tr><th>Days remaining</th>
+                <td>
+                    {% if cert_meta.days_remaining is not none %}
+                    {% if cert_meta.days_remaining < config.renewal_threshold_days %}
+                    <strong style="color:var(--pico-del-color);">
+                        {{ cert_meta.days_remaining }} (renewal due)
+                    </strong>
+                    {% else %}
+                    {{ cert_meta.days_remaining }}
+                    {% endif %}
+                    {% else %}
+                    &mdash;
+                    {% endif %}
+                </td>
+            </tr>
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>No certificate present at <code>{{ cert_dir }}/server.crt</code>. Use Issue now below to mint one.</em></p>
+    {% endif %}
+</section>
+
+<section style="margin-top:1.5rem;">
+    <h3>DNS-01 diagnostics</h3>
+    <p style="font-size:0.9em;">
+        Configured: nameserver <code>{{ rfc.nameserver }}:{{ rfc.nameserver_port }}</code>,
+        TSIG key <code>{{ rfc.tsig_key_name }}</code> ({{ rfc.tsig_algorithm }}),
+        update zone <code>{{ rfc.update_zone or '(unset — falls back to cert subject)' }}</code>.
+    </p>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <button type="button" class="outline" onclick="runTest('/admin/acme-status/test/dns-reach')">
+            1. Test DNS reach
+        </button>
+        <button type="button" class="outline" onclick="runTest('/admin/acme-status/test/tsig')">
+            2. Test TSIG auth
+        </button>
+        <button type="button" class="outline" onclick="runTest('/admin/acme-status/test/publish')">
+            3. Test publish + verify
+        </button>
+        <button type="button" onclick="runTestCycle('/admin/acme-status/test/full-cycle')">
+            Run all 1→3
+        </button>
+    </div>
+    <pre id="acme-test-output"
+         style="margin-top:0.75rem;padding:0.6rem;background:var(--pico-code-background-color);
+                font-size:0.85rem;min-height:4rem;border-radius:4px;
+                white-space:pre-wrap;"></pre>
+</section>
+
+<section style="margin-top:1.5rem;">
+    <h3>Manual issue</h3>
+    <p style="font-size:0.9em;">
+        Two explicit buttons to prevent a single click from accidentally
+        burning the LE production rate limit (5 certs / week / domain).
+    </p>
+    <div style="display:flex;gap:0.5rem;">
+        <button type="button" class="outline secondary"
+                onclick="runIssue('staging')">
+            Issue from STAGING directory
+        </button>
+        <button type="button"
+                onclick="if(confirm('Issue against LE PRODUCTION (rate-limited). Continue?')) runIssue('production');">
+            Issue from PRODUCTION
+        </button>
+    </div>
+    <pre id="acme-issue-output"
+         style="margin-top:0.75rem;padding:0.6rem;background:var(--pico-code-background-color);
+                font-size:0.85rem;min-height:4rem;border-radius:4px;
+                white-space:pre-wrap;"></pre>
+    {# #103 -- Cancel button. Hidden by default; reattachToJob /
+       renderJobState shows it during cancellable phases. The
+       button POSTs to /admin/acme-status/cancel which flips the
+       cancel_requested flag on the persisted acme_jobs row; the
+       worker thread sees it at the next retry-loop boundary and
+       transitions to the 'cancelled' terminal phase. Cancel does
+       not affect Let's Encrypt rate limits -- pending orders age
+       out within seven days regardless. #}
+    <div id="acme-cancel-row" style="margin-top:0.5rem;display:none;">
+        <button type="button" class="outline secondary"
+                id="acme-cancel-btn"
+                style="padding:0.3rem 0.8rem;font-size:0.9em;
+                       border-color:var(--pico-color-amber-500);
+                       color:var(--pico-color-amber-500);"
+                onclick="return cancelIssue();">
+            Stop this run
+        </button>
+        <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
+            Stops the in-flight issuance. The Let&rsquo;s Encrypt order
+            ages out in 7 days; stopping here does not affect rate-limit
+            windows. Already-finalized issuances finish saving the
+            certificate before stopping.
+        </small>
+    </div>
+</section>
+
+<section style="margin-top:1.5rem;">
+    <h3>Renewal log (last {{ log_rows | length }})</h3>
+    {% if log_rows %}
+    <table>
+        <thead>
+            <tr>
+                <th>When</th><th>Domain</th><th>Outcome</th>
+                <th>Not after</th><th>Error</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in log_rows %}
+            <tr>
+                <td><small>{{ r.ts[:19] }}</small></td>
+                <td><code>{{ r.domain }}</code></td>
+                <td>
+                    {% if r.outcome == 'renewed' %}
+                    <small style="color:var(--pico-ins-color);">renewed</small>
+                    {% elif r.outcome == 'skipped_fresh' %}
+                    <small>skipped (fresh)</small>
+                    {% else %}
+                    <small style="color:var(--pico-del-color);">{{ r.outcome }}</small>
+                    {% endif %}
+                </td>
+                <td><small>{{ r.not_after[:19] if r.not_after else '—' }}</small></td>
+                <td><small style="color:var(--pico-del-color);">{{ r.error or '' }}</small></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>No renewal events logged yet.</em></p>
+    {% endif %}
+</section>
+
+<p style="margin-top:1.5rem;">
+    <a href="/dashboard" role="button" class="outline">&larr; Dashboard</a>
+</p>
+
+<script>
+function fmtStep(s) {
+    const icon = s.ok ? "✓" : "✗";
+    const color = s.ok ? "var(--pico-ins-color)" : "var(--pico-del-color)";
+    return `<span style="color:${color};">${icon}</span> [${s.elapsed_ms}ms] ${s.name}\n` +
+           (s.detail ? `    ${s.detail}\n` : "") +
+           (s.error ? `    error: ${s.error}\n` : "");
+}
+async function runTest(url) {
+    const out = document.getElementById("acme-test-output");
+    out.textContent = "Running…";
+    try {
+        const resp = await fetch(url, {method: "POST"});
+        const data = await resp.json();
+        out.innerHTML = fmtStep(data);
+    } catch (e) {
+        out.textContent = "Network error: " + e.message;
+    }
+}
+async function runTestCycle(url) {
+    const out = document.getElementById("acme-test-output");
+    out.textContent = "Running full cycle…";
+    try {
+        const resp = await fetch(url, {method: "POST"});
+        const data = await resp.json();
+        let txt = `Overall: ${data.overall_ok ? "✓ ALL OK" : "✗ FAILED"}\n` +
+                  `Started:  ${data.started_at}\n` +
+                  `Finished: ${data.finished_at}\n\n`;
+        for (const s of data.steps) txt += fmtStep(s) + "\n";
+        out.innerHTML = txt;
+    } catch (e) {
+        out.textContent = "Network error: " + e.message;
+    }
+}
+// Server-rendered upper bound for the issue flow, derived from the
+// configured propagation + retry knobs. Happy path is still seconds;
+// these numbers describe the worst case before the renewer gives up.
+const ACME_MAX_PER_ATTEMPT_SECS = {{
+    config.rfc2136.public_propagation_timeout_secs
+    + config.pre_validation_grace_secs + 120
+}};
+const ACME_MAX_ATTEMPTS = {{ config.validation_retries + 1 }};
+const ACME_RETRY_DELAY_SECS = {{ config.validation_retry_delay_secs }};
+const ACME_MAX_TOTAL_SECS = (
+    ACME_MAX_PER_ATTEMPT_SECS * ACME_MAX_ATTEMPTS
+    + ACME_RETRY_DELAY_SECS * (ACME_MAX_ATTEMPTS - 1)
+);
+function fmtSecs(s) {
+    if (s < 90) return s + "s";
+    if (s < 3600) return Math.round(s / 60) + " min";
+    return (s / 3600).toFixed(1) + " hr";
+}
+async function runIssue(directory) {
+    const out = document.getElementById("acme-issue-output");
+    let elapsed = 0;
+    out.textContent =
+        `Issuing from ${directory}… elapsed 0s. ` +
+        `Happy path: ~30s. Up to ${ACME_MAX_ATTEMPTS} attempts; ` +
+        `worst case ~${fmtSecs(ACME_MAX_TOTAL_SECS)} before giving up.`;
+    const tick = setInterval(() => {
+        elapsed += 1;
+        out.textContent =
+            `Issuing from ${directory}… elapsed ${fmtSecs(elapsed)}. ` +
+            `Happy path: ~30s. Up to ${ACME_MAX_ATTEMPTS} attempts; ` +
+            `worst case ~${fmtSecs(ACME_MAX_TOTAL_SECS)} before giving up.`;
+    }, 1000);
+    try {
+        const fd = new FormData();
+        fd.append("directory", directory);
+        const resp = await fetch("/admin/acme-status/issue", {method: "POST", body: fd});
+        const data = await resp.json();
+        clearInterval(tick);
+        if (data.ok) {
+            out.innerHTML = `✓ Issued (${directory}) in ${fmtSecs(elapsed)}\n` +
+                            `  CN:        ${data.cert.subject_cn}\n` +
+                            `  SANs:      ${(data.cert.sans||[]).join(", ")}\n` +
+                            `  Not after: ${data.cert.not_after}`;
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            out.textContent = `✗ (after ${fmtSecs(elapsed)}) ` + data.error;
+        }
+    } catch (e) {
+        clearInterval(tick);
+        out.textContent = "Network error: " + e.message;
+    }
+}
+
+// #75 -- live re-attach. On page load, GET /admin/acme-status/job and
+// poll if a job is in flight. Lets a refresh / nav-away-and-back
+// reconnect to the running worker instead of staring at idle UI.
+function fmtPhase(phase) {
+    const labels = {
+        "starting": "Starting",
+        "publishing": "Publishing TXT",
+        "polling_local": "Polling local NS",
+        "polling_authoritative": "Polling authoritative NS chain",
+        "grace": "Pre-validation grace pause",
+        "answering": "Answering challenge",
+        "finalizing": "Finalizing order",
+        "retrying": "Retrying after validation failure",
+        "done": "Done",
+        "failed": "Failed",
+        "cancelled": "Stopped",
+        "idle": "Idle",
+    };
+    return labels[phase] || phase;
+}
+// #103 -- Cancel button toggle. Visible only when phase is in the
+// cancellable set. Hidden during answering / finalizing (cancelling
+// mid-finalize would discard a successful issuance) and on terminal
+// phases. The set must match the worker's check in acme_renewer.
+const CANCELLABLE_PHASES = new Set([
+    "starting", "publishing", "polling_local",
+    "polling_authoritative", "grace", "retrying",
+]);
+function setCancelVisible(state) {
+    const row = document.getElementById("acme-cancel-row");
+    const btn = document.getElementById("acme-cancel-btn");
+    if (!row || !btn) return;
+    const live = state && state.in_flight
+                 && CANCELLABLE_PHASES.has(state.phase)
+                 && !state.cancel_requested;
+    row.style.display = live ? "" : "none";
+    btn.disabled = !live;
+    if (state && state.cancel_requested && state.in_flight) {
+        // Already requested; show pending hint instead of the
+        // primary button so a second click can't double-fire.
+        row.style.display = "";
+        btn.disabled = true;
+        btn.textContent = "Stop requested…";
+    } else {
+        btn.textContent = "Stop this run";
+    }
+}
+async function cancelIssue() {
+    const btn = document.getElementById("acme-cancel-btn");
+    if (btn) btn.disabled = true;
+    if (!confirm(
+        "Stop the in-flight Let’s Encrypt issuance? " +
+        "The pending order ages out in 7 days; stopping does not " +
+        "affect rate-limit windows."
+    )) {
+        if (btn) btn.disabled = false;
+        return false;
+    }
+    try {
+        const resp = await fetch("/admin/acme-status/cancel", {
+            method: "POST", credentials: "same-origin",
+        });
+        if (!resp.ok) {
+            const t = await resp.text();
+            alert("Stop failed: " + t);
+            if (btn) btn.disabled = false;
+        }
+    } catch (e) {
+        alert("Network error: " + e.message);
+        if (btn) btn.disabled = false;
+    }
+    return false;
+}
+function renderJobState(state) {
+    const out = document.getElementById("acme-issue-output");
+    if (!out) return;
+    const dir = (state.directory_url || "").includes("staging")
+        ? "staging" : "production";
+    const elapsed = Math.round(state.elapsed_secs || 0);
+    setCancelVisible(state);
+    if (state.in_flight) {
+        const visLines = [];
+        for (const [d, v] of Object.entries(state.visibility || {})) {
+            const flags = [
+                v.local ? "local✓" : "local—",
+                v.authoritative ? "auth✓" : "auth—",
+            ].join(" ");
+            visLines.push(`  ${d}: ${flags}`);
+        }
+        out.textContent =
+            `In-flight: ${dir} · phase ${fmtPhase(state.phase)} · ` +
+            `attempt ${state.attempt}/${state.max_attempts} · ` +
+            `elapsed ${fmtSecs(elapsed)}` +
+            (state.last_error ? `\n  last error: ${state.last_error}` : "") +
+            (visLines.length ? "\n" + visLines.join("\n") : "");
+    } else if (state.phase === "done" && state.result) {
+        out.innerHTML =
+            `✓ Issued (${dir}) in ${fmtSecs(elapsed)}\n` +
+            `  CN:        ${state.result.subject_cn || ""}\n` +
+            `  SANs:      ${(state.result.sans || []).join(", ")}\n` +
+            `  Not after: ${state.result.not_after || ""}`;
+    } else if (state.phase === "failed") {
+        out.textContent =
+            `✗ Failed (${dir}, ${fmtSecs(elapsed)}): ` +
+            (state.last_error || "(no error message)");
+    } else if (state.phase === "cancelled") {
+        out.textContent =
+            `Stopped (${dir}, ${fmtSecs(elapsed)}): ` +
+            (state.last_error || "operator cancelled");
+    }
+    // phase=idle and no in-flight job: leave the static placeholder
+    // alone so a fresh page load doesn't visibly "blink" empty.
+}
+async function reattachToJob() {
+    try {
+        const resp = await fetch("/admin/acme-status/job",
+                                  {credentials: "same-origin"});
+        if (!resp.ok) return;
+        const state = await resp.json();
+        renderJobState(state);
+        if (state.in_flight) {
+            // Poll every 2s while in flight. Stops on the first
+            // terminal snapshot.
+            const poll = setInterval(async () => {
+                try {
+                    const r = await fetch("/admin/acme-status/job",
+                                          {credentials: "same-origin"});
+                    if (!r.ok) return;
+                    const s = await r.json();
+                    renderJobState(s);
+                    if (!s.in_flight) {
+                        clearInterval(poll);
+                        // On terminal success the page reload picks
+                        // up the new cert metadata in the "Current
+                        // certificate" section above.
+                        if (s.phase === "done") {
+                            setTimeout(() => location.reload(), 1500);
+                        }
+                    }
+                } catch (e) { /* transient; retry on next tick */ }
+            }, 2000);
+        }
+    } catch (e) {
+        // Endpoint unreachable on first load -- silently skip;
+        // direct runIssue() flow still works for fresh issues.
+    }
+}
+document.addEventListener("DOMContentLoaded", reattachToJob);
+</script>
+
+{% endblock %}

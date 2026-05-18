@@ -1,0 +1,41 @@
+{# Partial: BAA acknowledgment chip — HTMX swap target after toggle. #}
+<article style="padding:0.6rem 0.9rem;margin-bottom:0.75rem;
+                border-left:4px solid {% if classifier_baa_status.is_local %}var(--pico-ins-color){% else %}var(--pico-color-amber-500){% endif %};
+                background:var(--pico-card-background-color);font-size:0.9rem;">
+    <strong>
+        {% if classifier_baa_status.is_local %}
+        🔒 Local classifier — PHI never leaves this install.
+        {% else %}
+        ⚠ External classifier — PHI would egress to
+        <code>{{ classifier_baa_status.host }}</code>.
+        BAA acknowledgment {% if classifier_baa_status.baa_acked %}<em>on file</em>{% else %}<strong style="color:var(--pico-del-color);">NOT on file</strong>{% endif %}.
+        {% endif %}
+    </strong>
+
+    {% if not classifier_baa_status.is_local %}
+    <p style="margin:0.3rem 0 0;font-size:0.85rem;">
+        HIPAA §164.308(b)(1) requires a Business Associate
+        Agreement with any subprocessor that handles PHI. Until
+        a BAA is in force with the vendor at
+        <code>{{ classifier_baa_status.host }}</code>, mail from
+        HIPAA-flagged accounts will refuse to classify (fail-closed).
+    </p>
+    <form hx-post="/config/baa-ack"
+          hx-target="closest article"
+          hx-swap="outerHTML"
+          style="margin-top:0.4rem;">
+        <input type="hidden" name="backend" value="{{ classifier_baa_status.backend }}">
+        <input type="hidden" name="host" value="{{ classifier_baa_status.host }}">
+        <label style="font-size:0.85rem;">
+            <input type="checkbox" name="acked" value="1"
+                   {% if classifier_baa_status.baa_acked %}checked{% endif %}>
+            I confirm a Business Associate Agreement is in place
+            with the operator of <code>{{ classifier_baa_status.host }}</code>
+            authorising PHI processing.
+        </label>
+        <button type="submit" class="outline" style="padding:0.2rem 0.7rem;font-size:0.8rem;margin:0.3rem 0 0;">
+            Save acknowledgment
+        </button>
+    </form>
+    {% endif %}
+</article>

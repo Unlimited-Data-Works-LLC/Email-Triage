@@ -1,0 +1,47 @@
+{# Shared tab-strip nav for the Rules cluster.
+
+   Pass active="X" where X is one of:
+   my-rules | global | discover | categories | personal-categories
+
+   Five sibling pages collected here under the unified "Rules"
+   top-nav slot. Top-nav has Rules as a single link to /rules; this
+   strip handles cross-page navigation. Pattern matches
+   accounts/_edit_tabs.html (single top-nav entry, tab strip on
+   page) and triage/_tabs.html.
+
+   Visibility per role:
+     * my-rules — all authenticated users
+     * global — admin / power_user only
+     * discover — all authenticated users
+     * categories — admin only (system-wide categories)
+     * personal-categories — all authenticated users (their own)
+
+   Active tab gets bold styling. No JS; no ARIA tablist.
+#}
+<nav style="margin:0 0 1.5rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
+    <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
+        {% set _all_tabs = [
+            ("my-rules",            "/rules",                     "My Rules",            None),
+            ("global",              "/rules/global",              "Global Rules",        ("admin", "power_user")),
+            ("discover",            "/triage/discover",           "Discover Categories", None),
+            ("categories",          "/categories",                "Categories",          ("admin",)),
+            ("personal-categories", "/rules/personal-categories", "Personal Categories", None),
+        ] %}
+        {% for slug, href, label, role_gate in _all_tabs %}
+        {% if role_gate is none or (user is defined and user and user.role in role_gate) %}
+        {% set is_active = (active == slug) %}
+        <li style="margin:0;">
+            <a href="{{ href }}"
+               style="display:inline-block;padding:0.5rem 1rem;
+                      text-decoration:none;
+                      border:1px solid transparent;
+                      border-bottom:none;
+                      border-radius:6px 6px 0 0;
+                      {% if is_active %}background:var(--pico-card-background-color, #1f2530);border-color:var(--pico-muted-border-color);color:var(--pico-color);font-weight:600;margin-bottom:-1px;{% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </a>
+        </li>
+        {% endif %}
+        {% endfor %}
+    </ul>
+</nav>

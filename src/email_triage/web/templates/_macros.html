@@ -1,0 +1,29 @@
+{# Shared Jinja macros — import with: {% import "_macros.html" as m %}. #}
+
+{% macro help(text, placement="bottom") -%}
+{#
+    Renders an in-UI help tooltip trigger.
+
+    Originally shipped on Pico's CSS-pseudo-element data-tooltip
+    (#64). That mechanism kept failing in production: ancestor
+    overflow:hidden / transform / contain contexts clip the
+    pseudo-element regardless of viewport math, and a JS-stamped
+    data-tip-anchor patch only solved the viewport-edge subset.
+    The base.html tooltip engine now renders into a single shared
+    `#et-tooltip` <div> at body scope, positioned via fixed
+    coordinates on hover/focus — escapes every ancestor's overflow
+    + transform stack. The macro emits the trigger element + the
+    text payload; the engine handles show/hide/position/touch.
+
+    The ``placement`` arg is preserved on the attribute for the
+    engine's directional preference but real placement is computed
+    at hover time (auto-flips above when no room below).
+
+    Args:
+        text: plain-English explanation. Keep ≤ 200 chars.
+        placement: "top" | "right" | "bottom" | "left" (default bottom).
+-#}
+<span data-tooltip="{{ text|e }}" data-placement="{{ placement }}"
+      role="img" aria-label="Help: {{ text|e }}" tabindex="0"
+      style="cursor:help;margin-left:0.35rem;font-size:0.85em;color:var(--pico-muted-color);vertical-align:middle;">ℹ️</span>
+{%- endmacro %}

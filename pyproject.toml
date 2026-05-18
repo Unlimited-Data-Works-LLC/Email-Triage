@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "email-triage"
+version = "0.1.0"
+description = "Portable email triage system with LLM classification and configurable routing"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "pyyaml>=6.0",
+    "httpx>=0.27.0",
+    "mcp>=1.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+    "itsdangerous>=2.2.0",
+    "pyjwt[crypto]>=2.8.0",
+    "icalendar>=5.0",
+    # Auth-surface upgrade (#67): dev-keypair + WebAuthn + ACME automation.
+    # cryptography was previously transitive via pyjwt[crypto]; promoting
+    # to direct dep because dev_keypair + acme_renewer use it directly.
+    "cryptography>=43.0.0",
+    # WebAuthn / FIDO2 hardware-key auth (Duo's library, BSD).
+    "webauthn>=2.0",
+    # ACME client (Let's Encrypt) + JOSE for protocol-level signing.
+    # Same library certbot uses internally.
+    "acme>=2.10",
+    "josepy>=1.14",
+    # DNS-01 challenge needs dnspython for RFC-2136 (TSIG-signed dynamic
+    # updates against the operator's BIND).
+    "dnspython>=2.4",
+    # Vector math for the M-4 sent-mail RAG cosine hot-path (#136). Pure
+    # Python cosine over ~10k rows x 768 dims is seconds per draft reply
+    # and blocks the event loop. numpy + precomputed L2 norms get the
+    # per-call cost into the millisecond range.
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+keyfile = ["cryptography>=43.0.0"]
+keyring = ["keyring>=25.0.0"]
+imap = ["aioimaplib>=1.1.0"]
+office365 = ["msal>=1.30.0"]
+openai = ["openai>=1.0.0"]
+gemini = ["google-generativeai>=0.8.0"]
+# #151 — optional Redis-backed classification cache. Operator paste a
+# Redis URL into /admin/integrations to enable. ``valkey`` (Linux
+# Foundation fork) speaks the identical wire protocol and works with
+# the same client unchanged — no library change is needed.
+cache = ["redis>=5.0"]
+# In-process CPU embedding backend (M-4 / M-5). Pulls sentence-
+# transformers + the torch CPU stack into the install. Used when
+# the install's primary GPU is saturated by the chat model and a
+# co-resident embedder would thrash VRAM. Model files download
+# once on first use into the container's HF cache; no network
+# traffic after that. Privacy posture: local-only by design, same
+# allowlist gate as the Ollama backend; the call never leaves the
+# container.
+embedding = [
+    "sentence-transformers>=3.0",
+    # Pin to CPU-only torch wheel to skip the ~3 GB CUDA bundle
+    # we don't need. Operators wanting GPU embedding still install
+    # via the upstream torch index manually.
+    "torch>=2.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27.0",
+    # Parallel test runner — invoke via ``pytest -n auto``.
+    # Cuts the full web/cache/privacy/providers sweep from
+    # ~50 min to ~12-15 min on a 4-core box (4x speedup; some
+    # tests serialise on shared resources so it's not strictly
+    # linear). Off by default; deploy flow uses ``scripts/test-fast``
+    # which invokes ``-n auto`` explicitly. Plain ``pytest`` still
+    # runs serially so anyone debugging a single test isn't
+    # confused by worker output.
+    "pytest-xdist>=3.5",
+]
+
+[project.scripts]
+email-triage = "email_triage.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "openclaw/skills/email-triage-api/tests"]
+# Resolve ``email_triage`` from this worktree's local ``src/`` regardless
+# of which sibling worktree's editable install last claimed the shared
+# site-packages ``.pth`` file. Removes the need for ``PYTHONPATH=src``.
+pythonpath = ["src"]

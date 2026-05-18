@@ -1,0 +1,90 @@
+# Podman Compose / Docker Compose for email-triage.
+#
+# Usage:
+#   podman-compose up -d          # Start in background
+#   podman-compose logs -f        # Follow logs
+#   podman-compose down           # Stop
+#
+# Before starting:
+#   1. Copy your email-triage.yaml into ./config/
+#   2. Set secrets:
+#      - Container backend: podman secret create SMTP_PASSWORD <file>
+#      - Keyfile backend: place keyfile in ./data/
+#   3. Optionally create an initial admin user:
+#      podman-compose exec email-triage email-triage apikey create \
+#        --name "admin" --user admin@example.com
+
+services:
+  email-triage:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: email-triage
+    restart: unless-stopped
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      # Persistent data: SQLite database, MSAL token cache, summary queue.
+      - ./data:/app/data
+
+      # Configuration: email-triage.yaml.
+      - ./config:/app/config
+
+    environment:
+      # Tell the app where to find config when mounted.
+      - EMAIL_TRIAGE_CONFIG=/app/config/email-triage.yaml
+
+    # Resource limits (adjust for your hardware).
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 512M
+    #       cpus: "1.0"
+
+    # For Podman secrets (container secrets backend):
+    # secrets:
+    #   - SMTP_PASSWORD
+    #   - IMAP_PASSWORD
+    #   - OAUTH_CLIENT_SECRET
+
+    # For Tailscale Funnel push notifications on the host:
+    # The container maps port 8080, and Tailscale Funnel on the host
+    # exposes it as https://your-machine.tailnet.ts.net.
+    # No extra config needed here — just run:
+    #   tailscale funnel --bg 8080
+
+    # Healthcheck is built into the Containerfile.
+
+  # ---------------------------------------------------------------------------
+  # Optional: Tailscale sidecar for push webhook ingress.
+  # Uncomment if you want Tailscale inside the compose stack instead of
+  # running it on the host.
+  # ---------------------------------------------------------------------------
+  # tailscale:
+  #   image: tailscale/tailscale:latest
+  #   hostname: email-triage
+  #   cap_add:
+  #     - NET_ADMIN
+  #     - NET_RAW
+  #   environment:
+  #     - TS_AUTHKEY=${TS_AUTHKEY}
+  #     - TS_EXTRA_ARGS=--advertise-tags=tag:funnel
+  #     - TS_SERVE_CONFIG=/config/serve.json
+  #   volumes:
+  #     - tailscale-state:/var/lib/tailscale
+  #     - ./tailscale-serve.json:/config/serve.json:ro
+  #   restart: unless-stopped
+
+# Podman secrets (uncomment to use):
+# secrets:
+#   SMTP_PASSWORD:
+#     external: true
+#   IMAP_PASSWORD:
+#     external: true
+#   OAUTH_CLIENT_SECRET:
+#     external: true
+
+# volumes:
+#   tailscale-state:

@@ -1,0 +1,131 @@
+# Email Triage — Homelab Configuration Example
+#
+# This example is designed for a homelab environment:
+# - Gmail via the native REST API (OAuth 2.0 device-code flow)
+# - Ollama running on a local GPU server for classification
+# - Container deployment on Podman
+# - Push notifications via Gmail Pub/Sub + Tailscale Funnel
+#
+# Copy this to ./email-triage.yaml or ~/.config/email-triage/config.yaml
+# and adjust to match your setup.
+
+provider:
+  type: gmail_api
+  gmail_api:
+    account: you@gmail.com               # Gmail account
+    client_id: xxx.apps.googleusercontent.com
+    # client_secret: GOCSPX-...          # Required for "Web application" OAuth client
+    # refresh_token is acquired via the Accounts UI → Authenticate with Google.
+    #
+    # OAuth client setup (one-time, in https://console.cloud.google.com/apis/credentials):
+    #
+    #   Option A: "Web application" client (recommended; needed for push)
+    #     Authorized redirect URI: https://<your-public-url>/oauth/google/callback
+    #     Save both client_id AND client_secret.
+    #     Use the "Authenticate (web callback)" button on the Accounts page.
+    #
+    #   Option B: "Desktop" client (simpler; no public URL required)
+    #     Save only client_id; leave client_secret blank.
+    #     Use the "Authenticate (manual paste)" button. Browser will fail to
+    #     load http://127.0.0.1:1/?code=... — that's expected. Copy the URL
+    #     from the address bar and paste it back into email-triage.
+    #
+    # NOTE: The OAuth 2.0 device-code flow is NOT usable for Gmail. Google
+    # restricted the device-flow scope allowlist in 2022 and Gmail isn't on it.
+
+classifier:
+  backend: ollama
+  model: [local-llm-model]                     # Or any model on your Ollama instance
+  ollama_url: http://gpu-server.local:11434
+
+  categories:
+    to-respond: "Emails that need a reply from you"
+    fyi: "Informational, no action needed"
+    newsletters: "Subscriptions and recurring content"
+    comments: "Mentions, comments, and notifications from tools"
+    notifications: "System alerts and automated messages"
+    invoices: "Bills, receipts, and payment-related emails"
+    action-required: "Tasks, requests, deadlines"
+    meetings: "Meeting invites, agenda, scheduling"
+
+routes:
+  to-respond: [notify, draft_reply]
+  action-required: [notify, label]
+  invoices: [label]
+  newsletters: [label]
+  meetings: [notify, label]
+
+escalation:
+  enabled: true
+  categories: [to-respond, action-required]
+  cooldown_minutes: 15
+
+logging:
+  level: INFO
+  format: json
+  hipaa: false
+
+secrets:
+  backend: container                     # Podman secrets (/run/secrets/<key>)
+
+persistence:
+  db_path: /app/data/triage.db           # Container volume mount
+
+push:
+  listen_port: 8080
+  public_url: https://your-host.tailnet.ts.net
+
+  # Gmail Pub/Sub push config. One topic + one push subscription serves
+  # every watched Gmail account in this install; inbound notifications
+  # carry a signed JWT that we verify against Google's public certs.
+  #
+  # Setup (one-time, in the Google Cloud console):
+  #   1. Create a Pub/Sub topic: projects/<proj>/topics/gmail-triage-push
+  #   2. Grant gmail-api-push@system.gserviceaccount.com the
+  #      Pub/Sub Publisher role on that topic (Google's Gmail service
+  #      publishes into it).
+  #   3. Create a push subscription pointed at
+  #      https://<public_url>/webhooks/gmail with Authentication
+  #      enabled — Google mints an OIDC identity token for each push.
+  #   4. Pick a dedicated service account identity for the push
+  #      subscription; put its address in gmail_subscription_sa_email
+  #      so we reject anything signed by a different SA.
+  #   5. Set gmail_audience to the full push URL (or leave blank to
+  #      reuse public_url).
+  gmail_topic_name: ""
+  gmail_subscription_sa_email: ""
+  gmail_audience: ""
+
+  # OpenClaw / agent-instance bearer-token API.
+  # `openclaw_webhook_enabled` is the global kill switch for the
+  # outbound `triage.completed` event — flip it off to silence the
+  # emitter without removing the webhooks: block below. Each account
+  # also has its own pause + quiet-hours toggle on the Accounts page.
+  # `openclaw_rate_limit_per_minute` caps requests per API key
+  # (single-instance bucket; set 0 for local dev).
+  openclaw_webhook_enabled: true
+  openclaw_rate_limit_per_minute: 60
+
+  # Cap on OpenClaw bulk-endpoint batches. 0 = unlimited.
+  # The server returns 400 batch_too_large when an explicit
+  # message_ids list or a filter-resolved id list exceeds this.
+  bulk_max_batch_size: 100
+
+# Outbound webhooks. Subscribe `triage.completed` here so OpenClaw
+# learns about every triage run (manual, watcher, push, API). HIPAA
+# accounts are skipped automatically; per-account quiet hours and
+# the global kill switch above also gate the emit.
+# webhooks:
+#   - url: http://openclaw-host:3000/hooks/email-triage
+#     events: [triage.completed]
+#     secret_key: WEBHOOK_SECRET          # Key name in secrets store
+
+# Calendar subsystem + meeting-request intercept (Phase 4) — no
+# config-file knobs. Per-account "Enable Calendar" lives on the
+# Accounts page (Gmail device-code re-auth or O365 MSAL prompt);
+# per-user meeting preferences (length / count / business hours /
+# timezone / weekend skip) live on the Profile page; per-account
+# routes (e.g. `meeting-request` -> `suggest_meeting_times`) live
+# on the Routes page. Actions never send mail directly: invite
+# responses use the calendar API to notify organizers, the
+# intercept creates drafts only.

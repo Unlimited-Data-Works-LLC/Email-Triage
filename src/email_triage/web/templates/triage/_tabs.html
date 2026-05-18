@@ -1,0 +1,41 @@
+{# Shared tab-strip for the Triage cluster.
+
+   Pass active="X" where X is one of:
+   run | classify | jobs
+
+   Three sibling activities: run triage on a query, test-classify a
+   pasted message, see the bulk-runs list. Discover Categories used
+   to live here but moved to the Rules cluster (see
+   _rules_tabs.html) because it answers "what categories does my
+   mail need?" — same neighbourhood as Categories + Personal
+   Categories.
+
+   "Bulk runs" added 2026-05-12 — the /triage/jobs index page was
+   reachable but had no nav entry, so operator couldn't find it
+   from the mine-limit tooltip's "Bulk runs page" reference.
+
+   No JS; no ARIA tablist. Active tab gets bold styling.
+#}
+<nav style="margin:0 0 1.5rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
+    <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
+        {% set _tabs = [
+            ("run",      "/triage",        "Run Triage"),
+            ("classify", "/classify",      "Test Classify"),
+            ("jobs",     "/triage/jobs",   "Bulk runs"),
+        ] %}
+        {% for slug, href, label in _tabs %}
+        {% set is_active = (active == slug) %}
+        <li style="margin:0;">
+            <a href="{{ href }}"
+               style="display:inline-block;padding:0.5rem 1rem;
+                      text-decoration:none;
+                      border:1px solid transparent;
+                      border-bottom:none;
+                      border-radius:6px 6px 0 0;
+                      {% if is_active %}background:var(--pico-card-background-color, #1f2530);border-color:var(--pico-muted-border-color);color:var(--pico-color);font-weight:600;margin-bottom:-1px;{% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+</nav>

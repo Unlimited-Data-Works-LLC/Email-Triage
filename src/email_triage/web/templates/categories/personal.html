@@ -1,0 +1,27 @@
+{# Personal Categories standalone page — moved out of /profile so
+   it can sit under the Rules tab cluster alongside Categories,
+   Discover Categories, etc. The HTMX endpoints used by the
+   embedded form (/profile/personal-categories/create + /delete)
+   stay where they were so existing handler code doesn't move. #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "category name" not "slug".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Rules - Personal Categories - Email Triage{% endblock %}
+{% block content %}
+<h2>Rules</h2>
+{% set active = "personal-categories" %}
+{% include "_rules_tabs.html" %}
+
+<h3>Personal Categories{{ m.help("Categories the AI considers only when your mail is being triaged. Great for niches that aren't broadly useful. Example: a 'woodworking-news' category catches newsletters from woodworking sites for an Operator A who runs a hobby blog, while leaving every other user's classifier untouched. Capped at 20 to keep prompts compact.") }}</h3>
+<p>
+    Add classification categories visible only to your own account(s).
+    They merge with the system categories when mail is triaged. On
+    category-name collision, your personal description wins.
+</p>
+{% include "profile/_personal_categories.html" %}
+{% endblock %}

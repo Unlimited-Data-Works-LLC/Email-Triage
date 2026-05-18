@@ -1,0 +1,13 @@
+{% if error %}
+<small style="color:var(--pico-del-color);">{{ error }}</small>
+{% elif not folders %}
+<small style="color:var(--pico-muted-color);">No folders found on this account.</small>
+{% else %}
+{% for folder in folders %}
+<label style="margin-bottom:0;padding:0.1rem 0;">
+    <input type="checkbox" name="folders" value="{{ folder }}"
+           {% if folder in visible %}checked{% endif %}>
+    {{ folder }}{% if folder not in visible %} <span style="color:var(--pico-muted-color);font-size:0.8em;">(excluded)</span>{% endif %}
+</label>
+{% endfor %}
+{% endif %}

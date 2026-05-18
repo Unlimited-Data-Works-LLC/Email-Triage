@@ -1,0 +1,152 @@
+<tr id="acct-row-{{ acct.id }}">
+    <td>
+        <strong>{{ acct.name }}</strong>
+        {# Effective HIPAA for this account = system flag OR per-account flag.
+           Small chip, muted styling. 🔐 glyph indicates the flag is locked on
+           (account was created under system HIPAA and can't be unset while
+           system HIPAA remains on). #}
+        {% if hipaa_mode or acct.hipaa %}
+        <span title="{% if hipaa_mode %}System HIPAA mode is active{% else %}Per-account HIPAA mode{% endif %}"
+              style="display:inline-block;margin-left:0.4rem;
+                     padding:0.05rem 0.4rem;font-size:0.7rem;
+                     color:var(--pico-muted-color);
+                     border:1px solid var(--pico-muted-border-color);
+                     border-radius:999px;vertical-align:middle;">
+            {% if acct.hipaa and acct.created_under_system_hipaa and hipaa_mode %}🔐{% else %}🔒{% endif %} HIPAA
+        </span>
+        {% endif %}
+        {% if hipaa_error is defined and hipaa_error %}
+        <br><small style="color:var(--pico-del-color);">{{ hipaa_error }}</small>
+        {% endif %}
+    </td>
+    <td><code>{{ acct.provider_type }}</code></td>
+    {% if is_admin %}
+    <td>
+        {{ acct.owner_name if acct.owner_name else acct.owner_email }}
+        {% if acct.owner_name %}
+        <small style="color:var(--pico-muted-color);" title="{{ acct.owner_email }}">
+            ({{ acct.owner_email }})
+        </small>
+        {% endif %}
+    </td>
+    {% endif %}
+    <td>
+        {% if acct.provider_type == 'imap' %}
+            {{ acct.config.get('host', '-') }}:{{ acct.config.get('port', 993) }}
+            ({{ acct.config.get('username', '') }})
+        {% elif acct.provider_type == 'gmail_api' %}
+            {{ acct.config.get('account', '-') }}
+        {% elif acct.provider_type == 'office365' %}
+            {% if acct.config.get('is_personal_msa') %}
+                personal account
+            {% else %}
+                org tenant
+            {% endif %}
+        {% endif %}
+    </td>
+    <td title="When disabled, this account is skipped during triage runs and scheduled digest generation."
+        style="min-width:12rem;">
+        {# Status column is DISPLAY-ONLY — every interactive control
+           lives behind the Edit button. That keeps the row scannable
+           and avoids the chip-wrapping issues that plagued the
+           inline-button era. #}
+        <div style="line-height:1.4;">
+            {% if acct.is_active %}
+            <span style="color:var(--pico-ins-color);">Enabled</span>
+            {% else %}
+            <span style="color:var(--pico-muted-color);">Disabled</span>
+            {% endif %}
+        </div>
+        {# Stale-auth chip (#auth) — refresh token revoked / expired,
+           or basic-auth password no longer valid. Operator sees this
+           at a glance instead of digging through logs. #}
+        {% if acct.get('auth_stale') %}
+        <div style="margin-top:0.25rem;display:inline-flex;align-items:center;gap:0.4rem;
+                    padding:0.25rem 0.6rem;border-radius:var(--pico-border-radius);
+                    background:var(--pico-del-color);color:white;font-size:0.85rem;">
+            ⚠ Re-authenticate required
+            <a href="/accounts/{{ acct.id }}/edit" role="button"
+               class="contrast" style="padding:0.1rem 0.5rem;font-size:0.75rem;margin:0;background:white;color:var(--pico-del-color);">
+                Re-auth
+            </a>
+        </div>
+        {% endif %}
+        {# Watch status always visible — green pulsing dot when the
+           real-time watch is connected for this account, muted dot
+           otherwise. Gmail / O365 accounts use push or polling
+           rather than IMAP IDLE, so they show "Not watching" here
+           even when push is on (push state has its own line below). #}
+        <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;display:inline-flex;align-items:center;gap:0.35rem;white-space:nowrap;">
+            {% if acct.get('watch_active') %}
+            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--pico-ins-color);animation:pulse 2s infinite;"></span>
+            <span style="color:var(--pico-ins-color);">Watching</span>
+            {% else %}
+            <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--pico-muted-border-color);"></span>
+            <span style="color:var(--pico-muted-color);">Not watching</span>
+            {% endif %}
+        </div>
+        {# #52 — per-mailbox watch chips. Only render when there is
+           more than one mailbox; for single-mailbox accounts the
+           aggregate row above is sufficient. #}
+        {% set _mbs = acct.get('watch_mailboxes') or [] %}
+        {% if _mbs|length > 1 %}
+        <div style="font-size:0.75rem;line-height:1.3;margin-top:0.15rem;display:flex;flex-wrap:wrap;gap:0.4rem;">
+            {% for mb in _mbs %}
+            <span style="display:inline-flex;align-items:center;gap:0.2rem;white-space:nowrap;color:var(--pico-muted-color);">
+                {% if mb.status == 'watching' %}
+                <span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--pico-ins-color);"></span>
+                {% elif mb.status in ('reconnecting', 'starting') %}
+                <span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--pico-color-amber-500);"></span>
+                {% elif mb.status in ('error', 'disconnected') %}
+                <span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--pico-del-color);"></span>
+                {% else %}
+                <span style="display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--pico-muted-border-color);"></span>
+                {% endif %}
+                <code style="font-size:0.75rem;">{{ mb.mailbox }}</code>
+            </span>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <style>@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }</style>
+        {% if acct.provider_type == 'gmail_api' and acct.gmail_push_status is defined %}
+        <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;">
+            {{ acct.gmail_push_status | safe }}
+        </div>
+        {% endif %}
+        {% if acct.provider_type == 'gmail_api' and acct.cadence_status is defined and acct.cadence_status %}
+        <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;">
+            {{ acct.cadence_status | safe }}
+        </div>
+        {% endif %}
+        {% if not acct.hipaa and not hipaa_mode and acct.openclaw_status is defined %}
+        <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;">
+            {{ acct.openclaw_status | safe }}
+        </div>
+        {% endif %}
+        {% if not acct.hipaa and not hipaa_mode and acct.calendar_status is defined %}
+        <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;">
+            {{ acct.calendar_status | safe }}
+        </div>
+        {% endif %}
+    </td>
+    <td>
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+            <a href="/accounts/{{ acct.id }}/edit"
+               class="outline secondary" role="button"
+               style="padding:0.25rem 0.5rem;margin:0;font-size:0.875rem;line-height:1.5;text-decoration:none;">Edit</a>
+            <a href="/accounts/{{ acct.id }}/routes"
+               class="outline secondary" role="button"
+               style="padding:0.25rem 0.5rem;margin:0;font-size:0.875rem;line-height:1.5;text-decoration:none;">Routes</a>
+            <button class="outline secondary" style="padding:0.25rem 0.5rem;margin:0;"
+                    hx-post="/accounts/{{ acct.id }}/test"
+                    hx-target="#test-result-{{ acct.id }}"
+                    hx-swap="innerHTML">Test</button>
+            <button class="outline secondary" style="padding:0.25rem 0.5rem;margin:0;color:var(--pico-del-color);"
+                    hx-delete="/accounts/{{ acct.id }}"
+                    hx-target="#acct-row-{{ acct.id }}"
+                    hx-swap="outerHTML"
+                    hx-confirm="Delete account '{{ acct.name }}'?">Del</button>
+        </div>
+        <div id="test-result-{{ acct.id }}" style="margin-top:0.25rem;"></div>
+    </td>
+</tr>

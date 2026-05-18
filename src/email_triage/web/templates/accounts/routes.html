@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+     - No protocol jargon.
+     - "AI" not "language model" / "LLM".
+     - "category name" not "slug" in user-rendered text. The
+       {% raw %}{{ slug }}{% endraw %} option text in the picker
+       IS the canonical name (the value), so we leave the picker
+       entries alone and reframe via help text above the select.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Routes - {{ acct.name }} - Email Triage{% endblock %}
+{% block content %}
+{# Per-account routes page. Reachable two ways:
+     * /accounts/{id}/routes — direct URL with the account-edit
+       tab strip on top (preserves operator's mental model when
+       moving between Provider/Watch/Digests/etc tabs).
+     * /routes?account_id={id} — top-level picker page. That page
+       (templates/routes_top.html) renders an account-dropdown
+       above the body and reuses the same shared partial.
+   The body itself lives in _routes_body.html. #}
+<h2>Editing: {{ acct.name }}</h2>
+
+{# Show the same tab strip as /accounts/{id}/edit so operator
+   keeps visual context when they click "Routing" from the
+   account-edit tabs. Routing is the only tab that lives on a
+   separate URL; the rest go through ?tab=<slug> on the edit
+   page. #}
+{% set active = "routing" %}
+{% include "accounts/_edit_tabs.html" %}
+
+{% include "accounts/_routes_body.html" %}
+{% endblock %}

@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (operator / account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:
+     - "Bulk runs" / "background runs" — never "jobs" or "tasks" in
+       headings or prose. "Run" matches the operator's mental model
+       (a sweep on a mailbox) and is what the rest of the UI uses.
+     - No "AI" / "LLM" jargon in copy. Status words ("Running",
+       "Done", "Failed", "Cancelled") render verbatim.
+     - No admin-only-path links. This page is operator-scope.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Bulk runs - Email Triage{% endblock %}
+{% block content %}
+{% set active = "jobs" %}
+{% include "triage/_tabs.html" %}
+<h2>Bulk runs{{ m.help("Background work that takes too long to wait on inline — large triage sweeps, mining the Sent items for style learning when you ask for more than 50 messages, etc. Click a row to see its live progress + recent activity.") }}</h2>
+
+<p style="color:var(--pico-muted-color);font-size:0.9em;">
+    Runs queued recently across your accounts. Click any row for the
+    live progress page.
+</p>
+
+{% if active_jobs %}
+<section style="margin-top:1.5rem;">
+    <h3 style="margin-bottom:0.5rem;">Active</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Account</th>
+                <th>Kind</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Queued</th>
+                <th style="width:7rem;">Open</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for j in active_jobs %}
+            {% set a = accts_by_id.get(j.account_id) %}
+            <tr>
+                <td>
+                    {% if a %}
+                    {{ a.name }}
+                    <small style="color:var(--pico-muted-color);">
+                        ({{ a.owner_email or "" }})
+                    </small>
+                    {% else %}
+                    <small>—</small>
+                    {% endif %}
+                </td>
+                <td><code>{{ j.kind or "triage" }}</code></td>
+                <td>{{ j.status|capitalize }}</td>
+                <td>
+                    {# Counter columns differ by kind. triage uses
+                       total_seen + total_processed (per-message);
+                       style_mine bumps total_seen with messages
+                       mined + total_processed=1 when the descriptor
+                       writes. Branch labels accordingly so the row
+                       doesn't misread as "1 / 100 = 1% done" for a
+                       successful style-mine job. #}
+                    {% set seen = j.total_seen or 0 %}
+                    {% set processed = j.total_processed or 0 %}
+                    {% if (j.kind or "triage") == "style_mine" %}
+                    {% if seen > 0 %}
+                    {{ seen }} mined
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">starting…</small>
+                    {% endif %}
+                    {% elif seen > 0 %}
+                    {{ processed }} / {{ seen }}
+                    ({{ "%d"|format((processed * 100 // seen) if seen else 0) }}%)
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">starting…</small>
+                    {% endif %}
+                </td>
+                <td>
+                    <small class="local-datetime"
+                           data-utc="{{ j.created_at }}">
+                        {{ j.created_at }}
+                    </small>
+                </td>
+                <td>
+                    <a href="/triage/jobs/{{ j.job_id }}" role="button"
+                       class="outline secondary"
+                       style="padding:0.25rem 0.6rem;font-size:0.85em;">
+                        View
+                    </a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<section style="margin-top:1.5rem;">
+    <h3 style="margin-bottom:0.5rem;">Recent</h3>
+    {% if done_jobs %}
+    <table>
+        <thead>
+            <tr>
+                <th>Account</th>
+                <th>Kind</th>
+                <th>Status</th>
+                <th>Result</th>
+                <th>Finished</th>
+                <th style="width:7rem;">Open</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for j in done_jobs %}
+            {% set a = accts_by_id.get(j.account_id) %}
+            <tr>
+                <td>
+                    {% if a %}
+                    {{ a.name }}
+                    <small style="color:var(--pico-muted-color);">
+                        ({{ a.owner_email or "" }})
+                    </small>
+                    {% else %}
+                    <small>—</small>
+                    {% endif %}
+                </td>
+                <td><code>{{ j.kind or "triage" }}</code></td>
+                <td>
+                    {% if j.status == "done" %}
+                    <span style="color:var(--pico-color-green-500);">Done</span>
+                    {% elif j.status == "failed" %}
+                    <span style="color:var(--pico-color-red-500);">Failed</span>
+                    {% elif j.status == "cancelled" %}
+                    <span style="color:var(--pico-muted-color);">Cancelled</span>
+                    {% else %}
+                    {{ j.status|capitalize }}
+                    {% endif %}
+                </td>
+                <td>
+                    {% set seen = j.total_seen or 0 %}
+                    {% set processed = j.total_processed or 0 %}
+                    {% if (j.kind or "triage") == "style_mine" %}
+                    {% if processed and seen %}
+                    descriptor saved · {{ seen }} mined
+                    {% elif seen %}
+                    {{ seen }} mined · no descriptor
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">—</small>
+                    {% endif %}
+                    {% elif seen %}
+                    {{ processed }} / {{ seen }}
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">—</small>
+                    {% endif %}
+                </td>
+                <td>
+                    {# DB column is ``ended_at`` (terminal-status
+                       timestamp). The agent that built this page
+                       initially named it ``finished_at`` which
+                       silently rendered empty. #}
+                    <small class="local-datetime"
+                           data-utc="{{ j.ended_at or j.created_at }}">
+                        {{ j.ended_at or j.created_at }}
+                    </small>
+                </td>
+                <td>
+                    <a href="/triage/jobs/{{ j.job_id }}" role="button"
+                       class="outline secondary"
+                       style="padding:0.25rem 0.6rem;font-size:0.85em;">
+                        View
+                    </a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color:var(--pico-muted-color);">
+        No recent background runs.
+    </p>
+    {% endif %}
+</section>
+
+<script>
+document.querySelectorAll('.local-datetime').forEach(function(el) {
+    var utc = el.getAttribute('data-utc');
+    if (!utc) return;
+    try {
+        var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
+        var d = new Date(hastz ? utc : utc + 'Z');
+        el.textContent = d.toLocaleString(undefined, {
+            month: 'short', day: 'numeric',
+            hour: 'numeric', minute: '2-digit',
+        });
+    } catch (e) { /* leave UTC string */ }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,372 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Not terminal users; not protocol readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC numbers, ISO 8601, OData, "language
+       model", "AND-combined", "substring match"). Plain English.
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+   NOTE: the freeform-query disclosure inside <details> below
+   exposes provider-native syntax tables (IMAP / Gmail / Office
+   365). Power-user escape hatch — kept behind a closed details
+   pane so the default end-user view stays jargon-free.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Run Triage - Email Triage{% endblock %}
+{% block content %}
+<h2>Triage</h2>
+
+{% set active = "run" %}
+{% include "triage/_tabs.html" %}
+
+<h3>Run Triage</h3>
+<p>Select an email account, set a limit, and run classification + actions on matching messages.</p>
+
+{% if visible_owners %}
+{# Owner filter visible only when current user can see accounts
+   from more than one owner (admin-of-the-install OR delegate of
+   someone else's account). Defaults to current user. #}
+<form method="get" action="/triage" style="margin:0 0 1rem 0;">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Filter by owner:
+        <select name="owner_filter" onchange="this.form.submit()" style="margin:0;width:auto;">
+            <option value="all" {% if owner_filter == "all" %}selected{% endif %}>All users</option>
+            {% for o in visible_owners %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                {{ o.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+{% endif %}
+
+{% if not accounts %}
+<article style="border-left: 3px solid var(--pico-color-amber-500); padding: 0.5rem 1rem;">
+    <p>No email accounts configured. <a href="/accounts">Add an account</a> first.</p>
+</article>
+{% else %}
+<form hx-post="/triage/run"
+      hx-target="#triage-results"
+      hx-swap="innerHTML"
+      hx-indicator="#triage-spinner">
+    <div class="grid">
+        <label>
+            Account
+            <select name="account_id" required>
+                {% for acct in accounts %}
+                <option value="{{ acct.id }}" {% if not acct.is_active %}disabled{% endif %}>
+                    {{ acct.name }} ({{ acct.provider_type }}{% if acct.config.get('username') %} - {{ acct.config.get('username') }}{% endif %}){% if not acct.is_active %} [disabled]{% endif %}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Limit
+            <select name="limit" id="triage-limit">
+                <option value="5" selected>5 messages</option>
+                <option value="10">10 messages</option>
+                <option value="25">25 messages</option>
+                <option value="50">50 messages</option>
+            </select>
+        </label>
+    </div>
+
+    {# Mode selector — inline (default, bounded sync run) vs.
+       background bulk (whole-mailbox sweep, #101). When "All
+       matches" is picked, the form POST creates a triage_jobs
+       row + redirects to the progress page; the limit dropdown
+       above is ignored for that mode. #}
+    <p style="margin:0.5rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+        Pick a mode below. <strong>Inline</strong> runs right here
+        and shows results on this page — best for testing rules
+        with the limit set above. <strong>All matches</strong>
+        kicks off a background sweep over every matching message.
+        It runs at a steady pace (the limit sets how many it
+        classifies per minute, configured by your admin) so the
+        AI service isn't overloaded; you can come back to a live
+        progress page and stop the run any time — already-classified
+        messages stay processed.
+    </p>
+    <fieldset style="margin:0.5rem 0;padding:0.5rem 0.75rem;
+                     border:1px solid var(--pico-muted-border-color);
+                     border-radius:var(--pico-border-radius);">
+        <legend style="font-size:0.9em;padding:0 0.4rem;">
+            Mode{{ m.help("Inline runs right now and shows results on this page, capped by the limit above. All matches starts a background job that sweeps every matching message — for example, after onboarding a new account or adding a category, when you want everything classified, not just the latest 50. Try a small inline run first to make sure your rules are right.") }}
+        </legend>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;cursor:pointer;">
+            <input type="radio" name="mode" value="inline" checked
+                   onchange="document.getElementById('triage-limit').disabled=false;
+                            document.getElementById('bulk-warning').style.display='none';"
+                   style="margin:0;">
+            <span><strong>Inline</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— synchronous, results in this page, capped by the limit above.
+                </small>
+            </span>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;cursor:pointer;">
+            <input type="radio" name="mode" value="all"
+                   onchange="document.getElementById('triage-limit').disabled=true;
+                            document.getElementById('bulk-warning').style.display='block';"
+                   style="margin:0;">
+            <span><strong>All matches (background)</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— sweeps every match. Progress page polls live; cancellable.
+                </small>
+            </span>
+        </label>
+        <article id="bulk-warning"
+                 style="display:none;margin:0.4rem 0 0;padding:0.4rem 0.75rem;
+                        font-size:0.85em;
+                        border-left:3px solid var(--pico-color-amber-500);
+                        background:var(--pico-card-background-color, transparent);">
+            Bulk mode classifies + acts on every matching message.
+            Verify rules + categories with a small inline run first
+            — actions on a wrong category amplify across the whole
+            sweep.
+        </article>
+    </fieldset>
+    <div class="grid">
+        <label>
+            Search Query{{ m.help("Which messages to scan. Presets cover the common cases; pick 'Other (freeform)' to type a native IMAP SEARCH or Gmail query when you need something specific.") }}
+            <select name="search_preset" id="search-preset"
+                    onchange="document.getElementById('query-freeform').style.display=(this.value==='other'?'block':'none');">
+                <option value="unread_today" selected>Unread, today</option>
+                <option value="unread_week">Unread, last 7 days</option>
+                <option value="unread_month">Unread, last 30 days</option>
+                <option value="unread">Unread (no date cap)</option>
+                <option value="all_today">All, today</option>
+                <option value="all_week">All, last 7 days</option>
+                <option value="all_month">All, last 30 days</option>
+                <option value="all">All (no date cap)</option>
+                <option value="other">Other (freeform)…</option>
+            </select>
+            <small>The preset translates to provider-native syntax (IMAP SEARCH or Gmail <code>q=</code>) at submit time.</small>
+        </label>
+    </div>
+    {# #129 — "Has label" filter. Renders only when the catalog
+       has at least one entry. Intersects with the search query —
+       the runner restricts the message-id set to messages already
+       tagged with the chosen slug before classification. #}
+    {% if all_labels %}
+    <div class="grid">
+        <label>
+            Has label{{ m.help("Limit triage to messages already tagged with the chosen label. Example: only re-run actions on messages tagged 'vendor-action-required'. Leave blank to scan every match.") }}
+            <select name="has_label">
+                <option value="">— any (no label filter) —</option>
+                {% for label in all_labels %}
+                <option value="{{ label.slug }}">{{ label.name }} ({{ label.slug }})</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    {% endif %}
+    <div id="query-freeform" style="display:none;margin:0.5rem 0;">
+        <label>
+            Freeform query
+            <input type="text" name="query" value=""
+                   placeholder="e.g. UNSEEN SINCE 01-Apr-2026 (IMAP) / is:unread after:2026/04/01 (Gmail)">
+            <small>Only used when "Other (freeform)" is selected above. Syntax matches the account's provider — IMAP SEARCH on IMAP accounts, Gmail query syntax on Gmail accounts, OData on Office 365.</small>
+        </label>
+        <details style="margin-top:0.4rem;">
+            <summary style="cursor:pointer;font-size:0.9em;color:var(--pico-muted-color);">
+                Common patterns + examples
+            </summary>
+            <div style="margin-top:0.4rem;font-size:0.85em;
+                        border:1px solid var(--pico-muted-border-color);
+                        border-radius:var(--pico-border-radius);
+                        padding:0.5rem 0.75rem;
+                        background:var(--pico-card-background-color, transparent);">
+                <table style="margin:0;font-size:0.95em;">
+                    <thead>
+                        <tr>
+                            <th style="width:14rem;">Pattern</th>
+                            <th>IMAP</th>
+                            <th>Gmail</th>
+                            <th>Office 365 (OData)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Sent before a date</td>
+                            <td><code>BEFORE 01-Apr-2026</code></td>
+                            <td><code>before:2026/04/01</code></td>
+                            <td><code>receivedDateTime lt 2026-04-01T00:00:00Z</code></td>
+                        </tr>
+                        <tr>
+                            <td>Sent after a date</td>
+                            <td><code>SINCE 01-Apr-2026</code></td>
+                            <td><code>after:2026/04/01</code></td>
+                            <td><code>receivedDateTime gt 2026-04-01T00:00:00Z</code></td>
+                        </tr>
+                        <tr>
+                            <td>From a specific address</td>
+                            <td><code>FROM "user@example.com"</code></td>
+                            <td><code>from:user@example.com</code></td>
+                            <td><code>from/emailAddress/address eq 'user@example.com'</code></td>
+                        </tr>
+                        <tr>
+                            <td>From any address at a domain</td>
+                            <td><code>FROM "@example.com"</code></td>
+                            <td><code>from:example.com</code></td>
+                            <td><code>endswith(from/emailAddress/address,'@example.com')</code></td>
+                        </tr>
+                        <tr>
+                            <td>Subject contains text</td>
+                            <td><code>SUBJECT "invoice"</code></td>
+                            <td><code>subject:invoice</code></td>
+                            <td><code>contains(subject,'invoice')</code></td>
+                        </tr>
+                        <tr>
+                            <td>Body contains text</td>
+                            <td><code>BODY "tracking number"</code></td>
+                            <td><code>"tracking number"</code></td>
+                            <td><code>contains(body/content,'tracking number')</code></td>
+                        </tr>
+                        <tr>
+                            <td>Has any attachment</td>
+                            <td><code>(no native — use a body-text proxy)</code></td>
+                            <td><code>has:attachment</code></td>
+                            <td><code>hasAttachments eq true</code></td>
+                        </tr>
+                        <tr>
+                            <td>Unread + from a domain + this month</td>
+                            <td><code>UNSEEN FROM "@example.com" SINCE 01-Apr-2026</code></td>
+                            <td><code>is:unread from:example.com after:2026/04/01</code></td>
+                            <td><code>isRead eq false and endswith(from/emailAddress/address,'@example.com') and receivedDateTime gt 2026-04-01T00:00:00Z</code></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <small style="color:var(--pico-muted-color);display:block;margin-top:0.4rem;">
+                    Combine clauses with whitespace (IMAP / Gmail) or
+                    <code>and</code> (OData). Quote multi-word values
+                    with double quotes on IMAP; bare on Gmail when
+                    safe. Date format is provider-specific —
+                    <code>dd-Mon-yyyy</code> on IMAP,
+                    <code>yyyy/mm/dd</code> on Gmail, ISO 8601 on
+                    Office 365.
+                </small>
+            </div>
+        </details>
+    </div>
+    {# #151 — force re-classify. Only renders the row when the
+       optional classification cache is configured on this install
+       (an empty Redis URL = cache off, in which case the toggle
+       is meaningless). The flag still POSTs as unchecked-by-default
+       so a non-debug run benefits from the cache when present. #}
+    {% if classification_cache_enabled %}
+    <details style="margin:0.5rem 0;font-size:0.9em;">
+        <summary style="cursor:pointer;color:var(--pico-muted-color);">
+            Advanced — bypass classification cache
+        </summary>
+        <label style="display:flex;align-items:center;gap:0.5rem;
+                      margin:0.4rem 0 0;padding:0.4rem 0.6rem;
+                      border:1px solid var(--pico-muted-border-color);
+                      border-radius:var(--pico-border-radius);">
+            <input type="checkbox" name="force_reclassify" value="1"
+                   style="margin:0;">
+            <span>
+                Force re-classify (skip cached results)
+                {{ m.help("Bypass the optional classification cache for this run. Every message hits the language model, even if a recent identical message is in the cache. Useful when debugging rules or after a category description changed. The fresh result still gets written back so the next normal run picks it up.") }}
+            </span>
+        </label>
+    </details>
+    {% endif %}
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+        <button type="submit">
+            Run Triage
+        </button>
+        {# Preview — read-only sample of up to 20 matching messages.
+           Same form fields (account + preset + freeform) so the
+           query reflects whatever the operator has typed. No
+           classifier call, no actions, no DB writes. Swaps the
+           result table into #triage-preview below. #}
+        <button type="button" class="secondary outline"
+                hx-post="/triage/preview"
+                hx-include="closest form"
+                hx-target="#triage-preview"
+                hx-swap="innerHTML"
+                hx-indicator="#preview-spinner">
+            Preview matches
+        </button>
+        <span id="triage-spinner" class="htmx-indicator">
+            Processing...
+        </span>
+        <span id="preview-spinner" class="htmx-indicator"
+              style="color:var(--pico-muted-color);">
+            Looking up...
+        </span>
+    </div>
+</form>
+
+<section id="triage-preview" style="margin-top:1rem;">
+    <!-- Preview fragment swaps in here via HTMX -->
+</section>
+
+<section id="triage-results" style="margin-top:2rem;">
+    <!-- Results will be swapped in here via HTMX -->
+</section>
+
+{# Recent bulk-triage jobs across visible accounts (#101). Empty
+   on installs that haven't run a bulk sweep yet — the section
+   then renders nothing rather than an empty placeholder. #}
+{% if recent_jobs %}
+<section style="margin-top:2.5rem;">
+    <h3>Recent bulk runs{{ m.help("Background whole-mailbox sweeps started via the 'All matches' mode above. Click a job to see live progress / cancel. Older jobs roll off after the 10 most-recent.") }}</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Status</th>
+                <th>Account</th>
+                <th>Query</th>
+                <th>Progress</th>
+                <th>Started</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for job in recent_jobs %}
+            {% set acct = accounts_by_id.get(job.account_id) or {} %}
+            <tr>
+                <td>
+                    <small style="display:inline-block;padding:0.1rem 0.5rem;
+                                  border-radius:999px;
+                                  {% if job.status == 'done' %}background:var(--pico-ins-color);color:white;
+                                  {% elif job.status == 'failed' %}background:var(--pico-del-color);color:white;
+                                  {% elif job.status == 'cancelled' %}background:var(--pico-color-amber-500);color:white;
+                                  {% elif job.status == 'running' %}background:var(--pico-primary);color:white;
+                                  {% else %}background:var(--pico-muted-color);color:white;
+                                  {% endif %}">
+                        {{ job.status }}
+                    </small>
+                </td>
+                <td><small>{{ acct.get('name', '') or '#' ~ job.account_id }}</small></td>
+                <td><small><code>{{ (job.query or '(empty)')[:40] }}</code></small></td>
+                <td><small>{{ job.total_processed }} / {{ job.total_seen }}</small></td>
+                <td><small style="color:var(--pico-muted-color);">
+                    {{ (job.started_at or job.created_at or '')[:19] }}
+                </small></td>
+                <td>
+                    <a href="/triage/jobs/{{ job.job_id }}"
+                       role="button" class="outline secondary"
+                       style="padding:0.15rem 0.5rem;font-size:0.8em;
+                              text-decoration:none;">
+                        View
+                    </a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% endif %}
+{% endblock %}

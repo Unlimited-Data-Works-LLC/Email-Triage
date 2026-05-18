@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user. The notifications tab is where account
+                owners set up their phone alert path.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Not terminal users; not protocol readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC, ISO 8601, OData, "language model",
+       "AND-combined", "substring match", "SMTP relay", "system log").
+       Plain English. "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+     - Tooltips use m.help() with concrete examples (real-shape
+       values, NOT real PII — the cell-number rule says 555-0100).
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}My Settings - Email Triage{% endblock %}
+{% block content %}
+<h2>My Settings</h2>
+
+{# Settings cluster shares one tab strip across notifications,
+   meeting prefs, hardware keys, accounts, and api-keys. Personal
+   Categories used to be a profile sub-tab; it moved to the Rules
+   cluster (see _rules_tabs.html) so users find it next to
+   Categories + Discover Categories. #}
+{% set active = active_tab or "notifications" %}
+{% include "_settings_tabs.html" %}
+
+<style>
+    .tab-pane { display: none; }
+    .tab-pane.tab-pane-active { display: block; }
+</style>
+
+{% if save_msg %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    {{ save_msg }}
+</article>
+{% endif %}
+
+<form method="post" action="/profile/save">
+    {{ csrf_input(request) }}
+<input type="hidden" name="active_tab" value="{{ active }}">
+
+<div class="tab-pane{% if active == 'notifications' %} tab-pane-active{% endif %}">
+{# ── Notification Address ──────────────────────────────────────────── #}
+<section id="notifications">
+    <h3>Notification Address{{ m.help("Where urgent escalation alerts land when the classifier flags a message in one of your Escalation Categories below. SMS via carrier gateway is plaintext (sender + subject hidden — only category + timestamp are sent); HIPAA mode reduces the text further to first name only. Use Advanced for pager / on-call / non-US carriers.") }}</h3>
+    <p>Where urgent escalation alerts are sent. Pick your cell carrier
+       and type your number — the system computes the email-to-SMS
+       gateway for you.</p>
+
+    {% if error %}
+    <article style="border-left:3px solid var(--pico-del-color);padding:0.4rem 0.8rem;margin-bottom:0.75rem;">
+        <small style="color:var(--pico-del-color);">{{ error }}</small>
+    </article>
+    {% endif %}
+
+    <div class="grid">
+        <label>
+            Cell number
+            <input type="tel" name="sms_number"
+                   value="{{ sms_prefs.number or '' }}"
+                   placeholder="(555) 123-4567"
+                   pattern="[0-9 .()+\-]*"
+                   inputmode="tel">
+        </label>
+        <label>
+            Carrier
+            <select name="sms_carrier">
+                <option value="" {% if not sms_prefs.carrier %}selected{% endif %}>
+                    — select —
+                </option>
+                {% for slug, name, _gw in sms_carriers %}
+                <option value="{{ slug }}"
+                    {% if sms_prefs.carrier == slug %}selected{% endif %}>
+                    {{ name }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <small style="color:var(--pico-muted-color);display:block;">
+        SMS over carrier email-to-SMS gateways is plaintext and not
+        encrypted by the carrier. Email-triage sends category +
+        timestamp only — no sender, subject, or body content. In
+        HIPAA mode (system-wide or per-account) the alert text is
+        further reduced to first name only. Carrier list is
+        US-only; non-US users use the Advanced field below.
+    </small>
+
+    <details style="margin-top:0.75rem;">
+        <summary style="cursor:pointer;font-size:0.9em;color:var(--pico-muted-color);">
+            Advanced — custom address (pager email, on-call list,
+            non-US carrier, …)
+        </summary>
+        <label for="notify_email" style="margin-top:0.5rem;">
+            <small>Used only if you leave the carrier dropdown blank.</small>
+        </label>
+        <input type="email" id="notify_email" name="notify_email"
+               value="{% if not sms_prefs.carrier %}{{ current_user.notify_email or '' }}{% endif %}"
+               placeholder="oncall@example.com"
+               style="max-width:25rem;">
+    </details>
+
+    {% if current_user.notify_email %}
+    <p style="margin-top:0.5rem;">
+        <small style="color:var(--pico-muted-color);">
+            Currently sending to: <code>{{ current_user.notify_email }}</code>
+        </small>
+    </p>
+
+    {# ── Test Now (#102) ──────────────────────────────────────────
+       Verify the wiring (cell + carrier or free-text address) by
+       firing one fixed-text message through the live escalation
+       send path. Button only renders when an address is configured;
+       the handler also defends in depth in case the surface leaks.
+       The synthetic body never carries PHI even on HIPAA installs. #}
+    <div style="margin-top:0.75rem;display:flex;align-items:center;
+                gap:0.75rem;flex-wrap:wrap;">
+        <p id="test-send-help"
+           style="margin:0;color:var(--pico-muted-color);
+                  font-size:0.9em;flex:1 1 20rem;">
+            Sends a one-time test message to your configured
+            notification address.
+        </p>
+        <button type="button"
+                hx-post="/profile/escalation-test-send"
+                hx-target="#test-send-result"
+                hx-swap="innerHTML"
+                aria-describedby="test-send-help"
+                class="outline secondary"
+                style="margin:0;padding:0.35rem 0.9rem;
+                       font-size:0.9em;flex:0 0 auto;">
+            Test Now{{ m.help("Sends a one-time test message to your phone or email. Example: if you set up text alerts at 555-0100 with carrier 'Carrier A', a test message will arrive within 60 seconds. Use this after changing your number or carrier. One test per minute.") }}
+        </button>
+    </div>
+    <div id="test-send-result"
+         style="margin-top:0.5rem;font-size:0.9em;min-height:1.25rem;"
+         aria-live="polite"></div>
+    {% else %}
+    <p style="margin-top:0.5rem;">
+        <small style="color:var(--pico-muted-color);">
+            Set your cell number and carrier (or use the Advanced
+            field) above and save before testing.
+        </small>
+    </p>
+    {% endif %}
+</section>
+
+{# ── Per-Category Escalation ──────────────────────────────────────── #}
+<section>
+    <h3>Escalation Categories{{ m.help("A category fires the escalation alert ONLY if it's checked here AND your notification address (above) is configured. Unchecked categories still classify normally; they just don't page you. Categories you escalate ride the same SMS / email path as the notification address — pick conservatively.") }}</h3>
+    <p>Select which email categories trigger an urgent notification to your
+       notify address. Only categories with a checkmark will escalate.</p>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width:3rem;">Escalate</th>
+                <th>Category</th>
+                <th>Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cat in categories %}
+            <tr>
+                <td style="text-align:center;">
+                    <input type="checkbox" name="escalate_{{ cat.slug }}" value="1"
+                           {% if cat.slug in escalation_categories %}checked{% endif %}
+                           style="margin:0;">
+                </td>
+                <td><code>{{ cat.slug }}</code></td>
+                <td><small>{{ cat.description }}</small></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<button type="submit">Save Settings</button>
+</div>{# /notifications tab-pane (Save button stays inside since
+        it only persists the Notification Address + Escalation
+        Categories fields — the meeting tab has its own save flow) #}
+
+</form>
+
+<div class="tab-pane{% if active == 'meeting' %} tab-pane-active{% endif %}">
+<div id="meeting">
+    {% include "profile/_meeting_prefs.html" %}
+</div>
+</div>{# /meeting tab-pane #}
+
+<div class="tab-pane{% if active == 'writing' %} tab-pane-active{% endif %}">
+    {% include "profile/_writing.html" %}
+</div>{# /writing tab-pane — M-1 + M-2 user-stated style knobs #}
+
+{# Personal Categories tab-pane removed — section now lives at
+   /rules/personal-categories under the Rules cluster. #}
+
+{% endblock %}

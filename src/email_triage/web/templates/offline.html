@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work). NOT developers.
+   TECH-SKILL:  computer-literate professional. Will read this when
+                the device has no network or the server is
+                unreachable. Use plain English; no jargon.
+   COPY RULES:  no developer terms ("network stack", "DNS",
+                "service worker", "503"). Speak in user terms:
+                "no internet connection", "try again". No
+                admin-path links — this page is reached when the
+                user is offline; admin paths would be useless even
+                if they could be reached.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Offline - Email Triage{% endblock %}
+{% block content %}
+
+<section>
+    <h2>You appear to be offline</h2>
+    <p style="color: var(--pico-muted-color);">
+        Email Triage needs an internet connection to fetch your messages
+        and sync your changes. Your inbox lives on the mail server, not on
+        this device, so there's nothing to show until the connection comes
+        back.
+    </p>
+</section>
+
+<section>
+    <h3>What to try</h3>
+    <ul>
+        <li>Check your Wi-Fi or mobile data connection.</li>
+        <li>If you're using a VPN, confirm it's still connected.</li>
+        <li>Tap or click <strong>Try again</strong> below to reload the dashboard.</li>
+    </ul>
+    <a href="/dashboard" role="button" class="contrast">Try again</a>
+</section>
+
+<section>
+    <p style="color: var(--pico-muted-color); font-size: 0.9rem;">
+        Tip: if you installed Email Triage as an app on this device, this
+        page will keep working even when other browser tabs say "no internet".
+        Re-open the app once your connection is back.
+    </p>
+</section>
+
+{% endblock %}

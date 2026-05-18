@@ -1,0 +1,469 @@
+name: Release
+
+# Container release pipeline: build, push, sign, and attest.
+#
+# Triggers:
+#   * push to `main`               -> :edge tag (no GitHub Release)
+#   * push of a `v*` tag (semver)  -> vX.Y.Z + :latest + :stable + Release
+#                                     + air-gap tarball asset
+#
+# Two distinct OIDC subjects are emitted across the release pipeline,
+# both keyless (sigstore / Fulcio):
+#
+#   1. `release.yml` workflow identity  -> cosign signature on the image
+#      digest + SLSA-3 build provenance attestation. Proves the image
+#      came out of this CI pipeline (build provenance: who/what/when).
+#
+#   2. `operator-attest.yml` workflow identity -> separate cosign custom
+#      attestation by a human operator that the build is HIPAA-safe.
+#      See `.github/workflows/operator-attest.yml`. Customer-side
+#      verifier checks BOTH subjects distinctly (build-provenance OR
+#      build-provenance + operator-validated for HIPAA installs).
+#
+# Cosign uses keyless OIDC throughout. No long-lived key material on
+# disk, no rotation. Fulcio issues a short-lived cert tied to the
+# workflow identity; Rekor logs the entry for transparency.
+#
+# Registry namespace defaults to `unlimited-data-works-llc` (operator's public-mirror
+# slot) but can be overridden via the repo variable `GHCR_NAMESPACE`
+# for forks / private mirrors. The image NAME is always
+# `email-triage`. Together they form `ghcr.io/<namespace>/email-triage`.
+#
+# Layer-cache discipline: every build pulls `--cache-from ghcr.io/.../
+# email-triage:edge` so PR + tag builds don't re-download wheels +
+# torch / sentence-transformers on every run. Pre-fix (homelab deploy
+# loop, 2026-05-13) a same-day burst pulled ~13 GB of layers; this is
+# the CI equivalent, so install the cache hook from day one.
+#
+# Air-gap path: the `release-tarball-asset` job runs ONLY on tag pushes.
+# It re-pulls the just-pushed image, exports it via `podman save |
+# zstd --long=27 -19 -T0`, attaches the resulting tarball + a
+# separately-signed SHA-256 digest to the GitHub Release. Customers
+# without GHCR reachability download the tarball, decompress with
+# `zstd --long=27 -d`, `podman load`, then verify cosign signature
+# against the REGISTRY-side signature copy that ships alongside the
+# image manifest. Compression switched from gzip to zstd 2026-05-17
+# (#180): GH Releases caps a single asset at 2 GiB; gzip --best on
+# the v0.1.0 OCI archive came in at 2.30 GiB. zstd's higher ratio
+# (~25% smaller than gzip --best on this content) + the #180 image-
+# slim work (~1.5 GiB uncompressed savings) keeps the tarball under
+# the cap with headroom for small future growth. Pre-upload size
+# guard in the job fails the build cleanly if the cap is ever
+# breached again.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# Per-workflow permission baseline. Individual jobs widen where needed
+# (`packages: write` on push, `id-token: write` for OIDC sign/attest).
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: email-triage
+  # `GHCR_NAMESPACE` is a repo variable; falls back to the operator's
+  # default slot if unset (e.g. on the public mirror before the
+  # variable is configured).
+  GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE || 'unlimited-data-works-llc' }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # build-and-push — single source of truth for the image artifact.
+  #
+  # Uses docker/buildx (the upstream-supported builder) rather than
+  # podman because buildx has first-class GitHub Actions integration:
+  # cache import/export, multi-platform builds, OCI annotations,
+  # cosign-compatible output digest. The Containerfile is buildx-
+  # compatible (it builds identically under `podman build` and
+  # `docker buildx build` — verified by the operator's deploy.sh
+  # which already uses podman build on the same file).
+  # ──────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # push to GHCR
+      id-token: write       # OIDC token for downstream sign/attest jobs
+      attestations: write   # SLSA-3 build provenance
+    outputs:
+      image-ref: ${{ steps.meta.outputs.image-ref }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      # ubuntu-latest runners ship with ~14 GB free disk after the
+      # default tool-cache provisioning. This Containerfile pulls a
+      # torch CPU wheel (~250 MB), the HuggingFace embedding model
+      # (~90 MB), plus the full Python dependency tree — easily
+      # blows past 14 GB by the time buildx finishes layering. First
+      # run of this workflow on 2026-05-17 failed with "No space
+      # left on device" mid-build. The free-disk-space action
+      # reclaims ~30 GB by removing pre-installed Android SDK,
+      # .NET, GHC, and CodeQL — none of which we need for a Python
+      # container build. Standard fix across the Python+ML-on-GHA
+      # ecosystem; keep it as step 0 until the build slims down
+      # enough to fit in the default 14 GB envelope.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false        # keep the python/node toolchains we use
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Stamp commit SHA into COMMIT
+        # The Containerfile COPYs ``COMMIT`` into ``/app/VERSION``;
+        # the runtime ``/health`` endpoint reads that to surface the
+        # build's exact commit. The repo ships a placeholder
+        # ``COMMIT`` file containing ``dev``; the local deploy
+        # script overwrites it via ``git rev-parse HEAD`` before
+        # ``podman build``. CI must do the same — without this
+        # step the in-image VERSION literally reads ``dev`` and the
+        # build provenance + /health output disagree with reality.
+        # Belt-and-braces: the COMMIT file MUST exist (the bootstrap
+        # script's ``EXCLUDES`` once dropped it and the first CI
+        # build broke with ``"/COMMIT": not found`` until we restored
+        # it + added this step).
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          printf '%s\n' "${sha}" > COMMIT
+          echo "Stamped COMMIT with ${sha}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags + labels
+        id: meta
+        # docker/metadata-action computes the full tag set from the
+        # trigger (push to main -> :edge; push of v1.2.3 -> 1.2.3,
+        # 1.2, 1, latest). We override the `latest` policy so it
+        # only fires on semver tags, never on a main push, and we
+        # add `:stable` as an explicit alias for the most-recent
+        # semver tag.
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},suffix=
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # 2026-05-17: also publish the v-prefixed semver form
+            # (e.g. ``v0.1.0`` in addition to the docker-conventional
+            # ``0.1.0``). Customers who naïvely match the image tag to
+            # the git tag (``docker pull foo:v0.1.0`` because they see
+            # ``v0.1.0`` on the GitHub Release page) hit MANIFEST_
+            # UNKNOWN with just ``{{version}}``. Both forms are
+            # cheap to publish and removes a customer-facing footgun.
+            # ``{{raw}}`` emits the literal git-tag text minus the
+            # ``refs/tags/`` prefix — i.e. ``v0.1.0``.
+            type=semver,pattern={{raw}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=email-triage
+            org.opencontainers.image.description=Portable email triage with LLM classification and configurable routing
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer-cache discipline (see header comment). :edge is the
+          # always-present cache anchor; tag builds also pull from
+          # :latest to short-circuit common-base layers when a release
+          # cuts straight off main.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:edge
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
+          # Always export the :edge cache; tag builds also refresh it
+          # so the next main push starts from the latest released base.
+          cache-to: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:edge,mode=max
+          provenance: true
+          sbom: false  # SBOM ships separately via .github/workflows/security.yml
+
+      - name: Emit image reference
+        # Stable digest-pinned reference for downstream jobs. Tag
+        # references can move (`:latest` always does); the digest
+        # does not.
+        run: |
+          echo "image-ref=${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────────────────────────────
+  # sign-and-attest — cosign keyless signature + SLSA-3 build provenance.
+  #
+  # Both artifacts attach to the image by digest, not by tag, so they
+  # survive tag re-pointing (e.g. a future `:stable` retag). Customer-
+  # side verifier resolves a tag to a digest first, then verifies the
+  # digest.
+  # ──────────────────────────────────────────────────────────────────
+  sign-and-attest:
+    name: Sign and attest image
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # cosign signature stored as an OCI artifact in GHCR
+      id-token: write       # keyless OIDC
+      attestations: write   # GH-native attestation storage for SLSA provenance
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        # cosign needs to push the signature + attestation artifacts
+        # into the registry alongside the image manifest.
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cosign sign image (keyless OIDC)
+        # `--yes` accepts the Sigstore TOS prompt non-interactively.
+        # The OIDC identity is the `release.yml` workflow at this
+        # commit; customer-side verifier pins it via
+        # `--certificate-identity-regexp` + `--certificate-oidc-issuer`.
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+
+      # GitHub's attestation persistence API is gated on the repo
+      # being public OR the account being on a paid GitHub plan
+      # (Team/Enterprise Cloud). User-owned private repos hit:
+      #   "Failed to persist attestation: Feature not available for
+      #    user-owned private repositories."
+      # Source: https://docs.github.com/rest/repos/attestations
+      #
+      # Until the public mirror exists (#150 — see PUNCH-LIST.md and
+      # docs/release-process.md), the SLSA-3 step is skipped on
+      # private repos. Cosign keyless signature still attaches and
+      # still proves CI built the image; SLSA provenance is the
+      # additional belt-and-braces layer that GitHub's API gates.
+      # Customer-side verifier already handles "signature only, no
+      # attestation" gracefully — the operator-attestation workflow
+      # (the second OIDC subject) carries the human-validation claim
+      # and is the gate HIPAA installs actually enforce.
+      - name: SLSA-3 build provenance
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.build-and-push.outputs.image-digest }}
+          push-to-registry: true
+
+      - name: SLSA attestation skipped (private repo)
+        if: github.event.repository.visibility != 'public'
+        run: |
+          echo "::notice title=SLSA attestation skipped::Repository is private; GitHub's attestation API requires the repo to be public OR the account to be on a paid plan. Cosign keyless signature was attached successfully and is sufficient for customer-side verification of CI build origin. SLSA-3 provenance will start attaching automatically once the public mirror (#150) is established."
+
+  # ──────────────────────────────────────────────────────────────────
+  # release-tarball-asset — air-gap path (Version A install profile).
+  #
+  # Customers behind a registry-blocking firewall download a single
+  # tarball from the GitHub Release, `podman load` it locally, and
+  # verify cosign against the registry-side signature copy. The
+  # tarball + its SHA-256 are signed separately so the air-gap
+  # operator can verify the file BEFORE loading it.
+  # ──────────────────────────────────────────────────────────────────
+  release-tarball-asset:
+    name: Air-gap tarball + GitHub Release
+    needs: [build-and-push, sign-and-attest]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create / update GitHub Release
+      packages: read        # pull the just-pushed image
+      id-token: write       # cosign sign-blob keyless
+
+    steps:
+      # podman pull + save + gzip on the just-built image easily
+      # exceeds ubuntu-latest's default 14 GB free-disk envelope —
+      # same disk-pressure reason as the build-and-push job above.
+      # Reclaim ~30 GB before the pull step starts.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout (for CHANGELOG)
+        uses: actions/checkout@v5
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install zstd
+        # zstd is preinstalled on ubuntu-latest at version 1.4.8
+        # which doesn't support ``--long=27``. Bump to the latest
+        # zstd from the apt-get-able package list (typically 1.5.x
+        # on current images) so the high-ratio compression flags
+        # don't silently fall back to lower defaults.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zstd
+          zstd --version | head -1
+
+      - name: Resolve version tag
+        id: version
+        # github.ref is `refs/tags/vX.Y.Z`; strip the prefix.
+        # 2026-05-17 (#180): filename suffix bumped from ``.tar.gz``
+        # to ``.tar.zst``. The first v0.1.0 release-tarball-asset run
+        # produced a 2.30 GiB gzip-compressed tarball, over GH
+        # Releases' 2 GiB per-asset cap (asset upload rejected
+        # outright; entire release blocked). Switching to zstd at
+        # level 19 + ``--long=27`` cuts compressed size by another
+        # ~25% vs gzip --best on this image content, which puts it
+        # under the cap with headroom. The slim-image work in #180
+        # itself drops the uncompressed footprint by ~1.5 GiB; zstd
+        # buys belt-and-braces margin so a small future bloat
+        # doesn't immediately re-fail the asset upload.
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+          echo "filename=email-triage-${ref}.tar.zst" >> "$GITHUB_OUTPUT"
+
+      - name: Save image to tarball
+        # podman is preinstalled on ubuntu-latest. ``podman save``
+        # writes an OCI-archive; zstd level 19 with ``--long=27``
+        # (max window log; needs the matching ``--long=27`` on
+        # decompress) cuts ~70-75% off the wire size for OCI-archive
+        # content (a mix of compressed manifest JSON + uncompressed
+        # layer tarballs + already-compressed wheel binaries).
+        # ``-T0`` uses all available threads.
+        run: |
+          set -euo pipefail
+          podman pull "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+          podman tag \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}" \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}"
+          podman save \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}" \
+            | zstd --long=27 -19 -T0 > "${{ steps.version.outputs.filename }}"
+          ls -lh "${{ steps.version.outputs.filename }}"
+
+      - name: Pre-upload size guard
+        # GitHub Releases caps a single asset at 2 GiB
+        # (2147483648 bytes; documented in the REST API reference).
+        # The upload step's failure mode on oversize is a vague
+        # 422 deep in the action's logs — pre-checking here gives
+        # us a clear actionable error AND avoids the partial-upload
+        # state where some sibling assets land + the tarball doesn't.
+        # If this fires post-#180, the image grew + needs further
+        # slimming (see ``Slim-down options`` in the punch-list).
+        run: |
+          set -euo pipefail
+          size=$(stat -c%s "${{ steps.version.outputs.filename }}")
+          limit=2147483648
+          echo "Tarball size: ${size} bytes (limit: ${limit})"
+          if [ "${size}" -gt "${limit}" ]; then
+            echo "::error title=Tarball exceeds 2 GiB cap::tarball ${size} bytes exceeds GitHub Release 2 GiB limit — image needs slimming or asset needs hosted elsewhere"
+            exit 1
+          fi
+
+      - name: SHA-256 of tarball
+        id: sha
+        run: |
+          digest=$(sha256sum "${{ steps.version.outputs.filename }}" | awk '{print $1}')
+          echo "$digest  ${{ steps.version.outputs.filename }}" > "${{ steps.version.outputs.filename }}.sha256"
+          echo "sha256=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Cosign sign tarball (keyless blob signature)
+        # Blob signatures are independent of the registry-side image
+        # signature. Air-gap operator verifies this BEFORE loading the
+        # tarball into podman; the in-image cosign signature is checked
+        # AFTER load against the registry copy (or a sideloaded
+        # signature artifact if the operator has no network at all).
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "${{ steps.version.outputs.filename }}.sig" \
+            --output-certificate "${{ steps.version.outputs.filename }}.pem" \
+            "${{ steps.version.outputs.filename }}"
+
+      - name: Generate release notes
+        id: notes
+        # Prefer CHANGELOG.md if present (operator-curated narrative);
+        # otherwise let GitHub auto-generate the commit list. Daily
+        # health probes parse the Release body for the version
+        # banner, so the format must stay stable across both paths.
+        run: |
+          version_tag="${{ steps.version.outputs.tag }}"
+          if [ -f CHANGELOG.md ]; then
+            # Extract the section matching this version. CHANGELOG
+            # convention: `## [vX.Y.Z] - YYYY-MM-DD` or `## vX.Y.Z`.
+            # Stop at the next `## ` heading.
+            awk -v tag="${version_tag}" '
+              $0 ~ "^## .*" tag { capture=1; next }
+              capture && /^## / { exit }
+              capture { print }
+            ' CHANGELOG.md > release-body.md
+            if [ ! -s release-body.md ]; then
+              echo "auto=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "auto=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "auto=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          # If CHANGELOG had a matching section we use it; otherwise
+          # `generate_release_notes: true` falls back to the commit
+          # list (auto-generated by GitHub from PRs since the last
+          # tag).
+          body_path: ${{ steps.notes.outputs.auto == 'false' && 'release-body.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.auto == 'true' }}
+          files: |
+            ${{ steps.version.outputs.filename }}
+            ${{ steps.version.outputs.filename }}.sha256
+            ${{ steps.version.outputs.filename }}.sig
+            ${{ steps.version.outputs.filename }}.pem
+          fail_on_unmatched_files: true

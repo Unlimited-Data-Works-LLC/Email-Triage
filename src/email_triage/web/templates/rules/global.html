@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (admin / power-user). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Rules - Global Lists - Email Triage{% endblock %}
+{% block content %}
+<h2>Rules</h2>
+{% set active = "global" %}
+{% include "_rules_tabs.html" %}
+
+<h3>Global Classification Lists{{ m.help("Same shape as personal lists, but applied to every user's mail on the install. Use for organisation-wide policies (company-domain VIP signal, vendor-list blocklist, etc.). Example: a global 'company-domain' list with @example.com suggesting category 'internal' tags every coworker's mail across all users. Personal lists ride alongside; on label collision, both fire and the AI picks. Admin / power-user only.") }}</h3>
+<p>Global lists apply to all users. They are passed to the AI as hints in the classification prompt. Personal lists from individual users still fire alongside global ones; on label collision both lists are presented to the AI and it weighs them together.</p>
+
+<section>
+    <details>
+        <summary role="button" class="outline">Create Global List</summary>
+        <p style="margin-top:0.5rem;color:var(--pico-muted-color);font-size:0.9em;">
+            A list groups one or more rules under a suggested category. A new list does
+            nothing by itself — add at least one rule below (sender, sender domain, or
+            subject phrase) so the list can match incoming mail. You can fill in the first
+            rule here, or leave the rule fields blank and add rules later from each list.
+        </p>
+        <form method="post" action="/rules/create">
+            {{ csrf_input(request) }}
+            <input type="hidden" name="is_global" value="1">
+            <div class="grid">
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="Company Domains" required>
+                </label>
+                <label>
+                    Suggested Category{{ m.help("Which classification category this list nudges matching mail toward across every user on the install. Example: a 'Company Domains' list set to 'internal' nudges mail from your coworker domains toward 'internal' for everyone.") }}
+                    <select name="category">
+                        {% for cat, desc in categories.items() %}
+                        <option value="{{ cat }}">{{ cat }} — {{ desc }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+            </div>
+
+            <p style="margin-top:1rem;margin-bottom:0.25rem;"><strong>First rule (optional)</strong></p>
+            <p style="margin-top:0;color:var(--pico-muted-color);font-size:0.9em;">
+                Adds one rule to the list right away so it starts matching mail. Leave
+                Pattern blank to create the list with no rules — you can add rules later.
+            </p>
+            <div class="grid">
+                <label>
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com) — useful for catching everyone at a company. subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    <select name="rule_type">
+                        {% for rt in rule_types %}
+                        <option value="{{ rt }}">{{ rt }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase. Leave blank to skip adding a first rule.") }}
+                    <input type="text" name="pattern" placeholder="example.com">
+                </label>
+            </div>
+            <label>
+                <input type="checkbox" name="skip_ai" value="1">
+                Force category — bypass the AI when this rule matches{{ m.help("Checked = every matching email is filed under the list's category, no exceptions. The AI is not asked. Unchecked = the rule is advisory; the AI sees the suggestion but may pick a different category based on the email body. GLOBAL rules affect every user on this install — flip Force on sparingly.") }}
+            </label>
+            <button type="submit">Create Global List</button>
+        </form>
+    </details>
+</section>
+
+{% for lst in global_lists %}
+<section>
+    <h3>{{ lst.name }} <small>({{ lst.category }})</small></h3>
+
+    {% if lst.rules %}
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Pattern</th>
+                <th>Mode{{ m.help("Force = matching mail is filed under this list's category, no exceptions (AI is bypassed). Hint = the rule is advisory; AI weighs it against the email body and may override.") }}</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for rule in lst.rules %}
+            <tr>
+                <td><code>{{ rule.rule_type }}</code></td>
+                <td>{{ rule.pattern }}</td>
+                <td>
+                    {% if rule.skip_ai %}
+                    <span style="color:var(--pico-color-amber-500);font-weight:600;">Force</span>
+                    {% else %}
+                    <span style="color:var(--pico-muted-color);">Hint</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <form method="post" action="/rules/{{ lst.id }}/rules/{{ rule.id }}/delete" style="margin:0">
+                        {{ csrf_input(request) }}
+                        <button type="submit" class="outline secondary" style="padding:0.25rem 0.5rem">Remove</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div role="alert"
+         style="background:var(--pico-color-amber-100, #fef3c7);
+                border-left:4px solid var(--pico-color-amber-500, #f59e0b);
+                color:var(--pico-color-amber-900, #78350f);
+                padding:0.75rem 1rem;
+                margin:0.5rem 0;
+                border-radius:4px;">
+        <strong>This list isn't matching anything yet</strong> — add a rule below to start.
+    </div>
+    {% endif %}
+
+    <details>
+        <summary>Add Rule</summary>
+        <form method="post" action="/rules/{{ lst.id }}/add-rule">
+            {{ csrf_input(request) }}
+            <div class="grid">
+                <label>
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com). subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    <select name="rule_type">
+                        {% for rt in rule_types %}
+                        <option value="{{ rt }}">{{ rt }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase.") }}
+                    <input type="text" name="pattern" placeholder="example.com" required>
+                </label>
+            </div>
+            <label>
+                <input type="checkbox" name="skip_ai" value="1">
+                Force category — bypass the AI when this rule matches{{ m.help("Checked = every matching email is filed under the list's category, no exceptions. The AI is not asked. Unchecked = the rule is advisory; the AI sees the suggestion but may pick differently based on the email body. GLOBAL rules affect every user — flip Force on sparingly.") }}
+            </label>
+            <button type="submit">Add Rule</button>
+        </form>
+    </details>
+
+    <form method="post" action="/rules/{{ lst.id }}/delete"
+          onsubmit="return confirm('Delete global list {{ lst.name }}?')"
+          style="margin-top:0.5rem">
+        <button type="submit" class="outline secondary">Delete List</button>
+    </form>
+</section>
+{% endfor %}
+
+{% if not global_lists %}
+<p>No global lists yet.</p>
+{% endif %}
+{% endblock %}

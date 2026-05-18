@@ -1,0 +1,73 @@
+{# Admin BAA-expiry banner partial (#169 Wave 2-α — I7).
+
+   AUDIENCE: admin (operator). Surfaces vendor-agreement expiry on
+   AI backends so the admin can renew before the auto-disable
+   triggers for HIPAA accounts.
+
+   Usage:
+       {% include "admin/_baa_expiry_banner.html" %}
+   in any admin page. Reads ``baa_banner`` from the page ctx —
+   shape matches :func:`email_triage.baa_expiry.build_banner_context`.
+
+   Severity bands:
+     silent  — nothing in scope, render nothing.
+     soft    — >7 days but <=30 days: muted yellow strip.
+     loud    — <=7 days OR already expired: red strip.
+
+   Plain-English copy. No protocol jargon ("BAA" appears once with
+   plain-English explanation alongside).
+#}
+{% if baa_banner is defined and baa_banner and baa_banner.severity != "silent" %}
+<aside style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              {% if baa_banner.severity == "loud" %}
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);
+              {% else %}
+              border-left:4px solid var(--pico-mark-color, orange);
+              background:var(--pico-card-background-color);
+              {% endif %}">
+    <strong>
+        {% if baa_banner.expired %}
+        AI backend vendor agreement has expired
+        {% elif baa_banner.expiring_urgent %}
+        AI backend vendor agreement expires within a week
+        {% else %}
+        AI backend vendor agreement expires soon
+        {% endif %}
+    </strong>
+    <ul style="margin:0.4rem 0 0 1.2rem;padding:0;">
+        {% for row in baa_banner.expired %}
+        <li>
+            <strong>{{ row.name }}</strong>
+            ({{ row.type }}) &mdash;
+            <strong style="color:var(--pico-del-color);">
+                expired {{ row.baa_expires_at }}
+            </strong>.
+            HIPAA accounts using this backend have been switched to
+            the install default.
+        </li>
+        {% endfor %}
+        {% for row in baa_banner.expiring_urgent %}
+        <li>
+            <strong>{{ row.name }}</strong>
+            ({{ row.type }}) &mdash;
+            <strong style="color:var(--pico-del-color);">
+                expires in {{ row.days_until_expiry }} days
+                ({{ row.baa_expires_at }})
+            </strong>.
+        </li>
+        {% endfor %}
+        {% for row in baa_banner.expiring_soon %}
+        <li>
+            <strong>{{ row.name }}</strong>
+            ({{ row.type }}) &mdash;
+            expires in {{ row.days_until_expiry }} days
+            ({{ row.baa_expires_at }}).
+        </li>
+        {% endfor %}
+    </ul>
+    <p style="margin:0.4rem 0 0 0;font-size:0.9em;">
+        <a href="/config/ai-backends">Renew or update agreements</a>
+    </p>
+</aside>
+{% endif %}

@@ -1,0 +1,170 @@
+{# Partial: watcher status for an account (HTMX-swappable into #watch-status) #}
+{% import "_macros.html" as m %}
+
+{% if watch_msg %}
+<p style="font-size:0.85rem;margin-bottom:0.5rem;
+   {% if 'started' in watch_msg.lower() %}color:var(--pico-ins-color);{% elif 'error' in watch_msg.lower() or 'not support' in watch_msg.lower() %}color:var(--pico-del-color);{% endif %}">
+    {{ watch_msg }}
+</p>
+{% endif %}
+
+<div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;">
+    {# Status indicator #}
+    {% if watch_status.status == 'watching' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-ins-color);animation:pulse 2s infinite;"></span>
+        <strong style="color:var(--pico-ins-color);font-size:0.9rem;">Watching</strong>
+    </span>
+    {% elif watch_status.status == 'starting' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-color-amber-500);"></span>
+        <strong style="color:var(--pico-color-amber-500);font-size:0.9rem;">Starting...</strong>
+    </span>
+    {% elif watch_status.status == 'reconnecting' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-color-amber-500);animation:pulse 1s infinite;"></span>
+        <strong style="color:var(--pico-color-amber-500);font-size:0.9rem;">Reconnecting...</strong>
+    </span>
+    {% elif watch_status.status == 'error' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-del-color);"></span>
+        <strong style="color:var(--pico-del-color);font-size:0.9rem;">Error</strong>
+    </span>
+    {% elif watch_status.status == 'push-active' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-ins-color);"></span>
+        <strong style="color:var(--pico-ins-color);font-size:0.9rem;">Push active</strong>
+    </span>
+    {% elif watch_status.status == 'polling' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-ins-color);"></span>
+        <strong style="color:var(--pico-ins-color);font-size:0.9rem;">Polling</strong>
+    </span>
+    {% elif watch_status.status == 'unsupported' %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-muted-color);"></span>
+        <span style="color:var(--pico-muted-color);font-size:0.9rem;">Not applicable</span>
+    </span>
+    {% else %}
+    <span style="display:inline-flex;align-items:center;gap:0.35rem;">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--pico-muted-color);"></span>
+        <span style="color:var(--pico-muted-color);font-size:0.9rem;">Stopped</span>
+    </span>
+    {% endif %}
+
+    {# Start / Stop buttons #}
+    {% if watch_status.status in ('watching', 'starting', 'reconnecting') %}
+    <button class="outline secondary" style="padding:0.25rem 0.75rem;margin:0;font-size:0.85rem;"
+            hx-post="/accounts/{{ acct.id }}/watch/stop"
+            hx-target="#watch-status"
+            hx-swap="innerHTML">
+        Stop Watching
+    </button>
+    {% elif watch_status.status in ('push-active', 'polling', 'unsupported') %}
+    {# Non-IMAP providers don't have an IDLE watcher to start/stop here —
+       delivery is webhook or server-poll based. No action button. #}
+    {% else %}
+    <button class="outline" style="padding:0.25rem 0.75rem;margin:0;font-size:0.85rem;"
+            hx-post="/accounts/{{ acct.id }}/watch/start"
+            hx-target="#watch-status"
+            hx-swap="innerHTML">
+        Start Watching
+    </button>
+    {% endif %}
+
+    {# Stats #}
+    {% if watch_status.processed %}
+    <small style="color:var(--pico-muted-color);">
+        {{ watch_status.processed }} message{{ "s" if watch_status.processed != 1 else "" }} triaged
+        {% if watch_status.errors %}, {{ watch_status.errors }} error{{ "s" if watch_status.errors != 1 else "" }}{% endif %}
+    </small>
+    {% endif %}
+
+    {# HWM controls — only when stopped #}
+    {% if watch_status.status == 'stopped' %}
+    <button class="outline" style="padding:0.2rem 0.6rem;margin:0;font-size:0.8rem;"
+            hx-post="/accounts/{{ acct.id }}/watch/set-hwm-current"
+            hx-target="#watch-status"
+            hx-swap="innerHTML"
+            hx-indicator="#hwm-spinner">
+        Set to Current
+    </button>
+    {% if hwm_uid %}
+    <button class="outline secondary" style="padding:0.2rem 0.6rem;margin:0;font-size:0.8rem;"
+            hx-post="/accounts/{{ acct.id }}/watch/reset-hwm"
+            hx-target="#watch-status"
+            hx-swap="innerHTML"
+            hx-confirm="Reset the high-water mark? The watcher will reprocess old unseen messages on next start.">
+        Reset Position
+    </button>
+    {% endif %}
+    <span id="hwm-spinner" class="htmx-indicator" style="font-size:0.8rem;color:var(--pico-muted-color);">connecting...</span>
+    {% endif %}
+</div>
+
+{# High-water mark info #}
+{% if hwm_uid %}
+<div style="margin-top:0.35rem;font-size:0.8rem;color:var(--pico-muted-color);">
+    Last processed UID: {{ hwm_uid }}{{ m.help("High-water mark — the most recent message UID this watcher has classified. Stops the watcher from re-processing the same message on reconnect / restart. 'Set to Current' bumps it to whatever the server says is newest right now (skips backlog). 'Reset Position' clears it so the next start replays from the oldest unseen message.") }}
+    {% if hwm_updated %}&mdash;
+    <span class="local-datetime" data-utc="{{ hwm_updated }}">{{ hwm_updated }}</span>
+    {% endif %}
+</div>
+{% endif %}
+
+{# Last message info #}
+{% if watch_status.last_message %}
+<div style="margin-top:0.5rem;padding:0.5rem 0.75rem;background:var(--pico-card-background-color);border-radius:var(--pico-border-radius);font-size:0.85rem;">
+    <strong>Last:</strong>
+    {{ watch_status.last_message.sender }} &mdash;
+    <em>{{ watch_status.last_message.subject[:60] }}{% if watch_status.last_message.subject|length > 60 %}...{% endif %}</em>
+    &rarr; <code>{{ watch_status.last_message.category }}</code>
+    ({{ "%.0f"|format(watch_status.last_message.confidence * 100) }}%)
+    <span class="local-datetime" data-utc="{{ watch_status.last_message.at }}"
+          style="color:var(--pico-muted-color);margin-left:0.5rem;">
+        {{ watch_status.last_message.at[:16] }}
+    </span>
+</div>
+{% endif %}
+
+{# Convert all UTC timestamps to local time #}
+<script>
+(function() {
+    document.querySelectorAll('#watch-status .local-datetime').forEach(function(el) {
+        var utc = el.getAttribute('data-utc');
+        if (!utc) return;
+        try {
+            var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
+            var d = new Date(hastz ? utc : utc + 'Z');
+            if (isNaN(d)) return;
+            el.textContent = d.toLocaleString(undefined, {
+                month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            });
+            el.title = utc;
+        } catch(e) {}
+    });
+})();
+</script>
+
+{# Error info #}
+{% if watch_status.last_error and watch_status.status in ('error', 'reconnecting') %}
+<div style="margin-top:0.35rem;font-size:0.8rem;color:var(--pico-del-color);">
+    Error: {{ watch_status.last_error }}
+</div>
+{% endif %}
+
+{# Auto-poll for status updates while watching #}
+{% if watch_status.status in ('watching', 'starting', 'reconnecting') %}
+<div hx-get="/accounts/{{ acct.id }}/watch/status"
+     hx-target="#watch-status"
+     hx-swap="innerHTML"
+     hx-trigger="every 10s"></div>
+{% endif %}
+
+<style>
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+</style>

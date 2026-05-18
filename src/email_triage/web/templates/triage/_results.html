@@ -1,0 +1,241 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner running a triage cycle).
+   TECH-SKILL:  computer-literate professional. Not protocol readers.
+   COPY RULES:
+     - Plain English. No "RFC", "ISO 8601", "OData", "IMAP",
+       "language model", "LLM".
+     - "AI" not "language model". Use disabled-control state to
+       communicate gating, not text.
+     - No admin-only-path links ("/config", "/admin/*", "Ask your
+       administrator").
+     - Use friendly phrasing for action results ("added to your
+       calendar", not "create_event=ok").
+     - Skip-rows surface as a muted status pill, not an error.
+     - HIPAA mode redacts sender/subject/event detail per the
+       actor != owner audit gate (feedback_hipaa_actor_owner_gate).
+   ─────────────────────────────────────────────────────────── #}
+{% import "_macros.html" as m %}
+
+{% if errors %}
+{% for err in errors %}
+<article style="border-left: 3px solid var(--pico-del-color); padding: 0.5rem 1rem;">
+    <p><strong>Error:</strong> {{ err }}</p>
+</article>
+{% endfor %}
+{% endif %}
+
+{% if total == 0 and not errors %}
+<article style="border-left: 3px solid var(--pico-color-amber-500); padding: 0.5rem 1rem;">
+    <p>No messages found matching "<code>{{ query }}</code>" on {{ acct.name }}.</p>
+</article>
+{% elif results %}
+{% set effective_hipaa = hipaa_mode or (acct.hipaa if acct and acct.hipaa is defined else False) %}
+<h3>Triage Results</h3>
+
+{% if dry_run %}
+<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 1rem;margin-bottom:1rem;background:var(--pico-card-background-color);">
+    <strong style="color:var(--pico-color-amber-500);">DRY RUN</strong> &mdash;
+    Actions were <em>not</em> executed. Classification ran normally but all actions
+    were skipped and logged only.
+</article>
+{% endif %}
+
+<p>
+    Processed <strong>{{ total }}</strong> message{{ "s" if total != 1 else "" }}
+    on <strong>{{ acct.name }}</strong> in {{ "%.1f"|format(elapsed) }}s.
+</p>
+
+{# #129 — bulk-tag (multi-LABEL). Surfaces only when at least one
+   label exists in the catalog. We use the HTML5 form-attr binding:
+   the controls below + the per-row checkboxes carry
+   ``form="triage-bulk-label"`` so they all submit together even
+   though the form element doesn't physically wrap the table (the
+   table cells render in a separate macro-like flow). HTMX swaps
+   the response into #bulk-label-status. #}
+{% if all_labels %}
+<form id="triage-bulk-label" method="post"
+      action="/messages/{{ acct.id }}/bulk-labels/add"
+      hx-post="/messages/{{ acct.id }}/bulk-labels/add"
+      hx-target="#bulk-label-status"
+      hx-swap="innerHTML"
+      style="margin:0.5rem 0;">
+    {{ csrf_input(request) }}
+    <fieldset role="group" style="display:flex;gap:0.5rem;align-items:center;">
+        <label for="bulk-label-slug" style="margin:0;">Tag selected with:</label>
+        <select id="bulk-label-slug" name="label_slug" style="max-width:14rem;margin:0;">
+            {% for label in all_labels %}
+            {# Operator picks by display name. Slug stays as the
+               option ``value`` (form submission shape unchanged)
+               but it's no longer rendered in the option text —
+               "slug" is internal jargon per the audience rule. #}
+            <option value="{{ label.slug }}">{{ label.name }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="outline">Tag selected</button>
+        <span id="bulk-label-status" style="margin-left:0.5rem;"></span>
+    </fieldset>
+</form>
+{% endif %}
+
+<table>
+    <thead>
+        <tr>
+            {% if all_labels %}
+            <th style="width:1.5rem;"></th>
+            {% endif %}
+            <th>Sender</th>
+            <th>Subject</th>
+            <th>Category</th>
+            <th>Confidence</th>
+            <th>Actions</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for r in results %}
+        <tr>
+            {% if all_labels %}
+            <td>
+                {% if r.status == 'ok' and r.get('message_id') %}
+                <input type="checkbox" name="message_ids"
+                       value="{{ r.message_id }}"
+                       form="triage-bulk-label"
+                       aria-label="Select this message for bulk tagging">
+                {% endif %}
+            </td>
+            {% endif %}
+            <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                {{ "[redacted]" if effective_hipaa else r.get('sender', '-') }}
+            </td>
+            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                title="{{ '[redacted]' if effective_hipaa else r.get('subject', '') }}">
+                {{ "[redacted]" if effective_hipaa else r.get('subject', '-') }}
+            </td>
+            <td>
+                {% if r.status == 'ok' %}
+                <code>{{ r.get('category', '?') }}</code>
+                {% elif r.status == 'skipped' %}
+                <em style="color:var(--pico-muted-color);">skipped</em>
+                {% else %}
+                <span style="color:var(--pico-del-color);">error</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if r.status == 'ok' %}
+                {{ "%.0f"|format((r.get('confidence', 0) or 0) * 100) }}%
+                {% endif %}
+            </td>
+            <td>
+                {% if r.status == 'ok' and r.get('actions') %}
+                {% for a in r.actions %}
+                <small>
+                    <code>{{ a.name }}</code>:
+                    {% if a.result == 'dry_run' %}
+                    <span style="color:var(--pico-color-amber-500);">dry run</span>
+                    {% elif a.result == 'completed' %}
+                    {# Self-sent event row gets a calendar icon + start
+                       time when the calendar write succeeded. The
+                       data envelope carries 'start' as ISO string;
+                       slice to the date-and-clock portion (no need
+                       for full timezone offset in a dense table).
+                       HIPAA redaction kicks in via effective_hipaa —
+                       sender/subject/start are all PHI candidates
+                       on a HIPAA account so the row says 'done'
+                       without the event detail. #}
+                    {% if a.name == 'self_sent_event' and not effective_hipaa
+                          and a.data and a.data.get('calendar_write') == 'ok' %}
+                    <span style="color:var(--pico-ins-color);">📅 added</span>
+                    {% if a.data.get('start') %}
+                    <span style="color:var(--pico-muted-color);">
+                        — {{ a.data.start[:16]|replace('T', ' ') }}
+                    </span>
+                    {% endif %}
+                    {% elif a.name == 'self_sent_event' and not effective_hipaa
+                            and a.data and a.data.get('calendar_write') == 'skipped' %}
+                    <span style="color:var(--pico-color-amber-500);">no time found</span>
+                    {% else %}
+                    <span style="color:var(--pico-ins-color);">done</span>
+                    {% endif %}
+                    {% elif a.result == 'skipped' %}
+                    <span style="color:var(--pico-color-amber-500);">skipped</span>
+                    {% elif a.result == 'failed' %}
+                    <span style="color:var(--pico-del-color);">failed{% if a.error %}: {{ a.error[:50] }}{% endif %}</span>
+                    {% else %}
+                    {{ a.result }}
+                    {% endif %}
+                </small>
+                {% if not loop.last %}<br>{% endif %}
+                {% endfor %}
+                {% elif r.status == 'ok' %}
+                <small style="color:var(--pico-color-amber-500);">no routes configured</small>
+                {% endif %}
+            </td>
+            <td>
+                {% if r.status == 'ok' %}
+                <span style="color:var(--pico-ins-color);">ok</span>
+                {% elif r.status == 'skipped' %}
+                {# Backend marks loop-prevention skips (X-Email-Triage
+                   header match, RFC-Message-Id dedup, in-flight gate)
+                   with status="skipped". Render MUTED, NOT amber — these
+                   rows are correct triage behaviour, not warnings. The
+                   tooltip discriminates the gate that fired so the
+                   operator can tell self-origin (#117) from in-flight
+                   race fix (#114). See punch-list #119 + #117 + #114. #}
+                <span style="color:var(--pico-muted-color);"
+                      title="{{ r.get('reason') or 'skipped (loop prevention)' }}">
+                    skipped
+                </span>
+                {% if r.get('reason') == 'self_origin'
+                      or r.get('skip_reason') in (
+                          'x_email_triage_header', 'self_from_match',
+                      ) %}
+                {{ m.help(
+                    "Skipped because this message was sent by Email "
+                    "Triage itself (digest, draft reply, sign-in code, "
+                    "or daily health email). Example: a digest "
+                    "delivered to your watched inbox carries an "
+                    "X-Email-Triage stamp and is short-circuited so "
+                    "it isn't re-classified.",
+                ) }}
+                {% elif r.get('skip_reason') == 'in_flight' %}
+                {{ m.help(
+                    "Skipped because triage was already running for "
+                    "this message. Example: a push delivery and a "
+                    "poll cycle both fired on the same UID within "
+                    "seconds; only the first run completes.",
+                ) }}
+                {% endif %}
+                {% else %}
+                <span style="color:var(--pico-del-color);" title="{{ r.get('error', '') }}">
+                    error
+                </span>
+                {% endif %}
+            </td>
+        </tr>
+        {% if r.status == 'ok' and r.get('reason') %}
+        <tr>
+            <td colspan="{{ 7 if all_labels else 6 }}">
+                <small style="color:var(--pico-muted-color);">Reason: {{ "[redacted]" if effective_hipaa else r.reason }}</small>
+            </td>
+        </tr>
+        {% endif %}
+        {% if r.status == 'skipped' %}
+        <tr>
+            <td colspan="{{ 7 if all_labels else 6 }}">
+                <small style="color:var(--pico-muted-color);">
+                    Skipped: {{ r.get('reason') or 'this message was generated by email-triage (loop prevention)' }}
+                </small>
+            </td>
+        </tr>
+        {% endif %}
+        {% if r.status == 'error' %}
+        <tr>
+            <td colspan="{{ 7 if all_labels else 6 }}">
+                <small style="color:var(--pico-del-color);">{{ r.get('error', 'Unknown error') }}</small>
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}

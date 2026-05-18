@@ -1,0 +1,65 @@
+{% set effective_hipaa = hipaa_mode or (parsed.hipaa if parsed and parsed.hipaa is defined else False) %}
+<article>
+    <header><strong>Classification Result</strong></header>
+    <table>
+        <tr><td><strong>Category</strong></td><td><code>{{ classification.category }}</code></td></tr>
+        <tr><td><strong>Confidence</strong></td><td>{{ "%.0f%%"|format(classification.confidence * 100) }}</td></tr>
+        <tr><td><strong>Reason</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else classification.reason }}</td></tr>
+        <tr><td><strong>Source</strong></td>
+            <td>
+                {% if classification.source == "list_rule" %}
+                <span style="color:var(--pico-color-amber-500);">Forced by rule</span>
+                {% else %}
+                AI ({{ classification.source }})
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+
+    {# #163-followup — show every rule that MATCHED this email + whether
+       the final category honoured it. Lets the operator see when a rule
+       fired in advisory mode but the AI picked something else (the
+       CTOx → Promotions confusion 2026-05-12). #}
+    {% if list_hints %}
+    <section style="margin-top:0.75rem;">
+        <strong style="font-size:0.9em;">Rules that matched this email:</strong>
+        <ul style="margin:0.25rem 0 0 1.25rem;font-size:0.85em;">
+            {% for h in list_hints %}
+            {% set forced = h.skip_ai %}
+            {% set honoured = (h.category == classification.category) %}
+            <li>
+                <code>{{ h.rule_type.value }}</code> = "<code>{{ h.pattern }}"</code> →
+                suggests <strong>{{ h.category }}</strong>
+                {% if forced %}
+                <span style="color:var(--pico-color-amber-500);">(Force — AI bypassed)</span>
+                {% elif honoured %}
+                <span style="color:var(--pico-color-green-500);">(Hint — AI agreed)</span>
+                {% else %}
+                <span style="color:var(--pico-color-red-500);">(Hint — AI chose <strong>{{ classification.category }}</strong> instead; flip the rule to "Force category" if you want it to win)</span>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+    </section>
+    {% endif %}
+
+    <details>
+        <summary>Parsed email fields</summary>
+        <table>
+            <tr><td><strong>From</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.sender }}</td></tr>
+            <tr><td><strong>To</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.recipients|join(", ") }}</td></tr>
+            <tr><td><strong>Subject</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.subject }}</td></tr>
+            <tr><td><strong>Date</strong></td><td>{{ parsed.date }}</td></tr>
+            <tr><td><strong>Body (first 500 chars)</strong></td><td>
+                {% if effective_hipaa %}
+                <em style="color:var(--pico-muted-color);">[redacted — HIPAA]</em>
+                {% else %}
+                <pre style="white-space:pre-wrap;font-size:0.85em;">{{ parsed.body_text[:500] }}</pre>
+                {% endif %}
+            </td></tr>
+        </table>
+    </details>
+    {% if timing %}
+    <footer><small>Classified in {{ "%.1f"|format(timing) }}s using {{ model }}</small></footer>
+    {% endif %}
+</article>

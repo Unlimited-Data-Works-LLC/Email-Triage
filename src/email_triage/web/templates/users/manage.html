@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Users - Email Triage{% endblock %}
+{% block content %}
+<h2>User Management</h2>
+
+<section>
+    <details>
+        <summary role="button" class="outline">Add User</summary>
+        <form method="post" action="/users/create">
+            {{ csrf_input(request) }}
+            <div class="grid">
+                <label>
+                    Email
+                    <input type="email" name="email" placeholder="user@example.com" required>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="Full Name" required>
+                </label>
+            </div>
+            <div class="grid">
+                <label>
+                    Role
+                    <select name="role">
+                        {% for r in roles %}
+                        <option value="{{ r }}">{{ r }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Notification Email (optional)
+                    <input type="email" name="notify_email" placeholder="alerts@example.com">
+                </label>
+            </div>
+            <button type="submit">Create User</button>
+        </form>
+    </details>
+</section>
+
+<section>
+    <h3>Existing Users</h3>
+    {% if users %}
+    <table>
+        <thead>
+            <tr>
+                <th>Email</th>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Status</th>
+                <th>Notify Email</th>
+                <th>Last Login</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for u in users %}
+            <tr>
+                <td>{{ u.email }}</td>
+                <td>{{ u.name }}</td>
+                <td>{{ u.role }}</td>
+                <td>
+                    {% if u.disabled %}
+                    <mark style="background-color: var(--pico-del-color, #c33); color: white;">Disabled</mark>
+                    {% else %}
+                    <span class="status-active">Active</span>
+                    {% endif %}
+                </td>
+                <td>{{ u.notify_email or "-" }}</td>
+                <td>{{ u.last_login or "Never" }}</td>
+                <td>
+                    <details>
+                        <summary role="button" class="outline secondary">Edit</summary>
+                        <form method="post" action="/users/{{ u.id }}/update">
+                            {{ csrf_input(request) }}
+                            <label>
+                                Email
+                                <input type="email" name="email" value="{{ u.email }}" required>
+                            </label>
+                            <label>
+                                Name
+                                <input type="text" name="name" value="{{ u.name }}" required>
+                            </label>
+                            <label>
+                                Role
+                                <select name="role">
+                                    {% for r in roles %}
+                                    <option value="{{ r }}" {% if r == u.role %}selected{% endif %}>{{ r }}</option>
+                                    {% endfor %}
+                                </select>
+                            </label>
+                            <label>
+                                Notify Email
+                                <input type="email" name="notify_email" value="{{ u.notify_email or '' }}">
+                            </label>
+                            <button type="submit">Save</button>
+                        </form>
+
+                        {% if u.email != user.email %}
+                        {% if u.disabled %}
+                        <form method="post" action="/users/{{ u.id }}/enable">
+                            {{ csrf_input(request) }}
+                            <label>
+                                Reason (optional)
+                                <input type="text" name="reason" placeholder="Restored access">
+                            </label>
+                            <button type="submit">Enable</button>
+                        </form>
+                        {% else %}
+                        <form method="post" action="/users/{{ u.id }}/disable"
+                              hx-confirm="Disable {{ u.email }}? They will be locked out of login, API, OTP, and triage."
+                              onsubmit="return confirm('Disable {{ u.email }}? They will be locked out of login, API, OTP, and triage.')">
+                            <label>
+                                Reason (optional)
+                                <input type="text" name="reason" placeholder="Why are you disabling this user?">
+                            </label>
+                            <button type="submit" class="secondary">Disable</button>
+                        </form>
+                        {% endif %}
+                        <form method="post" action="/users/{{ u.id }}/delete"
+                              onsubmit="return confirm('Delete user {{ u.email }}?')">
+                            <button type="submit" class="secondary">Delete</button>
+                        </form>
+                        {% endif %}
+                    </details>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No users yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

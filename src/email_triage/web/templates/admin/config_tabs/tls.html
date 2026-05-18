@@ -1,0 +1,66 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (install operator).
+   TECH-SKILL:  technical — comfortable with ACME, RFC 8555, CSR
+                workflows, Tailscale cert issuance.
+   COPY RULES:  protocol-aware copy is fine here.
+                See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+
+<h3>TLS configuration</h3>
+<p>
+    Pick the right approach for your install. Most deployments are
+    well-served by the built-in ACME automation (free Let's
+    Encrypt certs, hands-off renewal). Use the manual CSR path
+    only when an institutional CA is signing on your behalf.
+</p>
+
+<div class="grid">
+    <article style="padding:1rem;">
+        <header><strong>🤖 Auto (ACME)</strong>
+        <small style="color:var(--pico-muted-color);"> &mdash; recommended</small></header>
+        <p>
+            Built-in ACME client speaks directly to Let's Encrypt
+            (or any RFC 8555 directory). Publishes challenges via
+            DNS-01 (RFC 2136) or HTTP-01. Writes cert + key into
+            <code>cert_dir</code>; renews automatically on a 24-hour
+            timer. Zero ongoing operator overhead.
+        </p>
+        <a href="/admin/acme-status" role="button">Configure ACME</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>✍️ Manual CSR</strong></header>
+        <p>
+            Generate a Certificate Signing Request, hand it to your
+            institutional CA, and import the signed certificate.
+            Use when the CA is on the operator's side (corporate /
+            university PKI) and you can't use ACME.
+        </p>
+        <a href="/admin/tls/csr" role="button" class="outline">CSR / Manual import</a>
+    </article>
+</div>
+
+<div class="grid" style="margin-top:1rem;">
+    <article style="padding:1rem;">
+        <header><strong>🔗 Tailscale-issued LE</strong></header>
+        <p>
+            Tailscale exposes a <code>tailscale cert</code> command
+            that fetches a Let's Encrypt cert valid for your
+            Tailnet hostname. Useful when the install is
+            Tailnet-only and DNS-01 isn't an option.
+        </p>
+        <p><small><code>email-triage tls fetch-tailscale --hostname &lt;host&gt;</code></small></p>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>🔧 Self-signed</strong>
+        <small style="color:var(--pico-muted-color);"> &mdash; dev / fallback</small></header>
+        <p>
+            Bootstrap-only fallback; browsers warn on every connect.
+            WebAuthn won't work cross-host with self-signed.
+            Generated automatically if <code>cert_dir</code> is empty
+            at startup.
+        </p>
+        <p><small><code>email-triage tls bootstrap</code></small></p>
+    </article>
+</div>

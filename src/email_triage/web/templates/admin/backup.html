@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}Backup - Email Triage{% endblock %}
+{% block content %}
+
+<h2>Backup &amp; Restore</h2>
+<p>
+    Download an encrypted bundle of this install's state. Operator
+    drives cadence: run an export whenever you want a fresh copy
+    (calendar reminder works fine; no automation involved).
+</p>
+
+{% if error %}
+<p style="color:var(--pico-del-color);"><small>{{ error }}</small></p>
+{% endif %}
+
+<article style="border-left:3px solid var(--pico-color-amber-500);
+                padding:0.75rem 1rem;margin:1rem 0;">
+    <strong>Bundle = entire install.</strong>
+    The full bundle contains every credential, audit row, and
+    message-state row this install holds. Anyone with the bundle
+    file <em>and</em> the passphrase has full access. Pick a strong
+    passphrase (16+ random characters) and store the bundle apart
+    from any other auth material.
+</article>
+
+<h3>Full bundle</h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    Contains the database, the YAML config, optional TLS certs, and
+    optionally the master key. Without the master key, the bundle's
+    encrypted credential rows are unreadable -- which is the point if
+    you also export a separate <em>master key only</em> bundle below.
+    </small>
+</p>
+
+<form method="post" action="/admin/backup/export-full">
+    {{ csrf_input(request) }}
+    <div class="grid">
+        <label>
+            Passphrase
+            <input type="password" name="passphrase" required
+                   autocomplete="new-password" minlength="12">
+        </label>
+        <label>
+            Confirm passphrase
+            <input type="password" name="passphrase_confirm" required
+                   autocomplete="new-password" minlength="12">
+        </label>
+    </div>
+    <p><small style="color:var(--pico-muted-color);">
+        Minimum 12 characters; 16+ random chars recommended. Store
+        in a password manager. <strong>Forgotten passphrase = data
+        loss.</strong>
+    </small></p>
+
+    <fieldset style="margin-top:0.5rem;">
+        <legend>Include</legend>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="checkbox" name="include_tls_certs" value="1" checked>
+            <span><strong>TLS certificates</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— skip if your install uses ACME / Tailscale
+                    Funnel certs that auto-issue.
+                </small>
+            </span>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="checkbox" name="include_logs" value="1">
+            <span><strong>Logs older than 30 days</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— off by default to keep bundle size manageable.
+                    Recent logs (≤ 30 days) are always included.
+                </small>
+            </span>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="checkbox" name="include_master_key" value="1">
+            <span><strong>Master key</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— recommended <em>off</em>. Use the
+                    <em>master key only</em> form below to export the
+                    key separately so the two halves live apart.
+                </small>
+            </span>
+        </label>
+    </fieldset>
+
+    <button type="submit" style="margin-top:0.5rem;">
+        Export full bundle
+    </button>
+</form>
+
+<hr style="margin:2rem 0;">
+
+<h3>Master key only</h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    Tiny file (under one kilobyte) with just the encryption key for
+    the credentials inside a full bundle. Store this somewhere
+    different from the full bundle: different password manager
+    entry, different cloud, different USB drive. Recovery requires
+    both files plus both passphrases.
+    </small>
+</p>
+
+<form method="post" action="/admin/backup/export-key">
+    {{ csrf_input(request) }}
+    <div class="grid">
+        <label>
+            Passphrase
+            <input type="password" name="passphrase" required
+                   autocomplete="new-password" minlength="12">
+        </label>
+        <label>
+            Confirm passphrase
+            <input type="password" name="passphrase_confirm" required
+                   autocomplete="new-password" minlength="12">
+        </label>
+    </div>
+    <p><small style="color:var(--pico-muted-color);">
+        Use a <strong>different</strong> passphrase from the full bundle
+        above. Same-passphrase defeats the split-storage point.
+    </small></p>
+    <button type="submit" style="margin-top:0.5rem;">
+        Export master key only
+    </button>
+</form>
+
+<hr style="margin:2rem 0;">
+
+<h3>Restoring a bundle</h3>
+<p><small style="color:var(--pico-muted-color);">
+    Restore is CLI-only. On the target host, with the service stopped:
+</small></p>
+
+<pre style="font-size:0.85em;line-height:1.4;"><code>email-triage restore &lt;bundle&gt;
+# Auto-detects bundle type (full vs key-only).
+# Prompts for the passphrase.
+# Extracts to side-by-side .restore files.
+# Print the swap-in instructions; operator runs them manually.</code></pre>
+
+<p><small style="color:var(--pico-muted-color);">
+    Don't drop a bundle into a running install. The CLI route
+    forces a deliberate stop / restore / start dance.
+</small></p>
+
+{% endblock %}

@@ -1,0 +1,21 @@
+<tr id="cat-{{ cat.id }}">
+    <form hx-put="/categories/{{ cat.id }}" hx-target="#cat-{{ cat.id }}" hx-swap="outerHTML">
+        <td>
+            <input type="text" name="slug" value="{{ cat.slug }}" required
+                   pattern="[a-z0-9][a-z0-9\-]*" style="margin-bottom: 0;">
+        </td>
+        <td>
+            <input type="text" name="description" value="{{ cat.description }}" required
+                   style="margin-bottom: 0;">
+        </td>
+        <td>
+            <div role="group">
+                <button type="submit" class="outline">Save</button>
+                <button type="button" class="secondary outline"
+                        hx-get="/categories/{{ cat.id }}/row"
+                        hx-target="#cat-{{ cat.id }}"
+                        hx-swap="outerHTML">Cancel</button>
+            </div>
+        </td>
+    </form>
+</tr>

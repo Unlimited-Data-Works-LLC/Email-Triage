@@ -1,0 +1,622 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (install operator / homelab owner).
+   TECH-SKILL:  homelab tinkerer / dev. Counters + raw values
+                acceptable; no end-user prose obligation.
+   COPY RULES:
+     - Tooltips OK + reference protocol/internal field names.
+     - "schema_version" / "csrf_rejects" / "audit_failures" /
+       "classification_cache" stay verbatim — these mirror the
+       /health/detail JSON payload keys 1:1 so the JSON consumer
+       (Nagios scrape) + admin UI never drift.
+     - No PHI — counters + status flags only.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Admin Stats - Email Triage{% endblock %}
+{% block content %}
+<h2>Admin Stats</h2>
+<p style="color: var(--pico-muted-color);">
+    Admin only. Every dashboard stat lives here now so the dashboard can
+    focus on orientation. Operational signals mirror the
+    <code>/health/detail</code> JSON payload — same source.
+</p>
+
+{# ── Operational signals (#health-detail mirror) ─────────────
+   Counters + flags identical to /health/detail. csrf_rejects,
+   audit_failures, classification_cache, schema_version, version,
+   uptime + supervised-task quarantine + ingestion rollup. #}
+{% if health %}
+<section id="operational-signals-section">
+    <h3>Operational signals</h3>
+
+    {# 2026-05-13 v2 — switched per-metric rows from <table>
+       (auto-width; label cell expanded + value cell collapsed)
+       to flex-row dl. Each row is `label : value` with
+       justify-content: space-between, so the value always
+       sticks to the right regardless of label length. #}
+    <style>
+    .op-metrics { margin: 0; }
+    .op-metrics .op-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.5rem;
+        padding: 0.3rem 0;
+        border-bottom: 1px solid var(--pico-muted-border-color);
+        min-width: 0;
+    }
+    .op-metrics .op-row:last-child { border-bottom: none; }
+    .op-metrics .op-label {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 0.3rem;
+        font-weight: 600;
+        min-width: 0;
+        flex: 1 1 auto;
+    }
+    .op-metrics .op-value {
+        flex: 0 0 auto;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        word-break: break-all;
+        max-width: 60%;
+    }
+    </style>
+
+    <div class="et-cards" style="flex-direction:row;flex-wrap:wrap;">
+        <article class="et-card et-card-stack" style="flex:1 1 22rem;">
+            <header class="et-card-header">
+                <strong>Counters</strong>
+                <small class="et-card-desc">
+                    Process-level. Reset on container restart.
+                </small>
+            </header>
+            <div class="et-card-body">
+                <dl class="op-metrics">
+                    <div class="op-row">
+                        <span class="op-label">csrf_rejects {{ m.help("Count of CSRF would-rejects in log_entries since csrf_count_since baseline. Soft-launch mode logs without blocking; counter increments + WARN row written. Set csrf_count_since to 'now' (via direct DB write) to baseline-reset without losing audit trail.") }}</span>
+                        <span class="op-value">{{ health.csrf_rejects | default(0) }}</span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">audit_failures {{ m.help("Count of access_log hash-chain verification failures since process start. Non-zero = chain broken; investigate via /admin/compliance audit-chain verify.") }}</span>
+                        <span class="op-value">{{ health.audit_failures | default(0) }}</span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">schema_version {{ m.help("Highest migration version applied to triage.db. Increments on every CREATE/ALTER migration the framework runs at startup.") }}</span>
+                        <span class="op-value">{{ health.schema_version | default("?") }}</span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">version {{ m.help("Build identifier — git commit SHA when the container was built. Matches the deploy.sh output.") }}</span>
+                        <span class="op-value"><code>{{ health.version | default("unknown") }}</code></span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">uptime_secs {{ m.help("Seconds since process start. Reset on container restart; deploy.sh restarts every time so this rolls each deploy.") }}</span>
+                        <span class="op-value">{{ health.uptime_secs | default(0) }} s</span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">last_triage {{ m.help("ISO timestamp of the most recent triage_runs row across every account. Compared against now() to derive the 'stale > 24h' degraded flag.") }}</span>
+                        <span class="op-value"><small>{{ health.last_triage or "—" }}</small></span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">db {{ m.help("'ok' when a SELECT 1 on triage.db succeeds within the health budget; 'error' when the DB ping fails or times out.") }}</span>
+                        <span class="op-value"><code>{{ health.db | default("?") }}</code></span>
+                    </div>
+                </dl>
+            </div>
+        </article>
+
+        <article class="et-card et-card-stack" style="flex:1 1 22rem;">
+            <header class="et-card-header">
+                <strong>Classification Cache</strong>
+                <small class="et-card-desc">
+                    Optional Redis cache. Hits skip the live AI
+                    classification call for repeat emails. Empty
+                    defaults when the cache is disabled.
+                </small>
+            </header>
+            <div class="et-card-body">
+                {% set _cc = health.classification_cache or {} %}
+                {% set _life = _cc.lifetime or {} %}
+                <p style="margin:0.15rem 0 0.3rem 0;">
+                    <strong>enabled:</strong>
+                    {% if _cc.enabled %}<code style="color:var(--pico-ins-color);">true</code>{% else %}<code style="color:var(--pico-muted-color);">false</code>{% endif %}
+                </p>
+                <table style="width:100%;font-size:0.88em;margin:0;">
+                    <thead>
+                        <tr>
+                            <th style="text-align:left;">Counter</th>
+                            <th style="text-align:right;">Process{{ m.help("Process-local — resets every container restart.") }}</th>
+                            <th style="text-align:right;">Lifetime{{ m.help("Persisted in Redis; survives restarts. Resets only via the Reset button on /config?tab=integrations. Empty when the cache Redis URL is unset.") }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for field, helptip in [
+                            ("hits_exact", "Exact match — same (sender, subject, body) already classified by the same model. Cached answer returned; AI call skipped entirely. The high-value column."),
+                            ("hits_hint_topk", "Sender history hint fired (full distribution mode). AI got the sender's prior category distribution as a bias signal. AI still ran."),
+                            ("hits_hint_dominant", "Sender history hint fired (top-category-only mode). The sender's top category met the dominant-threshold; AI got a single-category bias. AI still ran."),
+                            ("hits_hint_skipped", "Hint not fired (top-category-only mode). Sender's history was too mixed for a dominant category; AI went cold without bias."),
+                            ("misses_cold", "No history at all for this sender — first email from them. AI ran cold; result stored as the seed."),
+                            ("errors", "Redis connection / parse failures. Non-zero with enabled=true = check the Redis URL or LAN reachability."),
+                        ] %}
+                        <tr>
+                            <td><code>{{ field }}</code>{{ m.help(helptip) }}</td>
+                            <td style="text-align:right;">{{ _cc[field] | default(0) }}</td>
+                            <td style="text-align:right;">{{ _life[field] | default(0) }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </article>
+
+        <article class="et-card et-card-stack" style="flex:1 1 22rem;">
+            <header class="et-card-header">
+                <strong>Embedding backend</strong>
+                <small class="et-card-desc">
+                    Vector embedder used for the recent-reply-examples
+                    retrieval + captured-edit-pair indexing. A
+                    ``fallback`` backend means a primary+backup chain
+                    is active; fires count is how often the backup
+                    absorbed a primary failure.
+                </small>
+            </header>
+            <div class="et-card-body">
+                {% set _emb = health.embedding or {} %}
+                {% set _emb_life = _emb.lifetime or {} %}
+                {% set _life_ollama = _emb_life.ollama or {} %}
+                {% set _life_st = _emb_life.sentence_transformers or {} %}
+                {% set _life_fb = _emb_life.fallback or {} %}
+                <dl class="op-metrics" style="margin-bottom:0.4rem;">
+                    <div class="op-row">
+                        <span class="op-label">configured</span>
+                        <span class="op-value">
+                            {% if _emb.configured %}<code style="color:var(--pico-ins-color);">true</code>{% else %}<code style="color:var(--pico-muted-color);">false</code>{% endif %}
+                        </span>
+                    </div>
+                    {% if _emb.configured %}
+                    <div class="op-row">
+                        <span class="op-label">backend</span>
+                        <span class="op-value"><code>{{ _emb.backend_type }}</code></span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">model</span>
+                        <span class="op-value"><code>{{ _emb.model or "—" }}</code></span>
+                    </div>
+                    {% endif %}
+                </dl>
+                {% if _emb.configured %}
+                {% set _em = _emb.metrics or {} %}
+                <table style="width:100%;font-size:0.88em;margin:0;">
+                    <thead>
+                        <tr>
+                            <th style="text-align:left;">Counter</th>
+                            <th style="text-align:right;">Process{{ m.help("Process-local — resets every container restart.") }}</th>
+                            <th style="text-align:right;">Lifetime{{ m.help("Persisted in Redis (namespace embedding:<backend>); survives restarts. Empty when the cache Redis URL is unset.") }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% if _em.backend_type == "fallback" %}
+                        {% set _pri = _em.primary or {} %}
+                        {% set _bak = _em.backup or {} %}
+                        <tr>
+                            <td><code>fallback_fires</code>{{ m.help("Count of times the primary embedder raised and the backup absorbed the call.") }}</td>
+                            <td style="text-align:right;">{% if _em.fallback_fires %}<strong style="color:var(--pico-color-amber-500);">{{ _em.fallback_fires }}</strong>{% else %}0{% endif %}</td>
+                            <td style="text-align:right;">{{ _life_fb.fires | default(0) }}</td>
+                        </tr>
+                        <tr>
+                            <td><code>primary.calls</code>{{ m.help("Successful embed_text calls into the primary backend.") }}</td>
+                            <td style="text-align:right;">{{ _pri.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _pri.avg_latency_ms | default(0) }} ms</small></td>
+                            <td style="text-align:right;">{{ _life_ollama.calls | default(0) }}{% if _life_ollama.calls and _life_ollama.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_life_ollama.latency_us_sum or 0) / (_life_ollama.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
+                        </tr>
+                        <tr>
+                            <td><code>primary.errors</code></td>
+                            <td style="text-align:right;">{% if _pri.errors %}<strong style="color:var(--pico-del-color);">{{ _pri.errors }}</strong>{% else %}0{% endif %}</td>
+                            <td style="text-align:right;">{{ _life_ollama.errors | default(0) }}</td>
+                        </tr>
+                        <tr>
+                            <td><code>backup.calls</code>{{ m.help("Successful embed_text calls into the backup backend (only fires when primary raises).") }}</td>
+                            <td style="text-align:right;">{{ _bak.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _bak.avg_latency_ms | default(0) }} ms</small></td>
+                            <td style="text-align:right;">{{ _life_st.calls | default(0) }}{% if _life_st.calls and _life_st.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_life_st.latency_us_sum or 0) / (_life_st.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
+                        </tr>
+                        <tr>
+                            <td><code>backup.errors</code></td>
+                            <td style="text-align:right;">{% if _bak.errors %}<strong style="color:var(--pico-del-color);">{{ _bak.errors }}</strong>{% else %}0{% endif %}</td>
+                            <td style="text-align:right;">{{ _life_st.errors | default(0) }}</td>
+                        </tr>
+                    {% else %}
+                        {# Single backend — match its namespace to the lifetime slice. #}
+                        {% set _single_life = _life_ollama if _em.backend_type == "ollama" else (_life_st if _em.backend_type == "sentence_transformers" else {}) %}
+                        <tr>
+                            <td><code>calls</code></td>
+                            <td style="text-align:right;">{{ _em.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _em.avg_latency_ms | default(0) }} ms</small></td>
+                            <td style="text-align:right;">{{ _single_life.calls | default(0) }}{% if _single_life.calls and _single_life.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_single_life.latency_us_sum or 0) / (_single_life.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
+                        </tr>
+                        <tr>
+                            <td><code>errors</code></td>
+                            <td style="text-align:right;">{% if _em.errors %}<strong style="color:var(--pico-del-color);">{{ _em.errors }}</strong>{% else %}0{% endif %}</td>
+                            <td style="text-align:right;">{{ _single_life.errors | default(0) }}</td>
+                        </tr>
+                    {% endif %}
+                    </tbody>
+                </table>
+                {% endif %}
+            </div>
+        </article>
+
+        {# 2026-05-13 — Webhook counters card. Process counters live
+           in app.state.metrics; lifetime mirror sits in Redis under
+           namespace ``webhooks``. Card hidden when no counters exist
+           at all (fresh install, no push integrations). #}
+        {% set _wh = health.webhooks or {} %}
+        {% set _wh_proc = _wh.process or {} %}
+        {% set _wh_life = _wh.lifetime or {} %}
+        {% if _wh_proc or _wh_life %}
+        <article class="et-card et-card-stack" style="flex:1 1 22rem;">
+            <header class="et-card-header">
+                <strong>Webhooks</strong>
+                <small class="et-card-desc">
+                    Per-event counters from the Gmail Pub/Sub + Microsoft
+                    Graph receivers. Mirrors the same names the receiver
+                    emits — useful for spotting silent drops vs auth
+                    rejections vs queue saturation.
+                </small>
+            </header>
+            <div class="et-card-body">
+                <table style="width:100%;font-size:0.88em;margin:0;">
+                    <thead>
+                        <tr>
+                            <th style="text-align:left;">Counter</th>
+                            <th style="text-align:right;">Process{{ m.help("Process-local — resets every container restart.") }}</th>
+                            <th style="text-align:right;">Lifetime{{ m.help("Persisted in Redis (namespace webhooks); survives restarts. Empty when the cache Redis URL is unset.") }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {# Union of keys across both dicts so a new
+                           counter name on either side surfaces. #}
+                        {% set _wh_keys = (_wh_proc.keys() | list) + (_wh_life.keys() | list) %}
+                        {% set _wh_keys_unique = _wh_keys | unique | list | sort %}
+                        {% for k in _wh_keys_unique %}
+                        <tr>
+                            <td><code>{{ k }}</code></td>
+                            <td style="text-align:right;">{{ _wh_proc.get(k) | default(0) }}</td>
+                            <td style="text-align:right;">{{ _wh_life.get(k) | default(0) }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </article>
+        {% endif %}
+
+        <article class="et-card et-card-stack" style="flex:1 1 22rem;">
+            <header class="et-card-header">
+                <strong>Supervised tasks</strong>
+                <small class="et-card-desc">
+                    Long-running background workers (digest scheduler,
+                    push consumers, poll loop, etc.).
+                </small>
+            </header>
+            <div class="et-card-body">
+                {% set _tasks = health.tasks or {} %}
+                <dl class="op-metrics">
+                    <div class="op-row">
+                        <span class="op-label">healthy</span>
+                        <span class="op-value">{{ _tasks.healthy_count | default(0) }}</span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">quarantined {{ m.help("Tasks the supervisor marked dead after repeated crash loops. Restart the container to reset; investigate the prior crash via /logs first.") }}</span>
+                        <span class="op-value">
+                            {% if _tasks.any_quarantined %}<strong style="color:var(--pico-del-color);">{{ _tasks.quarantined_count | default(0) }}</strong>{% else %}{{ _tasks.quarantined_count | default(0) }}{% endif %}
+                        </span>
+                    </div>
+                    <div class="op-row">
+                        <span class="op-label">watchers_failing {{ m.help("Per-account watchers that disconnected and the manager couldn't restart. Listed under Watcher state below.") }}</span>
+                        <span class="op-value">
+                            {% set _wf = health.watchers_failing or [] %}
+                            {% if _wf %}<strong style="color:var(--pico-del-color);">{{ _wf | length }}</strong>{% else %}0{% endif %}
+                        </span>
+                    </div>
+                </dl>
+            </div>
+        </article>
+    </div>
+</section>
+
+{# ── Ingestion rollup (mirror of /health/detail "ingestion") ─ #}
+<section id="ingestion-rollup-section">
+    <h3>Ingestion rollup</h3>
+    <p style="color: var(--pico-muted-color);">
+        Per-provider account coverage. <strong>push</strong> = IMAP IDLE
+        / Gmail Pub/Sub / O365 Graph push active.
+        <strong>poll</strong> = poll loop registered.
+        <strong>uncovered</strong> = neither push nor poll healthy;
+        new mail won't classify until the operator fixes it.
+    </p>
+    {% set _ing = health.ingestion or {} %}
+    <table>
+        <thead>
+            <tr>
+                <th>Provider</th>
+                <th style="text-align:right;">Total</th>
+                <th style="text-align:right;">Push</th>
+                <th style="text-align:right;">Poll</th>
+                <th style="text-align:right;">Push + Poll</th>
+                <th style="text-align:right;">Uncovered</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for prov in ["imap", "gmail_api", "office365"] %}
+            {% set _p = _ing.get(prov) or {} %}
+            <tr>
+                <td><code>{{ prov }}</code></td>
+                <td style="text-align:right;">{{ _p.total | default(0) }}</td>
+                <td style="text-align:right;">{{ _p.push | default(0) }}</td>
+                <td style="text-align:right;">{{ _p.poll | default(0) }}</td>
+                <td style="text-align:right;">{{ _p.push_plus_poll | default(0) }}</td>
+                <td style="text-align:right;">
+                    {% set _u = _p.uncovered | default(0) %}
+                    {% if _u %}<strong style="color:var(--pico-del-color);">{{ _u }}</strong>{% else %}0{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% if _ing.any_alert %}
+    <p style="color:var(--pico-del-color);"><strong>any_alert = true</strong> — at least one account is
+    in a degraded state. See Watcher state below for which one.</p>
+    {% endif %}
+</section>
+{% endif %}
+
+<form method="get" action="/admin/stats" style="margin-bottom:1rem;">
+    <label for="window-select" style="display:inline-block; margin-right:0.5rem;">Window:</label>
+    <select id="window-select" name="window" onchange="this.form.submit()"
+            style="display:inline-block; width:auto;">
+        {% for w in windows %}
+        <option value="{{ w }}" {% if w == window %}selected{% endif %}>
+            {% if w == '1h' %}Last hour
+            {% elif w == '24h' %}Last 24 hours
+            {% elif w == '7d' %}Last 7 days
+            {% elif w == '30d' %}Last 30 days
+            {% else %}{{ w }}{% endif %}
+        </option>
+        {% endfor %}
+    </select>
+</form>
+
+<section id="volume-section">
+    <h3>Volume</h3>
+    <div class="grid">
+        <article style="text-align:center;">
+            <p style="font-size:1.5rem;margin:0;font-weight:bold;">{{ volume.hour }}</p>
+            <small>Last hour</small>
+        </article>
+        <article style="text-align:center;">
+            <p style="font-size:1.5rem;margin:0;font-weight:bold;">{{ volume.day }}</p>
+            <small>Last 24 hours</small>
+        </article>
+        <article style="text-align:center;">
+            <p style="font-size:1.5rem;margin:0;font-weight:bold;">{{ volume.week }}</p>
+            <small>Last 7 days</small>
+        </article>
+        <article style="text-align:center;">
+            <p style="font-size:1.5rem;margin:0;font-weight:bold;">{{ volume.month }}</p>
+            <small>Last 30 days</small>
+        </article>
+    </div>
+    <p style="color: var(--pico-muted-color);">
+        Messages processed in the selected window: <strong>{{ volume.window }}</strong>
+    </p>
+</section>
+
+<section id="performance-section">
+    <h3>Performance</h3>
+    <p>Seconds per message (normalised across runs, so a 100-message
+       batch doesn't outweigh a 2-message run).</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Metric</th>
+                <th style="text-align:right;">Value</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Average s / message</td>
+                <td style="text-align:right;">{{ "%.2f"|format(perf.avg) }}</td>
+            </tr>
+            <tr>
+                <td>Min s / message</td>
+                <td style="text-align:right;">{{ "%.2f"|format(perf.min) }}</td>
+            </tr>
+            <tr>
+                <td>Max s / message</td>
+                <td style="text-align:right;">{{ "%.2f"|format(perf.max) }}</td>
+            </tr>
+            <tr>
+                <td>Samples</td>
+                <td style="text-align:right;">{{ perf.samples }}</td>
+            </tr>
+            <tr>
+                <td>Error rate</td>
+                <td style="text-align:right;">{{ error_rate.pct }}% ({{ error_rate.err_runs }}/{{ error_rate.runs }})</td>
+            </tr>
+        </tbody>
+    </table>
+    <p style="color: var(--pico-muted-color);">
+        Classifier-latency-only + rate-limit-bucket hits are future
+        work; the schema doesn't track them separately yet.
+    </p>
+</section>
+
+<section id="classification-section">
+    <h3>Classification breakdown</h3>
+    {% if category_counts %}
+    <table>
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th style="text-align:right;">Count</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cat, count in category_counts.items() %}
+            <tr>
+                <td><code>{{ cat }}</code></td>
+                <td style="text-align:right;">{{ count }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--pico-muted-color);">No classifications in this window.</p>
+    {% endif %}
+</section>
+
+<section id="account-breakdown-section">
+    <h3>Per-account breakdown</h3>
+    {% if account_breakdown %}
+    <table>
+        <thead>
+            <tr>
+                <th>Account</th>
+                <th style="text-align:right;">Runs</th>
+                <th style="text-align:right;">Messages</th>
+                <th style="text-align:right;">Avg s / run</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in account_breakdown %}
+            <tr>
+                <td>{{ a.account_name }}</td>
+                <td style="text-align:right;">{{ a.runs }}</td>
+                <td style="text-align:right;">{{ a.total }}</td>
+                <td style="text-align:right;">{{ a.avg_elapsed }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--pico-muted-color);">No activity yet.</p>
+    {% endif %}
+</section>
+
+<section id="health-history-section">
+    <h3>Health history</h3>
+    <h4>Watcher state (current snapshot)</h4>
+    {% if watcher_states %}
+    <table>
+        <thead>
+            <tr>
+                <th>Account</th>
+                <th>Status</th>
+                <th style="text-align:right;">Processed</th>
+                <th style="text-align:right;">Errors</th>
+                <th>Started</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for w in watcher_states %}
+            <tr>
+                <td>
+                    {% if w.account_name %}
+                    <a href="/accounts?owner=all#account-{{ w.account_id }}"
+                       style="text-decoration:none;">
+                        {{ w.account_name }} <small style="color:var(--pico-muted-color);">(#{{ w.account_id }})</small>
+                    </a>
+                    {% else %}
+                    <code>#{{ w.account_id }}</code>
+                    {% endif %}
+                </td>
+                <td><code>{{ w.status }}</code></td>
+                <td style="text-align:right;">{{ w.processed }}</td>
+                <td style="text-align:right;">{{ w.errors }}</td>
+                <td><small>{{ w.started_at or "-" }}</small></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color: var(--pico-muted-color);">No watchers tracked.</p>
+    {% endif %}
+
+    {# #166 — push-delivery counter rollup. Surfaces Gmail Pub/Sub +
+       O365 Graph counts together (same UI surface, shared schema).
+       Rolling 14-day window; oldest rows trimmed by daily-health
+       prune. AUDIENCE: admin operator — technical terms (Pub/Sub,
+       Graph, history-id) are OK on this admin page. #}
+    {% if push_deliveries_days %}
+    <h4>Push deliveries (last 14 days)</h4>
+    <p style="color: var(--pico-muted-color); font-size: 0.85em;">
+        Webhook deliveries from Gmail Pub/Sub + Microsoft Graph,
+        counted per UTC day. One row per delivery the receiver
+        successfully queued for processing. Days with no activity
+        are omitted.
+    </p>
+    <table style="margin-top: 0.5rem;">
+        <thead>
+            <tr>
+                <th>Day (UTC)</th>
+                <th style="text-align:right;">Gmail</th>
+                <th style="text-align:right;">Office 365</th>
+                <th style="text-align:right;">Total</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for day in push_deliveries_days %}
+            {% set slot = push_deliveries_by_day[day] %}
+            <tr>
+                <td><code>{{ day }}</code></td>
+                <td style="text-align:right;">
+                    {% if slot.gmail %}{{ slot.gmail }}{% else %}—{% endif %}
+                </td>
+                <td style="text-align:right;">
+                    {% if slot.office365 %}{{ slot.office365 }}{% else %}—{% endif %}
+                </td>
+                <td style="text-align:right;"><strong>{{ slot.total }}</strong></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <details style="margin-top: 0.5rem;">
+        <summary style="cursor:pointer;font-size:0.85em;color:var(--pico-muted-color);">
+            Per-account breakdown
+        </summary>
+        <table style="margin-top: 0.4rem;font-size:0.9em;">
+            <thead>
+                <tr>
+                    <th>Day</th>
+                    <th>Account</th>
+                    <th>Provider</th>
+                    <th style="text-align:right;">Count</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in push_deliveries %}
+                <tr>
+                    <td><code>{{ r.day }}</code></td>
+                    <td>
+                        {% if r.account_name %}
+                        {{ r.account_name }} <small style="color:var(--pico-muted-color);">(#{{ r.account_id }})</small>
+                        {% else %}
+                        <code>Account #{{ r.account_id }}</code>
+                        {% endif %}
+                    </td>
+                    <td><code>{{ r.provider }}</code></td>
+                    <td style="text-align:right;">{{ r.count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </details>
+    {% elif pubsub_configured %}
+    <h4>Push deliveries</h4>
+    <p style="color: var(--pico-muted-color);">
+        Gmail Pub/Sub topic configured but no deliveries recorded
+        in the last 14 days. Raw events live in <a href="/logs">system
+        logs</a>; deliveries land here once Pub/Sub or Microsoft Graph
+        starts sending notifications.
+    </p>
+    {% endif %}
+</section>
+{% endblock %}

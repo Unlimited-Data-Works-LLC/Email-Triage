@@ -1,0 +1,97 @@
+{# Partial: per-account delegates section (#50). HTMX swap target. #}
+<div id="delegates-{{ acct.id }}">
+{% if error %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.4rem 0.75rem;margin:0.4rem 0;font-size:0.9rem;">
+    {{ error }}
+</article>
+{% endif %}
+
+<p style="font-size:0.85rem;color:var(--pico-muted-color);margin-bottom:0.4rem;">
+    Delegates can manage day-to-day settings for this account
+    (routes, watcher, folder prefs, digest schedules, run-triage).
+    They cannot toggle the HIPAA flag or delete the account —
+    those stay owner / admin only.
+</p>
+
+{% macro user_label(name, email) -%}
+{{ name if name else email }}{% if name %} <small style="color:var(--pico-muted-color);">({{ email }})</small>{% endif %}
+{%- endmacro %}
+
+{% if delegates %}
+<table style="font-size:0.9rem;">
+    <thead>
+        <tr>
+            <th>User</th>
+            <th>Granted by</th>
+            <th>Granted at</th>
+            <th style="width:6rem;">Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for d in delegates %}
+        <tr>
+            <td>{{ user_label(d.name, d.email) }}</td>
+            <td><small>{{ d.granted_by_email or '—' }}</small></td>
+            <td><small style="font-family:var(--pico-font-family-monospace);">{{ d.granted_at[:19] }}</small></td>
+            <td>
+                <button class="outline secondary"
+                        style="padding:0.15rem 0.5rem;font-size:0.8rem;color:var(--pico-del-color);"
+                        hx-delete="/accounts/{{ acct.id }}/delegates/{{ d.user_id }}"
+                        hx-target="#delegates-{{ acct.id }}"
+                        hx-swap="outerHTML"
+                        hx-confirm="Revoke {{ d.name or d.email }}'s access to this account?">
+                    Revoke
+                </button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color:var(--pico-muted-color);font-size:0.9rem;margin:0.3rem 0;">
+    No delegates. Add one below to share account management.
+</p>
+{% endif %}
+
+{# Owner-or-admin only sees the grant form. Delegates viewing the
+   account see the list above without the add form. #}
+{% if user.id == acct.user_id or is_admin %}
+<form hx-post="/accounts/{{ acct.id }}/delegates/add"
+      hx-target="#delegates-{{ acct.id }}"
+      hx-swap="outerHTML"
+      style="margin-top:0.5rem;max-width:32rem;">
+    {% if grantable_users is not none %}
+    {# Admin path: dropdown of valid users (admin already has roster
+       visibility via /users). Posted value = user.id. #}
+    <label style="display:block;margin:0 0 0.25rem 0;">
+        <small style="color:var(--pico-muted-color);">
+            Grant delegate access to
+        </small>
+        <select name="user_id" required
+                style="font-size:0.9rem;padding:0.35rem 0.5rem;width:100%;">
+            <option value="">— select a user —</option>
+            {% for u in grantable_users %}
+            <option value="{{ u.id }}">{{ u.name if u.name else u.email }}{% if u.name %} ({{ u.email }}){% endif %}</option>
+            {% endfor %}
+        </select>
+    </label>
+    {% else %}
+    {# Owner path: free-text email so the owner doesn't enumerate the
+       user roster. Server validates and surfaces a "no user with
+       email '...'" error inline if the address doesn't match. #}
+    <label style="display:block;margin:0 0 0.25rem 0;">
+        <small style="color:var(--pico-muted-color);">
+            Grant delegate access (email of an existing user)
+        </small>
+        <input type="email" name="user_email" required
+               placeholder="user@example.com"
+               style="font-size:0.9rem;padding:0.35rem 0.5rem;width:100%;">
+    </label>
+    {% endif %}
+    <button type="submit"
+            style="padding:0.3rem 0.9rem;font-size:0.85rem;width:auto;">
+        Grant
+    </button>
+</form>
+{% endif %}
+</div>

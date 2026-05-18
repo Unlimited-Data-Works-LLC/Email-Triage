@@ -1,0 +1,45 @@
+{# Preview fragment — first N message headers matching the
+   submitted query. Read-only smoke test before a real triage run.
+   Swapped into #triage-preview on /triage by HTMX. #}
+{% if error %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">
+    <p>{{ error }}</p>
+</article>
+{% elif rows %}
+<article style="border-left:3px solid var(--pico-primary);padding:0.5rem 1rem;margin:0.5rem 0;">
+    <p style="margin:0 0 0.5rem 0;">
+        <strong>Preview:</strong> showing {{ total }}
+        message{% if total != 1 %}s{% endif %}
+        {% if total >= limit %}(capped at {{ limit }} — full sweep continues from there){% endif %}
+        for query <code>{{ query }}</code>.
+    </p>
+    <table style="margin:0;font-size:0.9em;">
+        <thead>
+            <tr>
+                <th style="width:11rem;">Date</th>
+                <th>Sender</th>
+                <th>Subject</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td><small>{{ (row.date_iso or '')[:19] }}</small></td>
+                <td><small>{{ row.sender }}</small></td>
+                <td><small>{{ row.subject }}</small></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <small style="color:var(--pico-muted-color);display:block;margin-top:0.4rem;">
+        No classification ran. No actions fired. No data persisted.
+    </small>
+</article>
+{% else %}
+<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 1rem;margin:0.5rem 0;">
+    <p style="margin:0;">
+        Preview returned <strong>0 messages</strong> for query
+        <code>{{ query }}</code>. Refine the query or pick a wider preset.
+    </p>
+</article>
+{% endif %}

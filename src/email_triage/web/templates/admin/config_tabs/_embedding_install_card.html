@@ -1,0 +1,264 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Manages the lazy install
+                of the local embedding stack (#180).
+   TECH-SKILL:  medium-to-high — admin path; technical vocabulary
+                (hash, manifest, sideload, sentence-transformers)
+                is fine here.
+   COPY RULES:  Surface the security posture (hash-verified) in
+                every state so the operator never has to dig.
+                State-aware buttons: don't show [Install] in
+                downloading state, don't show [Cancel] in installed
+                state.
+   PARTIAL CONTRACT:
+                Can render standalone via the HTMX poll endpoint
+                (hx-get=".../embedding-install-status") or embedded
+                in ai_backends.html via {% include %}. Both contexts
+                expect ``install_state`` (dict) + ``install_manifest_sha_short``
+                (str) + ``install_runtime_ready`` (bool) in scope.
+   ─────────────────────────────────────────────────────────── #}
+
+{% set _st = install_state.status %}
+{# 2026-05-18 — operator caught the auto-refresh gap: after clicking
+   [Install Now] / [Re-install] / [Sideload] / [Retry] / [Cancel],
+   the card didn't poll for progress, so the operator had to manually
+   reload the page to see status transitions. Two-part fix:
+
+   1. Active polling: when the state is mid-flight (downloading,
+      verifying, installing), the article has hx-get + hx-trigger
+      every 2s, replacing itself via outerHTML on the GET partial
+      endpoint. Polling stops when the state transitions to a
+      terminal value (installed, failed, not_installed) because those
+      branches don't carry the hx attributes.
+
+   2. Form swaps via HTMX: every action form below uses hx-post with
+      hx-target=#embedding-install-card + hx-swap=outerHTML. Route
+      handlers detect HX-Request and return the partial template (not
+      a 303 redirect), so the post-click card renders immediately with
+      the new state (status="downloading" set synchronously by the
+      handler before the worker fires). The polling then keeps it
+      fresh until the terminal state lands. #}
+{% set _in_flight = _st in ("downloading", "verifying", "installing") %}
+<article class="et-card" id="embedding-install-card"
+         style="margin:1rem 0;"
+         {% if _in_flight %}
+         hx-get="/config/ai-backends/embedding-install-status"
+         hx-trigger="every 2s"
+         hx-swap="outerHTML"
+         {% endif %}>
+    <header class="et-card-header">
+        <strong>Local embedding backend — install</strong>
+        <small class="et-card-desc">
+            The heavy embedding stack (torch + sentence-transformers
+            + the all-MiniLM-L6-v2 model, ~600 MB total) ships as a
+            lazy install so the runtime image stays slim. Files are
+            verified against the pinned manifest baked into this
+            image — operator cannot bypass hash-check.
+        </small>
+    </header>
+    <div class="et-card-body">
+
+    {# ── not_installed: idle, offer Install + Sideload ─────────── #}
+    {% if _st == "not_installed" %}
+        <p style="margin:0.25rem 0;">
+            The local embedding backend is <strong>not installed</strong>
+            yet. Install it now to enable auto-scan, captured edit
+            pairs, and recent-reply-examples retrieval at draft time.
+            Pick a method:
+        </p>
+        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-top:0.5rem;">
+            <form hx-post="/config/ai-backends/embedding-install" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                {{ csrf_input(request) }}
+                <input type="hidden" name="install_method" value="auto">
+                <button type="submit" class="contrast">
+                    Install now (download from internet){{ m.help("Downloads the pinned wheels + model files over HTTPS, verifies each against the manifest, then pip-installs into the persistent volume at /app/data/runtime-deps. ~600 MB total; ~5-10 minutes on a typical home connection.") }}
+                </button>
+            </form>
+            <form hx-post="/config/ai-backends/embedding-sideload" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                {{ csrf_input(request) }}
+                <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0;">
+                    Sideload from:
+                    <input type="text" name="source_dir"
+                           value="/app/data/runtime-deps/sideload"
+                           style="margin:0;min-width:18em;">
+                </label>
+                <button type="submit">
+                    Sideload pre-staged bits{{ m.help("For air-gapped installs: run scripts/download-embedding-bits.sh on a connected machine, copy the resulting tarball into /app/data/runtime-deps/sideload/ (extract first), then click this. Same hash verification as auto-install.") }}
+                </button>
+            </form>
+        </div>
+
+    {# ── downloading / verifying / installing: progress bar + cancel ── #}
+    {% elif _st in ("downloading", "verifying", "installing") %}
+        {% set _done = install_state.progress_files_done or 0 %}
+        {% set _total = install_state.progress_files_total or 1 %}
+        {% set _pct = (100 * _done // _total) if _total > 0 else 0 %}
+        <p style="margin:0.25rem 0;">
+            <strong>
+                {% if _st == "downloading" %}Downloading files
+                {% elif _st == "verifying" %}Verifying hashes
+                {% elif _st == "installing" %}Unpacking installed packages
+                {% endif %}
+            </strong>
+            {% if install_state.install_method %}
+            (<code>{{ install_state.install_method }}</code>)
+            {% endif %}
+        </p>
+        <div style="margin:0.5rem 0;">
+            {# 2026-05-18 — during the installing phase the download
+               progress is at 100% but pip's unpack-into-site-packages
+               step takes 30-60s with no per-package event stream we
+               can hook (pip subprocess + check_output). Operator
+               observed it as a "long pause" with the bar locked.
+               Three lines of CSS keyframes pulse the bar so the UI
+               clearly signals "still working" without faking
+               numeric progress. Same animation applies on verifying
+               (also brief, but symmetric). #}
+            <style>
+                @keyframes et-install-pulse {
+                    0% { opacity: 1.0; }
+                    50% { opacity: 0.35; }
+                    100% { opacity: 1.0; }
+                }
+            </style>
+            <div style="background:var(--pico-muted-border-color);
+                        border-radius:4px;height:0.5rem;overflow:hidden;">
+                <div style="background:var(--pico-primary);
+                            height:100%;width:{% if _st == 'installing' or _st == 'verifying' %}100{% else %}{{ _pct }}{% endif %}%;
+                            {% if _st in ('installing', 'verifying') %}animation:et-install-pulse 1.4s ease-in-out infinite;{% endif %}"></div>
+            </div>
+            <small style="color:var(--pico-muted-color);">
+            {% if _st == "downloading" %}
+                {{ _done }} of {{ _total }} files
+                {% if install_state.progress_bytes_total %}
+                · {{ "%.1f"|format(install_state.progress_bytes_done / 1048576) }} /
+                  {{ "%.1f"|format(install_state.progress_bytes_total / 1048576) }} MB
+                {% endif %}
+                {% if install_state.current_file %}
+                · <code>{{ install_state.current_file }}</code>
+                {% endif %}
+            {% elif _st == "verifying" %}
+                Re-hashing all {{ _total }} files against the pinned manifest.
+                Typically a few seconds.
+            {% elif _st == "installing" %}
+                Unpacking ~1.5 GiB of wheels into
+                <code>/app/data/runtime-deps/lib/python3.12/site-packages/</code>.
+                Typically 30-60 seconds. pip doesn't emit per-package
+                progress, so this step looks paused — the card will
+                update automatically when pip exits.
+            {% endif %}
+            </small>
+        </div>
+
+        <form hx-post="/config/ai-backends/embedding-install-cancel" hx-target="#embedding-install-card" hx-swap="outerHTML"
+              style="margin-top:0.5rem;">
+            {{ csrf_input(request) }}
+            <button type="submit" class="secondary outline"
+                    {% if _st == "installing" %}disabled{% endif %}>
+                Cancel{{ m.help("Stops at the next file boundary. Already-downloaded files remain staged; a future retry will skip them via the cached-hash fast-path. Once pip-install starts, cancel is disabled — subprocess teardown mid-pip can leave a partially-installed site-packages that's awkward to recover from. Wait for the pip step to finish (~30-60s).") }}
+            </button>
+        </form>
+
+    {# ── failed: surface error + Retry / Sideload ───────────────── #}
+    {% elif _st == "failed" %}
+        <p style="margin:0.25rem 0;padding:0.5rem 0.75rem;
+                  border-left:3px solid var(--pico-del-color);
+                  background:var(--pico-card-background-color);">
+            <strong>Install failed.</strong>
+            {% if install_state.last_error_class %}
+            Error type: <code>{{ install_state.last_error_class }}</code>.
+            {% endif %}
+            {% if install_state.last_error_msg %}
+            <br><small>{{ install_state.last_error_msg }}</small>
+            {% endif %}
+            {% if install_state.attempt_count and install_state.attempt_count > 1 %}
+            <br><small style="color:var(--pico-muted-color);">
+                {{ install_state.attempt_count }} attempts so far.
+            </small>
+            {% endif %}
+        </p>
+        <p style="margin:0.25rem 0;">
+            <small>Files verified against the pinned manifest baked
+                into this image — a hash mismatch indicates upstream
+                drift, mirror corruption, or a manifest from a
+                different image generation.</small>
+        </p>
+        <div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-top:0.5rem;">
+            <form hx-post="/config/ai-backends/embedding-install" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                {{ csrf_input(request) }}
+                <input type="hidden" name="install_method" value="auto">
+                <button type="submit" class="contrast">
+                    Retry (auto-download)
+                </button>
+            </form>
+            <form hx-post="/config/ai-backends/embedding-sideload" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                {{ csrf_input(request) }}
+                <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0;">
+                    Sideload from:
+                    <input type="text" name="source_dir"
+                           value="/app/data/runtime-deps/sideload"
+                           style="margin:0;min-width:18em;">
+                </label>
+                <button type="submit">Sideload pre-staged bits</button>
+            </form>
+        </div>
+
+    {# ── installed: compact summary + Re-verify / Re-install ─────── #}
+    {% elif _st == "installed" %}
+        <p style="margin:0.25rem 0;">
+            <strong style="color:var(--pico-ins-color);">✓ Installed</strong>
+            {% if install_state.installed_at %}
+            <small style="color:var(--pico-muted-color);">
+                ({{ install_state.installed_at[:19] }})
+            </small>
+            {% endif %}
+            {% if install_state.install_method %}
+            via <code>{{ install_state.install_method }}</code>
+            {% endif %}
+        </p>
+        {% if install_state.runtime_deps_path %}
+        <p style="margin:0.25rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+            Runtime at <code>{{ install_state.runtime_deps_path }}</code>
+            {% if install_manifest_sha_short %}
+            · manifest <code>{{ install_manifest_sha_short }}</code>
+            {% endif %}
+        </p>
+        {% endif %}
+        {% if install_runtime_ready %}
+        <p style="margin:0.25rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+            <small>Files verified against the pinned manifest baked
+                into this image. The sentence_transformers package
+                imports successfully.</small>
+        </p>
+        {% else %}
+        <p style="margin:0.25rem 0;padding:0.5rem 0.75rem;
+                  border-left:3px solid var(--pico-del-color);
+                  background:var(--pico-card-background-color);">
+            <strong>Install state says "installed" but the package
+                does not import.</strong> Restart the container to
+            pick up the runtime path, or re-verify + re-install if
+            files are missing.
+        </p>
+        {% endif %}
+        <details style="margin-top:0.5rem;">
+            <summary><small>Re-verify / Re-install</small></summary>
+            <div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-top:0.5rem;">
+                <form hx-post="/config/ai-backends/embedding-reverify" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                    {{ csrf_input(request) }}
+                    <button type="submit" class="outline">
+                        Re-verify{{ m.help("Re-hashes every staged file against the manifest. No re-download. Catches bit-rot or operator-side tampering.") }}
+                    </button>
+                </form>
+                <form hx-post="/config/ai-backends/embedding-install" hx-target="#embedding-install-card" hx-swap="outerHTML">
+                    {{ csrf_input(request) }}
+                    <input type="hidden" name="install_method" value="auto">
+                    <button type="submit" class="outline">
+                        Re-install (force-redownload){{ m.help("Re-downloads + reinstalls. Use only if the runtime is in a confused state — the cached-hash fast-path normally skips already-staged files.") }}
+                    </button>
+                </form>
+            </div>
+        </details>
+    {% endif %}
+
+    </div>
+</article>

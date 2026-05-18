@@ -1,0 +1,121 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner). Signs in to their
+                Microsoft account; doesn't need to know anything
+                about Azure / Microsoft Entra / app registrations.
+                The install operator handles all of that on the
+                admin /config page (one Azure registration shared
+                across every Office 365 account on this install).
+   TECH-SKILL:  low. Reads as a sign-in flow, not a credential
+                form. The only end-user choice on this page is
+                personal-vs-organization, which is "what does my
+                email address look like" — phrased that way.
+   COPY RULES:  no Azure portal terminology (lifted to /config
+                page audience); no admin-only paths inside
+                email-triage (/config, /admin/*) — disabled
+                controls speak via their state. AADSTS jargon
+                stays on the probe-failure chip + the install
+                /config page. No mention of internal dev-mode
+                bypasses. No "Anthropic". Concrete examples in
+                every tooltip; "AI" not "language model".
+   USED BY:     Both the account-edit Integrations / Provider tab
+                via accounts/_fields_office365.html AND the manual-
+                add wizard step2-o365 form. Single source of truth
+                for the per-account Microsoft Graph block.
+   HISTORY:     2026-05-10 — per-account client_id/tenant_id/
+                client_secret fields lifted to install-level
+                (Office365OAuthConfig); this partial reduced to
+                a single "Personal Microsoft account" checkbox
+                + amber chip when install isn't configured yet.
+   ─────────────────────────────────────────────────────────── #}
+
+{# Caller toggles whether the Probe button + Calendar checkbox + the
+   surrounding <fieldset>/<legend>/intro paragraph render. Defaults
+   match the account-edit page (full chrome). The wizard sets these
+   to false so step2 keeps its own outer form layout + skips Calendar
+   (handled in step 4). #}
+{% set _show_legend = show_legend if show_legend is defined else true %}
+{% set _show_intro = show_intro if show_intro is defined else true %}
+{% set _show_calendar = show_calendar if show_calendar is defined else true %}
+{% set _show_probe = show_probe if show_probe is defined else (acct is defined and acct.id is defined) %}
+{% set _is_personal_msa = (acct is defined and acct.config.get('is_personal_msa', false)) %}
+{% set _calendar_opted_in = (acct is defined and acct.config.get('calendar_opted_in')) %}
+{% set _o365_ready = office365_oauth and office365_oauth.client_id and office365_oauth.client_secret %}
+
+{% if _show_legend %}<fieldset>
+<legend>Office 365 / Microsoft Graph</legend>{% endif %}
+
+{% if _show_intro %}
+<p><small>
+    Office 365 / Microsoft Graph delivery uses the install's shared
+    Microsoft sign-in. You'll authorise email-triage once via
+    device-code sign-in; the install stores a refresh token for
+    ongoing access. If you sign in with a personal Microsoft
+    address (outlook.com / hotmail.com / live.com), tick the
+    <strong>Personal Microsoft account</strong> box below — work
+    and school accounts leave it unticked.
+</small></p>
+{% endif %}
+
+{% if not _o365_ready %}
+<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 0.75rem;">
+    <small>
+        No Office 365 sign-in credentials configured yet — the
+        install isn't yet set up to talk to Microsoft. The install
+        operator handles this in the deploy config.
+    </small>
+</article>
+{% endif %}
+
+<label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0 0.25rem;">
+    <input type="checkbox" name="is_personal_msa" value="1" style="margin:0;"
+           {% if _is_personal_msa %}checked{% endif %}>
+    <span><strong>Personal Microsoft account</strong>{{ m.help("Check this if you sign in to Microsoft with a personal address: outlook.com, hotmail.com, live.com, or a microsoft.com personal account. Leave unchecked for a work or school account — the install will use its configured organisation tenant. Example: tick this for you@outlook.com; leave unchecked for you@acme-research.org.") }}
+    <small style="color:var(--pico-muted-color);">&nbsp;— outlook.com / hotmail.com / live.com / personal microsoft.com addresses</small>
+    </span>
+</label>
+
+{% if _show_calendar %}
+<label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0 0.25rem;">
+    <input type="checkbox" name="calendar_opted_in" value="1" style="margin:0;"
+           {% if _calendar_opted_in %}checked{% endif %}>
+    <span><strong>Enable Calendar</strong>{{ m.help("Lets email-triage read your Outlook Calendar and respond to invites in your inbox. Required if you want meeting-request intercept, accept/decline replies, or out-of-office reads. Example: turn on so a 'Quick sync Friday?' email can check your Friday afternoon for free time before drafting a reply.") }}
+    <small style="color:var(--pico-muted-color);">&nbsp;— meeting-request intercept, invite accept/decline, Out-of-Office reads</small>
+    </span>
+</label>
+<small style="color:var(--pico-muted-color);">
+    Microsoft prompts for Calendar consent the first time email-triage
+    reads your calendar — no re-auth round-trip needed.
+</small>
+{% endif %}
+
+{% if _show_probe %}
+{# ── Pre-flight verifier. Calls /me through Graph using the install's
+   tenant + client + secret combo (resolved per-account: tenant routes
+   to "common" when Personal MSA is ticked, else the install's org
+   tenant). Sits OUTSIDE the form proper so click never accidentally
+   submits the surrounding edit-page Save. ── #}
+<div style="margin:0.75rem 0 0.25rem 0;display:flex;
+            align-items:center;gap:0.5rem;flex-wrap:wrap;">
+    <button type="button"
+            hx-post="/accounts/{{ acct.id }}/o365/probe"
+            hx-target="#o365-probe-result-{{ acct.id }}"
+            hx-swap="innerHTML"
+            hx-indicator="#o365-probe-spinner-{{ acct.id }}"
+            class="outline"
+            style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;
+                   min-height:1.9rem;line-height:1.4;">
+        Probe my config
+    </button>
+    <small id="o365-probe-spinner-{{ acct.id }}"
+           class="htmx-indicator"
+           style="color:var(--pico-muted-color);">
+        checking…
+    </small>
+    {{ m.help("Asks Microsoft Graph 'who am I?' using the install-level Microsoft sign-in credentials plus your Personal-vs-Organisation choice. A green result means Microsoft accepted the sign-in plus the requested permissions; the next step is enabling push subscriptions on the Push tab. A red result tells you what's wrong before you wait for a real push delivery to fail.") }}
+</div>
+<div id="o365-probe-result-{{ acct.id }}"
+     style="margin:0.25rem 0 0.5rem 0;font-size:0.9em;"></div>
+{% endif %}
+
+{% if _show_legend %}</fieldset>{% endif %}

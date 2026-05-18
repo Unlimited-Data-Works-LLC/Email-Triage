@@ -1,0 +1,180 @@
+{# ─── AUDIENCE ─── #}
+{# Inherits the /rules-cluster audience from _rules_tabs.html: the
+   end-user-owned classification rules editor. Copy rules: plain
+   English, no developer/protocol jargon, no admin-path references.
+   Examples use generic placeholders (boss@example.com, hospital.org)
+   not operator-specific identifiers.
+#}
+{% import "_macros.html" as m %}
+{# Inline edit-mode row partial for one rule on /rules.
+
+   Context required:
+     * lst                      — dict-like with .id.
+     * rule                     — dict-like with .id, .rule_type,
+                                  .pattern, .skip_ai,
+                                  .adds_labels_list,
+                                  .provider_labels_list (#163).
+     * rule_types               — list of valid rule types (sender /
+                                  sender_domain / subject); same list
+                                  the create form uses.
+     * all_labels               — label catalog for the "Also adds
+                                  labels" picker.
+     * provider_label_groups    — #163 — per-account groups of
+                                  provider-native labels. Shape:
+                                  [{"account_id", "account_name",
+                                    "provider_type", "labels": [
+                                    {"slug","name","color"}, ...]}, ...]
+                                  Empty list / None hides the section.
+     * request                  — for the csrf_input() helper.
+
+   The form posts to `/rules/<lst>/rules/<rule>/save` via htmx; the
+   handler renders this row back as `_rule_row.html` (view mode).
+   Cancel hx-gets `/rules/<lst>/rules/<rule>/row` and swaps back to
+   view-mode without persisting changes.
+#}
+<tr id="rule-{{ lst.id }}-{{ rule.id }}" class="editing">
+    {# Single full-width cell — the inline edit panel needs more
+       horizontal room than the four data columns provide. #}
+    <td colspan="5">
+        <form method="post"
+              action="/rules/{{ lst.id }}/rules/{{ rule.id }}/save"
+              hx-post="/rules/{{ lst.id }}/rules/{{ rule.id }}/save"
+              hx-target="#rule-{{ lst.id }}-{{ rule.id }}"
+              hx-swap="outerHTML"
+              style="margin:0;">
+            {{ csrf_input(request) }}
+            <div class="grid">
+                <label>
+                    Type
+                    <select name="rule_type">
+                        {% for rt in rule_types %}
+                        <option value="{{ rt }}" {% if rt == rule.rule_type %}selected{% endif %}>{{ rt }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Pattern
+                    <input type="text" name="pattern"
+                           value="{{ rule.pattern }}" required>
+                </label>
+            </div>
+            <label>
+                <input type="checkbox" name="skip_ai" value="1"
+                       {% if rule.skip_ai %}checked{% endif %}>
+                Force category — bypass the AI when this rule matches
+                {{ m.help("Checked = every email matching this rule is filed under the list's category, no exceptions. The AI is not even asked. Useful for sender_domain rules like 'all mail from your-domain.example' → 'work'. Unchecked = the rule is advisory: the AI sees the suggestion but may pick a different category based on the email body. If you've created a rule and the AI keeps overriding it, switch this checkbox on.") }}
+            </label>
+
+            <fieldset style="margin:0.5rem 0;padding:0.5rem 0.75rem;
+                             border:1px solid var(--pico-muted-border-color);
+                             border-radius:var(--pico-border-radius);">
+                <legend style="font-size:0.9em;padding:0 0.4rem;">
+                    Also adds labels
+                </legend>
+                {% if all_labels %}
+                {% set _selected = rule.adds_labels_list or [] %}
+                {% for label in all_labels %}
+                <label style="display:inline-flex;align-items:center;gap:0.4rem;margin-right:1rem;">
+                    <input type="checkbox" name="adds_labels" value="{{ label.slug }}"
+                           {% if label.slug in _selected %}checked{% endif %}>
+                    <span style="display:inline-block;padding:0.1rem 0.5rem;border-radius:0.7rem;background:{{ label.color }};color:#fff;font-size:0.8rem;">{{ label.name }}</span>
+                </label>
+                {% endfor %}
+                {% else %}
+                <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+                    No labels yet — create one on the
+                    <a href="/labels">Labels tab</a> first.
+                </p>
+                {% endif %}
+            </fieldset>
+
+            <fieldset style="margin:0.5rem 0;padding:0.5rem 0.75rem;
+                             border:1px solid var(--pico-muted-border-color);
+                             border-radius:var(--pico-border-radius);">
+                <legend style="font-size:0.9em;padding:0 0.4rem;">
+                    Also apply provider labels{{ m.help("Apply labels that already exist on your Gmail or Outlook accounts. One picker per account — pick which labels to attach when this rule matches a message on THAT account. IMAP accounts are skipped here on purpose: IMAP keywords (also called tags or flags per RFC 3501) technically can carry labels, but mail-client support is uneven enough that surfacing IMAP keywords usually ends in confusion. For IMAP, use a route's 'move' action to file matching mail in a folder instead. Gmail system labels (INBOX, SENT, CATEGORY_*, etc.) are filtered out; only your own labels appear.") }}
+                </legend>
+                {% if provider_label_groups %}
+                {% set _selected_pl = rule.provider_labels_list or [] %}
+                {% set _selected_keys = _selected_pl | map(attribute='_key') | list %}
+                {% for group in provider_label_groups %}
+                <details style="margin-bottom:0.5rem;">
+                    {# Multi-select dropdown style: each account is a
+                       <details> that the operator expands to see + tick
+                       its labels. Collapsed by default so a 5-account
+                       install doesn't fill half the screen with chips.
+                       Per-account counter on the summary line shows
+                       how many labels are currently ticked, so the
+                       operator can collapse + still know what's set. #}
+                    {% set _ticked = 0 %}
+                    {% for label in group.labels %}
+                    {% set _key = group.account_id ~ ":" ~ label.slug %}
+                    {% if _key in _selected_keys %}{% set _ticked = _ticked + 1 %}{% endif %}
+                    {% endfor %}
+                    <summary style="cursor:pointer;font-size:0.85em;padding:0.25rem 0;">
+                        <strong>{{ group.account_name }}</strong>
+                        <small style="color:var(--pico-muted-color);">
+                            ({{ group.provider_type }}{% if group.labels %} · {{ group.labels|length }} labels{% if _ticked %}, {{ _ticked }} selected{% endif %}{% endif %})
+                        </small>
+                    </summary>
+                    {% if group.labels %}
+                    {# data-multiselect = picked up by
+                       static/multiselect.js which replaces the
+                       native scrollbox with a chip-pill control
+                       + filterable popup. Native control is the
+                       fallback if JS fails to load. The placeholder
+                       attr shows when nothing is ticked. #}
+                    <select multiple
+                            name="provider_labels"
+                            data-multiselect
+                            data-placeholder="Pick labels to apply…"
+                            size="{{ [group.labels|length, 8] | min }}"
+                            style="margin:0.35rem 0 0 0;width:100%;
+                                   font-size:0.85em;padding:0.25rem;">
+                        {% for label in group.labels %}
+                        {% set _key = group.account_id ~ ":" ~ label.slug %}
+                        <option value="{{ _key }}"
+                                {% if _key in _selected_keys %}selected{% endif %}>
+                            {{ label.name }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    {% else %}
+                    <small style="display:block;color:var(--pico-muted-color);
+                                  margin:0.25rem 0 0 0.5rem;">
+                        {% if group.provider_type == "imap" %}
+                        Labels are skipped for IMAP accounts. The IMAP
+                        protocol (RFC 3501) does carry keywords / tags
+                        / flags that can act as labels, but client
+                        support is patchy enough that they rarely
+                        survive a round-trip across mail clients. Use
+                        a route's "move" action to file matching mail
+                        in a folder instead — that works everywhere.
+                        {% else %}
+                        No labels found on this account. Create labels in
+                        {% if group.provider_type == "gmail_api" %}Gmail{% else %}Outlook{% endif %}
+                        first; they'll appear here on the next reload.
+                        {% endif %}
+                    </small>
+                    {% endif %}
+                </details>
+                {% endfor %}
+                {% else %}
+                <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+                    No accounts with provider labels available. Add a Gmail
+                    or Outlook account first. IMAP accounts are skipped here
+                    by design — see the help icon above for why.
+                </p>
+                {% endif %}
+            </fieldset>
+
+            <div role="group">
+                <button type="submit">Save</button>
+                <button type="button" class="secondary outline"
+                        hx-get="/rules/{{ lst.id }}/rules/{{ rule.id }}/row"
+                        hx-target="#rule-{{ lst.id }}-{{ rule.id }}"
+                        hx-swap="outerHTML">Cancel</button>
+            </div>
+        </form>
+    </td>
+</tr>

@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% block title %}Retry queue — Email Triage{% endblock %}
+{% block content %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (operator with cross-account visibility).
+                Technical tier — knows what a message id is, but
+                shouldn't have to read a Python qualname.
+   COPY RULES:
+     - Plain English on "Last error" — show the class name only,
+       not the module path (R-A persists "httpx.ReadTimeout";
+       we render "ReadTimeout").
+     - State chips use everyday words ("waiting to retry",
+       "abandoned", "done") not the DB slug.
+     - HIPAA accounts get "(redacted)" in the mailbox cell; the
+       sender / subject are never shown in this list (R-A's
+       enqueue path already scrubs the error message).
+     - No user-facing links — this page is admin-only.
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>Retry queue{{ m.help("Per-message failures the watcher couldn't classify on first try. The sweeper retries each row on backoff (1m, 2m, 4m, …) until it succeeds or hits the attempt limit. Use the actions to bump a row to the front of the line or abandon it.") }}</h2>
+
+<p style="color:var(--pico-muted-color);">
+    When a watcher hits a per-message exception — an LLM timeout, a
+    flaky network read, a temporary backend hiccup — the message lands
+    here instead of being lost. The background sweeper retries on a
+    growing backoff. Abandoned rows stay visible for forensics but the
+    sweeper skips them.
+</p>
+
+{# Install-wide threshold banner. Populated by _shared._render for
+   admin pages when ≥5 deads in 24h or any account has ≥3. The
+   partial self-guards on the absence of the ctx key. #}
+{% include "admin/_retry_queue_banner.html" ignore missing %}
+
+{% if error_note %}
+<aside style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-mark-color, orange);
+              background:var(--pico-card-background-color);">
+    <strong>Heads up</strong>
+    <p style="margin:0.3rem 0 0 0;">{{ error_note }}</p>
+</aside>
+{% endif %}
+
+{# Filter dropdown. Plain HTML form posting back to the same URL
+   with a query-string parameter; htmx-free because the page is
+   short + the table is the only content that changes. #}
+<form method="get" action="/admin/retry-queue"
+      style="margin:0.5rem 0 1rem 0;">
+    <label for="state" style="margin-right:0.4rem;">
+        Show:
+    </label>
+    <select name="state" id="state"
+            onchange="this.form.submit()"
+            style="display:inline-block;width:auto;">
+        <option value="pending_and_dead"
+                {% if state_filter == "pending_and_dead" %}selected{% endif %}>
+            Waiting + abandoned (default)
+        </option>
+        <option value="pending"
+                {% if state_filter == "pending" %}selected{% endif %}>
+            Waiting to retry
+        </option>
+        <option value="dead"
+                {% if state_filter == "dead" %}selected{% endif %}>
+            Abandoned / out of attempts
+        </option>
+        <option value="done"
+                {% if state_filter == "done" %}selected{% endif %}>
+            Succeeded on retry
+        </option>
+        <option value="all"
+                {% if state_filter == "all" %}selected{% endif %}>
+            All
+        </option>
+    </select>
+    <noscript>
+        <button type="submit" style="margin-left:0.4rem;">
+            Apply
+        </button>
+    </noscript>
+</form>
+
+{% if rows|length == 0 %}
+<p>Nothing in this view. (That's good — the queue is empty for the
+   selected filter.)</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Account</th>
+            <th>Provider</th>
+            <th>Addressing</th>
+            <th>State</th>
+            <th>Attempts</th>
+            <th>Next attempt</th>
+            <th>Last error</th>
+            <th>Why abandoned</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in rows %}
+        <tr>
+            <td>
+                {{ row.account_label }}
+                {% if row.account_owner %}
+                <br>
+                <small style="color:var(--pico-muted-color);">
+                    {{ row.account_owner }}
+                </small>
+                {% endif %}
+            </td>
+            <td style="font-size:0.88em;">
+                {{ row.provider_type or "" }}
+            </td>
+            <td style="font-size:0.85em;">
+                {% if row.mailbox_display %}
+                {{ row.mailbox_display }}
+                {% if row.uid %}
+                / uid {{ row.uid }}
+                {% endif %}
+                {% elif row.gmail_msg_id %}
+                gmail id {{ row.gmail_msg_id[:16] }}{% if row.gmail_msg_id|length > 16 %}…{% endif %}
+                {% elif row.o365_msg_id %}
+                o365 id {{ row.o365_msg_id[:16] }}{% if row.o365_msg_id|length > 16 %}…{% endif %}
+                {% else %}
+                <span style="color:var(--pico-muted-color);">(none)</span>
+                {% endif %}
+            </td>
+            <td>
+                {% set st = row.state or "" %}
+                {% if st == "pending" %}
+                <span style="color:var(--pico-mark-color, orange);">Waiting to retry</span>
+                {% elif st == "dead" %}
+                <span style="color:var(--pico-del-color);">Abandoned</span>
+                {% elif st == "done" %}
+                <span style="color:var(--pico-ins-color);">Done</span>
+                {% else %}
+                {{ st }}
+                {% endif %}
+            </td>
+            <td style="text-align:right;">
+                {{ row.attempts if row.attempts is not none else (row.attempt_count or 0) }}
+            </td>
+            <td style="font-size:0.85em;color:var(--pico-muted-color);">
+                {% if row.state == "pending" %}
+                {{ (row.next_attempt_at or "")[:19] }}
+                {% else %}
+                —
+                {% endif %}
+            </td>
+            <td style="font-size:0.85em;">
+                {% if row.error_class_short %}
+                <strong>{{ row.error_class_short }}</strong>
+                {% endif %}
+                {% set msg = row.error_msg or row.last_error or "" %}
+                {% if msg %}
+                <br>
+                <span style="color:var(--pico-muted-color);">
+                    {{ msg[:120] }}{% if msg|length > 120 %}…{% endif %}
+                </span>
+                {% endif %}
+            </td>
+            <td style="font-size:0.85em;">
+                {% if row.dead_reason == "auth_revoked" %}
+                Account needs re-authentication.
+                {% elif row.dead_reason == "max_attempts_exceeded" %}
+                Out of retry attempts.
+                {% elif row.dead_reason == "uidvalidity_changed" %}
+                Mailbox UID space reset; address is stale.
+                {% elif row.dead_reason == "message_gone" %}
+                Message was deleted before retry could run.
+                {% elif row.dead_reason == "operator_abandoned" %}
+                Marked abandoned manually.
+                {% elif row.dead_reason %}
+                {{ row.dead_reason }}
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td style="white-space:nowrap;">
+                {% if row.state == "pending" %}
+                <form method="post"
+                      action="/admin/retry-queue/{{ row.id }}/retry-now"
+                      style="display:inline;margin:0;">
+                    {{ csrf_input(request) }}
+                    <button type="submit"
+                            class="outline"
+                            style="padding:0.2rem 0.5rem;font-size:0.85em;margin:0 0.3rem 0 0;">
+                        Retry now
+                    </button>
+                </form>
+                <form method="post"
+                      action="/admin/retry-queue/{{ row.id }}/abandon"
+                      style="display:inline;margin:0;"
+                      onsubmit="return confirm('Mark this row abandoned? It will stop retrying.');">
+                    {{ csrf_input(request) }}
+                    <button type="submit"
+                            class="outline secondary"
+                            style="padding:0.2rem 0.5rem;font-size:0.85em;margin:0;">
+                        Abandon
+                    </button>
+                </form>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% endblock %}

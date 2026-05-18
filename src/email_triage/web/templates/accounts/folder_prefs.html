@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Folder Preferences - {{ acct.name }} - Email Triage{% endblock %}
+{% block content %}
+<h2>Folder Preferences</h2>
+<p>
+    <strong>{{ acct.name }}</strong> ({{ acct.provider_type }})
+    &mdash; Choose which folders appear in route dropdowns.
+    Unchecking a folder also hides all its subfolders.
+    <br>
+    <a href="/accounts/{{ acct.id }}/routes">&larr; Back to Routes</a>
+</p>
+
+{% if error %}
+<article style="background:var(--pico-del-color);color:white;padding:0.75rem;">
+    {{ error }}
+</article>
+{% endif %}
+
+{% if tree %}
+<form method="post" action="/accounts/{{ acct.id }}/folders/prefs">
+    {{ csrf_input(request) }}
+    <div id="prefs-msg" style="margin-bottom:0.5rem;"></div>
+
+    <div style="margin-bottom:1rem;">
+        <button type="button" onclick="toggleAll(true)" class="outline secondary"
+                style="padding:0.25rem 0.5rem;font-size:0.875rem;">Check All</button>
+        <button type="button" onclick="toggleAll(false)" class="outline secondary"
+                style="padding:0.25rem 0.5rem;font-size:0.875rem;">Uncheck All</button>
+    </div>
+
+    <div class="folder-tree" style="font-family:monospace;font-size:0.9rem;">
+        {{ _render_tree(tree, folder_included, 0) }}
+    </div>
+
+    <button type="submit" style="margin-top:1rem;">Save Preferences</button>
+</form>
+
+<script>
+function toggleAll(state) {
+    document.querySelectorAll('.folder-tree input[type="checkbox"]').forEach(cb => {
+        cb.checked = state;
+    });
+}
+
+function toggleChildren(checkbox) {
+    // Find the sibling container with children.
+    const container = checkbox.closest('.folder-node').querySelector('.folder-children');
+    if (container) {
+        container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.checked = checkbox.checked;
+        });
+    }
+}
+</script>
+
+{% else %}
+<p>No folders found on the server. Make sure the account is connected and test the connection first.</p>
+{% endif %}
+{% endblock %}
+
+{# Recursive macro to render the folder tree #}
+{% macro _render_tree(nodes, folder_included, depth) %}
+{% for node in nodes %}
+<div class="folder-node" style="margin-left:{{ depth * 1.5 }}rem;padding:0.15rem 0;">
+    <input type="hidden" name="all_folders" value="{{ node.path }}">
+    <label style="display:inline-flex;align-items:center;gap:0.35rem;margin:0;cursor:pointer;">
+        <input type="checkbox" name="included" value="{{ node.path }}"
+               {% if folder_included.get(node.path, true) %}checked{% endif %}
+               style="margin:0;"
+               onchange="toggleChildren(this)">
+        {% if node.children %}
+        <strong>{{ node.name }}</strong>
+        {% else %}
+        {{ node.name }}
+        {% endif %}
+    </label>
+    <small style="color:var(--pico-muted-color);margin-left:0.5rem;">{{ node.path }}</small>
+    {% if node.children %}
+    <div class="folder-children">
+        {{ _render_tree(node.children, folder_included, depth + 1) }}
+    </div>
+    {% endif %}
+</div>
+{% endfor %}
+{% endmacro %}

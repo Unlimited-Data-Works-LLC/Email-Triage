@@ -1,0 +1,93 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account integration setup)
+   TECH-SKILL:  medium — the operator already chose this provider;
+                they can be expected to know what host/port/SSL mean
+                at a high level, but not server-specific syntax.
+   COPY RULES:  no vendor-internal jargon; concrete examples over
+                abstract definitions. No admin-only paths
+                (/config, /admin/*). Disabled controls speak via
+                their disabled state — don't say "Ask your
+                administrator". "AI" not "language model" / "LLM".
+   ─────────────────────────────────────────────────────────── #}
+<fieldset>
+    <legend>IMAP Connection</legend>
+    <p><small>
+        These fields connect email-triage to your IMAP mail server.
+        The default values work for most providers; check your
+        provider's IMAP settings page if connection fails.
+    </small></p>
+    <div class="grid">
+        <label>
+            Host{{ m.help("The IMAP server's address. Example: imap.gmail.com for Gmail, outlook.office365.com for Office 365, mail.fastmail.com for Fastmail. Your provider's IMAP help page lists this.") }}
+            <input type="text" name="host" value="{{ acct.config.host or acct.config.get('host', '') if acct is defined else '' }}" required
+                   placeholder="mail.example.com">
+        </label>
+        <label>
+            Port{{ m.help("The IMAP server port. 993 for SSL/TLS (default and recommended), 143 for plain (avoid).") }}
+            <input type="number" name="port" value="{{ acct.config.port or acct.config.get('port', 993) if acct is defined else 993 }}" required>
+        </label>
+    </div>
+    <div class="grid">
+        <label>
+            Your email address{{ m.help("The email address mail is sent FROM and replies arrive AT — for example you@example.com. Many IMAP servers let you log in with just a username (no @domain); without this field, email-triage can't tell which messages in your Sent folder you actually wrote. Leave blank only if your IMAP username already includes the @domain.") }}
+            <input type="email" name="email_address" value="{{ acct.config.email_address or acct.config.get('email_address', '') if acct is defined else '' }}"
+                   placeholder="you@example.com">
+        </label>
+        <label>
+            Username{{ m.help("Whatever your IMAP server expects when you log in. On some hosts this is your full email address (you@example.com); on others it's just the local part (e.g. ``you``). Check your provider's IMAP settings page.") }}
+            <input type="text" name="username" value="{{ acct.config.username or acct.config.get('username', '') if acct is defined else '' }}" required
+                   placeholder="user@example.com or just user">
+        </label>
+    </div>
+    <div class="grid">
+        <label>
+            Password{{ m.help("Your IMAP password. For Gmail / Outlook / Fastmail and most modern providers this needs to be an APP password — not your regular login password — because of two-factor authentication. Generate one in your provider's account-security page.") }}
+            <input type="password" name="password" value=""
+                   placeholder="{{ '********' if (acct is defined and acct.get('has_password', false)) else 'Enter password' }}">
+            {% if acct is defined and acct.get('has_password', false) %}
+            <small>Leave blank to keep existing password.</small>
+            {% endif %}
+        </label>
+    </div>
+    <div style="margin:0.5rem 0;">
+        <label>
+            <input type="checkbox" name="use_ssl" value="1"
+                   {% if acct is not defined or acct.config.get('use_ssl', true) %}checked{% endif %}>
+            Use SSL/TLS{{ m.help("Connect with TLS encryption from the start. Leave on for port 993 (the default). Turn off only when the server doesn't support TLS — rare and not recommended.") }}
+        </label>
+    </div>
+    {# 2026-05-13 — Drafts folder override. When email-triage saves
+       a drafted reply it has to APPEND the message to your Drafts
+       folder. Different IMAP servers spell that folder differently
+       (Drafts / INBOX.Drafts / INBOX/Drafts).
+       2026-05-14 — replaced the freeform text input with a dropdown
+       populated from the live LIST response (filtered to entries
+       containing "drafts" — case-insensitive). The probe runs on
+       page render in accounts.py; if it fails (auth not saved yet,
+       server unreachable) the dropdown shows only the saved value +
+       "(auto-detect)" so the operator can still save the form. #}
+    <div style="margin:0.5rem 0;">
+        <label>
+            Drafts folder{{ m.help("Where email-triage saves your drafted replies. The dropdown lists every folder on your server with 'Drafts' in the name. Pick the one your mail program shows drafts in. Leave at '(auto-detect)' if you're not sure — email-triage tries to figure it out from your server's SPECIAL-USE flag.") }}
+            {% set _df_saved = acct.config.drafts_folder or acct.config.get('drafts_folder', '') if acct is defined else '' %}
+            <select name="drafts_folder">
+                <option value="" {% if not _df_saved %}selected{% endif %}>(auto-detect)</option>
+                {% for f in drafts_folder_candidates or [] %}
+                <option value="{{ f }}" {% if f == _df_saved %}selected{% endif %}>{{ f }}</option>
+                {% endfor %}
+                {# Saved value not in the live list — render it so the operator can KEEP it (or pick something else). Common on first-load before the probe succeeded. #}
+                {% if _df_saved and _df_saved not in (drafts_folder_candidates or []) %}
+                <option value="{{ _df_saved }}" selected>{{ _df_saved }} (saved, not in live list)</option>
+                {% endif %}
+            </select>
+        </label>
+    </div>
+    {# The per-folder watch picker (formerly here) lives on the
+       Watch + Push tab now — see _watch_folders_imap.html. Folder
+       selection is a watch concern; keeping it next to the
+       host/port connection knobs was crossing wires per operator
+       review. The save handler still reads ``mailboxes`` /
+       ``mailboxes_csv`` from the same form regardless of which tab
+       the input came from. #}
+</fieldset>

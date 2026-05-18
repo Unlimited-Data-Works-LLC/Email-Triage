@@ -1,0 +1,1077 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Not terminal users; not protocol readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC numbers, ISO 8601, OData, "language
+       model", "AND-combined", "substring match"). Plain English.
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+   ─────────────────────────────────────────────────────────── #}
+{# Two render paths share this partial:
+   * HTMX in-place edit on /accounts (manage.html row swap) — needs a
+     <tr><td><article> shell so the row replaces an account-list row
+     and the bordered article distinguishes edit mode from neighbours.
+   * Standalone /accounts/{id}/edit page — base.html provides full-page
+     chrome and a clean h2 sits above; the article + table shell is
+     redundant chrome that nests headers and breaks symmetry with the
+     sibling /accounts/{id}/routes page. ``embed_in_table`` defaults to
+     True (HTMX path); edit_page.html sets it False to drop the
+     chrome and render flat content under its own h2. #}
+{# ── Section-as-card refactor (2026-05-12) ────────────────────
+   Per-tab content is grouped into ``.et-card.et-card-stack``
+   shells (shared rule lives in style.css; same hierarchy that
+   the routes editor + admin/integrations + dashboard use). The
+   stack variant is full-width single-column — each section's
+   body holds wide forms, so the two-column header-left/body-
+   right variant isn't appropriate here. Where a card holds
+   multiple natural sub-blocks (e.g. account basics + provider
+   fields + aliases + timezone all live under "Account &
+   provider"), each sub-block is a ``.et-card-section`` so the
+   operator sees a subtle top-border between them; the first
+   sub-block has no border (CSS handles that). All form IDs,
+   field names, HTMX targets, and JS hooks are unchanged from
+   the prior long-form layout — this refactor is markup only. #}
+{% set _embed = embed_in_table if embed_in_table is defined else true %}
+{% if _embed %}
+<tr id="acct-row-{{ acct.id }}" class="editing">
+    <td colspan="{{ 6 if is_admin else 5 }}">
+        <article style="border-left:3px solid var(--pico-primary);
+                        padding:1rem 1.25rem;margin:0;
+                        background:var(--pico-card-background-color, transparent);">
+            <header style="margin:0 0 0.75rem 0;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                <strong>Editing: {{ acct.name }}</strong>
+                <small style="color:var(--pico-muted-color);">
+                    All settings are here. Tabs below jump between sections; "Routing" links to the per-account routes page.
+                </small>
+            </header>
+{% endif %}
+
+            {# Tab strip — navigates via ?tab=<slug> on the same page.
+               Each section is wrapped in a tab-pane div; only the
+               active tab's content is visible. All sections still
+               render in DOM (so the form's Save submit posts every
+               field) — `display:none` hides the inactive ones.
+               Save button always visible. #}
+            <style>
+                .tab-pane { display: none; }
+                .tab-pane.tab-pane-active { display: block; }
+            </style>
+            {% set active = active_tab or "provider" %}
+            {% include "accounts/_edit_tabs.html" %}
+
+            {% if mailbox_cap_error %}
+            <p style="color:var(--pico-del-color);margin:0 0 0.75rem 0;">
+                {{ mailbox_cap_error }}
+            </p>
+            {% endif %}
+
+            {# Stale-auth banner — surfaces the same signal the
+               Accounts row chip carries. Operator who clicked
+               "Re-auth" lands here without losing context for why.
+               Persists until the next successful provider call
+               clears the auth_stale flag. The id lets the manual-
+               re-auth completion path OOB-swap a success banner
+               in here without a full page reload. #}
+            <div id="auth-stale-banner-{{ acct.id }}">
+            {% if acct.get('auth_stale') %}
+            <article style="border-left:3px solid var(--pico-del-color);
+                            background:var(--pico-card-background-color, transparent);
+                            padding:0.6rem 0.9rem;margin:0 0 0.75rem 0;">
+                <strong>⚠ Re-authentication required for this account.</strong>
+                <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+                    The configured credentials are no longer valid. Triage,
+                    polling, and watchers for this account will fail until
+                    you reauthenticate below. The flag clears automatically
+                    on the next successful provider call.
+                </p>
+                {% if acct.auth_stale.reason %}
+                <details style="margin-top:0.4rem;">
+                    <summary style="font-size:0.85rem;cursor:pointer;color:var(--pico-muted-color);">
+                        Provider error detail
+                    </summary>
+                    <pre style="font-size:0.8rem;white-space:pre-wrap;
+                                margin:0.3rem 0 0;padding:0.4rem;
+                                background:var(--pico-code-background-color);
+                                border-radius:var(--pico-border-radius);">{{ acct.auth_stale.reason }}</pre>
+                </details>
+                {% endif %}
+                {% if acct.auth_stale.at %}
+                <small style="color:var(--pico-muted-color);">
+                    Detected at {{ acct.auth_stale.at[:19] }} UTC.
+                </small>
+                {% endif %}
+            </article>
+            {% endif %}
+            </div>
+
+            {# ── Main form: account basics + provider config + Save/Cancel ──
+                 Plain HTML POST (no HTMX): submit redirects to /accounts on
+                 success. Uniform "edit = full page" workflow. #}
+            <form id="acct-edit-form-{{ acct.id }}" method="POST" action="/accounts/{{ acct.id }}/save">
+                {{ csrf_input(request) }}
+                <input type="hidden" name="active_tab" value="{{ active }}">
+
+                <div id="provider" class="tab-pane{% if active == 'provider' %} tab-pane-active{% endif %}">
+                <div class="et-cards">
+
+                    {# ── Card: Account & provider ─────────────────────
+                       Holds account-basics (name + provider + Enabled /
+                       HIPAA toggles), provider-specific fields (host
+                       / port / OAuth status / token state — fed by
+                       _fields_<provider>.html), additional-addresses
+                       (alias include), and local-timezone — every knob
+                       that says "this account is X reached via Y at
+                       address Z". Sub-blocks separated by
+                       .et-card-section dividers. ─────────────────── #}
+                    <article class="et-card et-card-stack">
+                        <header class="et-card-header">
+                            <h3>Account &amp; provider</h3>
+                            <small class="et-card-desc">
+                                How this mailbox is identified and reached, plus the
+                                addresses it accepts mail at and the timezone its
+                                events are rendered in.
+                            </small>
+                        </header>
+                        <div class="et-card-body">
+
+                            <div class="et-card-section">
+                                {# Row 1: name + provider — equal-width 2-up. #}
+                                <div class="grid">
+                                    <label>
+                                        Account Name{{ m.help("Operator-supplied label for this account. Shown in the Accounts list, log entries, audit trail, and digest emails. Doesn't have to match the email address -- pick a name that disambiguates owners (e.g. 'Personal Gmail' vs 'Work Outlook').") }}
+                                        <input type="text" name="name" value="{{ acct.name }}" required>
+                                    </label>
+                                    <label>
+                                        Provider Type{{ m.help("How email-triage talks to this mailbox. IMAP works against any IMAP server with IDLE support (Dovecot, Exchange, Fastmail, etc.). Gmail (native) uses Google's API + Pub/Sub push -- requires OAuth setup. Office 365 uses Microsoft Graph (push not yet implemented). Pick once per account; switching providers means re-authenticating + re-watching folders.") }}
+                                        <select name="provider_type" id="edit-provider-type-{{ acct.id }}"
+                                                hx-get="/accounts/form-fields"
+                                                hx-target="#edit-provider-fields-{{ acct.id }}"
+                                                hx-swap="innerHTML"
+                                                hx-include="[name='provider_type']">
+                                            <option value="imap" {% if acct.provider_type == 'imap' %}selected{% endif %}>IMAP</option>
+                                            <option value="gmail_api" {% if acct.provider_type == 'gmail_api' %}selected{% endif %}>Gmail (native)</option>
+                                            <option value="office365" {% if acct.provider_type == 'office365' %}selected{% endif %}>Office 365 (Microsoft Graph)</option>
+                                        </select>
+                                    </label>
+                                </div>
+
+                                {# Row 2: toggles in a tight flex row, NOT inside a Pico grid. #}
+                                <div style="display:flex;flex-wrap:wrap;gap:1.5rem;align-items:flex-start;
+                                            margin:0.25rem 0 1rem 0;">
+                                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.4rem;"
+                                           title="When disabled, this account is skipped during triage runs and scheduled digest generation. You can still configure routes and run triage manually.">
+                                        <input type="checkbox" name="is_active" value="1"
+                                               {% if acct.is_active %}checked{% endif %}
+                                               style="margin:0;">
+                                        Enabled
+                                    </label>
+
+                                    {# Per-account HIPAA flag. Disabled (and kept checked) when
+                                       system HIPAA is on AND the account was created under
+                                       system HIPAA — the "sticky inheritance" lock rule. #}
+                                    <label style="margin:0;display:inline-flex;align-items:flex-start;gap:0.4rem;flex-direction:column;"
+                                           title="When enabled, mail data for this account is treated as HIPAA-protected (PHI scrubbed from logs and notifications) regardless of the system HIPAA setting.">
+                                        <span style="display:inline-flex;align-items:center;gap:0.4rem;">
+                                            <input type="checkbox" name="hipaa" value="1"
+                                                   {% if acct.hipaa %}checked{% endif %}
+                                                   {% if account_locked %}disabled{% endif %}
+                                                   {% if acct.hipaa and not account_locked %}
+                                                   onchange="if (!this.checked && !confirm('This account was previously HIPAA-protected. Turning it off means new mail for this account will be logged with full details. Previously-written rows are unaffected. Continue?')) { this.checked = true; }"
+                                                   {% endif %}
+                                                   style="margin:0;">
+                                            HIPAA
+                                        </span>
+                                        {% if account_locked %}
+                                        <small style="color:var(--pico-muted-color);max-width:24rem;">
+                                            System HIPAA is active — this account is auto-flagged
+                                            and cannot be unflagged while system HIPAA remains on.
+                                        </small>
+                                        {% endif %}
+                                    </label>
+                                </div>
+
+                                <input type="hidden" name="hipaa_submitted" value="1">
+
+                                <div id="edit-provider-fields-{{ acct.id }}">
+                                    {% include "accounts/_fields_" + acct.provider_type + ".html" %}
+                                </div>
+                            </div>
+
+                            {# ── Sub-block: Additional addresses (#106) ──
+                               Lets the owner declare extra addresses that deliver
+                               to the same inbox so triage routes + digest delivery
+                               work for each. The partial owns its own HTMX-driven
+                               add/remove flow (sibling forms, submitted independently
+                               from the main account-edit Save) and renders its own
+                               "Additional addresses" heading + helper copy, so the
+                               .et-card-section wrapper just provides the divider —
+                               no duplicate header here. #}
+                            <div class="et-card-section">
+                                {% include "accounts/_aliases.html" %}
+                            </div>
+
+                            {# ── Sub-block: Local timezone ─────────────────
+                               Used to render calendar event times back to you in
+                               your local clock. Pick the zone you live in. New
+                               accounts default to Eastern (Detroit); change as
+                               needed. Drives the day-of-week + AM/PM strings
+                               shown by the assistant.
+                               Common North American + a few global zones; the
+                               list intentionally short — operators in zones
+                               not on it can ask to have theirs added. #}
+                            <div class="et-card-section">
+                                {% set _account_tz = acct.config.get('tz') or 'America/Detroit' %}
+                                {% set _common_tzs = [
+                                    'America/Detroit',
+                                    'America/New_York',
+                                    'America/Chicago',
+                                    'America/Denver',
+                                    'America/Phoenix',
+                                    'America/Los_Angeles',
+                                    'America/Anchorage',
+                                    'Pacific/Honolulu',
+                                    'America/Toronto',
+                                    'America/Vancouver',
+                                    'America/Mexico_City',
+                                    'America/Sao_Paulo',
+                                    'Europe/London',
+                                    'Europe/Dublin',
+                                    'Europe/Paris',
+                                    'Europe/Berlin',
+                                    'Europe/Madrid',
+                                    'Europe/Rome',
+                                    'Europe/Amsterdam',
+                                    'Europe/Stockholm',
+                                    'Europe/Athens',
+                                    'Africa/Johannesburg',
+                                    'Asia/Dubai',
+                                    'Asia/Kolkata',
+                                    'Asia/Singapore',
+                                    'Asia/Shanghai',
+                                    'Asia/Tokyo',
+                                    'Asia/Seoul',
+                                    'Australia/Sydney',
+                                    'Pacific/Auckland',
+                                    'UTC',
+                                ] %}
+                                {% if _account_tz not in _common_tzs %}
+                                    {% set _common_tzs = [_account_tz] + _common_tzs %}
+                                {% endif %}
+                                <label style="display:block;">
+                                    Local timezone{{ m.help("Used to render calendar times back to you. The assistant uses this to write things like 'Friday, 8:20 AM' in chat replies. Change this if you move; existing events shift to the new clock automatically.") }}
+                                    <select name="tz" style="margin:0;width:auto;min-width:14rem;">
+                                        {% for tz in _common_tzs %}
+                                            <option value="{{ tz }}" {% if tz == _account_tz %}selected{% endif %}>{{ tz }}</option>
+                                        {% endfor %}
+                                    </select>
+                                </label>
+                            </div>
+
+                        </div>{# /et-card-body — Account & provider #}
+                    </article>{# /et-card — Account & provider #}
+
+                </div>{# /et-cards #}
+                </div>{# /provider tab-pane #}
+
+                <div class="tab-pane{% if active == 'watch' %} tab-pane-active{% endif %}">
+                <div class="et-cards">
+
+                    {# ── Card: Real-Time Watch ───────────────────────
+                       Unified push + poll knobs. Two independent
+                       checkboxes + a cadence input. The hidden marker
+                       lets the save handler distinguish "checkbox
+                       unchecked" from "section not on form". The id
+                       ``watch`` is preserved on the card article so
+                       anchor links (#watch) still land here. ─────── #}
+                    <article id="watch" class="et-card et-card-stack">
+                        <header class="et-card-header">
+                            <h3>Real-Time Watch{{ m.help("Two independent ingestion mechanisms. Push delivers new mail to email-triage in seconds (IMAP IDLE socket / Gmail Pub/Sub webhook / Office365 Graph subscription). Poll runs on a fixed cadence regardless of push state -- catches dropped push deliveries, IDLE socket resets, and webhook outages. Most accounts run both. Disable both to mark the account as manual-only (operator clicks Triage Now to ingest).") }}</h3>
+                            <small class="et-card-desc">
+                                Push delivers new mail in seconds; poll catches
+                                anything push drops. Most accounts run both.
+                            </small>
+                        </header>
+                        <div class="et-card-body">
+                            <input type="hidden" name="__ingestion_fields_present" value="1">
+                            {# Push checkbox gating:
+                               * IMAP: always enabled (IDLE works without an OAuth dance).
+                               * Gmail: disabled until Primary -- push-enabled OAuth flow
+                                 has been completed AND the install has push enabled.
+                                 Existing healthy push counts as proof of the flow.
+                               * O365: not yet implemented — disabled with a note. #}
+                            {% set _gmail_push_blocked = (
+                                acct.provider_type == 'gmail_api'
+                                and not (acct.push_enabled_flow_done and acct.gmail_topic_configured)
+                            ) %}
+                            {% set _o365_push_blocked = acct.provider_type == 'office365' %}
+                            {% set _push_disabled = _gmail_push_blocked or _o365_push_blocked %}
+                            <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+                                <input type="checkbox" name="push_enabled" value="1" style="margin:0;"
+                                       {% if acct.config.get('push_enabled', True) and not _push_disabled %}checked{% endif %}
+                                       {% if _push_disabled %}disabled{% endif %}>
+                                <span><strong>Push</strong>
+                                    <small style="color:var(--pico-muted-color);">
+                                        &nbsp;— instant delivery.
+                                        {% if acct.provider_type == 'imap' %}IMAP IDLE.
+                                        {% elif acct.provider_type == 'gmail_api' %}
+                                            Gmail Pub/Sub.
+                                            {% if not acct.push_enabled_flow_done %}
+                                            <em>Authenticate via <strong>Primary &mdash; push-enabled</strong> above first.</em>
+                                            {% elif not acct.gmail_topic_configured %}
+                                            <em>Push isn&rsquo;t enabled for this install yet.</em>
+                                            {% endif %}
+                                        {% elif acct.provider_type == 'office365' %}Microsoft Graph subscriptions (not yet implemented).
+                                        {% endif %}
+                                    </small>
+                                </span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;flex-wrap:wrap;">
+                                <input type="checkbox" name="poll_enabled" value="1" style="margin:0;"
+                                       {% if acct.config.get('poll_enabled', True) %}checked{% endif %}>
+                                <span><strong>Poll every</strong></span>
+                                <input type="number" name="poll_interval_minutes"
+                                       value="{{ acct.config.get('poll_interval_minutes', 60) }}"
+                                       min="10" max="240" step="10"
+                                       style="width:6rem;margin:0;padding:0.25rem 0.5rem;">
+                                <small style="color:var(--pico-muted-color);">
+                                    minutes (10–240, step 10). Runs regardless of push
+                                    state — catches dropped push deliveries and IDLE
+                                    socket resets; primary ingestion when push is off.
+                                </small>
+                            </label>
+                        </div>{# /et-card-body — Real-Time Watch #}
+                    </article>{# /et-card — Real-Time Watch #}
+
+                    {# IMAP-only: per-folder watch picker. Was on the
+                       Provider + Auth tab next to host/port; moved here
+                       because folder selection is conceptually a watch
+                       concern, not a connection concern. Other providers
+                       (Gmail, Office 365) don't have folder pickers —
+                       their IDs are global. Wrapped in its own card so
+                       it sits as a sibling to the Push + Poll card. #}
+                    {% if acct.provider_type == 'imap' %}
+                    <article class="et-card et-card-stack">
+                        <header class="et-card-header">
+                            <h3>Folders to watch</h3>
+                            <small class="et-card-desc">
+                                IMAP IDLE is one connection per folder — keep this
+                                list short; most servers cap per-user connections.
+                            </small>
+                        </header>
+                        <div class="et-card-body">
+                            {% include "accounts/_watch_folders_imap.html" %}
+                        </div>
+                    </article>
+                    {% endif %}
+
+                </div>{# /et-cards #}
+                </div>{# /watch tab-pane #}
+
+                <div class="tab-pane{% if active == 'digests' %} tab-pane-active{% endif %}">
+                <div class="et-cards">
+
+                {# Multi-digest tab. Phase 5 ships the read-only
+                   listing: preset card always at top with the
+                   enable + send-time controls (same form fields
+                   as before so save round-trip is unchanged);
+                   custom digests render below as collapsed
+                   summary cards. Phase 6 plugs in the editor +
+                   "+ Add custom digest" button. #}
+
+                {% set preset_cfg = digest_configs[0] if digest_configs and digest_configs[0].kind == 'preset_daily_activity' else None %}
+                {% set custom_cfgs = digest_configs[1:] if preset_cfg else digest_configs %}
+
+                {# Operator-friendly labels for the format + cadence
+                   enum values. Mirrors the maps in _digest_editor.html
+                   so the read-only card surfaces match what the
+                   operator picked in the editor. #}
+                {% set _format_labels = {
+                    "table":              "Table",
+                    "grouped_list":       "Grouped list",
+                    "plain_list":         "Plain list",
+                    "newsletter":         "Newsletter (article cards)",
+                    "newsletter_classic": "Newsletter (styled)",
+                } %}
+                {% set _cadence_labels = {
+                    "daily":   "every day",
+                    "weekly":  "every week",
+                    "monthly": "every month",
+                } %}
+
+                {# ── Card: Daily Activity (preset) ──────────────
+                   Always-on preset digest. The id ``digests`` is
+                   preserved on the card article so anchor links
+                   (#digests) still land on the preset. ──────── #}
+                {% if preset_cfg %}
+                <article id="digests" class="et-card et-card-stack">
+                    <header class="et-card-header">
+                        <h3>Daily Activity{{ m.help("Scheduled summary emails delivered back to this mailbox. The Daily Activity digest is always available and shows everything triaged in the last 24 hours. Add custom digests for tailored summaries — for example, a weekly digest of all classified newsletters, or a daily summary of every message moved to Receipts.") }}</h3>
+                        <small class="et-card-desc">
+                            Always-on summary of everything triaged in the
+                            last 24 hours. Delivered back to this mailbox.
+                        </small>
+                    </header>
+                    <div class="et-card-body">
+                        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+                            <input type="checkbox" name="recipient_digest_enabled" value="1" style="margin:0;"
+                                   {% if preset_cfg.enabled %}checked{% endif %}>
+                            <span><strong>Email me this digest</strong>
+                                <small style="color:var(--pico-muted-color);">
+                                    &nbsp;— delivered to <code>{{ acct.email_address or '(no address yet)' }}</code>
+                                </small>
+                            </span>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;flex-wrap:wrap;">
+                            <span style="white-space:nowrap;">Send time:</span>
+                            <select name="recipient_digest_send_at" style="margin:0;width:auto;">
+                                {% set _send_at = preset_cfg.schedule.time_local or '08:10' %}
+                                {% for h in range(24) %}
+                                    {% set bucket = '%02d:10' % h %}
+                                    <option value="{{ bucket }}"
+                                            {% if _send_at == bucket %}selected{% endif %}>
+                                        {{ bucket }}
+                                    </option>
+                                {% endfor %}
+                            </select>
+                            <small style="color:var(--pico-muted-color);">
+                                Server local time. Sends ten minutes past
+                                the chosen hour to avoid the top-of-hour
+                                cron rush.
+                            </small>
+                        </label>
+                        <div style="margin:0.5rem 0 0 0;display:flex;
+                                    align-items:center;gap:0.4rem;flex-wrap:wrap;">
+                            {# Same Show matches / Preview / Send test now
+                               triad as the custom-digest cards below. The
+                               preset's id is "preset:daily_activity"
+                               (PRESET_ID) and the new /candidates +
+                               /preview routes accept any digest id. The
+                               preset's render path is the legacy table —
+                               Preview shows that table in a sandboxed
+                               iframe so the operator can see what the
+                               daily-activity email actually looks like
+                               before flipping the toggle. #}
+                            <button type="button"
+                                    hx-post="/accounts/{{ acct.id }}/digests/{{ preset_cfg.id }}/candidates"
+                                    hx-target="#recipient-digest-result-{{ acct.id }}"
+                                    hx-swap="innerHTML"
+                                    hx-indicator="#recipient-digest-cand-spinner-{{ acct.id }}"
+                                    class="outline"
+                                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                Show matches
+                            </button>
+                            <small id="recipient-digest-cand-spinner-{{ acct.id }}"
+                                   class="htmx-indicator"
+                                   style="color:var(--pico-muted-color);">
+                                checking…
+                            </small>
+                            <button type="button"
+                                    hx-post="/accounts/{{ acct.id }}/digests/{{ preset_cfg.id }}/preview"
+                                    hx-target="#recipient-digest-result-{{ acct.id }}"
+                                    hx-swap="innerHTML"
+                                    hx-indicator="#recipient-digest-prev-spinner-{{ acct.id }}"
+                                    class="outline"
+                                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                Preview
+                            </button>
+                            <small id="recipient-digest-prev-spinner-{{ acct.id }}"
+                                   class="htmx-indicator"
+                                   style="color:var(--pico-muted-color);">
+                                rendering…
+                            </small>
+                            <button type="button"
+                                    hx-post="/accounts/{{ acct.id }}/recipient-digest/send-now"
+                                    hx-target="#recipient-digest-result-{{ acct.id }}"
+                                    hx-swap="innerHTML"
+                                    hx-indicator="#recipient-digest-spinner-{{ acct.id }}"
+                                    class="outline secondary"
+                                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                Send test now
+                            </button>
+                            <small id="recipient-digest-spinner-{{ acct.id }}"
+                                   class="htmx-indicator"
+                                   style="color:var(--pico-muted-color);">
+                                sending…
+                            </small>
+                        </div>
+                        {# Single result container shared by all three
+                           buttons — only one runs at a time so the latest
+                           result simply replaces the previous one. Mirrors
+                           the custom-digest card pattern below. #}
+                        <div id="recipient-digest-result-{{ acct.id }}"
+                             style="margin-top:0.5rem;font-size:0.85em;"></div>
+                    </div>{# /et-card-body — Daily Activity #}
+                </article>{# /et-card — Daily Activity #}
+                {% endif %}
+
+                {# ── Card: Custom digests ──────────────────────
+                   Lists each custom digest as an inner article
+                   (per-digest summary card). The outer card is
+                   the container; per-digest items keep their
+                   own bordered <article> styling because they
+                   are list items, not top-level sections. The
+                   "+ Add custom digest" button lives inside the
+                   card body so the action sits next to the list
+                   it acts on. ─────────────────────────────── #}
+                <article class="et-card et-card-stack">
+                    <header class="et-card-header">
+                        <h3>Custom digests</h3>
+                        <small class="et-card-desc">
+                            Tailored summaries beyond Daily Activity — for
+                            example, a weekly digest of all newsletters, or
+                            a daily summary of every message moved to a
+                            given folder.
+                        </small>
+                    </header>
+                    <div class="et-card-body">
+                        {% if custom_cfgs %}
+                        {% for dcfg in custom_cfgs %}
+                        <article style="margin:0.5rem 0;padding:0.6rem 0.85rem;
+                                        border:1px solid var(--pico-muted-border-color);
+                                        border-radius:var(--pico-border-radius);
+                                        {% if not dcfg.enabled %}opacity:0.65;{% endif %}">
+                            <header style="display:flex;justify-content:space-between;
+                                           align-items:center;gap:0.75rem;flex-wrap:wrap;
+                                           margin:0 0 0.35rem 0;">
+                                <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                                    <strong style="font-size:1.05em;">{{ dcfg.name }}</strong>
+                                    {% if dcfg.enabled %}
+                                    <small style="display:inline-block;padding:0.1rem 0.55rem;
+                                                  border-radius:999px;font-size:0.75em;
+                                                  background:var(--pico-ins-color);color:white;">
+                                        Active
+                                    </small>
+                                    {% else %}
+                                    <small style="display:inline-block;padding:0.1rem 0.55rem;
+                                                  border-radius:999px;font-size:0.75em;
+                                                  background:var(--pico-muted-color);color:white;">
+                                        Off
+                                    </small>
+                                    {% endif %}
+                                </div>
+                                <small style="color:var(--pico-muted-color);">
+                                    {{ _format_labels.get(dcfg.format.render_as, dcfg.format.render_as | replace('_', ' ')) }}
+                                    · sent {{ _cadence_labels.get(dcfg.schedule.cadence, dcfg.schedule.cadence) }}
+                                    at {{ dcfg.schedule.time_local or '08:10' }}
+                                </small>
+                            </header>
+                            {# Filter summary — operator-friendly phrasing
+                               (no "categories" / "tags" jargon). Empty
+                               values omit; the no-filter case reads
+                               "Includes every classified message". #}
+                            <div style="font-size:0.85em;color:var(--pico-muted-color);">
+                                {% set _bits = [] %}
+                                {% if dcfg.filter.categories %}
+                                    {% set _ = _bits.append("classification: " ~ (dcfg.filter.categories | join(", "))) %}
+                                {% endif %}
+                                {% if dcfg.filter.folders %}
+                                    {% set _ = _bits.append("folder: " ~ (dcfg.filter.folders | join(", "))) %}
+                                {% endif %}
+                                {% if dcfg.filter.tags %}
+                                    {% set _ = _bits.append("label: " ~ (dcfg.filter.tags | join(", "))) %}
+                                {% endif %}
+                                {% if dcfg.filter.from_addr %}
+                                    {% set _ = _bits.append("from " ~ dcfg.filter.from_addr) %}
+                                {% endif %}
+                                {% if dcfg.filter.advanced %}
+                                    {% set _ = _bits.append("custom search") %}
+                                {% endif %}
+                                {% if _bits %}
+                                    Includes {{ _bits | join(" · ") }}
+                                {% else %}
+                                    Includes every classified message
+                                {% endif %}
+                            </div>
+                            <div style="margin-top:0.5rem;display:flex;align-items:center;
+                                        gap:0.4rem;flex-wrap:wrap;">
+                                <a href="/accounts/{{ acct.id }}/digests/{{ dcfg.id }}/edit"
+                                   role="button"
+                                   class="outline"
+                                   style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;
+                                          text-decoration:none;display:inline-flex;align-items:center;">
+                                    Edit
+                                </a>
+                                {# ── Show matches: cheapest feedback path. Lists the
+                                   messages the digest WOULD include, no rendering, no
+                                   AI extraction. Sub-100ms. ETA hint surfaces in the
+                                   result for newsletter formats so the operator can
+                                   gauge how long Preview / Send would take. #}
+                                <button type="button"
+                                        hx-post="/accounts/{{ acct.id }}/digests/{{ dcfg.id }}/candidates"
+                                        hx-target="#digest-result-{{ dcfg.id }}"
+                                        hx-swap="innerHTML"
+                                        hx-indicator="#digest-cand-spinner-{{ dcfg.id }}"
+                                        class="outline"
+                                        style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                    Show matches
+                                </button>
+                                <small id="digest-cand-spinner-{{ dcfg.id }}"
+                                       class="htmx-indicator"
+                                       style="color:var(--pico-muted-color);">
+                                    checking…
+                                </small>
+                                {# ── Preview: render the email body but don't SMTP-send.
+                                   Same wall time + AI cost as a real send for
+                                   newsletter formats; near-instant for table /
+                                   grouped / plain_list. Result = sandboxed iframe so
+                                   the digest's CSS doesn't fight the editor page. #}
+                                <button type="button"
+                                        hx-post="/accounts/{{ acct.id }}/digests/{{ dcfg.id }}/preview"
+                                        hx-target="#digest-result-{{ dcfg.id }}"
+                                        hx-swap="innerHTML"
+                                        hx-indicator="#digest-prev-spinner-{{ dcfg.id }}"
+                                        class="outline"
+                                        style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                    Preview
+                                </button>
+                                <small id="digest-prev-spinner-{{ dcfg.id }}"
+                                       class="htmx-indicator"
+                                       style="color:var(--pico-muted-color);">
+                                    {% if dcfg.format.render_as in ('newsletter', 'newsletter_classic') %}
+                                        rendering… (newsletter formats summarize each source with AI — can take a minute)
+                                    {% else %}
+                                        rendering…
+                                    {% endif %}
+                                </small>
+                                <button type="button"
+                                        hx-post="/accounts/{{ acct.id }}/digests/{{ dcfg.id }}/test-send"
+                                        hx-target="#digest-result-{{ dcfg.id }}"
+                                        hx-swap="innerHTML"
+                                        hx-indicator="#test-send-spinner-{{ dcfg.id }}"
+                                        class="outline secondary"
+                                        style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;min-height:1.9rem;line-height:1.4;">
+                                    Send test now
+                                </button>
+                                <small id="test-send-spinner-{{ dcfg.id }}"
+                                       class="htmx-indicator"
+                                       style="color:var(--pico-muted-color);">
+                                    {% if dcfg.format.render_as in ('newsletter', 'newsletter_classic') %}
+                                        sending… (newsletter formats summarize each source with AI — can take a minute)
+                                    {% else %}
+                                        sending…
+                                    {% endif %}
+                                </small>
+                            </div>
+                            {# Single result container shared by all three buttons —
+                               only one runs at a time so the latest result simply
+                               replaces the previous one. Removes the split between
+                               per-button result spans that confused the layout. #}
+                            <div id="digest-result-{{ dcfg.id }}"
+                                 style="margin-top:0.5rem;font-size:0.85em;"></div>
+                        </article>
+                        {% endfor %}
+                        {% else %}
+                        <p style="margin:0 0 0.5rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+                            None yet. Add one below.
+                        </p>
+                        {% endif %}
+
+                        {# "+ Add custom digest" — sibling form (the main edit
+                           form is still open here, but the Add action only
+                           redirects, so we use a plain anchor that GETs the
+                           stub-creation route via a POST-substitute. Actually
+                           simpler: link straight to the "new" editor path,
+                           no DB write until the operator hits Save inside
+                           the editor. Keeps cancel / back behaviour clean. #}
+                        <p style="margin-top:0.5rem;">
+                            <a href="/accounts/{{ acct.id }}/digests/new/edit"
+                               role="button" class="outline"
+                               style="padding:0.3rem 0.7rem;font-size:0.9em;
+                                      text-decoration:none;">
+                                + Add custom digest
+                            </a>
+                        </p>
+                    </div>{# /et-card-body — Custom digests #}
+                </article>{# /et-card — Custom digests #}
+
+                </div>{# /et-cards #}
+                </div>{# /digests tab-pane #}
+            </form>
+
+            {# Watches tab retired by #154 — match-and-fire watches
+               moved to /profile/watches with a multi-account picker.
+               The accounts edit page no longer renders a Watches
+               pane; operators reach the editor from the My Settings
+               cluster's tab strip. #}
+
+            {# Save / Cancel pair was inside the form above + appeared
+               at the very bottom of the form's content. Visually it
+               landed BELOW provider/watch/digests tab-panes (correct)
+               but ABOVE integrations + delegates tab-panes that
+               follow (wrong — operator on integrations or delegates
+               saw the Save button at the TOP of their tab content
+               instead of the bottom). Moved out of the form via the
+               HTML5 ``form="<id>"`` attribute so the button can sit
+               AFTER every tab-pane closes; layout is consistent
+               across all 5 tabs. The form attribute on the submit
+               button keeps its submit semantics (still posts the
+               same /accounts/{id}/save action with the form's
+               serialised state). Cancel is an anchor, no form
+               attribute needed. #}
+
+            <div class="tab-pane{% if active == 'integrations' %} tab-pane-active{% endif %}" id="integrations-tab">
+            {# ── Integrations: each lives in its own sibling form so it
+               submits independently via HTMX without nesting (HTML
+               doesn't allow nested <form> tags). The chip render
+               functions emit the start/stop/edit buttons inside each
+               targeted div. ── #}
+
+            {% if not acct.hipaa and not hipaa_mode %}
+            <h4 id="integrations" style="margin:0 0 0.5rem 0;">Integrations</h4>
+            <div class="et-cards">
+
+            {% if acct.provider_type == 'gmail_api' %}
+            <article class="et-card et-card-stack">
+                <header class="et-card-header">
+                    <h3>Gmail Pub/Sub push{{ m.help("Gmail's users.watch API delivers new-message notifications to a Pub/Sub topic the install owns; this push subscription forwards the notification to /webhooks/gmail. The watch lasts up to 7 days and must be renewed; the install renews automatically every ~6 days. The chip below shows current state + last renewal. 'Stale' usually means the OAuth token expired -- re-auth the account and the next renewal cycle will recover.") }}</h3>
+                    <small class="et-card-desc">
+                        Real-time delivery via Google Cloud Pub/Sub.
+                    </small>
+                </header>
+                <div class="et-card-body">
+                    <div id="gmail-push-cell-{{ acct.id }}"
+                         style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                        {{ acct.gmail_push_chip | safe }}
+                    </div>
+                </div>
+            </article>
+            {% endif %}
+
+            {% if acct.provider_type == 'office365' %}
+            <article class="et-card et-card-stack">
+                <header class="et-card-header">
+                    <h3>Office 365 push{{ m.help("Subscribes email-triage to real-time delivery from Office 365 so new mail starts triaging within seconds instead of waiting for the next poll. Example: turn this on for your work Outlook account; messages get classified the moment they hit your inbox. The subscription lasts about three days and must be refreshed; if it expires, push turns off and polling takes over until you start it again.") }}</h3>
+                    <small class="et-card-desc">
+                        Real-time delivery via Microsoft Graph. New mail starts
+                        triaging within seconds. Use Stop Push if you want this
+                        account to fall back to scheduled polling only.
+                    </small>
+                </header>
+                <div class="et-card-body">
+                    {% set _o365_err = request.query_params.get('o365_err') if request else '' %}
+                    {% if _o365_err == 'public_url_unset' %}
+                    <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
+                        Push couldn't start: the install's public address isn't set yet,
+                        so Office 365 has nowhere to deliver notifications.
+                    </p>
+                    {% elif _o365_err == 'create_failed' %}
+                    <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
+                        Push couldn't start: Office 365 rejected the subscription
+                        request. Check that the account is authenticated and try again.
+                    </p>
+                    {% elif _o365_err == 'malformed_response' %}
+                    <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
+                        Push couldn't start: Office 365 didn't return the expected
+                        confirmation. Try Start Push again in a moment.
+                    </p>
+                    {% endif %}
+                    <div id="o365-push-cell-{{ acct.id }}"
+                         style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                        {{ acct.o365_push_chip | safe }}
+                    </div>
+                </div>
+            </article>
+            {% endif %}
+
+            {# #96 — OpenClaw chip + Pause / quiet-hours controls only
+               surface when at least one webhook target is configured
+               at the install level. With no destination, those
+               controls have nothing to gate — showing them implies a
+               working integration that does not exist. The disabled
+               hint card below replaces them; controls speak via their
+               disabled state, no admin-path copy. #}
+            <article class="et-card et-card-stack">
+                <header class="et-card-header">
+                    <h3>OpenClaw webhook{{ m.help("Outbound signed notifications to a downstream OpenClaw agent so it can react to triage outcomes. Pausing keeps triage running but holds back the outbound call. Quiet hours apply each day in your local time; messages classified during quiet hours wait until the next active window.") }}</h3>
+                    {% if has_webhooks %}
+                    <small class="et-card-desc">
+                        Outbound triage-completed notifications.
+                        Pause, set quiet hours, or turn off entirely below.
+                    </small>
+                    {% endif %}
+                </header>
+                <div class="et-card-body">
+                    {% if has_webhooks %}
+                    <div id="openclaw-cell-{{ acct.id }}"
+                         style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                        {{ acct.openclaw_chip | safe }}
+                    </div>
+                    {% else %}
+                    <article style="margin:0;padding:0.6rem 0.8rem;
+                                    background:var(--pico-card-background-color, transparent);
+                                    border-left:3px solid var(--pico-muted-border-color);">
+                        <small style="color:var(--pico-muted-color);">
+                            No outbound webhook is configured for this install,
+                            so there is nothing to pause, quiet, or switch off
+                            here yet. Once an install-wide webhook destination
+                            is configured, controls for this account will appear.
+                        </small>
+                    </article>
+                    <fieldset disabled style="margin:0.4rem 0 0 0;opacity:0.6;">
+                        <label style="display:inline-flex;align-items:center;gap:0.4rem;margin:0;">
+                            <input type="checkbox" disabled> On
+                        </label>
+                        <label style="display:inline-flex;align-items:center;gap:0.4rem;margin:0 0 0 0.6rem;">
+                            <input type="checkbox" disabled> Pause
+                        </label>
+                    </fieldset>
+                    {% endif %}
+                </div>
+            </article>
+
+            <article class="et-card et-card-stack">
+                <header class="et-card-header">
+                    <h3>Calendar{{ m.help("Pick which calendars this account engages with and what each one is used for. Hit Refresh to fetch the list, tick the ones you want, and assign roles per column. Example: turn Meetings on for your main work calendar so meeting-request conflicts get caught before you accept; leave a private journal calendar off everywhere so the assistant never mentions it.") }}</h3>
+                    <small class="et-card-desc">
+                        Hit Refresh calendars to pull the list, then tick the
+                        ones you want this account to read or write. Each role
+                        column has a tooltip with an example.
+                    </small>
+                </header>
+                <div class="et-card-body">
+                    <div id="calendar-cell-{{ acct.id }}"
+                         style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                        {{ acct.calendar_chip | safe }}
+                    </div>
+                    <span id="calendar-auth-panel-{{ acct.id }}"></span>
+                    {{ acct.calendar_surrogate_picker | safe }}
+                    {% if acct.provider_type in ('gmail_api', 'office365', 'imap') %}
+                    <div style="margin-top:0.6rem;">
+                        <button type="button"
+                                hx-post="/accounts/{{ acct.id }}/calendars/discover"
+                                hx-target="#calendars-table-{{ acct.id }}"
+                                hx-swap="innerHTML"
+                                hx-indicator="#calendars-discover-spinner-{{ acct.id }}"
+                                class="outline"
+                                style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;
+                                       min-height:1.9rem;line-height:1.4;">
+                            Refresh calendars
+                        </button>
+                        <small id="calendars-discover-spinner-{{ acct.id }}"
+                               class="htmx-indicator"
+                               style="margin-left:0.4rem;color:var(--pico-muted-color);">
+                            loading…
+                        </small>
+                    </div>
+                    <div id="calendars-table-{{ acct.id }}" style="margin-top:0.5rem;">
+                        {# Render the saved selection on initial load when present.
+                           Empty / never-discovered: prompt to Refresh. The table
+                           renderer is server-side; HTMX swaps it on Refresh. #}
+                        {% set _stored_cals = (acct.config or {}).get('calendars') or [] %}
+                        {% if _stored_cals %}
+                            {{ acct.calendars_table | safe }}
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">
+                                No calendars selected yet. Hit Refresh calendars to
+                                see what's available
+                                {% if acct.provider_type == 'imap' %}
+                                on the account you picked above.
+                                {% else %}
+                                on this account.
+                                {% endif %}
+                            </small>
+                        {% endif %}
+                    </div>
+
+                    {# ── Self-Schedule explainer ────────────────────────
+                       The Self-Schedule role column already carries a
+                       per-cell tooltip explaining what the radio does;
+                       this section-level paragraph gives the operator
+                       the concrete "what happens when you turn this
+                       on" example without needing to hover. End-user
+                       audience — plain language, no admin paths, no
+                       protocol jargon. #}
+                    <p style="margin-top:0.5rem;font-size:0.85em;color:var(--pico-muted-color);">
+                        <strong>About Self-Schedule:</strong>
+                        When you email yourself with event details — like
+                        "Coffee Tuesday 3pm at Test Cafe" — email-triage
+                        adds it to the calendar you picked above. Example:
+                        send to your own address with subject "Dentist
+                        Friday 2pm", and a Friday 2pm event lands on your
+                        calendar without you opening the calendar app.
+                        Pick at most one calendar to keep these notes-to-self
+                        in.{{ m.help("Only fires when the From address matches your account's primary or alias address. HIPAA-flagged accounts do not use this path. Events that can't be parsed for a date or time are logged but not added — pick a different subject or include a clearer time in the body and re-send.") }}
+                    </p>
+                    {% endif %}
+                </div>
+            </article>
+
+            </div>{# /et-cards (non-HIPAA integrations) #}
+
+            {# ── 2026-05-11 RELOCATION ────────────────────────────────
+               The "AI learns from your past replies" toggle + its
+               per-contact sub-toggle used to live here. They now sit
+               inline on /profile/style-data (per-account row) so the
+               toggle is right next to the data it governs — operators
+               kept asking why a flip here didn't show up on the
+               style-data page until a refresh. Same helpers
+               (is_rag_sent_index_enabled / set_rag_sent_index_enabled),
+               same HIPAA gate, new location.
+               ──────────────────────────────────────────────────────#}
+            {% endif %}
+
+            {# ── #152 Phase 2 — M-1+M-2 HIPAA opt-in ──────────────────
+               AUDIENCE: end-user (account owner). The opt-in is only
+               meaningful for HIPAA-flagged accounts — for non-HIPAA
+               accounts the M-1+M-2 layer is always on; this section
+               renders only when ``acct.hipaa`` is true (i.e. sibling
+               to the not-hipaa Integrations block above, not nested
+               inside it). Same Integrations tab so the operator sees
+               one place for "what AI features apply to this account".
+               COPY RULES: end-user audience, no protocol jargon. "AI"
+               not "LLM". Explain the §164.502(a) reasoning in plain
+               English ("your own typing").
+               ──────────────────────────────────────────────────────#}
+            {% if acct.hipaa %}
+            <h4 id="integrations" style="margin:0 0 0.5rem 0;">Integrations</h4>
+            <div class="et-cards">
+                <article class="et-card et-card-stack">
+                    <header class="et-card-header">
+                        <h3>Your writing-style preferences on this HIPAA account{{ m.help("Lets the AI use the preferences you set on the Profile / Writing tab (tone, length, greeting, signature, free-text notes) when drafting replies on this HIPAA-flagged account. Example: when on, a reply to a patient still uses your 'casual' tone and 'Thanks,\\nDr. Smith' sign-off; when off, the AI drops every personal preference and writes in a neutral default voice. This setting does NOT let the AI read past replies — only your typed-in preferences travel with the draft. Off by default — tick to opt in.") }}</h3>
+                        <small class="et-card-desc">
+                            Off by default. When on, the AI uses your own typed-in
+                            style preferences (tone, length, greeting, signature,
+                            notes) on this account's drafts. Your preferences are
+                            not patient data — they're your own typing, so this
+                            is safe to enable when you want consistent voice
+                            across HIPAA and non-HIPAA mail.
+                        </small>
+                    </header>
+                    <div class="et-card-body">
+                        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                            <input type="checkbox"
+                                   name="style_knobs_hipaa_allow"
+                                   value="1"
+                                   {% if acct.style_knobs_hipaa_allow %}checked{% endif %}
+                                   style="margin:0;">
+                            <span>Allow my writing-style preferences on this account</span>
+                        </label>
+                        <p style="margin:0.4rem 0 0 0;font-size:0.85em;color:var(--pico-muted-color);">
+                            Other AI style-learning features (reading your past
+                            replies, building an automatic profile from your sent
+                            mail) stay off on HIPAA accounts regardless of this
+                            setting.
+                        </p>
+                    </div>
+                </article>
+            </div>{# /et-cards (HIPAA integrations) #}
+            {% endif %}
+
+            {# ── #169 Wave 2-α I6 — Per-account AI backend selector ──
+               AUDIENCE: end-user (account owner) + admin / delegate
+               viewing this account's edit page. End-user audience
+               applies: NO admin-path links, NO "ask your administrator"
+               copy. If the dropdown is empty (no backends added on
+               this install yet), the message is plain "Using the
+               default AI backend."
+               COPY RULES: "AI backend" (end-user term) not "LLM
+               adapter". Plain BAA chip — "Vendor agreement in force
+               until X". Days-until-expiry shown as natural-language
+               ("renew soon" not "RFC 3339 expiry").
+               ──────────────────────────────────────────────────────#}
+            {% if ai_backend_options is defined %}
+            <h4 style="margin:1rem 0 0.5rem 0;">Style learning</h4>
+            <div class="et-cards">
+                <article class="et-card et-card-stack">
+                    <header class="et-card-header">
+                        <h3>AI backend{{ m.help("Which AI service email-triage uses to draft replies and learn your writing style on this account. The install default (local Ollama) keeps your mail on-premises. Pick a different backend only if the admin has added one with a vendor agreement that covers your account.") }}</h3>
+                        <small class="et-card-desc">
+                            Where the AI work for this account runs.
+                            Most accounts should leave this on the
+                            install default.
+                        </small>
+                    </header>
+                    <div class="et-card-body">
+                        {% if ai_backend_options %}
+                        <label style="margin:0;">
+                            Backend
+                            <select name="style_learning_backend_id">
+                                <option value="" {% if not acct.style_learning_backend_id %}selected{% endif %}>
+                                    Install default (local)
+                                </option>
+                                {% for opt in ai_backend_options %}
+                                <option value="{{ opt.id }}"
+                                        {% if acct.style_learning_backend_id == opt.id %}selected{% endif %}>
+                                    {{ opt.name }} ({{ opt.type }})
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                        {% set _sel = ai_backend_selected_chip %}
+                        {% if _sel %}
+                        <p style="margin:0.5rem 0 0 0;font-size:0.85em;color:var(--pico-muted-color);">
+                            {{ _sel }}
+                        </p>
+                        {% endif %}
+                        {% if acct.hipaa or hipaa_mode %}
+                        <p style="margin:0.4rem 0 0 0;font-size:0.85em;color:var(--pico-muted-color);">
+                            Only backends with a vendor agreement on
+                            file appear here because this account is
+                            HIPAA-flagged.
+                        </p>
+                        {% endif %}
+                        {% else %}
+                        <p style="margin:0;color:var(--pico-muted-color);">
+                            Using the default AI backend.
+                        </p>
+                        {% endif %}
+                    </div>
+                </article>
+            </div>
+            {% endif %}
+
+            </div>{# /integrations tab-pane #}
+
+            {# Delegates section — owner + admin see the full manage UI;
+               delegates see the read-only list above without the add
+               form. #}
+            <div class="tab-pane{% if active == 'delegates' %} tab-pane-active{% endif %}">
+            <div class="et-cards">
+                <article id="delegates" class="et-card et-card-stack">
+                    <header class="et-card-header">
+                        <h3>Delegates{{ m.help("Other users authorised to view + manage this account on the owner's behalf. Delegates get the same UI but the owner remains the audit-log actor on shared rows. Useful for executive-assistant or shared-mailbox patterns. Owner + admin can add/remove; delegates see the list read-only.") }}</h3>
+                        <small class="et-card-desc">
+                            People other than the owner who can view and manage
+                            this account.
+                        </small>
+                    </header>
+                    <div class="et-card-body">
+                        {% include "accounts/_delegates.html" %}
+                    </div>
+                </article>
+            </div>{# /et-cards #}
+            </div>{# /delegates tab-pane #}
+
+            {# Save / Cancel — out of the form, attached via
+               form="..." attribute so it submits the main edit form
+               regardless of where it lives in the DOM. Sits after
+               every tab-pane so its visual position is "bottom of
+               the page" on every tab — provider/watch/digests
+               (where Save persists their fields), integrations
+               (where saves are HTMX-driven per-card; Save still
+               persists any unsaved provider/watch/digests state),
+               delegates (same — delegates have their own inline
+               add/remove forms; Save persists the main form). #}
+            <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+                <button type="submit"
+                        form="acct-edit-form-{{ acct.id }}"
+                        style="margin:0;">
+                    Save
+                </button>
+                <a href="/accounts" role="button"
+                   class="secondary outline"
+                   style="margin:0;text-decoration:none;line-height:2;">
+                    Cancel
+                </a>
+            </div>
+{% if _embed %}
+        </article>
+    </td>
+</tr>
+{% endif %}

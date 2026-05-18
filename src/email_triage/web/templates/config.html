@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Not end users.
+   TECH-SKILL:  medium-to-high — five-tab admin landing covering
+                runtime / classifier / email + integrations OAuth +
+                Pub/Sub + Graph + webhook + TLS + backup +
+                compliance + dev keypairs.
+   COPY RULES:  per-tab partial declares its own AUDIENCE header.
+                See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}System Config - Email Triage{% endblock %}
+{% block content %}
+<div class="page-hero" style="
+    height:90px;margin:-0.5rem 0 1.25rem;border-radius:8px;
+    background:url('/static/hero-config.png') center/cover no-repeat;
+    position:relative;overflow:hidden;
+">
+    <div style="
+        position:absolute;inset:0;
+        background:linear-gradient(90deg, var(--pico-background-color) 50%, rgba(0,0,0,0) 100%);
+    "></div>
+    <h2 style="position:relative;margin:0;padding:1.25rem 1.5rem;">System Configuration</h2>
+</div>
+<p>Manage runtime and system settings. Changes take effect immediately. <small style="color:var(--pico-muted-color);">Admin only.</small></p>
+
+{# #171-D — BAA-expiry banner moved to base.html (auto-injected ctx
+   in ``_shared._render`` for admin users). Renders above the page
+   hero on EVERY admin page, not just /config. #}
+
+{# Tab strip — five tabs collapse the legacy /config + /admin/integrations
+   + /admin/tls + /admin/backup + /admin/dev-keys + /admin/compliance-security
+   pages. Legacy URLs 303-redirect to the matching tab. #}
+{% include "admin/_config_tabs.html" %}
+
+{# Per-tab body. The active variable is set by the route handler in
+   admin.py — defaults to "general" when ?tab= is missing / unknown. #}
+{% if active == "integrations" %}
+    {% include "admin/config_tabs/integrations.html" %}
+{% elif active == "ai_backends" %}
+    {% include "admin/config_tabs/ai_backends.html" %}
+{% elif active == "tls" %}
+    {% include "admin/config_tabs/tls.html" %}
+{% elif active == "backup" %}
+    {% include "admin/config_tabs/backup.html" %}
+{% elif active == "security" %}
+    {% include "admin/config_tabs/security.html" %}
+{% else %}
+    {% include "admin/config_tabs/general.html" %}
+{% endif %}
+
+{% endblock %}

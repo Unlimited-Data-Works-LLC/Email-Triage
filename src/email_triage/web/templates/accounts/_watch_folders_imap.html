@@ -1,0 +1,58 @@
+{# IMAP per-folder watch picker — rendered inside the Watch + Push tab
+   when ``acct.provider_type == 'imap'``. Lives outside the IMAP
+   connection fieldset (host/port/user/pass) because folder selection
+   is a watch / ingestion concern, not a connection concern, and the
+   operator review feedback was that the legacy placement on
+   Provider + Auth crossed those wires.
+
+   IMAP IDLE is per-mailbox, per-connection — watching N folders
+   means N concurrent IDLE connections. When ``folder_options`` is
+   populated (live discovery succeeded for an existing account), we
+   render a checkbox list so operators can pick Spam + Sent +
+   custom folders in one click. When discovery fails or the account
+   is new and not yet authenticated, we fall back to a comma-
+   separated text input so the form is never stuck behind an IMAP
+   probe. INBOX is always a safe default. The save handler reads
+   either ``mailboxes`` (multi-checkbox) or ``mailboxes_csv``
+   regardless of which tab the field came from — both ride the
+   same form submit. #}
+<fieldset style="margin-top:0.75rem;">
+    <legend>Watch these folders</legend>
+    <small style="color:var(--pico-muted-color);display:block;margin-bottom:0.4rem;">
+        One IDLE connection per folder. Most IMAP servers cap per-user
+        connections — keep this list short.
+    </small>
+
+    {% set selected_mailboxes = (acct.config.get('mailboxes') if acct is defined else None) or (['INBOX'] if acct is not defined else []) %}
+    {% if acct is defined and not selected_mailboxes and acct.config.get('mailbox') %}
+        {% set selected_mailboxes = [acct.config.get('mailbox')] %}
+    {% endif %}
+
+    {% if folder_options %}
+    <div style="display:flex;flex-direction:column;gap:0.2rem;max-height:12rem;overflow-y:auto;
+                padding:0.5rem;border:1px solid var(--pico-muted-border-color);border-radius:var(--pico-border-radius);">
+        {% for folder in folder_options %}
+        <label style="display:inline-flex;align-items:center;gap:0.4rem;margin:0;font-weight:normal;">
+            <input type="checkbox" name="mailboxes" value="{{ folder }}"
+                   {% if folder in selected_mailboxes or (folder == 'INBOX' and not selected_mailboxes) %}checked{% endif %}
+                   style="margin:0;">
+            <code>{{ folder }}</code>
+        </label>
+        {% endfor %}
+    </div>
+    {% else %}
+    {# Fallback: comma-separated text entry when folder discovery is
+       unavailable. The save handler parses this via ``mailboxes_csv``
+       in _extract_provider_config. #}
+    <label>
+        <input type="text" name="mailboxes_csv"
+               value="{{ selected_mailboxes | join(', ') if selected_mailboxes else 'INBOX' }}"
+               placeholder="INBOX, Spam, Sent">
+        <small>
+            Comma-separated folder names. Save the account and re-open
+            this form after authenticating to get a folder-discovery
+            checkbox list.
+        </small>
+    </label>
+    {% endif %}
+</fieldset>

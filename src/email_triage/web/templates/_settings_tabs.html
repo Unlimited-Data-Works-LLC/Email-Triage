@@ -1,0 +1,69 @@
+{# Shared tab-strip nav for the My Settings cluster.
+
+   Pass active="X" where X is one of:
+   notifications | meeting | hardware-keys | accounts | api-keys |
+   style-data | watches | labels | rules
+
+   Sibling pages collected here under the unified "My Settings"
+   top-nav slot. Top-nav has My Settings as a single link to /profile;
+   this strip handles cross-page navigation. Pattern matches
+   accounts/_edit_tabs.html and _rules_tabs.html (single top-nav entry,
+   tab strip on the cluster's pages).
+
+   Personal Categories used to live in this cluster (under Profile)
+   but moved to the Rules cluster — discoverability is rule-shaped,
+   not settings-shaped (it's about "what categories does my mail get
+   sorted into" alongside Categories, Discover Categories, etc.).
+
+   #158 (2026-05-11) — Labels + Rules moved into this cluster.
+   Both surface user-owned configuration of the operator's own
+   triage path (label catalog + per-list classification hints);
+   top-nav reserves quick-access slots for mail-touching surfaces
+   (Triage / Routes / Dashboard) and shouldn't carry config tabs.
+   The Rules cluster's own tab strip (_rules_tabs.html — My Rules /
+   Global Rules / Discover / Categories / Personal Categories)
+   continues to render INSIDE the /rules page; the My Settings tab
+   strip is the outer cluster nav that lands you on /rules.
+
+   Active tab gets bold styling. No JS; no ARIA tablist.
+#}
+<nav style="margin:0 0 1.5rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
+    <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
+        {# Tab order revised 2026-05-10: Accounts first (most-visited
+           settings surface for end users); Hardware Keys + API Keys
+           last (security-credential surfaces accessed less often).
+           #158 (2026-05-11): Labels + Rules inserted between
+           Notifications and Writing — they're triage-shape config
+           that operators touch alongside notification preferences
+           when tuning their inbox, not credential / hardware config. #}
+        {# Watches lives between Accounts and Notifications per #154:
+           an end-user "watch a specific kind of mail and ping me"
+           surface, used more often than Notifications-level config. #}
+        {% set _tabs = [
+            ("accounts",       "/accounts",                  "Accounts"),
+            ("watches",        "/profile/watches",           "Watches"),
+            ("notifications",  "/profile?tab=notifications", "Notifications"),
+            ("labels",         "/labels",                    "Labels"),
+            ("rules",          "/rules",                     "Rules"),
+            ("writing",        "/profile?tab=writing",       "Writing"),
+            ("style-data",     "/profile/style-data",        "Style data"),
+            ("meeting",        "/profile?tab=meeting",       "Meeting prefs"),
+            ("hardware-keys",  "/profile/hardware-keys",     "Hardware keys"),
+            ("api-keys",       "/accounts/api-keys",         "API Keys"),
+        ] %}
+        {% for slug, href, label in _tabs %}
+        {% set is_active = (active == slug) %}
+        <li style="margin:0;">
+            <a href="{{ href }}"
+               style="display:inline-block;padding:0.5rem 1rem;
+                      text-decoration:none;
+                      border:1px solid transparent;
+                      border-bottom:none;
+                      border-radius:6px 6px 0 0;
+                      {% if is_active %}background:var(--pico-card-background-color, #1f2530);border-color:var(--pico-muted-border-color);color:var(--pico-color);font-weight:600;margin-bottom:-1px;{% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+</nav>

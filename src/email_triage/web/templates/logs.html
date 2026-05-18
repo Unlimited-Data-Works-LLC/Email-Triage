@@ -1,0 +1,388 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}System Logs - Email Triage{% endblock %}
+{% block content %}
+{# ─── AUDIENCE ───────────────────────────────────────────────────
+   AUDIENCE: admin (system operator). Medium tech-skill.
+
+   COPY RULES (per feedback_audience_per_page rule, 2026-05-07):
+   * No protocol jargon ("RFC", "OData") in user-visible text.
+   * Pill keys (account_id, request_id, message_id) are kept as
+     code identifiers — admins read them; not user-facing copy.
+   * No "Ask your administrator" — the operator IS the
+     administrator on this page.
+   * "Explain" buttons next to error rows (#121-A) call the AI
+     backend for a plain-English explanation. The macro-emitted
+     tooltip carries a concrete example; the button label is
+     descriptive text, never just an icon.
+─────────────────────────────────────────────────────────────── #}
+<h2>System Logs</h2>
+<p>Recent log entries from the email triage system. <small style="color:var(--pico-muted-color);">Admin only.</small></p>
+
+{# Priority keys for inline pills (#10.3). Order matters: first match wins
+   and we cap rendering at 3 pills per row. ``account_id`` is handled
+   specially below because #11 resolves it to a linked name chip.
+
+   #118 broadening: request_id (cross-row trace), account_name (rendered
+   only when account_id is not present so we don't double-pill the chip),
+   message_id (correlates skip-rows to upstream cause). All checked
+   against triage_logging._PHI_KEYS so no PHI key is promoted into the
+   always-rendered set under HIPAA mode — the keys here are
+   IDs / counters, never message content. #}
+{% set priority_keys = priority_keys or [
+    'request_id', 'account_id', 'account_name',
+    'error', 'message_id', 'run_id', 'elapsed_secs',
+] %}
+
+<style>
+/* Sticky header (#10.6) — keeps column labels in view on long log pages. */
+.logs-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--pico-card-background-color);
+    z-index: 2;
+}
+
+/* Row-density pass (#10.4). */
+.logs-table td,
+.logs-table th {
+    padding-top: 0.25rem;
+    padding-bottom: 0.25rem;
+    vertical-align: top;
+}
+
+/* Inline priority pills (#10.3). */
+.log-pill {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.05rem 0.35rem;
+    margin-left: 0.25rem;
+    border-radius: 3px;
+    background: var(--pico-code-background-color);
+    color: var(--pico-muted-color);
+    white-space: nowrap;
+    vertical-align: baseline;
+}
+.log-pill-error {
+    background: var(--pico-del-color);
+    color: white;
+}
+.log-pill-key {
+    opacity: 0.7;
+    margin-right: 0.15rem;
+}
+
+/* Level-coloured filter buttons (#10.5). */
+.logs-filter-btn { padding: 0.25rem 0.75rem; font-size: 0.85rem; }
+.logs-filter-btn.level-ERROR.outline { --pico-color: var(--pico-del-color); --pico-border-color: var(--pico-del-color); color: var(--pico-del-color); }
+.logs-filter-btn.level-ERROR.contrast { background: var(--pico-del-color); border-color: var(--pico-del-color); color: white; }
+.logs-filter-btn.level-WARNING.outline { --pico-color: var(--pico-color-amber-500); --pico-border-color: var(--pico-color-amber-500); color: var(--pico-color-amber-500); }
+.logs-filter-btn.level-WARNING.contrast { background: var(--pico-color-amber-500); border-color: var(--pico-color-amber-500); color: white; }
+.logs-filter-btn.level-DEBUG.outline { --pico-color: var(--pico-muted-color); --pico-border-color: var(--pico-muted-color); color: var(--pico-muted-color); }
+
+/* Narrow viewport — stack time/level on one line, logger/message on
+   the next, so message column doesn't get crushed (#10.4). */
+@media (max-width: 640px) {
+    .logs-table thead { display: none; }
+    .logs-table tr.log-row { display: block; padding: 0.35rem 0; border-bottom: 1px solid var(--pico-muted-border-color); }
+    .logs-table tr.log-row td { display: inline-block; padding: 0.1rem 0.35rem; border: none; }
+    .logs-table tr.log-row td.log-col-message { display: block; padding: 0.15rem 0.35rem; }
+}
+
+/* 2026-05-10 — Details column removed entirely; the <details> block
+   is now rendered inline at the end of the Message cell so it's
+   reachable at every viewport width without horizontal scroll.
+   Wrapper still allows overflow on narrow screens for the remaining
+   four columns; nothing important hides off-right anymore. */
+.logs-table-wrap {
+    overflow-x: auto;
+}
+
+/* 2026-05-12 — explain-chip CSS hardening, third pass. Prior
+   ``max-width: 100%`` inline style on the chip beat this stylesheet
+   rule (inline > stylesheet specificity), letting the chip spread to
+   whatever width the parent table cell auto-sized to. Inline now
+   carries ``min(70ch, calc(100vw - 8rem))`` directly so the chip is
+   viewport-bound regardless of cell width. This rule is the backstop
+   for any rehydrated v3 entry that loses its inline style during
+   localStorage round-trip. Use ``!important`` so inline can't sneak
+   past this floor — if the body content needs more width, the parent
+   <td> will scroll horizontally via .logs-table-wrap rather than the
+   chip running off-screen. */
+.explain-chip {
+    display: block !important;
+    max-width: min(70ch, calc(100vw - 8rem)) !important;
+    box-sizing: border-box !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+    white-space: normal !important;
+}
+</style>
+
+<div style="display:flex;gap:0.75rem;align-items:center;margin-bottom:1rem;flex-wrap:wrap;">
+    <a href="/logs{% if query %}?q={{ query|urlencode }}{% endif %}" role="button"
+       class="logs-filter-btn {% if not level_filter %}contrast{% else %}outline{% endif %}">All</a>
+    {% for lv in ['ERROR', 'WARNING', 'INFO', 'DEBUG'] %}
+    <a href="/logs?level={{ lv }}{% if query %}&q={{ query|urlencode }}{% endif %}" role="button"
+       class="logs-filter-btn level-{{ lv }} {% if level_filter == lv %}contrast{% else %}outline{% endif %}">{{ lv }}</a>
+    {% endfor %}
+    {# Free-text search: matches message + logger + extras (JSON).
+       Useful for correlating on flow_id, account_name, uid, sender,
+       or any other text the caller threaded into log extras. #}
+    <form method="get" action="/logs"
+          style="display:flex;gap:0.35rem;align-items:center;margin:0;">
+        {% if level_filter %}
+        <input type="hidden" name="level" value="{{ level_filter }}">
+        {% endif %}
+        <input type="search" name="q" value="{{ query }}"
+               placeholder="search flow_id, sender, message…"
+               style="width:22ch;padding:0.25rem 0.5rem;font-size:0.85rem;margin:0;"
+               aria-label="Search log entries">
+        <button type="submit" class="outline"
+                style="padding:0.25rem 0.6rem;font-size:0.85rem;margin:0;">
+            Search
+        </button>
+        {% if query %}
+        <a href="/logs{% if level_filter %}?level={{ level_filter }}{% endif %}"
+           style="font-size:0.85rem;color:var(--pico-muted-color);">clear</a>
+        {% endif %}
+    </form>
+    <span style="flex:1;"></span>
+    <label style="display:flex;align-items:center;gap:0.35rem;font-size:0.85rem;cursor:pointer;margin:0;">
+        <input type="checkbox" id="logs-expand-all" style="margin:0;">
+        Expand all
+    </label>
+    <small style="color:var(--pico-muted-color);">
+        {{ entries|length }} entries{% if query %} matching “{{ query }}”{% endif %}
+    </small>
+</div>
+
+{% if entries %}
+<div class="logs-table-wrap" style="overflow-x:auto;">
+    <table class="logs-table" style="font-size:0.8rem;">
+        <thead>
+            <tr>
+                <th style="min-width:10rem;">Time</th>
+                <th style="width:5rem;">Level</th>
+                <th style="min-width:10rem;">Logger</th>
+                <th>Message</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for e in (rows if rows is defined and rows else entries) %}
+            {% if e._kind == 'boundary' %}
+            {# HIPAA boundary divider — marks the moment the flag flipped.
+               Rows above may reflect a different PHI posture than rows below. #}
+            <tr style="background:var(--pico-code-background-color);">
+                <td colspan="4" style="text-align:center;font-size:0.85rem;color:var(--pico-muted-color);padding:0.4rem;">
+                    ─── {% if e.direction == 'on' %}🔒{% else %}🔓{% endif %}
+                    HIPAA {{ e.direction }}
+                    for <code>{{ e.scope }}</code>
+                    at <span class="local-datetime" data-utc="{{ e.ts }}">{{ e.ts[:19] }}</span>
+                    {% if e.actor_email %}by {{ e.actor_email }}{% elif e.reason %}({{ e.reason }}){% endif %}
+                    ───
+                </td>
+            </tr>
+            {% else %}
+            <tr class="log-row log-level-{{ e.level }}" style="{% if e.level == 'ERROR' %}color:var(--pico-del-color);{% elif e.level == 'WARNING' %}color:var(--pico-color-amber-500);{% endif %}">
+                <td class="log-col-time" style="white-space:nowrap;">
+                    <span class="local-datetime" data-utc="{{ e.ts }}">{{ e.ts[:19] }}</span>
+                </td>
+                <td class="log-col-level">
+                    {% if e.level == 'ERROR' %}<mark style="background:var(--pico-del-color);color:white;padding:0.1rem 0.3rem;border-radius:3px;font-size:0.75rem;">{{ e.level }}</mark>
+                    {% elif e.level == 'WARNING' %}<mark style="background:var(--pico-color-amber-500);color:white;padding:0.1rem 0.3rem;border-radius:3px;font-size:0.75rem;">{{ e.level }}</mark>
+                    {% else %}<small>{{ e.level }}</small>{% endif %}
+                </td>
+                <td class="log-col-logger"><code style="font-size:0.75rem;">{{ e.logger | replace('email_triage.', '') }}</code></td>
+                <td class="log-col-message" colspan="1">
+                    {{ e.message }}
+                    {# Inline priority pills (#10.3) — pull 1-3 most useful
+                       fields out of the extras so triage doesn't require
+                       expanding the details row. Cap at 3. #}
+                    {% if e.extra %}
+                        {% set ns = namespace(count=0) %}
+                        {% for k in priority_keys %}
+                            {% if ns.count < 3 and k in e.extra %}
+                                {% set v = e.extra[k] %}
+                                {% if k == 'account_id' and accounts_by_id is defined and accounts_by_id.get(v) %}
+                                    <a href="/accounts" class="log-pill" style="text-decoration:none;"><span class="log-pill-key">account</span>{{ accounts_by_id[v].name }} (#{{ v }})</a>
+                                    {% set ns.count = ns.count + 1 %}
+                                {% elif k == 'account_name' and 'account_id' in e.extra %}
+                                    {# account_id chip already covers
+                                       this — don't double-pill. No
+                                       count bump so another priority
+                                       key gets the slot instead. #}
+                                {% elif k == 'error' %}
+                                    <span class="log-pill log-pill-error"><span class="log-pill-key">error</span>{{ v }}</span>
+                                    {% set ns.count = ns.count + 1 %}
+                                {% else %}
+                                    <span class="log-pill"><span class="log-pill-key">{{ k }}</span>{{ v }}</span>
+                                    {% set ns.count = ns.count + 1 %}
+                                {% endif %}
+                            {% endif %}
+                        {% endfor %}
+                    {% endif %}
+                    {# #121-A — "Explain" button on ERROR rows (inline,
+                       inside Message cell post-3e362d8 layout). Posts
+                       error text + provider + account_id context to
+                       /explain-error; HTMX swaps a sibling chip in
+                       below the row. Label is descriptive per the
+                       standing rule — never just an icon. #}
+                    {% if e.level == 'ERROR' %}
+                        {% set _err_text = (e.extra.error if e.extra and 'error' in e.extra else '') or e.message or '' %}
+                        {% set _err_class = (e.extra.error_class if e.extra and 'error_class' in e.extra else '') %}
+                        {% set _provider = (e.extra.provider_type if e.extra and 'provider_type' in e.extra else '') %}
+                        {% set _aid = (e.extra.account_id if e.extra and 'account_id' in e.extra else '') %}
+                        <button type="button"
+                                hx-post="/explain-error"
+                                hx-target="#explain-result-{{ loop.index }}"
+                                hx-swap="innerHTML"
+                                hx-indicator="#explain-spinner-{{ loop.index }}"
+                                hx-vals='{"error_text": "{{ _err_text|e|replace("\"", "\\\"")|replace("\n", " ") }}", "error_class": "{{ _err_class|e }}", "provider": "{{ _provider|e }}", "account_id": "{{ _aid }}"}'
+                                class="outline explain-btn"
+                                style="padding:0.05rem 0.45rem;font-size:0.7rem;
+                                       margin-left:0.35rem;line-height:1.4;
+                                       min-height:0;color:var(--pico-color);
+                                       border-color:var(--pico-muted-border-color);">
+                            Explain this error
+                        </button>
+                        <small id="explain-spinner-{{ loop.index }}"
+                               class="htmx-indicator"
+                               style="color:var(--pico-muted-color);
+                                      font-size:0.75rem;margin-left:0.25rem;">
+                            asking AI…
+                        </small>
+                        {{ m.help("Asks the AI what this error means in plain English and what to try next. Example: an AADSTS65001 row becomes 'Admin consent is required for this app. Ask the Microsoft 365 admin to grant consent in Azure Portal, or use a tenant-scoped account.' Saves a Google round-trip for codes the static AADSTS translator doesn't cover.") }}
+                        <div id="explain-result-{{ loop.index }}"
+                             class="explain-result"
+                             data-row-key="{{ e.ts }}-{{ loop.index }}"
+                             style="display:block;"></div>
+                    {% endif %}
+                    {# Details affordance moved inline 2026-05-10 (was a
+                       separate <td class="log-col-details"> column;
+                       got pushed off-screen at common viewport widths).
+                       Inline below the Explain button means the
+                       <details>/<pre> block is reachable at any width
+                       + auto-opens on ERROR + WARNING. #}
+                    {% if e.extra and e.extra != {} %}
+                    <details class="log-row-extras"{% if e.level in ('ERROR', 'WARNING') %} open{% endif %} style="margin:0.4rem 0 0 0;">
+                        <summary style="font-size:0.75rem;cursor:pointer;color:var(--pico-muted-color);">Details</summary>
+                        <pre style="font-size:0.7rem;white-space:pre-wrap;margin:0.25rem 0 0 0;">{% for k, v in e.extra.items() %}{% if k == 'account_id' and accounts_by_id is defined and accounts_by_id.get(v) %}{{ k }}=<a href="/accounts" style="text-decoration:none;"><span style="background:var(--pico-code-background-color);padding:0.05rem 0.3rem;border-radius:3px;">{{ accounts_by_id[v].name }} (#{{ v }})</span></a>
+{% elif k == 'account_name' %}{# rendered inline with account_id chip — suppress duplicate #}{% else %}{{ k }}={{ v }}
+{% endif %}{% endfor %}</pre>
+                    </details>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endif %}
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if entries|length >= 200 %}
+<p style="text-align:center;margin-top:1rem;">
+    <a href="/logs?offset={{ offset + 200 }}{% if level_filter %}&level={{ level_filter }}{% endif %}{% if query %}&q={{ query|urlencode }}{% endif %}">
+        Load older entries &rarr;
+    </a>
+</p>
+{% endif %}
+
+{% else %}
+<p style="color:var(--pico-muted-color);">No log entries found{% if level_filter %} for level {{ level_filter }}{% endif %}.</p>
+{% endif %}
+
+<script>
+document.querySelectorAll('.local-datetime').forEach(function(el) {
+    var utc = el.getAttribute('data-utc');
+    if (!utc) return;
+    try {
+        // isoformat() with UTC tz gives "+00:00" suffix, not "Z".
+        // Only append Z if there's no timezone info at all.
+        var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
+        var d = new Date(hastz ? utc : utc + 'Z');
+        el.textContent = d.toLocaleString(undefined, {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit', second: '2-digit'
+        });
+        el.title = utc;
+    } catch(e) {}
+});
+
+// Expand-all toggle (#10.1) — persist to localStorage so the admin's
+// preferred density sticks across page loads.
+(function() {
+    var box = document.getElementById('logs-expand-all');
+    if (!box) return;
+    var KEY = 'logs.expandAll';
+    function apply(state) {
+        document.querySelectorAll('details.log-row-extras').forEach(function(d) {
+            d.open = state;
+        });
+    }
+    try {
+        if (localStorage.getItem(KEY) === '1') {
+            box.checked = true;
+            apply(true);
+        }
+    } catch (e) {}
+    box.addEventListener('change', function() {
+        apply(box.checked);
+        try { localStorage.setItem(KEY, box.checked ? '1' : '0'); } catch (e) {}
+    });
+})();
+
+// #121-A — Persist "Explain this error" results across reloads.
+// Operators scan multiple rows quickly; if they re-open /logs they
+// shouldn't have to re-ask the AI for the same row's explanation.
+// Key = row_key data attr (ts + loop index); value = chip HTML.
+// Capped at 30 entries so localStorage doesn't grow unbounded.
+(function() {
+    // v3 — second cache bust 2026-05-12. v2 entries carry the
+    // ``max-width: 100%`` inline style that lets the chip spread to
+    // whatever cell width the row took. Bumping to v3 forces fresh
+    // server responses (which now carry viewport-relative max-width)
+    // on every Explain click. v1/v2 purged on load.
+    var CACHE_KEY = 'logs.explainChips.v3';
+    try { localStorage.removeItem('logs.explainChips.v1'); } catch (e) {}
+    try { localStorage.removeItem('logs.explainChips.v2'); } catch (e) {}
+    var MAX_ENTRIES = 30;
+    function loadCache() {
+        try {
+            return JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+        } catch (e) { return {}; }
+    }
+    function saveCache(c) {
+        try {
+            // Cap entries — keep last 30 by insertion order.
+            var keys = Object.keys(c);
+            if (keys.length > MAX_ENTRIES) {
+                var drop = keys.slice(0, keys.length - MAX_ENTRIES);
+                drop.forEach(function(k) { delete c[k]; });
+            }
+            localStorage.setItem(CACHE_KEY, JSON.stringify(c));
+        } catch (e) {}
+    }
+    // Rehydrate on initial render.
+    var cache = loadCache();
+    document.querySelectorAll('.explain-result').forEach(function(div) {
+        var key = div.getAttribute('data-row-key');
+        if (key && cache[key]) {
+            div.innerHTML = cache[key];
+        }
+    });
+    // Save AFTER an HTMX swap into an explain-result container.
+    document.body.addEventListener('htmx:afterSwap', function(evt) {
+        var tgt = evt.target;
+        if (!tgt || !tgt.classList.contains('explain-result')) return;
+        var key = tgt.getAttribute('data-row-key');
+        if (!key) return;
+        var c = loadCache();
+        c[key] = tgt.innerHTML;
+        saveCache(c);
+    });
+})();
+</script>
+{% endblock %}
+</content>
+</invoke>

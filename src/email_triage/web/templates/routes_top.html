@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+     - No protocol jargon.
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Routes - Email Triage{% endblock %}
+{% block content %}
+
+{% if not manageable_accounts %}
+{# Empty state: no accounts yet. Plain-language nudge per the
+   no-admin-path rule — point the operator at the Accounts page,
+   not at any /admin path. #}
+<h2>Routes</h2>
+<article style="padding:1rem 1.25rem;">
+    <strong>No mailboxes yet</strong>
+    <p style="margin:0.5rem 0 0 0;">
+        Route rules tell the system what to do with each kind of
+        email after the AI sorts it (move to a folder, label,
+        notify you, draft a reply). You'll see the routes table
+        here once you've added at least one mailbox.
+    </p>
+    <p style="margin:0.5rem 0 0 0;">
+        <a href="/accounts" role="button" class="outline">
+            Go to your mailboxes
+        </a>
+    </p>
+</article>
+{% else %}
+
+<h2>Routes</h2>
+<p>
+    Pick the mailbox whose routes you want to edit. Switching here
+    updates the table below without reloading the page.
+</p>
+
+{# Account picker. The dropdown's hx-get fires on every change and
+   swaps just the body region — the picker shell stays put. The
+   dropdown's value is included in the request via hx-include. #}
+<form id="routes-account-picker"
+      style="margin-bottom:1rem;display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;">
+    <label style="margin:0;display:flex;align-items:center;gap:0.5rem;">
+        <span style="font-weight:600;">Mailbox:</span>
+        <select name="account_id"
+                id="routes-account-select"
+                hx-get="/routes"
+                hx-include="[name='account_id']"
+                hx-target="#routes-table-region"
+                hx-swap="innerHTML"
+                hx-trigger="change"
+                style="margin:0;min-width:18rem;">
+            {% for opt in manageable_accounts %}
+            <option value="{{ opt.id }}"
+                    {% if opt.id == acct.id %}selected{% endif %}>
+                {{ opt.name }} (id {{ opt.id }})
+            </option>
+            {% endfor %}
+        </select>
+        {{ m.help("Pick which mailbox's routes you want to edit. Switching here updates the table below without reloading. Example: switch to your work account to change where invoices go.") }}
+    </label>
+    <small id="routes-account-meta" style="color:var(--pico-muted-color);">
+        {{ acct.email_address or '(no address yet)' }} &middot;
+        {{ acct.provider_type }}
+    </small>
+</form>
+
+<div id="routes-table-region">
+    {% include "accounts/_routes_body.html" %}
+</div>
+
+{% endif %}{# /manageable_accounts guard #}
+{% endblock %}

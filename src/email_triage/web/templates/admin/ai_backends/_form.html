@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}
+    {% if mode == "create" %}Add{% else %}Edit{% endif %} AI Backend
+    — Email Triage
+{% endblock %}
+{% block content %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Adds or edits one AI
+                backend row.
+   TECH-SKILL:  medium-to-high — admin-only page; technical
+                vocabulary (endpoint URL, model id, API key) is
+                fine here.
+   COPY RULES:  plain-English labels with concrete examples in
+                tooltips. "Vendor agreement on file" not "BAA".
+                Never echo the API key plaintext back on the page
+                — the form is write-only for that field.
+   ─────────────────────────────────────────────────────────── #}
+
+<h2 style="margin:0 0 0.5rem 0;">
+    {% if mode == "create" %}
+    Add AI backend
+    {% else %}
+    Edit AI backend: {{ row.name }}
+    {% endif %}
+</h2>
+
+<p style="margin:0 0 1rem 0;">
+    <a href="/config/ai-backends">&larr; Back to AI Backends</a>
+</p>
+
+{% if form_error %}
+<p style="padding:0.5rem 0.75rem;margin:0 0 1rem 0;
+          border-left:3px solid var(--pico-del-color);
+          background:var(--pico-card-background-color);">
+    <strong>Could not save:</strong> {{ form_error }}
+</p>
+{% endif %}
+
+{% if mode == "edit" and in_use_count %}
+<p style="padding:0.5rem 0.75rem;margin:0 0 1rem 0;
+          border-left:3px solid var(--pico-mark-color, orange);
+          background:var(--pico-card-background-color);">
+    <strong>In use:</strong> {{ in_use_count }} account{{ "" if in_use_count == 1 else "s" }}
+    currently route style-learning through this backend. Disabling or
+    deleting it will revert affected accounts to the install default.
+</p>
+{% endif %}
+
+<form method="post"
+      action="{% if mode == 'create' %}/config/ai-backends{% else %}/config/ai-backends/{{ row.id }}{% endif %}">
+    {{ csrf_input(request) }}
+
+    <label>
+        Name{{ m.help("Short label shown in the per-account dropdown. Example: 'Azure OpenAI (GPT-4o)' or 'Local Ollama'. Must be unique on this install.") }}
+        <input type="text" name="name" required maxlength="120"
+               value="{{ row.name }}"
+               placeholder="e.g. Azure OpenAI (GPT-4o)">
+    </label>
+
+    <label>
+        Type{{ m.help("Which vendor protocol email-triage uses to talk to the endpoint. 'ollama' = local-only OllamaRecognise (no key needed). 'azure_openai' = Azure-hosted OpenAI under your BAA. 'openai' = api.openai.com or a compatible proxy. 'gemini' = Google generativelanguage API.") }}
+        <select name="type">
+            {% for t in allowed_types %}
+            <option value="{{ t }}" {% if row.type == t %}selected{% endif %}>
+                {{ t }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+
+    <label>
+        Endpoint URL{{ m.help("Base URL the adapter posts to. Examples — Ollama: http://localhost:11434 . Azure OpenAI: https://your-resource.openai.azure.com/ . OpenAI: https://api.openai.com/v1 . Gemini: https://generativelanguage.googleapis.com/v1beta") }}
+        <input type="text" name="endpoint" required maxlength="500"
+               value="{{ row.endpoint }}"
+               placeholder="https://...">
+    </label>
+
+    <label>
+        Model{{ m.help("Specific model identifier. Examples — Ollama: '[local-llm-model] or 'llama3.1:8b' . Azure OpenAI: the deployment name you set in Azure portal (NOT the OpenAI model name). OpenAI: 'gpt-4o-mini' or 'gpt-4o'. Gemini: 'gemini-2.0-flash'. Leave empty to use the adapter's default.") }}
+        <input type="text" name="model" maxlength="120"
+               value="{{ row.model or '' }}"
+               placeholder="e.g. [local-llm-model]
+    </label>
+
+    {# ── API key section ─────────────────────────────────────────
+       Never round-trip the plaintext. Show "set" / "not set" + an
+       opt-in checkbox to replace OR clear. The plaintext input is
+       only POSTed when the operator unchecks "leave key unchanged"
+       — server handler honours the intent. #}
+    {% if row.type == "ollama" %}
+    <fieldset style="margin:1rem 0;padding:0.6rem 0.8rem;
+                     background:var(--pico-card-background-color);
+                     border:1px solid var(--pico-muted-border-color);">
+        <legend style="font-weight:600;padding:0 0.3rem;">API key</legend>
+        <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+            Ollama is local-only and does not need an API key.
+        </p>
+    </fieldset>
+    {% else %}
+    <fieldset style="margin:1rem 0;padding:0.6rem 0.8rem;
+                     background:var(--pico-card-background-color);
+                     border:1px solid var(--pico-muted-border-color);">
+        <legend style="font-weight:600;padding:0 0.3rem;">API key</legend>
+        {% if mode == "edit" and row.api_key_secret_ref %}
+        <p style="margin:0 0 0.5rem 0;color:var(--pico-ins-color);">
+            <strong>Key is set.</strong>
+            The plaintext is encrypted in the secrets store and never
+            shown on this page.
+        </p>
+        <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0;">
+            <input type="checkbox" name="replace_key" value="1"
+                   style="margin:0;">
+            <span>Replace key (enter new value below)</span>
+        </label>
+        <br>
+        <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0.3rem 0 0 0;">
+            <input type="checkbox" name="clear_key" value="1"
+                   style="margin:0;">
+            <span style="color:var(--pico-del-color);">
+                Clear key (account will fail to call this backend
+                until a new key is set)
+            </span>
+        </label>
+        <label style="margin:0.5rem 0 0 0;">
+            New key{{ m.help("Pasted plaintext. The server stores it encrypted in the secrets store under a backend-id-keyed name; the value is never displayed back on this page. To rotate a key: tick 'Replace key', paste the new value, hit Save.") }}
+            <input type="password" name="api_key_plain"
+                   autocomplete="off" maxlength="500"
+                   placeholder="sk-... or your Azure key">
+        </label>
+        {% else %}
+        <p style="margin:0 0 0.5rem 0;color:var(--pico-muted-color);">
+            No key set yet.
+            {% if mode == "create" %}
+            Paste the vendor's key below. The server encrypts it and
+            stores it in the secrets store; it will never be shown
+            back on this page.
+            {% endif %}
+        </p>
+        <label style="margin:0;">
+            API key{{ m.help("Pasted plaintext. The server stores it encrypted in the secrets store under a backend-id-keyed name; the value is never displayed back on this page.") }}
+            <input type="password" name="api_key_plain"
+                   autocomplete="off" maxlength="500"
+                   placeholder="sk-... or your Azure key">
+        </label>
+        {% endif %}
+    </fieldset>
+    {% endif %}
+
+    {# ── Vendor agreement section ──────────────────────────────── #}
+    <fieldset style="margin:1rem 0;padding:0.6rem 0.8rem;
+                     background:var(--pico-card-background-color);
+                     border:1px solid var(--pico-muted-border-color);">
+        <legend style="font-weight:600;padding:0 0.3rem;">Vendor agreement</legend>
+        <p style="margin:0 0 0.6rem 0;color:var(--pico-muted-color);font-size:0.9em;">
+            Tick when you have a Business Associate Agreement (BAA)
+            or equivalent contract on file with this vendor. Required
+            for HIPAA-flagged accounts to be allowed to select this
+            backend.
+        </p>
+        <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:0;">
+            <input type="checkbox" name="baa_certified" value="1"
+                   {% if row.baa_certified %}checked{% endif %}
+                   style="margin:0;">
+            <span>Vendor agreement on file</span>
+        </label>
+        <label style="margin:0.5rem 0 0 0;">
+            Expires{{ m.help("When the agreement expires. Required when 'Vendor agreement on file' is checked. The system warns 30 days before expiry, then auto-disables this backend for HIPAA accounts on the expiry date (they fall back to the install default; non-HIPAA accounts can continue using it).") }}
+            <input type="date" name="baa_expires_at"
+                   value="{{ row.baa_expires_at or '' }}">
+        </label>
+    </fieldset>
+
+    {# ── Enabled toggle ────────────────────────────────────────── #}
+    <label style="display:inline-flex;align-items:center;gap:0.5rem;margin:1rem 0;">
+        <input type="checkbox" name="enabled" value="1"
+               {% if row.enabled %}checked{% endif %}
+               style="margin:0;">
+        <span>
+            <strong>Enabled</strong> &mdash; disabled backends do not
+            appear in the per-account dropdown. Disable instead of
+            deleting if you want to temporarily route accounts off
+            this vendor (budget cut, outage) without losing the
+            configuration.
+        </span>
+    </label>
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit" class="contrast" style="margin:0;">
+            {% if mode == "create" %}Add backend{% else %}Save changes{% endif %}
+        </button>
+        <a href="/config/ai-backends" role="button"
+           class="secondary outline"
+           style="margin:0;text-decoration:none;line-height:2;">
+            Cancel
+        </a>
+    </div>
+</form>
+{% endblock %}

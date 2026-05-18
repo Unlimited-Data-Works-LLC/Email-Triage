@@ -1,0 +1,40 @@
+{# Digest generation result — returned by POST /accounts/{id}/digest/generate #}
+
+{% if error %}
+<article style="background:var(--pico-del-color);color:white;padding:0.75rem 1rem;">
+    <strong>Error:</strong> {{ error }}
+</article>
+{% elif no_messages %}
+<article style="padding:0.75rem 1rem;">
+    <strong>No messages found.</strong> No messages matching the criteria were found
+    in the source folder. Make sure emails have been triaged and moved to the
+    target folder first.
+</article>
+{% else %}
+<article style="padding:0.75rem 1rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">
+        <div>
+            <strong>Digest generated</strong> &mdash;
+            {{ article_count }} article{{ "s" if article_count != 1 else "" }}
+            from {{ source_count }} source{{ "s" if source_count != 1 else "" }}
+            ({{ message_count }} email{{ "s" if message_count != 1 else "" }} processed)
+        </div>
+        {% if draft_created %}
+        <small style="color:var(--pico-ins-color);">
+            {% if draft_folder == "Inbox" %}Delivered to Inbox{% else %}Draft created in {{ draft_folder }}{% endif %}
+        </small>
+        {% endif %}
+        {% if deleted_originals %}
+        <small style="color:var(--pico-muted-color);">Original messages archived</small>
+        {% endif %}
+    </div>
+</article>
+
+<details open>
+    <summary><strong>Preview</strong></summary>
+    <div style="border:1px solid var(--pico-muted-border-color);border-radius:4px;
+                padding:1rem;margin-top:0.5rem;background:white;color:#334155;">
+        {{ digest_html | safe }}
+    </div>
+</details>
+{% endif %}

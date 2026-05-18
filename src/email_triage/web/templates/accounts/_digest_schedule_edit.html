@@ -1,0 +1,157 @@
+{# Inline edit form swapped into a single schedule row.
+   Submits to /digest/edit/{idx} (POST), which persists then renders
+   _digest_schedules.html so the whole table refreshes. Cancel button
+   does an hx-get back to the read-only row partial. #}
+<tr id="sched-row-{{ idx }}">
+    <td colspan="6" style="background:var(--pico-card-background-color);padding:0.6rem 0.8rem;">
+        <form hx-post="/accounts/{{ acct.id }}/digest/edit/{{ idx }}"
+              hx-target="#digest-schedules"
+              hx-swap="innerHTML"
+              style="margin:0;">
+            <input type="hidden" name="tz_offset" class="tz-offset-input" value="0">
+
+            <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:end;margin-bottom:0.5rem;">
+                <label style="margin:0;">
+                    <small>Time (local)</small>
+                    <input type="time" class="local-time-input"
+                           name="schedule_time" data-utc="{{ sched.time_utc }}"
+                           required
+                           style="padding:0.2rem 0.4rem;font-size:0.85rem;width:auto;min-width:6.5rem;">
+                </label>
+                <label style="margin:0;">
+                    <small>Category</small>
+                    <select name="category" style="padding:0.2rem 0.4rem;font-size:0.85rem;width:auto;">
+                        {% for slug, _desc in categories.items() %}
+                        <option value="{{ slug }}" {% if slug == sched.category %}selected{% endif %}>{{ slug }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label style="margin:0;">
+                    <small>Source folder</small>
+                    <input type="text" name="source_folder"
+                           value="{{ sched.get('source_folder', '') }}"
+                           placeholder="(route-inferred)"
+                           style="font-size:0.85rem;padding:0.2rem 0.4rem;">
+                </label>
+                <label style="margin:0;">
+                    <small>Search filter</small>
+                    <select name="search_filter" style="font-size:0.85rem;padding:0.2rem 0.4rem;width:auto;">
+                        {% set _sf = sched.get('search_filter', 'today') %}
+                        <option value="today" {% if _sf == 'today' %}selected{% endif %}>Today</option>
+                        <option value="unread_today" {% if _sf == 'unread_today' %}selected{% endif %}>Unread today</option>
+                        <option value="unread_week" {% if _sf == 'unread_week' %}selected{% endif %}>Unread last 7d</option>
+                    </select>
+                </label>
+                <label style="margin:0;">
+                    <small>Limit</small>
+                    <input type="number" name="limit"
+                           value="{{ sched.get('limit', 25) }}" min="1" max="500"
+                           style="font-size:0.85rem;padding:0.2rem 0.4rem;width:5rem;">
+                </label>
+            </div>
+
+            {# #72 — cadence + days-of-week selector. JS toggles
+               the days row when cadence == 'weekly'. #}
+            {% set _cadence = sched.get('cadence', 'daily') %}
+            {% set _days = sched.get('days_of_week') or [] %}
+            <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:end;margin-bottom:0.5rem;">
+                <label style="margin:0;">
+                    <small>Cadence</small>
+                    <select name="cadence" class="cadence-select"
+                            data-target="cadence-days-{{ idx }}"
+                            style="font-size:0.85rem;padding:0.2rem 0.4rem;width:auto;">
+                        <option value="daily" {% if _cadence == 'daily' %}selected{% endif %}>Daily</option>
+                        <option value="weekly" {% if _cadence == 'weekly' %}selected{% endif %}>Weekly</option>
+                    </select>
+                </label>
+                <div id="cadence-days-{{ idx }}"
+                     style="display:{{ 'flex' if _cadence == 'weekly' else 'none' }};gap:0.25rem;align-items:center;flex-wrap:wrap;">
+                    <small style="margin-right:0.25rem;">Days:</small>
+                    {% for d, label in [(0,'Mon'),(1,'Tue'),(2,'Wed'),(3,'Thu'),(4,'Fri'),(5,'Sat'),(6,'Sun')] %}
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.2rem;font-size:0.85rem;">
+                        <input type="checkbox" name="day_{{ d }}" value="1"
+                               {% if d in _days %}checked{% endif %}
+                               style="margin:0;">
+                        {{ label }}
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:end;margin-bottom:0.5rem;">
+                <label style="margin:0;">
+                    <small>Deliver to</small>
+                    {% set _rm = sched.get('recipient_mode', 'back_to_account') %}
+                    <select name="recipient_mode" style="font-size:0.85rem;padding:0.2rem 0.4rem;width:auto;">
+                        <option value="back_to_account" {% if _rm == 'back_to_account' %}selected{% endif %}>Back to this account</option>
+                        <option value="user_email" {% if _rm == 'user_email' %}selected{% endif %}>Profile email</option>
+                        <option value="other" {% if _rm == 'other' %}selected{% endif %}>Other…</option>
+                    </select>
+                </label>
+                <label style="margin:0;">
+                    <small>Other address</small>
+                    <input type="email" name="recipient_custom"
+                           value="{{ sched.get('recipient_custom', '') }}"
+                           placeholder="name@example.com"
+                           style="font-size:0.85rem;padding:0.2rem 0.4rem;">
+                </label>
+                <label style="margin:0;align-self:center;font-size:0.85rem;">
+                    <input type="checkbox" name="delete_originals" value="1"
+                           {% if sched.get('delete_originals') %}checked{% endif %}>
+                    Delete originals after digest
+                </label>
+            </div>
+
+            <details style="margin-bottom:0.5rem;">
+                <summary style="font-size:0.85rem;cursor:pointer;">Format prompt + HTML template</summary>
+                <label style="margin-top:0.4rem;display:block;">
+                    <small>Format prompt</small>
+                    <textarea name="format_prompt" rows="3"
+                              style="font-size:0.8rem;font-family:monospace;">{{ sched.get('format_prompt', '') }}</textarea>
+                </label>
+                <label style="margin-top:0.3rem;display:block;">
+                    <small>HTML template (blank = default)</small>
+                    <textarea name="html_template" rows="4"
+                              style="font-size:0.75rem;font-family:monospace;">{{ sched.get('html_template', '') }}</textarea>
+                </label>
+            </details>
+
+            <div style="display:flex;gap:0.4rem;">
+                <button type="submit" style="padding:0.2rem 0.7rem;margin:0;font-size:0.85rem;">Save</button>
+                <button type="button" class="outline secondary"
+                        style="padding:0.2rem 0.7rem;margin:0;font-size:0.85rem;"
+                        hx-get="/accounts/{{ acct.id }}/digest/schedules"
+                        hx-target="#digest-schedules"
+                        hx-swap="innerHTML">
+                    Cancel
+                </button>
+            </div>
+        </form>
+    </td>
+</tr>
+
+<script>
+(function() {
+    var tzOffset = new Date().getTimezoneOffset();
+    document.querySelectorAll('#sched-row-{{ idx }} .local-time-input').forEach(function(el) {
+        var utc = el.getAttribute('data-utc');
+        if (!utc) return;
+        var p = utc.split(':');
+        var d = new Date();
+        d.setUTCHours(parseInt(p[0], 10), parseInt(p[1], 10), 0, 0);
+        var lh = String(d.getHours()).padStart(2, '0');
+        var lm = String(d.getMinutes()).padStart(2, '0');
+        el.value = lh + ':' + lm;
+    });
+    document.querySelectorAll('#sched-row-{{ idx }} .tz-offset-input').forEach(function(el) {
+        el.value = String(tzOffset);
+    });
+    // #72 — show/hide days-of-week checkboxes when cadence flips.
+    document.querySelectorAll('#sched-row-{{ idx }} .cadence-select').forEach(function(sel) {
+        sel.addEventListener('change', function() {
+            var target = document.getElementById(sel.getAttribute('data-target'));
+            if (target) target.style.display = (sel.value === 'weekly') ? 'flex' : 'none';
+        });
+    });
+})();
+</script>

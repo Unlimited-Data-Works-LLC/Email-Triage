@@ -1,0 +1,663 @@
+{% extends "base.html" %}
+{% block title %}Digest editor — Email Triage{% endblock %}
+{% block content %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional. Think exec, doctor,
+                lawyer, researcher. Comfortable with email + dashboards;
+                no terminal, no protocol RFCs, no provider internals.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths,
+       systemd unit names). See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon: avoid "RFC 2919", "RFC 3501", "ISO 8601",
+       "OData", "$filter", "AND-combined", "substring match".
+       Spell out the same idea in plain English with an example.
+     - Say "AI" not "language model" / "LLM" / "language-model step".
+     - Tooltips lead with an example, not an abstract definition.
+     - Provider-native query advanced section is the ONE place
+       where syntax labels are unavoidable — keep them, but make
+       them feel like a how-to, not a spec citation.
+   ─────────────────────────────────────────────────────────── #}
+
+{% set is_new = (not dcfg.id) %}
+{% set save_action = "/accounts/" ~ acct.id ~ "/digests/" ~ (dcfg.id or "new") ~ "/save" %}
+
+<h2>{% if is_new %}New digest{% else %}Editing: {{ dcfg.name or "Digest" }}{% endif %}</h2>
+<p>
+    <a href="/accounts/{{ acct.id }}/edit?tab=digests" role="button"
+       class="outline secondary"
+       style="padding:0.25rem 0.6rem;font-size:0.85em;">
+        ← Back to Digests
+    </a>
+</p>
+
+{% if errors %}
+<article style="border-left:3px solid var(--pico-del-color);
+                padding:0.4rem 0.8rem;margin:0 0 0.75rem 0;">
+    <strong>Validation errors</strong>
+    <ul style="margin:0.3rem 0 0 1.2rem;">
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+<form method="POST" action="{{ save_action }}">
+    {{ csrf_input(request) }}
+
+    <fieldset>
+        <legend>Identity + schedule</legend>
+
+        <label>
+            Name{{ m.help("A short label for this digest, shown on the Digests tab and in the email subject line. Example: 'AI Newsletters' or 'Boss VIP — daily.' Operator-only; recipients see the email subject the renderer builds, not this name.") }}
+            <input type="text" name="name" value="{{ dcfg.name }}"
+                   {% if is_preset %}readonly{% endif %}
+                   placeholder="e.g. AI Newsletters" required>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+            <input type="checkbox" name="enabled" value="1" style="margin:0;"
+                   {% if dcfg.enabled %}checked{% endif %}>
+            <span>Enabled</span>
+            {{ m.help("Off pauses the digest without deleting it. Use this when you're tuning a digest and don't want test runs while you iterate, or when you're going on vacation and want to skip a week's sends. Example: turn off your daily Newsletters digest on travel days, leave it on otherwise.") }}
+        </label>
+
+        <div class="grid">
+            <label>
+                Send time{{ m.help("Local clock time when the digest fires, in 24-hour HH:MM. The digest collects everything in its window up to this moment and sends it. Example: 08:10 means the digest lands in your inbox at 8:10 AM in the server's timezone — typically just after the morning's IMAP polls finish, so the daily summary is fresh.") }}
+                <input type="time" name="time_local"
+                       value="{{ dcfg.schedule.time_local or '08:10' }}"
+                       required>
+            </label>
+            <label>
+                Cadence{{ m.help("How often the digest fires. 'Daily' fires every day at the send time. 'Weekly' fires only on the days you check below. 'Monthly' fires on the 1st of each month. Example: pick 'Weekly' + Mon/Wed/Fri for a thrice-weekly summary, or 'Daily' for a morning roll-up.") }}
+                <select name="cadence" {% if is_preset %}disabled{% endif %}>
+                    {% for c in enums.cadences %}
+                    <option value="{{ c }}"
+                            {% if dcfg.schedule.cadence == c %}selected{% endif %}>
+                        {{ c | capitalize }}
+                    </option>
+                    {% endfor %}
+                </select>
+                {% if is_preset %}
+                <input type="hidden" name="cadence"
+                       value="{{ dcfg.schedule.cadence }}">
+                {% endif %}
+            </label>
+        </div>
+
+        {# Days-of-week chips for weekly cadence. JS-free —
+           checkbox group, server reads the list on save. #}
+        <fieldset style="margin:0.5rem 0;">
+            <legend><small>Days of week{{ m.help("Limits weekly digests to specific days. Ignored for daily / monthly cadences. Example: pick Mon/Tue/Wed/Thu/Fri to skip weekend digests, or just Sun for a once-weekly Sunday roll-up.") }}</small></legend>
+            {% set _wanted = dcfg.schedule.days_of_week or [] %}
+            {% for idx, lbl in [(0,'Mon'),(1,'Tue'),(2,'Wed'),(3,'Thu'),(4,'Fri'),(5,'Sat'),(6,'Sun')] %}
+            <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.4rem 0 0;">
+                <input type="checkbox" name="days_of_week" value="{{ idx }}"
+                       {% if idx in _wanted %}checked{% endif %}
+                       style="margin:0;">
+                <span>{{ lbl }}</span>
+            </label>
+            {% endfor %}
+        </fieldset>
+    </fieldset>
+
+    {% if not is_preset %}
+    <fieldset>
+        <legend>Window</legend>
+        <label>
+            Cover{{ m.help("Which messages get included, by time. 'Last 24h' is the rolling window most operators want for a daily digest. 'Since last sent' picks up only what's new since the previous send — a good fit for catch-up digests where you don't want yesterday's items repeated. 'This week' / 'This month' are calendar-aligned. 'Custom' lets you pin specific start + end timestamps. Example: a Monday-morning weekly digest pairs naturally with 'Last 7 days'.") }}
+            <select name="window_kind">
+                {% for k in enums.window_kinds %}
+                <option value="{{ k }}"
+                        {% if dcfg.window.kind == k %}selected{% endif %}>
+                    {{ k | replace('_', ' ') }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <div class="grid">
+            <label>
+                Custom start{{ m.help("Date and time the window OPENS. Used only when 'Cover' above is set to Custom. Format: year-month-day, then a 'T', then hour:minute:second, then your time-zone offset. Example: '2026-05-01T00:00:00+00:00' for messages received from May 1st onward (UTC).") }}
+                <input type="text" name="window_custom_start"
+                       value="{{ dcfg.window.custom_start_iso }}"
+                       placeholder="2026-05-01T00:00:00+00:00">
+            </label>
+            <label>
+                Custom end{{ m.help("Date and time the window CLOSES. Used only when 'Cover' above is set to Custom. Same format as Custom start. Leave empty to keep the window open until the digest fires. Example: '2026-05-15T23:59:59+00:00' for a fixed two-week window paired with a May-1 start.") }}
+                <input type="text" name="window_custom_end"
+                       value="{{ dcfg.window.custom_end_iso }}"
+                       placeholder="2026-05-15T00:00:00+00:00">
+            </label>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Filter — structured</legend>
+
+        <label>
+            Read state{{ m.help("Limit the digest to read or unread messages. 'Any' includes both. Example: pick 'Unread' for a wake-up summary of pending mail; pick 'Read' for a 'what got triaged yesterday' weekly recap.") }}
+            <select name="read_state">
+                {% for s in enums.read_states %}
+                <option value="{{ s }}"
+                        {% if dcfg.filter.read_state == s %}selected{% endif %}>
+                    {{ s | capitalize }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+
+        <fieldset style="margin:0.5rem 0;">
+            <legend><small>Folders{{ m.help("Restrict the digest to specific source folders. Leave empty to include the account's default mailbox only. Example: pick 'Newsletters' + 'Receipts' for a digest that ignores everything else, or check '*' below for every folder.") }}</small></legend>
+            {% set _selected_folders = dcfg.filter.folders or [] %}
+            {% if folder_options %}
+            <div style="max-height:10rem;overflow-y:auto;
+                        padding:0.4rem;border:1px solid var(--pico-muted-border-color);
+                        border-radius:var(--pico-border-radius);">
+                {% for f in folder_options %}
+                <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.5rem 0 0;font-weight:normal;">
+                    <input type="checkbox" name="folders" value="{{ f }}"
+                           {% if f in _selected_folders %}checked{% endif %}
+                           style="margin:0;">
+                    <code>{{ f }}</code>
+                </label>
+                {% endfor %}
+            </div>
+            <small>Or use ALL folders: type <code>*</code> in the override below.</small>
+            {% endif %}
+            <label>
+                Override (comma-separated; * = ALL folders)
+                <input type="text" name="folders_csv"
+                       value="{% if not folder_options %}{{ _selected_folders | join(', ') }}{% endif %}"
+                       placeholder="INBOX, Newsletters, *">
+            </label>
+        </fieldset>
+
+        <fieldset style="margin:0.5rem 0;">
+            <legend><small>Classifications{{ m.help("Limit the digest to specific classifier categories. Multi-select — picks AND together. Example: check 'newsletters' for a daily-newsletters digest; check '*' to include anything that got classified; check 'UNCLASSIFIED' to include the catch-all for messages the classifier couldn't bucket.") }}</small></legend>
+            {% set _selected_cats = dcfg.filter.categories or [] %}
+            <div style="max-height:10rem;overflow-y:auto;
+                        padding:0.4rem;border:1px solid var(--pico-muted-border-color);
+                        border-radius:var(--pico-border-radius);">
+                {% for c in categories %}
+                <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.5rem 0 0;font-weight:normal;">
+                    <input type="checkbox" name="categories" value="{{ c.slug }}"
+                           {% if c.slug in _selected_cats %}checked{% endif %}
+                           style="margin:0;">
+                    {{ c.slug }}
+                </label>
+                {% endfor %}
+                <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.5rem 0 0;font-weight:normal;">
+                    <input type="checkbox" name="categories" value="UNCLASSIFIED"
+                           {% if "UNCLASSIFIED" in _selected_cats %}checked{% endif %}
+                           style="margin:0;">
+                    <em>UNCLASSIFIED</em>
+                </label>
+                <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.5rem 0 0;font-weight:normal;">
+                    <input type="checkbox" name="categories" value="*"
+                           {% if "*" in _selected_cats %}checked{% endif %}
+                           style="margin:0;">
+                    <em>* (any classified)</em>
+                </label>
+            </div>
+        </fieldset>
+
+        <label>
+            Labels{{ m.help("Limit by Gmail labels or IMAP keywords. Comma-separated; multiple values AND together (a message must carry ALL of them to be included). Example: '$EmailTriaged' to digest only messages the triage pipeline has already touched; '$Important, $Followup' for important items still on your radar.") }}
+            <input type="text" name="tags_csv"
+                   value="{{ dcfg.filter.tags | join(', ') }}"
+                   placeholder="$EmailTriaged, $Important">
+        </label>
+
+        <div class="grid">
+            <label>
+                From{{ m.help("Limit to messages from a specific sender. Substring match — type the full address or just '@domain' for any sender at that domain. Example: 'newsletter@stratechery.com' for one author; '@stratechery.com' for the whole domain.") }}
+                <input type="text" name="from_addr"
+                       value="{{ dcfg.filter.from_addr }}"
+                       placeholder="boss@example.com or @example.com">
+            </label>
+            <label>
+                Subject contains{{ m.help("Words that appear anywhere in the subject line. Not case-sensitive. Example: 'invoice' to catch every receipt + bill, or 'urgent' to surface time-sensitive items.") }}
+                <input type="text" name="subject"
+                       value="{{ dcfg.filter.subject }}">
+            </label>
+        </div>
+
+        <div class="grid">
+            <label>
+                List-Id{{ m.help("Match a mailing-list identifier — every mailing list stamps one onto its messages, so this catches an entire list without depending on sender (authors rotate). You can find the value in any one message from the list (the mail client labels it 'List-Id'). Example: 'announcements.example.com' for a vendor's newsletter list.") }}
+                <input type="text" name="list_id"
+                       value="{{ dcfg.filter.list_id }}"
+                       placeholder="newsletter.example.com">
+            </label>
+            <label>
+                Has attachment{{ m.help("Limit by whether the message carries any attachments. 'Any' includes both. Example: pick 'Yes' for a digest of receipts / PDFs / contracts; 'No' to ignore noisy attachment-heavy newsletters in a daily digest.") }}
+                {% set _ha = dcfg.filter.has_attachment %}
+                <select name="has_attachment">
+                    <option value="" {% if _ha is none %}selected{% endif %}>any</option>
+                    <option value="yes" {% if _ha is sameas true %}selected{% endif %}>yes</option>
+                    <option value="no" {% if _ha is sameas false %}selected{% endif %}>no</option>
+                </select>
+            </label>
+        </div>
+
+        <fieldset style="margin:0.5rem 0;">
+            <legend><small>Triage actions{{ m.help("Limit to messages where specific triage actions fired. Pick more than one and a message must have ALL of them to be included. Example: pick 'moved' + 'labeled' for a digest of messages the pipeline both relocated AND tagged. Pick 'drafted' for a roll-up of mail that got an AI draft reply queued.") }}</small></legend>
+            {% set _selected_actions = dcfg.filter.actions or [] %}
+            {% for a in enums.action_keys %}
+            <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.5rem 0 0;font-weight:normal;">
+                <input type="checkbox" name="actions" value="{{ a }}"
+                       {% if a in _selected_actions %}checked{% endif %}
+                       style="margin:0;">
+                {{ a }}
+            </label>
+            {% endfor %}
+        </fieldset>
+    </fieldset>
+
+    <details {% if dcfg.filter.advanced %}open{% endif %}>
+        <summary><strong>Advanced — write your own search</strong>
+            ({{ acct.provider_type }}){{ m.help("Write a search in the same syntax your mail provider uses. Replaces every structured filter above. The Window dropdown still applies — both filters are required to match. Use when the structured fields can't express what you need. Example for Gmail: 'is:starred from:boss@example.com after:2026/01/01' for starred messages from your boss after a date. Click Validate below to dry-run before saving.") }}</summary>
+        <p><small style="color:var(--pico-muted-color);">
+            A non-empty value disables the structured filter rows
+            above. The Window dropdown still applies — both must
+            match. Syntax depends on your provider:
+        </small></p>
+        <ul><small>
+            {% if acct.provider_type == 'imap' %}
+            <li>Standard IMAP search syntax.
+                Examples: <code>FROM "x@y" SINCE 01-May-2026</code>;
+                <code>OR FROM "a@b" FROM "c@d"</code>;
+                <code>KEYWORD $EmailTriaged UNSEEN</code>.</li>
+            {% elif acct.provider_type == 'gmail_api' %}
+            <li>Gmail search syntax (the same syntax you'd type
+                in the Gmail search box).
+                Examples: <code>from:x@y after:2026/05/01</code>;
+                <code>label:Newsletter is:unread</code>;
+                <code>list:newsletter.example.com</code>.</li>
+            {% elif acct.provider_type == 'office365' %}
+            <li>Microsoft Graph filter syntax.
+                Examples: <code>from/emailAddress/address eq 'x@y'</code>;
+                <code>contains(subject, 'invoice')</code>.</li>
+            {% endif %}
+        </small></ul>
+        <textarea name="advanced" rows="3"
+                  placeholder="{{ 'FROM \"x@y\" SINCE 01-May-2026' if acct.provider_type == 'imap' else 'from:x@y after:2026/05/01' if acct.provider_type == 'gmail_api' else 'from/emailAddress/address eq ...' }}">{{ dcfg.filter.advanced }}</textarea>
+        <button type="button"
+                hx-post="/accounts/{{ acct.id }}/digests/{{ dcfg.id or 'new' }}/validate-query"
+                hx-include="[name='advanced']"
+                hx-target="#validate-result-{{ dcfg.id or 'new' }}"
+                hx-swap="innerHTML"
+                class="outline secondary"
+                style="padding:0.25rem 0.6rem;font-size:0.85em;margin:0;">
+            Validate query
+        </button>
+        <span id="validate-result-{{ dcfg.id or 'new' }}"
+              style="margin-left:0.5rem;font-size:0.85em;"></span>
+    </details>
+
+    {# ── Format ───────────────────────────────────────────────
+       Operator picks one of five rendering shapes. Each option
+       carries a human-readable description shown below the
+       picker (no variable / module names — operators see what
+       they get, not what the code calls it). The Table-columns
+       block below the format picker is hidden by JS unless
+       Table is the chosen format. #}
+    {% set _format_descriptions = {
+        "table":              "Spreadsheet-style table with configurable columns. Best for skimming a lot of messages at a glance — sortable by any column you pick (date, sender, category, etc.).",
+        "grouped_list":       "Sections grouped by your choice (classification, folder, day, or sender), with one line per message inside each section. Good for a structured rundown that mirrors how the messages were sorted.",
+        "plain_list":         "Single flat list, one line per message, in date order. Good for short digests or any time grouping would just add empty headers.",
+        "newsletter":         "Article-card email. Per-source heading followed by a bulleted list of articles, each with a one-line summary and a Read-more link. Re-reads each source and uses AI to pull article titles + summaries — best for digests of newsletters or RSS-driven mail. Slower than the other formats; expect a minute or two per send.",
+        "newsletter_classic": "Article-card email with rich styling: large title across the top, date subtitle, per-source headings with a bottom border, and a footer line. Same article extraction as Newsletter; pick this when you want the digest to feel like a polished daily edition.",
+    } %}
+    {% set _format_labels = {
+        "table":              "Table",
+        "grouped_list":       "Grouped list",
+        "plain_list":         "Plain list",
+        "newsletter":         "Newsletter (article cards)",
+        "newsletter_classic": "Newsletter (styled)",
+    } %}
+    <fieldset>
+        <legend>Format</legend>
+        <div class="grid">
+            <label>
+                Render as{{ m.help("How the digest email is laid out. Each option produces a different visual treatment — see the description below the dropdown for what to expect. Example: 'Table' for a spreadsheet you can scan column-by-column; 'Newsletter (article cards)' for a daily-edition feel with extracted articles per source.") }}
+                <select name="render_as" id="digest-render-as-{{ dcfg.id or 'new' }}"
+                        data-digest-id="{{ dcfg.id or 'new' }}"
+                        onchange="var d=this.dataset.digestId;document.getElementById('digest-fmt-desc-'+d).textContent=this.options[this.selectedIndex].dataset.desc||'';document.getElementById('digest-table-cols-'+d).style.display=(this.value==='table'?'block':'none');var nt=document.getElementById('digest-newsletter-template-'+d);if(nt){nt.style.display=(this.value==='newsletter'||this.value==='newsletter_classic')?'block':'none';}">
+                    {% for r in enums.render_as %}
+                    <option value="{{ r }}"
+                            data-desc="{{ _format_descriptions.get(r, '') }}"
+                            {% if dcfg.format.render_as == r %}selected{% endif %}>
+                        {{ _format_labels.get(r, r | replace('_', ' ')) }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <small id="digest-fmt-desc-{{ dcfg.id or 'new' }}"
+                       style="display:block;color:var(--pico-muted-color);
+                              margin-top:0.25rem;line-height:1.4;">
+                    {{ _format_descriptions.get(dcfg.format.render_as, '') }}
+                </small>
+            </label>
+            <label>
+                Group by{{ m.help("How sections are split inside a Grouped list digest. Picking 'By sender' makes one section per from-address — handy for newsletter digests where you want each source's items bundled together. 'By classification' groups by category (newsletters, urgent, etc.). 'By day' splits a multi-day digest into per-day sections. Ignored for any format other than Grouped list.") }}
+                <select name="group_by">
+                    {% set _group_labels = {
+                        "none": "No grouping",
+                        "category": "By classification",
+                        "folder": "By source folder",
+                        "day": "By day",
+                        "sender": "By sender",
+                    } %}
+                    {% for g in enums.group_bys %}
+                    <option value="{{ g }}"
+                            {% if dcfg.format.group_by == g %}selected{% endif %}>
+                        {{ _group_labels.get(g, g) }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <small style="display:block;color:var(--pico-muted-color);margin-top:0.25rem;">
+                    Only applies when the format is Grouped list.
+                </small>
+            </label>
+        </div>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+            <input type="checkbox" name="include_body_preview" value="1"
+                   {% if dcfg.format.include_body_preview %}checked{% endif %}
+                   style="margin:0;">
+            <span>Show a short preview of each message</span>
+            {{ m.help("Off by default. When on, adds a small block under each row with (1) the first line of the email body and (2) up to three article titles extracted from the email's HTML headings. Useful for content-aggregator newsletters — you can see what the email is about without opening it. No AI involved; titles come straight from the email's H1/H2 tags.") }}
+        </label>
+        <label>
+            Maximum messages per digest{{ m.help("Cap on how many messages the digest includes per send. Higher values risk slow renders + long emails; lower values keep the digest skimmable. Example: 50 for a daily digest of a busy mailbox; 200 for a weekly catch-up; 1000 for an archival run-down. Messages beyond the cap are silently dropped from the digest, not deleted.") }}
+            <input type="number" name="max_rows" min="1" max="1000"
+                   value="{{ dcfg.format.max_rows or 50 }}">
+        </label>
+
+        {# ── Newsletter HTML template ─────────────────────────
+           Visible only when the chosen format is one of the
+           newsletter shapes (newsletter / newsletter_classic).
+           Operator can paste a Jinja template with the same
+           context vars the defaults use. Empty = use the built-
+           in default for the chosen format. Two "Use default"
+           buttons fill the textarea with the matching default
+           string so the operator has a starting point to edit. #}
+        <div id="digest-newsletter-template-{{ dcfg.id or 'new' }}"
+             style="margin-top:0.75rem;
+                    display:{% if dcfg.format.render_as in ('newsletter', 'newsletter_classic') %}block{% else %}none{% endif %};">
+            <label>
+                HTML template{{ m.help("Replaces the built-in newsletter template when you save. Prefilled with the default that matches the format you've picked so you have a working starting point to edit. Same variables the defaults use: groups (list of senders, each with their articles), date_str, signature, digest_name, total_articles, cat_phrase, category. Click 'Use compact default' or 'Use styled default' to swap starting points; 'Clear' wipes the box and falls back to the built-in default at send time.") }}
+                {# Prefill: saved override wins; empty falls back
+                   to the built-in default that matches the
+                   current render_as. Save handler compares the
+                   submitted text against the matching default
+                   and persists empty if they match — that way
+                   future default upgrades flow through to
+                   non-edited operators. #}
+                {% set _tpl_value = dcfg.format.html_template %}
+                {% if not _tpl_value %}
+                    {% if dcfg.format.render_as == 'newsletter_classic' %}
+                        {% set _tpl_value = default_newsletter_classic_template %}
+                    {% else %}
+                        {% set _tpl_value = default_newsletter_template %}
+                    {% endif %}
+                {% endif %}
+                <textarea name="html_template" rows="10"
+                          id="digest-html-template-{{ dcfg.id or 'new' }}"
+                          style="font-size:0.75rem;font-family:var(--pico-font-family-monospace, monospace);">{{ _tpl_value }}</textarea>
+            </label>
+            <div style="display:flex;gap:0.4rem;flex-wrap:wrap;margin-top:0.25rem;">
+                <button type="button"
+                        onclick="document.getElementById('digest-html-template-{{ dcfg.id or 'new' }}').value = document.getElementById('digest-html-template-default-compact-{{ dcfg.id or 'new' }}').textContent;"
+                        class="outline secondary"
+                        style="padding:0.2rem 0.6rem;font-size:0.8em;margin:0;">
+                    Use compact default
+                </button>
+                <button type="button"
+                        onclick="document.getElementById('digest-html-template-{{ dcfg.id or 'new' }}').value = document.getElementById('digest-html-template-default-classic-{{ dcfg.id or 'new' }}').textContent;"
+                        class="outline secondary"
+                        style="padding:0.2rem 0.6rem;font-size:0.8em;margin:0;">
+                    Use styled default
+                </button>
+                <button type="button"
+                        onclick="document.getElementById('digest-html-template-{{ dcfg.id or 'new' }}').value = '';"
+                        class="outline"
+                        style="padding:0.2rem 0.6rem;font-size:0.8em;margin:0;">
+                    Clear (use built-in)
+                </button>
+            </div>
+            {# Hidden source-of-truth strings the buttons copy into
+               the textarea. Using <script type="text/template"> so
+               the browser doesn't interpret the template Jinja /
+               HTML as live markup. #}
+            <script type="text/template"
+                    id="digest-html-template-default-compact-{{ dcfg.id or 'new' }}">{{ default_newsletter_template }}</script>
+            <script type="text/template"
+                    id="digest-html-template-default-classic-{{ dcfg.id or 'new' }}">{{ default_newsletter_classic_template }}</script>
+        </div>
+
+        {# ── Table columns ────────────────────────────────────
+           Visible only when the chosen format is Table. The
+           outer wrapper's display is toggled by the render_as
+           select's onchange handler; initial state is set via
+           Jinja so the page lands in the right state without
+           needing JS to fire. Column rows are dynamically
+           added/removed client-side: the FIRST row carries a
+           "+" button (append a new row to the end); the LAST
+           row carries a "-" button (remove itself). Single-row
+           case shows only "+" so the column count never drops
+           to zero (validation refuses zero columns on table
+           render). #}
+        {% set _existing_cols = dcfg.format.columns or [] %}
+        {% if not _existing_cols %}
+            {# Defensive — table render requires at least one
+               column; render a single seeded row so the operator
+               isn't staring at an empty fieldset. The default
+               column set is "Datetime · Sender · Headline · Link"
+               but we render only ONE here per the new
+               one-at-a-time UX; operator clicks + to add more. #}
+            {% set _existing_cols = [{"key": "datetime", "label": "When", "sort_priority": 1, "sort_direction": "desc"}] %}
+        {% endif %}
+        <div id="digest-table-cols-{{ dcfg.id or 'new' }}"
+             style="margin:0.75rem 0;
+                    display: {% if dcfg.format.render_as == 'table' %}block{% else %}none{% endif %};">
+            <fieldset>
+                <legend><small>Columns{{ m.help("Each row defines one column in the digest table, in left-to-right render order. Columns can show metadata (sender, date, category) or message content (subject, link, body preview). Click + on the first row to add another column at the end; click - on the last row to remove it. Example column set for a newsletter digest: When · Sender · Headline · Link.") }}</small></legend>
+                <p><small style="color:var(--pico-muted-color);">
+                    Each column shows one piece of information per message. Sort priority controls the message order — set to 0 to leave a column out of the sort, 1 for the primary sort, 2 for the next tiebreaker, and so on.
+                </small></p>
+
+                {% set _column_field_labels = {
+                    "datetime": "When the message arrived",
+                    "sender": "Sender",
+                    "headline": "Headline (subject)",
+                    "subject": "Subject",
+                    "link": "First link in the message",
+                    "category": "Classification category",
+                    "reason": "Why the classifier picked this category",
+                    "preview": "Body preview (first 200 chars)",
+                    "unread": "Read / unread status",
+                    "attachment": "Has attachment",
+                    "folder": "Source folder",
+                } %}
+
+                <div id="digest-cols-list-{{ dcfg.id or 'new' }}"
+                     data-digest-id="{{ dcfg.id or 'new' }}">
+                    {% for _col in _existing_cols %}
+                    <div class="digest-col-row" data-row-index="{{ loop.index0 }}"
+                         style="display:grid;
+                                grid-template-columns: 1fr 1fr 1fr 1fr auto;
+                                gap:0.5rem;align-items:end;
+                                margin-bottom:0.4rem;">
+                        <label style="margin:0;">
+                            <small>What to show</small>
+                            <select name="columns_key">
+                                {% for k in enums.column_keys %}
+                                <option value="{{ k }}"
+                                        {% if _col.key == k %}selected{% endif %}>
+                                    {{ _column_field_labels.get(k, k) }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                        <label style="margin:0;">
+                            <small>Heading text (optional)</small>
+                            <input type="text" name="columns_label"
+                                   value="{{ _col.label or '' }}"
+                                   placeholder="(use default)">
+                        </label>
+                        <label style="margin:0;">
+                            <small>Sort priority</small>
+                            <input type="number" name="columns_sort_priority"
+                                   min="0" max="8"
+                                   value="{{ _col.sort_priority or 0 }}">
+                        </label>
+                        <label style="margin:0;">
+                            <small>Sort direction</small>
+                            <select name="columns_sort_direction">
+                                <option value="desc"
+                                        {% if _col.sort_direction == 'desc' %}selected{% endif %}>
+                                    Newest / largest first
+                                </option>
+                                <option value="asc"
+                                        {% if _col.sort_direction == 'asc' %}selected{% endif %}>
+                                    Oldest / smallest first
+                                </option>
+                            </select>
+                        </label>
+                        <div class="digest-col-control" style="padding-bottom:0.5rem;">
+                            {# +/- buttons populated by the JS at
+                               the end of this template based on
+                               first / last row position. #}
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+
+                {# Hidden template cloned by the +-button JS. Wrapped
+                   in a <template> tag so the form-serialiser doesn't
+                   pick up its inputs. The clone replaces the empty
+                   data-row-index with the new index at insert time. #}
+                <template id="digest-col-row-template-{{ dcfg.id or 'new' }}">
+                    <div class="digest-col-row"
+                         style="display:grid;
+                                grid-template-columns: 1fr 1fr 1fr 1fr auto;
+                                gap:0.5rem;align-items:end;
+                                margin-bottom:0.4rem;">
+                        <label style="margin:0;">
+                            <small>What to show</small>
+                            <select name="columns_key">
+                                {% for k in enums.column_keys %}
+                                <option value="{{ k }}"
+                                        {% if k == 'sender' %}selected{% endif %}>
+                                    {{ _column_field_labels.get(k, k) }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                        <label style="margin:0;">
+                            <small>Heading text (optional)</small>
+                            <input type="text" name="columns_label"
+                                   value=""
+                                   placeholder="(use default)">
+                        </label>
+                        <label style="margin:0;">
+                            <small>Sort priority</small>
+                            <input type="number" name="columns_sort_priority"
+                                   min="0" max="8" value="0">
+                        </label>
+                        <label style="margin:0;">
+                            <small>Sort direction</small>
+                            <select name="columns_sort_direction">
+                                <option value="desc">Newest / largest first</option>
+                                <option value="asc">Oldest / smallest first</option>
+                            </select>
+                        </label>
+                        <div class="digest-col-control" style="padding-bottom:0.5rem;"></div>
+                    </div>
+                </template>
+            </fieldset>
+        </div>
+    </fieldset>
+    {% endif %}
+
+    {# +/- button manager for the column rows. Re-runs on every
+       add/remove so the FIRST row always shows "+" only and the
+       LAST row always shows "-" only. Single-row case shows "+"
+       only (cannot drop to zero columns). Middle rows show
+       neither — operator adds at the top, removes at the
+       bottom, paired-stack style. #}
+    <script>
+    (function() {
+      var digestId = "{{ dcfg.id or 'new' }}";
+      var listEl = document.getElementById("digest-cols-list-" + digestId);
+      var tmplEl = document.getElementById("digest-col-row-template-" + digestId);
+      if (!listEl || !tmplEl) return;
+
+      function refreshControls() {
+        var rows = listEl.querySelectorAll(".digest-col-row");
+        rows.forEach(function (row, idx) {
+          var ctrl = row.querySelector(".digest-col-control");
+          if (!ctrl) return;
+          ctrl.innerHTML = "";
+          var isFirst = idx === 0;
+          var isLast = idx === rows.length - 1;
+          if (isFirst) {
+            var plus = document.createElement("button");
+            plus.type = "button";
+            plus.className = "outline secondary";
+            plus.style.cssText = "padding:0.2rem 0.6rem;font-size:1em;line-height:1;margin:0;";
+            plus.title = "Add another column";
+            plus.textContent = "+";
+            plus.addEventListener("click", function () {
+              var clone = tmplEl.content.firstElementChild.cloneNode(true);
+              listEl.appendChild(clone);
+              refreshControls();
+            });
+            ctrl.appendChild(plus);
+          }
+          if (isLast && rows.length > 1) {
+            var minus = document.createElement("button");
+            minus.type = "button";
+            minus.className = "outline secondary";
+            minus.style.cssText = "padding:0.2rem 0.6rem;font-size:1em;line-height:1;margin:0;color:var(--pico-del-color);border-color:var(--pico-del-color);";
+            minus.title = "Remove this column";
+            minus.textContent = "−";
+            minus.addEventListener("click", function () {
+              row.remove();
+              refreshControls();
+            });
+            ctrl.appendChild(minus);
+          }
+        });
+      }
+      refreshControls();
+    })();
+    </script>
+
+    <div style="display:flex;gap:0.5rem;margin-top:0.75rem;">
+        <button type="submit">Save digest</button>
+        <a href="/accounts/{{ acct.id }}/edit?tab=digests" role="button"
+           class="secondary outline"
+           style="margin:0;text-decoration:none;line-height:2;">
+            Cancel
+        </a>
+    </div>
+</form>
+
+{% if dcfg.id and not is_preset %}
+<form method="POST"
+      action="/accounts/{{ acct.id }}/digests/{{ dcfg.id }}/delete"
+      style="margin-top:1rem;"
+      onsubmit="return confirm('Delete digest {{ dcfg.name }}?');">
+    <button type="submit" class="outline"
+            style="color:var(--pico-del-color);
+                   border-color:var(--pico-del-color);
+                   padding:0.25rem 0.6rem;font-size:0.85em;margin:0;">
+        Delete this digest
+    </button>
+</form>
+{% endif %}
+
+{% endblock %}

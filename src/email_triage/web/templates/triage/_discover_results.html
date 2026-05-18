@@ -1,0 +1,129 @@
+{% if errors %}
+{% for err in errors %}
+<article style="border-left: 3px solid var(--pico-del-color); padding: 0.5rem 1rem;">
+    <p><strong>Error:</strong> {{ err }}</p>
+</article>
+{% endfor %}
+{% endif %}
+
+{% if total == 0 and not errors %}
+<article style="border-left: 3px solid var(--pico-color-amber-500); padding: 0.5rem 1rem;">
+    <p>No messages found matching "<code>{{ query }}</code>" on {{ acct.name }}.</p>
+</article>
+{% elif consolidated %}
+{% set effective_hipaa = hipaa_mode or (acct.hipaa if acct and acct.hipaa is defined else False) %}
+
+<h3>Discovery Results</h3>
+
+{# ── Section 1: Summary stats ── #}
+<p>
+    Scanned <strong>{{ total }}</strong> message{{ "s" if total != 1 else "" }}
+    on <strong>{{ acct.name }}</strong> in {{ "%.1f"|format(elapsed) }}s.
+    {% if folders_scanned and folders_scanned|length > 1 %}
+    across <strong>{{ folders_scanned|length }}</strong> folders
+    {% if folders_with_results %}
+    ({{ folders_with_results|length }} with results).
+    {% endif %}
+    {% endif %}
+    Found <strong>{{ consolidated|length }}</strong> unique categor{{ "ies" if consolidated|length != 1 else "y" }}
+    ({{ new_count }} new, {{ existing_count }} matching existing).
+</p>
+
+{% if folders_with_results and folders_with_results|length > 1 %}
+<details style="margin-bottom:1rem;">
+    <summary style="font-size:0.9rem;">Folders with results ({{ folders_with_results|length }})</summary>
+    <div style="margin-top:0.25rem;columns:2;column-gap:2rem;font-size:0.85rem;">
+        {% for f in folders_with_results %}
+        <div><code>{{ f }}</code></div>
+        {% endfor %}
+    </div>
+</details>
+{% endif %}
+
+{# ── Section 2: Consolidated results table ── #}
+<table>
+    <thead>
+        <tr>
+            <th>Category</th>
+            <th>Description</th>
+            <th>Count</th>
+            <th>Status</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for cat in consolidated %}
+        <tr>
+            <td><code>{{ cat.slug }}</code></td>
+            <td>
+                {{ "[redacted — HIPAA]" if effective_hipaa else cat.description }}
+                {% if cat.merged_from and not effective_hipaa %}
+                <br><small style="color:var(--pico-muted-color);">Merged from: {{ cat.merged_from|join(", ") }}</small>
+                {% endif %}
+            </td>
+            <td>{{ cat.count }}</td>
+            <td>
+                {% if cat.is_new %}
+                <span style="color:var(--pico-ins-color);font-weight:bold;">New</span>
+                {% else %}
+                <small style="color:var(--pico-muted-color);">Existing</small>
+                {% endif %}
+            </td>
+            <td>
+                {% if cat.is_new %}
+                {% if effective_hipaa %}
+                <small style="color:var(--pico-muted-color);">[redacted — HIPAA]</small>
+                {% else %}
+                <button class="outline secondary"
+                        style="padding:0.25rem 0.5rem;font-size:0.85rem;"
+                        hx-post="/categories/add-discovered"
+                        hx-vals='{"slug": "{{ cat.slug }}", "description": "{{ cat.description|e }}"}'
+                        hx-target="closest td"
+                        hx-swap="innerHTML">Add</button>
+                {% endif %}
+                {% else %}
+                <small style="color:var(--pico-muted-color);">Already configured</small>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+{# ── Section 3: Raw scan details ── #}
+<details style="margin-top:1.5rem;">
+    <summary>Raw scan details ({{ raw_results|length }} messages)</summary>
+    <table style="margin-top:0.5rem;">
+        <thead>
+            <tr>
+                {% if folders_scanned and folders_scanned|length > 1 %}
+                <th>Folder</th>
+                {% endif %}
+                <th>Sender</th>
+                <th>Subject</th>
+                <th>Suggested Category</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in raw_results %}
+            <tr>
+                {% if folders_scanned and folders_scanned|length > 1 %}
+                <td style="font-size:0.8rem;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                    title="{{ r.folder }}">
+                    {{ r.folder }}
+                </td>
+                {% endif %}
+                <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                    {{ "[redacted]" if effective_hipaa else r.sender }}
+                </td>
+                <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                    title="{{ '[redacted]' if effective_hipaa else r.subject }}">
+                    {% if effective_hipaa %}[redacted]{% else %}{{ r.subject[:60] }}{% if r.subject|length > 60 %}...{% endif %}{% endif %}
+                </td>
+                <td><code>{{ r.raw_category }}</code></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</details>
+{% endif %}

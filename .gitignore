@@ -1,0 +1,87 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.jsonl
+data/*.log
+data/*.enc
+.claude/
+*.egg
+.pytest_cache/
+.dev-data/
+
+# Internal compliance documents — contain specifics of auth/security controls
+# that shouldn't be advertised publicly. File lives at docs/compliance_audit.md
+# locally so README link works and future audits can diff against it.
+docs/compliance_audit.md
+docs/compliance_audit_*.md
+
+# Local debug dumps — never commit (contains real mailbox data)
+probe.json
+*.probe.json
+
+# Compliance audits (sensitive — paths + gaps named)
+audit/
+
+# Private punch list (internal file paths, audit gaps, infra
+# hostnames — not for public repo exposure). Source of truth for
+# tracked items, managed locally.
+PUNCH-LIST.md
+PUNCH-LIST-COMPLETED.md
+
+# Internal Gmail Pub/Sub setup runbook — contains GCP project IDs,
+# service-account emails, Tailscale hostnames, and homelab-specific
+# infra details that shouldn't be advertised publicly. Operator-
+# private companion to the public README "Set up Gmail push" section.
+docs/gmail-pubsub-setup.md
+
+# Session-recovery snapshots — capture deploy state, queued work,
+# and infra IDs in case the project context is corrupted between
+# sessions. Same privacy posture as the operator runbook.
+docs/session-recovery*.md
+
+# Operator-private backup/restore runbook. Spells out the recommended
+# split-storage pattern + verbatim CLI commands; not appropriate for
+# the public README which keeps the description scoped to "the feature
+# exists; here's where the button is."
+docs/backup-restore.md
+
+# Operator-private QA handover doc — brings a fresh QA agent (Cowork
+# workspace, contractor, etc.) up to speed. Names internal infra +
+# admin URL paths + persona-matrix specifics that don't belong in the
+# public repo.
+docs/cowork-qa-handover.md
+
+# Operator-private OpenClaw-skill handover doc. Combined from the
+# previously-tracked handover files in openclaw/skills/email-triage-api/
+# (#90, 2026-04-30): contains gateway hostname + token alias names +
+# internal infra paths that don't belong in the public repo.
+docs/openclaw-skill-handover.md
+
+
+# Operator-private deploy-script env (DEPLOYHOST / AGENTHOST /
+# NAGIOS_HOST). Operator copies scripts/deploy.env.local.example
+# -> deploy.env.local and fills in their hostnames; the .example
+# stays committed with neutral placeholders.
+scripts/deploy.env.local
+.coverage
+
+# Operator-private publish-workflow runbook. Documents the contract
+# with feedback_strict_action_gating.md (Tier-3 publish verb), names
+# internal remote conventions, and lists recovery procedures that
+# reference operator-private infra. The script + pattern catalogue
+# (scripts/publish-public-mirror.sh + scripts/publish-scrub-patterns.txt)
+# stay tracked.
+docs/PUBLISH-WORKFLOW.md
+
+# Operator-private M-series HIPAA exposure audit. Names internal
+# source-line citations + the Phase-3/4 lift mechanisms; companion to
+# the public docs/privacy-audit-runbook.md which keeps the description
+# scoped to the user-facing invariants.
+docs/m-series-hipaa-audit.md

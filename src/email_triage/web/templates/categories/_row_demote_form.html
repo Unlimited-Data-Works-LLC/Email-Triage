@@ -1,0 +1,32 @@
+<tr id="cat-{{ cat.id }}">
+    <td><code>{{ cat.slug }}</code></td>
+    <td colspan="3">
+        <form hx-post="/categories/{{ cat.id }}/demote"
+              hx-target="#cat-{{ cat.id }}"
+              hx-swap="outerHTML"
+              hx-confirm="Move '{{ cat.slug }}' (category name) to a personal category for the selected user? Other users will lose visibility of this category in their classifier prompt."
+              style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin:0;">
+            <label style="margin:0;flex:0 0 auto;">
+                Move to user:
+            </label>
+            <select name="target_user_id" required
+                    style="flex:1 1 14rem;max-width:18rem;">
+                <option value="">-- select user --</option>
+                {% for u in users %}
+                <option value="{{ u.id }}">{{ u.name or u.email }} ({{ u.email }})</option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="secondary"
+                    style="padding:0.3rem 0.8rem;font-size:0.85rem;">
+                Move
+            </button>
+            <button type="button" class="secondary outline"
+                    hx-get="/categories/{{ cat.id }}/row"
+                    hx-target="#cat-{{ cat.id }}"
+                    hx-swap="outerHTML"
+                    style="padding:0.3rem 0.8rem;font-size:0.85rem;">
+                Cancel
+            </button>
+        </form>
+    </td>
+</tr>

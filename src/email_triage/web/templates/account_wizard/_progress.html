@@ -1,0 +1,72 @@
+{# ─── AUDIENCE ───
+   END-USER. TECH-SKILL: low. Plain language only — this strip is
+   the operator's only orientation cue across all 5 wizard steps.
+   COPY RULES:
+     - Tab labels stay short (≤ 3 words) so the strip fits on one
+       line on narrow displays.
+     - Skipped-step tooltip: "skipped — defaults applied" tells the
+       operator they can adjust later, no action required now.
+   #}
+{# Progress strip for the /accounts/new wizard.
+
+   Pass:
+     - current_step (int 1..5)
+     - skipped_steps (set of step ints, optional) — rendered with a
+       struck-through dot and a "skipped" tooltip
+
+   Renders 5 numbered chips with the current step highlighted +
+   completed steps marked with a checkmark + skipped steps
+   struck-through. No interactivity — the wizard's state machine is
+   one-way (each step submits to the next); clicking a back-link is
+   on the operator's discretion via the browser back button.
+#}
+{% set _steps = [
+    (1, "Provider"),
+    (2, "Sign in"),
+    (3, "Real-time watch"),
+    (4, "Categories"),
+    (5, "Daily summary"),
+] %}
+{% set _skipped = skipped_steps or [] %}
+<nav style="margin:0 0 1.5rem 0;">
+    <ol style="list-style:none;padding:0;margin:0;display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+        {% for n, label in _steps %}
+        {% set is_skipped = (n in _skipped) %}
+        {% set is_done = (n < current_step) and not is_skipped %}
+        {% set is_current = (n == current_step) %}
+        <li style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;"
+            {% if is_skipped %}data-tooltip="skipped — defaults applied"{% endif %}>
+            <span style="display:inline-flex;align-items:center;justify-content:center;
+                         width:1.85rem;height:1.85rem;border-radius:50%;
+                         {% if is_skipped %}background:var(--pico-muted-border-color);color:var(--pico-muted-color);text-decoration:line-through;
+                         {% elif is_current %}background:var(--pico-primary);color:var(--pico-primary-inverse);font-weight:600;
+                         {% elif is_done %}background:var(--pico-ins-color);color:#fff;
+                         {% else %}background:var(--pico-muted-border-color);color:var(--pico-muted-color);{% endif %}
+                         font-size:0.85rem;"
+                  {% if is_skipped %}aria-label="Step {{ n }}: skipped"{% endif %}>
+                {% if is_skipped %}—{% elif is_done %}✓{% else %}{{ n }}{% endif %}
+            </span>
+            <span style="{% if is_skipped %}color:var(--pico-muted-color);text-decoration:line-through;
+                         {% elif is_current %}font-weight:600;
+                         {% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </span>
+            {% if not loop.last %}
+            <span style="color:var(--pico-muted-color);margin:0 0.25rem;">›</span>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ol>
+</nav>
+<p style="color:var(--pico-muted-color);font-size:0.85rem;margin-top:-0.5rem;">
+    <small>Step {{ current_step }} of 5 — Add Account wizard.</small>
+</p>
+{% if _skipped %}
+<p style="margin:-0.25rem 0 0.75rem 0;">
+    <small style="display:inline-block;background:var(--pico-muted-border-color);
+                  color:var(--pico-muted-color);padding:0.15rem 0.6rem;
+                  border-radius:0.75rem;font-size:0.8rem;">
+        We applied defaults — adjust later on the account edit page.
+    </small>
+</p>
+{% endif %}

@@ -1,0 +1,99 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account integration setup)
+   TECH-SKILL:  medium — the operator already picked Gmail; they
+                know what an OAuth sign-in is at a high level, but
+                not the underlying token-exchange machinery.
+   COPY RULES:  no vendor-internal jargon; concrete examples over
+                abstract definitions. No admin-only paths
+                (/config, /admin/*). Disabled buttons speak via
+                their disabled state — don't say "Ask your
+                administrator". "AI" not "language model" / "LLM".
+                Spell out "Out-of-Office" — never "OOO".
+   ─────────────────────────────────────────────────────────── #}
+<fieldset>
+    <legend>Gmail (native API)</legend>
+    <p><small>
+        These fields enable Gmail's official API for fastest
+        delivery. You'll authenticate with Google once via the
+        Authorize button below; email-triage stores a refresh
+        token so it can keep working after the initial sign-in.
+    </small></p>
+
+    {% set web_ready = google_oauth and google_oauth.web_client_id and google_oauth.web_client_secret %}
+    {% set desk_ready = google_oauth and google_oauth.desktop_client_id and google_oauth.desktop_client_secret %}
+    {% if not web_ready and not desk_ready %}
+    <article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 0.75rem;">
+        <small>No Google OAuth client credentials configured yet — the install isn't yet set up to talk to Google. The install operator handles this in the deploy config.</small>
+    </article>
+    {% endif %}
+
+    <div class="grid">
+        <label>
+            Gmail Account{{ m.help("The Gmail address email-triage will read and act on. Example: you@gmail.com. This must match the account you sign in with on the Authorize step below.") }}
+            <input type="email" name="account" value="{{ acct.config.get('account', '') if acct is defined else '' }}" required
+                   placeholder="you@gmail.com">
+        </label>
+    </div>
+
+    <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0 0.25rem;">
+        <input type="checkbox" name="calendar_opted_in" value="1" style="margin:0;"
+               {% if acct is defined and acct.config.get('calendar_opted_in') %}checked{% endif %}>
+        <span><strong>Enable Calendar</strong>{{ m.help("Lets email-triage read your Google Calendar and respond to invites in your inbox. Required if you want meeting-request intercept, accept/decline replies, or out-of-office reads. Example: turn on so a 'Quick sync Friday?' email can check your Friday afternoon for free time before drafting a reply.") }}
+        <small style="color:var(--pico-muted-color);">&nbsp;— meeting-request intercept, invite accept/decline, Out-of-Office reads</small>
+        </span>
+    </label>
+    <small style="color:var(--pico-muted-color);">
+        When checked, the Authenticate buttons below request Gmail <em>and</em>
+        Calendar scopes together. Changing this requires re-authenticating so the
+        refresh token carries the right scope set.
+    </small>
+
+    {% set ingestion = ingestion_config %}
+    {% if ingestion and acct is defined %}
+    {% set mode = acct.get('ingestion_mode', 'poll') %}
+    {% set default_iv = ingestion.push_poll_interval_min if mode == 'push' else ingestion.poll_poll_interval_min %}
+    <label style="margin-top:0.5rem;display:block;">
+        Poll interval override (min){{ m.help("How often email-triage checks Gmail for new mail when push is unavailable. Blank uses the install default. Example: enter 5 to check every 5 minutes for an account where push hasn't been enabled yet, or leave blank to follow the default.") }}
+        <input type="number" name="poll_interval_override"
+               value="{{ acct.config.get('poll_interval_override', '') if acct is defined else '' }}"
+               min="{{ ingestion.POLL_MIN }}" max="{{ ingestion.POLL_MAX }}" step="{{ ingestion.STEP }}"
+               placeholder="{{ default_iv }}"
+               style="width:8rem;">
+        <small style="color:var(--pico-muted-color);">
+            Blank = server default ({{ default_iv }} min for current
+            <strong>{{ mode }}</strong> mode). Override is reset automatically when
+            the account flips between push and poll.
+        </small>
+    </label>
+    {% endif %}
+
+    {% if acct is defined and acct.id %}
+    <div style="margin-top:0.75rem;">
+        {% if acct.get('has_refresh_token') %}
+            <small style="color:var(--pico-ins-color);">&#10003; Authenticated</small>
+            <small style="color:var(--pico-muted-color);">&nbsp;Re-auth below if needed:</small>
+        {% endif %}
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.4rem;align-items:center;">
+            <button type="button"
+                    hx-post="/accounts/{{ acct.id }}/gmail-api/auth/start"
+                    hx-target="#gmail-api-auth-panel"
+                    hx-swap="innerHTML"
+                    {% if not web_ready %}disabled{% endif %}>
+                Primary &mdash; push-enabled
+            </button>{{ m.help("Walks you through Google's sign-in screen and grants email-triage read + label permission on your inbox, plus push notifications for instant delivery. Run this once per account; the install remembers your token afterwards. Example: click Primary, sign in to your Gmail account, click Allow on the consent screen, and the page redirects back here with the connection ready.") }}
+            <button type="button" class="secondary outline"
+                    hx-post="/accounts/{{ acct.id }}/gmail-api/auth/start-manual"
+                    hx-target="#gmail-api-auth-panel"
+                    hx-swap="innerHTML"
+                    {% if not desk_ready %}disabled{% endif %}>
+                Fallback &mdash; manual paste
+            </button>{{ m.help("Use this when the push-enabled flow can't redirect back to email-triage (firewall, no public URL). You sign in to Google in a separate window, copy the resulting code, and paste it back here. Example: click Fallback, click the Google sign-in link in the panel that appears, paste the code Google shows you, and the connection is ready.") }}
+        </div>
+        <small style="color:var(--pico-muted-color);">&nbsp;Save first if you just changed the Gmail address.</small>
+        <div id="gmail-api-auth-panel" style="margin-top:0.75rem;"></div>
+    </div>
+    {% else %}
+    <small><em>Save this account first, then authenticate from the edit form.</em></small>
+    {% endif %}
+</fieldset>

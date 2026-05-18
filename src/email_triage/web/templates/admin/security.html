@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (security / compliance operator). Not end users.
+   TECH-SKILL:  high — reads HIPAA citations, BAA mechanics, session
+                policy, CSRF posture, audit-chain integrity.
+   COPY RULES:  protocol citations + LLM/backend terms are intentional
+                here (admin operators expect to read the spec citations
+                and the engine terms when configuring auth-policy
+                + compliance knobs). See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Security - Email Triage{% endblock %}
+{% block content %}
+
+<h2>Security &amp; Compliance</h2>
+<p>
+    Auth-policy and compliance knobs. Cert-related settings (HTTPS
+    listener mode, ACME, WebAuthn rp_id) live on
+    <a href="/admin/acme-status">/admin/acme-status</a>.
+</p>
+
+{% if request.query_params.get("saved") == "1" %}
+<p style="color:var(--pico-ins-color);"><small>Settings saved.</small></p>
+{% endif %}
+{% if request.query_params.get("err") %}
+<p style="color:var(--pico-del-color);"><small>{{ request.query_params.get("err") }}</small></p>
+{% endif %}
+
+<form method="post" action="/admin/security/save">
+    {{ csrf_input(request) }}
+
+<h3 id="hipaa">HIPAA Mode</h3>
+<label>
+    <input type="checkbox" name="hipaa" value="1"
+           {% if hipaa_mode %}checked{% endif %}>
+    Enable system HIPAA mode
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Strips PHI from logs, audit detail, escalation alerts; locks every
+    account created while on; refuses LLM classification against
+    vendors lacking a BAA. Flipping records a
+    <code>hipaa_boundary_events</code> row. Per-account flag stacks
+    with the system flag — most-restrictive wins. §164.312(b) "Audit
+    Controls" + §164.312(a)(2)(iii) "Automatic Logoff" cluster here.
+</small></p>
+
+<aside id="baa" style="border-left:3px solid var(--pico-muted-border-color);padding:0.4rem 0.8rem;margin:0.5rem 0 1rem 0;">
+    <strong>Classifier BAA</strong>
+    <small style="color:var(--pico-muted-color);">&nbsp;— read-only</small><br>
+    {% if baa_status %}
+    <small>
+        Backend: <code>{{ baa_status.backend }}</code> • Vendor host:
+        <code>{{ baa_status.host or '(local)' }}</code> • Acknowledged:
+        {% if baa_status.acked %}
+            <strong style="color:var(--pico-ins-color);">yes</strong>
+            ({{ baa_status.acked_by_email or '?' }} •
+            {{ baa_status.acked_at or '?' }})
+        {% else %}
+            <strong style="color:var(--pico-del-color);">no</strong>
+        {% endif %}
+    </small>
+    {% else %}
+    <small style="color:var(--pico-muted-color);">No classifier configured.</small>
+    {% endif %}
+    <br><small style="color:var(--pico-muted-color);">
+        Manage on <a href="/config">/config → Classifier</a>. Gates
+        HIPAA-flagged accounts from classifying against vendors
+        without a signed BAA.
+    </small>
+</aside>
+
+<h3 id="session" style="margin-top:1.5rem;">Session timeout</h3>
+<div class="grid">
+    <label>
+        Non-HIPAA session TTL
+        <select name="auth_session_ttl_secs"
+                {% if hipaa_mode %}disabled{% endif %}>
+            {% set ttl_opts = [
+                (900, "15 minutes"),
+                (1800, "30 minutes"),
+                (3600, "1 hour"),
+                (86400, "1 day"),
+                (604800, "1 week"),
+                (1209600, "2 weeks"),
+            ] %}
+            {% for secs, label in ttl_opts %}
+            <option value="{{ secs }}"
+                {% if auth and auth.session_ttl_secs == secs %}selected{% endif %}>
+                {{ label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <label>
+        HIPAA session cap
+        <select name="auth_hipaa_session_ttl_secs">
+            <option value="900"
+                {% if auth and auth.hipaa_session_ttl_secs == 900 %}selected{% endif %}>
+                15 minutes (default)
+            </option>
+            <option value="1800"
+                {% if auth and auth.hipaa_session_ttl_secs == 1800 %}selected{% endif %}>
+                30 minutes (max)
+            </option>
+        </select>
+    </label>
+</div>
+<p><small style="color:var(--pico-muted-color);">
+    §164.312(a)(2)(iii) Automatic Logoff. Industry norms: EHR /
+    clinical = 10–15 min; HIPAA research portal = 30 min. Hard
+    ceiling of 30 min on the HIPAA cap is enforced in code.
+    Effective TTL = <code>min(operator pick, hipaa cap)</code> when
+    HIPAA mode is on.
+    {% if hipaa_mode %}
+    <strong style="color:var(--pico-ins-color);">HIPAA mode is on
+    — non-HIPAA TTL disabled; effective TTL is the HIPAA cap.</strong>
+    {% endif %}
+</small></p>
+
+<h3 id="login-rate" style="margin-top:1.5rem;">Login rate limit</h3>
+<p><small style="color:var(--pico-muted-color);">
+    Per-email + per-IP rolling-window counters guarding OTP /
+    WebAuthn / dev-keypair / passkey login surfaces against
+    brute-force and credential-stuffing. Source of truth is the
+    <code>auth_events</code> table; the lockout trips when failure
+    rows in the window exceed the threshold. <code>max=0</code>
+    disables that scope. §164.312(a)(2)(i) "Unique User
+    Identification."
+</small></p>
+<div class="grid">
+    <label>
+        Max attempts per email
+        <input type="number" name="login_per_email_max" min="0" max="1000"
+               value="{{ auth.login_per_email_max if auth else 10 }}">
+    </label>
+    <label>
+        Per-email window (secs)
+        <input type="number" name="login_per_email_window_secs"
+               min="60" max="86400"
+               value="{{ auth.login_per_email_window_secs if auth else 600 }}">
+    </label>
+</div>
+<div class="grid">
+    <label>
+        Max attempts per IP
+        <input type="number" name="login_per_ip_max" min="0" max="10000"
+               value="{{ auth.login_per_ip_max if auth else 30 }}">
+    </label>
+    <label>
+        Per-IP window (secs)
+        <input type="number" name="login_per_ip_window_secs"
+               min="60" max="86400"
+               value="{{ auth.login_per_ip_window_secs if auth else 600 }}">
+    </label>
+</div>
+<p><small style="color:var(--pico-muted-color);">
+    Recommended: per-email 10 / 600s, per-IP 30 / 600s. Tune per-IP
+    higher (or set 0) when multiple legitimate users share a NAT.
+    Both checks run; first to trip raises a <code>login_lockout</code>
+    audit row.
+</small></p>
+
+<h3 id="csrf" style="margin-top:1.5rem;">CSRF token</h3>
+<label>
+    <input type="checkbox" name="tls_csrf_enforce" value="1"
+           {% if tls_csrf_enforce %}checked{% endif %}>
+    Enforce CSRF token on state-changing requests
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Off (default, soft-launch): violations log + bump
+    <code>csrf_rejects</code> counter on <code>/health</code>;
+    requests proceed. On: violations return HTTP 403. Override via
+    <code>EMAIL_TRIAGE_CSRF_ENFORCE</code> env var when debugging.
+    Current cumulative rejects:
+    <code>{{ csrf_rejects }}</code>; audit-write failures:
+    <code>{{ audit_failures }}</code>.
+</small></p>
+
+<details style="margin-top:0.5rem;">
+    <summary><small>Rejects rate (last 24h / 7d)</small></summary>
+    <p><small>
+        Last 24 hours: <code>{{ csrf_rejects_24h }}</code><br>
+        Last 7 days: <code>{{ csrf_rejects_7d }}</code>
+    </small></p>
+    {% if csrf_top_paths_24h %}
+    <p><small>Top offenders (24h):</small></p>
+    <ul style="margin-top:0;">
+        {% for route, n in csrf_top_paths_24h %}
+        <li><small><code>{{ route }}</code> — {{ n }}</small></li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p><small style="color:var(--pico-muted-color);">No
+    rejections recorded in the last 24 hours.</small></p>
+    {% endif %}
+    <p><small style="color:var(--pico-muted-color);">
+        Source: <code>access_log</code> rows with outcome
+        <code>csrf_would_reject</code> (soft-launch) or
+        <code>csrf_rejected</code> (enforce). Don't flip enforce
+        until the 24h count is steady at zero.
+    </small></p>
+</details>
+
+<label style="margin-top:0.75rem;">
+    Custom CSRF exempt prefixes (one per line)
+    <textarea name="csrf_exempt_prefixes" rows="3" cols="50"
+              placeholder="/api/foo/&#10;/integrations/x/">{{ csrf_exempt_prefixes | join('\n') }}</textarea>
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Operator-defined path prefixes that bypass CSRF validation.
+    Adds to the always-on set: <code>/health</code>,
+    <code>/webhooks/</code>, <code>/api/oauth/</code>,
+    <code>/login</code>. Each entry must start with <code>/</code>
+    (other lines silently dropped). Use sparingly — every entry is
+    a path the cookie-only attacker can exercise. Live; takes
+    effect on save without a restart.
+</small></p>
+
+<button type="submit" style="margin-top:1rem;">Save</button>
+</form>
+
+{% endblock %}

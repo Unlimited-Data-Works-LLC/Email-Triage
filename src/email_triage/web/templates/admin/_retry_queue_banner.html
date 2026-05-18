@@ -1,0 +1,55 @@
+{# Admin retry-queue threshold banner (#175 R-B).
+
+   AUDIENCE: admin (operator). Surfaces a high-watermark on the
+   per-message retry queue — either a single account is having a
+   bad day (≥3 deads in 24h) or the install as a whole is
+   accumulating failures (≥5 deads in 24h).
+
+   Usage:
+       {% include "admin/_retry_queue_banner.html" ignore missing %}
+   in any admin page. Reads ``retry_queue_banner`` from the page
+   ctx (auto-injected by ``_shared._render``). The partial
+   self-guards on the ctx key being absent or empty so non-admin
+   renders + clean-state admin renders emit zero markup.
+
+   Plain-English copy. No protocol jargon ("retry queue" is a
+   plain noun phrase the admin already knows from this page).
+#}
+{% if retry_queue_banner is defined and retry_queue_banner %}
+{% set rqb = retry_queue_banner %}
+{% if rqb.install_wide or rqb.per_account %}
+<aside style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+    <strong>Retry queue threshold crossed</strong>
+    <ul style="margin:0.4rem 0 0 1.2rem;padding:0;">
+        {% if rqb.install_wide %}
+        <li>
+            <strong>{{ rqb.dead_24h }}</strong> messages were
+            abandoned in the last 24 hours across this install.
+            Open the retry queue to see what's piling up.
+        </li>
+        {% endif %}
+        {% for acct in rqb.per_account %}
+        <li>
+            <strong>{{ acct.account_label }}</strong>
+            {%- if acct.owner %} ({{ acct.owner }}){% endif %}:
+            <strong>{{ acct.count }}</strong> abandoned in 24h
+            {% if acct.breakdown %}
+            —
+            {%- for reason, count in acct.breakdown.items() -%}
+                {{ count }} {{ reason | replace('_', ' ') }}
+                {%- if not loop.last %}, {% endif -%}
+            {%- endfor %}
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    <p style="margin:0.4rem 0 0 0;font-size:0.9em;">
+        <a href="/admin/retry-queue?state=dead">
+            Review abandoned rows
+        </a>
+    </p>
+</aside>
+{% endif %}
+{% endif %}

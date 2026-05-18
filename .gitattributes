@@ -1,0 +1,10 @@
+# Force LF line endings for shell scripts so bash (including
+# git-bash on Windows) executes them without CRLF interpretation
+# issues. Without this, `core.autocrlf=true` checkouts on Windows
+# can turn `.sh` files into CRLF and bash mis-parses the shebang.
+*.sh text eol=lf
+
+# Patterns file is read line-by-line by publish-public-mirror.sh.
+# Tolerated by the script's CRLF strip, but pinning LF avoids any
+# surprise.
+scripts/publish-scrub-patterns.txt text eol=lf

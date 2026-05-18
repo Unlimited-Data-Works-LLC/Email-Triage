@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / medical-researcher persona).
+                NOT developers, NOT admins doing operator work.
+   TECH-SKILL:  computer-literate professional (clinician, researcher,
+                exec, lawyer). Not terminal users; not protocol readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon. Replacements:
+         "AI"             not "language model" / "LLM"
+         "watch folder"   not "IMAP IDLE"
+         "folder"         not "mailbox"
+         "category"       not "label"
+         "send schedule"  not "cron"
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+     - Reference accounts by name ("your work-email account"),
+       never by number.
+     - No dev-mode references; this is a public artifact.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Help — Common Tasks{% endblock %}
+{% block content %}
+
+<h2>Help — Common Tasks</h2>
+
+<p>
+    This page walks you through common things you'll want to do with
+    Email Triage. Each task has step-by-step directions matching the
+    actual buttons and field labels in the app. New here? Start with
+    task 1 (route mail by sender) — it's the most common.
+</p>
+
+<p style="color:var(--pico-muted-color);font-size:0.95em;">
+    Setting up a new mailbox? See the
+    <a href="/help/integrations">Gmail + Office 365 setup guides</a>
+    for step-by-step OAuth + push / poll walkthroughs.
+</p>
+
+<p style="color:var(--pico-muted-color);font-size:0.95em;">
+    The directions below match the names on the screen. If a button
+    looks greyed out, the page is telling you something — usually that
+    a setting earlier in the page needs to be filled in first, or that
+    the action only applies to a different account type. Hover the
+    little <span aria-hidden="true">ℹ️</span> icons for plain-language
+    explanations of any field.
+</p>
+
+<nav aria-label="Task index" style="margin:1.5rem 0;padding:1rem;background:var(--pico-card-background-color);border-radius:6px;">
+    <strong>Jump to a task:</strong>
+    <ol style="margin:0.5rem 0 0 1.5rem;padding:0;">
+        <li><a href="#task-route-by-sender">Route all mail from one sender to a category</a></li>
+        <li><a href="#task-pause-account">Pause an account while you're on vacation</a></li>
+        <li><a href="#task-add-delegate">Let someone else triage your mail (add a delegate)</a></li>
+        <li><a href="#task-daily-digest">Set up a daily digest</a></li>
+        <li><a href="#task-disable-ai-drafts">Turn off AI draft replies for one account</a></li>
+        <li><a href="#task-see-training-data">See what training data has been captured</a></li>
+    </ol>
+</nav>
+
+{# ─── Task 1 ─────────────────────────────────────────────── #}
+{% set steps_1 = [
+    {
+        "label": "Open the Accounts list",
+        "body": "From the top nav, click <a href=\"/accounts\">Accounts</a>"
+                ~ m.help("The Accounts page lists every email account Email Triage is watching for you. Example: a work account at gmail.com plus a personal Outlook.com account would each show as a row, with their names, the folders being watched, and a button to edit each one.")
+                ~ ". You'll see a row for each of your accounts.",
+    },
+    {
+        "label": "Open the account's Routes",
+        "body": "Find the account you want the rule on (for example, your work-email account), then click the <strong>Routes</strong> button on that row"
+                ~ m.help("A route is one rule that fires when a message gets a category. Example: every message classified as 'invoices' gets moved to the Receipts folder. Each account has its own list of routes — they only apply to mail in that account.")
+                ~ ". This opens the Routes page for just that account.",
+        "screenshot_hint": "/accounts route button on the row",
+    },
+    {
+        "label": "Add a new route",
+        "body": "Click <strong>Add Route</strong>. In the form, set the trigger to <strong>From sender or domain</strong>, type "
+                ~ "<code>bcbsm.com</code> in the address box, and pick the destination category (for example, "
+                ~ "<strong>FYI</strong>"
+                ~ m.help("FYI is a built-in category for low-priority informational mail you want to skim later. Example: newsletters, automated status emails, vendor announcements. Mail in FYI doesn't trigger AI draft replies and doesn't show up in the urgent counts on your dashboard.")
+                ~ "). Click <strong>Save</strong>.",
+        "screenshot_hint": "/accounts/{id}/routes Add Route form",
+    },
+    {
+        "label": "Test the rule",
+        "body": "On the same Routes page, find the row you just added and click <strong>Test</strong>"
+                ~ m.help("Test runs the rule against a small recent slice of your mail and shows which messages would have matched, without actually moving anything. Use this to sanity-check that the address pattern matches what you expect before you let the rule run on real mail.")
+                ~ ". Email Triage shows the matching messages so you can confirm the rule is doing what you wanted before it runs on new mail.",
+    },
+] %}
+{% with num=1, slug="route-by-sender",
+        title="Route all mail from one sender to a category",
+        when="You keep getting low-priority mail from a known sender (insurer, newsletter, vendor) and you want it auto-filed instead of cluttering your inbox.",
+        steps=steps_1,
+        gotchas=[
+            "If the rule doesn't fire, check the address — match by domain (example: bcbsm.com) rather than a single specific sender, since insurers often rotate their from-addresses.",
+            "Routes only apply to new mail that arrives after you save the rule. Old messages already in the inbox stay where they are. To re-categorize old mail, run a one-time triage from the Triage page.",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+{# ─── Task 2 ─────────────────────────────────────────────── #}
+{% set steps_2 = [
+    {
+        "label": "Open the account's edit page",
+        "body": "From the top nav, click <a href=\"/accounts\">Accounts</a>, find the row for the account you want to pause, and click <strong>Edit</strong>.",
+    },
+    {
+        "label": "Untick the Active checkbox",
+        "body": "Near the top of the edit form there's a checkbox labeled <strong>Active</strong>"
+                ~ m.help("When Active is on, Email Triage watches the account's folders for new mail and runs the AI on incoming messages. When Active is off, the account is paused — no folder watching, no triage, no draft replies, no digests. Routing rules and settings are kept; flip Active back on when you're ready and triage resumes.")
+                ~ ". Untick it.",
+        "screenshot_hint": "/accounts/{id}/edit Active checkbox at the top",
+    },
+    {
+        "label": "Save",
+        "body": "Click <strong>Save</strong> at the bottom of the form. The account row on the Accounts page now shows <strong>Paused</strong> next to its name.",
+    },
+    {
+        "label": "Resume when you're back",
+        "body": "Open the same edit page, tick <strong>Active</strong> back on, and Save. Folder watching picks up where it left off — any mail that arrived during the pause is still in your real inbox waiting; Email Triage just wasn't classifying it. Run a one-time Triage if you want catch-up classification on the backlog.",
+    },
+] %}
+{% with num=2, slug="pause-account",
+        title="Pause an account while you're on vacation",
+        when="You're away for a stretch and don't want AI drafts firing or digests landing while you're not reading mail.",
+        steps=steps_2,
+        gotchas=[
+            "Pausing one account doesn't pause the others. If you have a work and a personal account both connected, untick Active on each one separately.",
+            "Digests scheduled while the account is paused will not send. If you rely on the daily digest as a vacation summary, leave Active on and turn off just the AI draft toggles instead (see task 5).",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+{# ─── Task 3 ─────────────────────────────────────────────── #}
+{% set steps_3 = [
+    {
+        "label": "Open the account's edit page",
+        "body": "From the top nav, click <a href=\"/accounts\">Accounts</a>, find the account you want help with, and click <strong>Edit</strong>.",
+    },
+    {
+        "label": "Open the Delegates tab",
+        "body": "On the edit page, click the <strong>Delegates</strong> tab"
+                ~ m.help("A delegate is another Email Triage user you trust to triage this account's mail on your behalf. Example: an executive assistant who handles a manager's inbox, or a research-team lead helping a clinician work through a backlog. Delegates can read and act; they cannot remove the account or change who else has access.")
+                ~ " in the row of tabs near the top of the form.",
+        "screenshot_hint": "/accounts/{id}/edit Delegates tab strip",
+    },
+    {
+        "label": "Add the person",
+        "body": "In the <strong>Add a delegate</strong> box, type the email address of the person you want to grant access to, then click <strong>Add</strong>. They'll appear in the delegates list below.",
+    },
+    {
+        "label": "Tell them to log in",
+        "body": "The new delegate signs in to Email Triage at the same site you use, with their own email address. Once signed in they'll see your account in their Accounts list with a small <strong>delegate</strong> badge next to the name. Their actions are recorded in the audit log under their name, not yours.",
+    },
+] %}
+{% with num=3, slug="add-delegate",
+        title="Let someone else triage your mail (add a delegate)",
+        when="You want an assistant, family member, or research-team member to help work through your inbox without sharing your password.",
+        steps=steps_3,
+        gotchas=[
+            "Removing a delegate is one click on the same Delegates tab — find their row, click Remove. Their access ends immediately; they keep no copy of any mail.",
+            "Delegate access is per-account. Adding someone to your work account doesn't give them access to your personal account.",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+{# ─── Task 4 ─────────────────────────────────────────────── #}
+{% set steps_4 = [
+    {
+        "label": "Open the Digests page",
+        "body": "From the top nav, click <a href=\"/digests\">Digests</a>"
+                ~ m.help("A digest is a single email Email Triage sends you on a schedule that summarizes mail from one category — for example, a 7am daily summary of every newsletter that arrived overnight. You read one short email instead of fifteen long ones.")
+                ~ ".",
+    },
+    {
+        "label": "Pick which account",
+        "body": "If you have more than one account connected, choose the account this digest belongs to from the dropdown at the top of the page.",
+    },
+    {
+        "label": "Click New Digest",
+        "body": "Click <strong>New Digest</strong>. A form opens with the schedule editor.",
+        "screenshot_hint": "/digests New Digest button",
+    },
+    {
+        "label": "Fill in the schedule",
+        "body": "Set the <strong>Name</strong> (a short label, like 'Morning newsletters'), the <strong>Send time</strong> (24-hour clock, like 07:00), the <strong>Cadence</strong> (Daily, Weekly, or Monthly), and which <strong>Category</strong>"
+                ~ m.help("The category whose mail goes into this digest. Example: pick 'newsletters' to get one daily email summarizing every newsletter that arrived. The category list comes from your account's Routes — if a category isn't here, no mail has been routed to it yet.")
+                ~ " to summarize.",
+    },
+    {
+        "label": "Save and watch",
+        "body": "Click <strong>Save</strong>. The next scheduled run will land in your inbox at the time you set. You can edit or pause the digest from the same page later.",
+    },
+] %}
+{% with num=4, slug="daily-digest",
+        title="Set up a daily digest",
+        when="You want one short summary email per day instead of getting interrupted by every newsletter / status email / FYI as it arrives.",
+        steps=steps_4,
+        gotchas=[
+            "Digests only include mail that's been classified into the chosen category. If a digest comes up empty, the routes for that category aren't matching — go to the Routes tab on the account and add a rule (see task 1).",
+            "The send time uses the server's local clock. If you're in a different timezone than the server, the digest lands at the server's local time — not yours.",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+{# ─── Task 5 ─────────────────────────────────────────────── #}
+{% set steps_5 = [
+    {
+        "label": "Open the account's edit page",
+        "body": "From <a href=\"/accounts\">Accounts</a>, click <strong>Edit</strong> on the account you want to change.",
+    },
+    {
+        "label": "Open the Integrations tab",
+        "body": "Click the <strong>Integrations</strong> tab"
+                ~ m.help("The Integrations tab is where you turn on or off the AI helper features for one account: AI draft replies, AI rewrite of your replies before send, and learning from your sent mail. Each toggle is per-account, so you can keep AI off on a personal account and on for work, or the other way around.")
+                ~ " in the tab strip near the top of the form.",
+        "screenshot_hint": "/accounts/{id}/edit Integrations tab",
+    },
+    {
+        "label": "Turn off the AI toggles",
+        "body": "Untick <strong>AI draft replies</strong>"
+                ~ m.help("When this is on, Email Triage prepares a draft reply in your account's drafts folder for messages it thinks need a response. You can review and send, edit, or delete the draft — it never sends on its own. Turn this off if you'd rather write replies from scratch.")
+                ~ " and <strong>AI rewrite</strong>"
+                ~ m.help("When this is on, Email Triage offers a polished version of your reply before you send it. You always see the suggestion and decide whether to use it. Turn this off if you'd rather your wording go out as-is.")
+                ~ ". Leave the other settings on the page alone.",
+    },
+    {
+        "label": "Save",
+        "body": "Click <strong>Save</strong> at the bottom. New mail from this point forward won't get AI drafts or rewrites for this account. Other accounts you have are unaffected.",
+    },
+] %}
+{% with num=5, slug="disable-ai-drafts",
+        title="Turn off AI draft replies for one account",
+        when="You want Email Triage to keep classifying and sorting mail on this account, but you'd rather write your own replies without an AI suggestion.",
+        steps=steps_5,
+        gotchas=[
+            "Turning AI drafts off doesn't delete drafts that already exist in your account — those stay until you delete them yourself or your mail provider auto-cleans them.",
+            "If the toggles look greyed out, the account doesn't have an AI helper configured at the install level. The page is telling you the feature isn't available to turn off in the first place.",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+{# ─── Task 6 ─────────────────────────────────────────────── #}
+{% set steps_6 = [
+    {
+        "label": "Open My Settings",
+        "body": "From the top nav, click <strong>My Settings</strong>.",
+    },
+    {
+        "label": "Click the Style data tab",
+        "body": "On the Settings page click <strong>Style data</strong>"
+                ~ m.help("Style data is the small set of patterns Email Triage learned from your sent mail to make AI drafts sound like you — your typical greeting, your sign-off, your average reply length. It's one tag per pattern, not the text of any message. You can review every entry, delete any one, or turn off learning entirely from this page.")
+                ~ " in the tab strip.",
+        "screenshot_hint": "/profile Style data tab",
+    },
+    {
+        "label": "Review the entries",
+        "body": "The table on this page lists every style pattern Email Triage has learned, when it was added, and what kind of message it came from. Click <strong>Delete</strong> on any row to remove that entry — drafts written from then on won't use it.",
+    },
+    {
+        "label": "Turn learning off entirely (optional)",
+        "body": "If you'd rather Email Triage never learn from your sent mail, click <strong>Turn off learning</strong> at the top of the page. Existing entries stay until you delete them; no new ones get added.",
+    },
+] %}
+{% with num=6, slug="see-training-data",
+        title="See what training data has been captured",
+        when="You want to confirm what Email Triage has learned about your writing style — or remove specific entries you'd rather it not use.",
+        steps=steps_6,
+        gotchas=[
+            "Deleting a style entry takes effect for new drafts. Drafts already sitting in your drafts folder were written before the deletion and aren't rewritten.",
+            "If the table is empty, learning either hasn't run yet (Email Triage learns on a schedule, not in real time) or it was turned off when the account was set up.",
+        ] %}
+    {% include "help/_task.html" %}
+{% endwith %}
+
+<hr style="margin:2.5rem 0 1.5rem 0;">
+
+<p style="color:var(--pico-muted-color);font-size:0.9em;">
+    Didn't find what you needed? Each page in Email Triage has a help
+    icon <span aria-hidden="true">ℹ️</span> next to its fields — hover
+    or tap any of them for a plain-language explanation with an
+    example. The most common how-to question is answered by the field
+    you're already looking at.
+</p>
+
+{% endblock %}

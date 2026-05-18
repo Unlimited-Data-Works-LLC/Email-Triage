@@ -1,0 +1,681 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}My Settings - Style data - Email Triage{% endblock %}
+{% block content %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate viewing their
+                own data). Admins viewing someone else's account
+                land here too — same plain-language copy applies.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Comfortable with email + dashboards;
+                no terminal, no protocol RFCs, no provider internals.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*). Disabled controls
+       speak via their disabled state; we DO link to the per-account
+       integrations tab where the toggles live.
+     - No protocol or framework jargon: avoid "RFC", "OData",
+       "AND-combined", "vector embedding", "language model".
+       Say "AI" not "language model" / "LLM".
+       Say "AI's similarity store" not "vector embedding store".
+     - Tooltips lead with a concrete example, not a definition.
+     - Plain-language renaming applied:
+         "Writing-style summary"  (NOT "Derived profile" / "M-3")
+         "Recent reply examples"  (NOT "RAG index" / "M-4")
+         "Captured edit pairs"    (kept verbatim per spec — the
+                                   page describes "captured edit pairs"
+                                   plainly in the section intro).
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>My Settings</h2>
+
+{% set active = "style-data" %}
+{% include "_settings_tabs.html" %}
+
+<style>
+    .et-style-section {
+        border-left: 3px solid var(--pico-muted-border-color);
+        padding: 0.75rem 1rem;
+        margin: 0.75rem 0;
+    }
+    .et-style-section h4 {
+        margin: 0 0 0.25rem 0;
+    }
+    .et-style-section .meta {
+        color: var(--pico-muted-color);
+        font-size: 0.9em;
+    }
+    .et-style-empty {
+        background: var(--pico-card-background-color);
+        border: 1px dashed var(--pico-muted-border-color);
+        padding: 1rem;
+        border-radius: 6px;
+        margin-bottom: 1rem;
+    }
+    .et-style-account-summary {
+        font-weight: 600;
+    }
+    .et-style-counts {
+        display: inline-flex;
+        gap: 0.75rem;
+        margin-left: 0.75rem;
+        font-weight: normal;
+        color: var(--pico-muted-color);
+        font-size: 0.9em;
+    }
+    .et-style-actions {
+        margin-top: 1rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+    .et-style-actions form {
+        margin: 0;
+    }
+    .et-style-actions button {
+        padding: 0.3rem 0.75rem;
+        font-size: 0.9em;
+    }
+</style>
+
+<h3>Style data{{ m.help("Everything Email Triage has learned about your writing voice — for example, your typical greeting (Hi Sam,) and sign-off (Thanks, Alex). This page lets you see, export, or delete it for each of your accounts.") }}</h3>
+
+{# ── Cadence banner (#161 item 1) ───────────────────────────────────
+   Top-of-page banner that surfaces the install-wide auto-scan
+   cadence so the user knows how fresh the AI's view of their voice
+   is + where the manual "Mine Now" button fits in. Reads the live
+   value passed in by the page handler so the banner stays in lock-
+   step with the admin /config setting without restart.
+   ────────────────────────────────────────────────────────────────── #}
+<article style="border-left:3px solid var(--pico-muted-border-color);padding:0.5rem 1rem;margin:0.75rem 0;background:var(--pico-card-background-color);">
+    <strong>Auto-scan runs every {{ capture_interval_hours }} hour{% if capture_interval_hours != 1 %}s{% endif %} on opted-in accounts.</strong>
+    Use Mine the Sent Items Now to refresh on demand.{{ m.help("Example: at 6 hour cadence, every opted-in account is scanned 4 times a day. The Mine the Sent Items Now button on each account triggers an immediate refresh.") }}
+</article>
+
+{# ── Embedding-runtime gate banner (#180 F) ─────────────────────
+   End-user audience: this page's actions need the AI's similarity
+   engine to be live. When it isn't, we show a banner explaining
+   that style-learning needs admin setup before features will work.
+   Buttons below render disabled in this state. We deliberately do
+   NOT link to /config/* — that's admin-only territory; the disabled
+   state speaks for itself per feedback_no_admin_path_in_user_copy.
+   ──────────────────────────────────────────────────────────────── #}
+{% if embedding_required and not embedding_runtime_ready %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.75rem 0;background:var(--pico-card-background-color);">
+    <strong>Style-learning features are paused.</strong>
+    {{ embedding_disabled_reason }}
+</article>
+{% endif %}
+
+<p>
+    When AI helps draft a reply in your voice, it leans on three
+    pieces of saved data per account: a short
+    <strong>writing-style summary</strong> built from your past sent
+    mail, a small set of <strong>recent reply examples</strong> the
+    AI uses for inspiration, and any <strong>captured edit pairs</strong>
+    where you tweaked a draft (the AI learns from the difference).
+    You can review what's stored, download a copy of the
+    summary&nbsp;/&nbsp;metadata, or delete it for any account at any
+    time.
+</p>
+
+{# ── Master-toggle off-chip ──────────────────────────────────────
+   #157 — replaced the always-rendered "Style learning is currently ON"
+   banner with an absence-as-signal chip: render NOTHING when the
+   master toggle is on (the default state — no banner needed), and
+   surface a clear OFF chip when it's off. The on-state confused
+   operators ("does this mean I have to do something?"); off-state
+   is the rare case that benefits from an explicit chip.
+   ──────────────────────────────────────────────────────────────── #}
+{% if not master_enabled %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:1rem 0;">
+    <strong>Style learning is OFF for this install.</strong>
+    {{ m.help("Example: while this is off, no new writing-style summaries are built and no new reply examples are saved — anything already saved stays put until you delete it on this page. Drafts will not lean on your past writing voice. Owner can turn this back on from the install-wide settings.") }}
+    <small style="display:block;color:var(--pico-muted-color);margin-top:0.25rem;">
+        Drafts use no operator-style context. New writing-style
+        summaries and reply examples are not being collected.
+        Existing saved data is shown below — use the delete buttons
+        to remove it.
+    </small>
+</article>
+{% endif %}
+
+{% if hipaa_mode %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin:1rem 0;">
+    <strong>HIPAA mode is on for this install.</strong>
+    {{ m.help("Example: under HIPAA mode, an indexed reply example shows up here as 'subject: [redacted], to: [redacted]' instead of the real subject line — counts and dates stay accurate, content stays out of view.") }}
+    <small style="display:block;color:var(--pico-muted-color);margin-top:0.25rem;">
+        For HIPAA-flagged accounts, sample subjects and recipient
+        addresses are replaced with [redacted] in the on-screen view
+        and in any export. Counts and timestamps remain accurate.
+    </small>
+</article>
+{% endif %}
+
+{% if not accounts %}
+<div class="et-style-empty">
+    <p>
+        <strong>No accounts yet.</strong>
+        Style data is stored per email account. Once you connect an
+        email account, it will show up here so you can review or
+        remove anything that's been saved.
+    </p>
+    <p>
+        <a href="/accounts" role="button" class="outline">
+            &rarr; Connect an account
+        </a>
+    </p>
+</div>
+{% endif %}
+
+{% for entry in accounts %}
+{# #180 F — composite disable gate for Preview / Mine buttons. The
+   existing ``entry.mine_button_disabled`` covers HIPAA-opt-in state
+   only; we OR in the embedding-runtime gate so style-learning
+   controls go disabled whenever AI features can't actually fire.
+   The chip text falls back to the embedding-reason when HIPAA gating
+   isn't the cause. #}
+{% set _embedding_blocked = embedding_required and not embedding_runtime_ready %}
+{% set _mine_disabled = entry.mine_button_disabled or _embedding_blocked %}
+{% set _mine_disabled_reason = entry.mine_disabled_reason if entry.mine_button_disabled else embedding_disabled_reason %}
+{# Pre-compute the totals so the <summary> line tells the user what's
+   inside before they expand it.
+   Operator caught (2026-05-13): rows always start condensed
+   regardless of state — the prior auto-expand-when-configured
+   behaviour made the page tall on installs where every account had
+   data. The summary line already carries the counts (profile yes/no,
+   N captured pairs, M index rows) so the operator knows what's
+   inside without opening. #}
+{% set _profile_present = entry.has_profile %}
+{% set _index_count = entry.index_summary.count if entry.index_summary else 0 %}
+{% set _captured_count = entry.captured_pair_count %}
+{% set _has_any = _profile_present or _index_count or _captured_count %}
+
+<details style="margin:1rem 0;border:1px solid var(--pico-muted-border-color);border-radius:6px;padding:0.5rem 1rem;">
+    <summary style="cursor:pointer;list-style:revert;">
+        <span class="et-style-account-summary">
+            {{ entry.account.name or "Account" }}
+            (id {{ entry.account.id }})
+        </span>
+        <span class="et-style-counts">
+            <span>summary: {% if _profile_present %}saved{% else %}none{% endif %}</span>
+            <span>reply examples: {{ _index_count }}</span>
+            {% if entry.index_summary and entry.index_summary.available %}
+            <span>captured edits: {{ _captured_count }}</span>
+            {% endif %}
+        </span>
+        {% if entry.account.hipaa %}
+        <span style="font-size:0.8em;border:1px solid var(--pico-ins-color);
+                     color:var(--pico-ins-color);padding:0.05rem 0.4rem;
+                     border-radius:3px;margin-left:0.5rem;">HIPAA</span>
+        {% endif %}
+        {% if entry.is_delegate %}
+        <span style="font-size:0.8em;border:1px solid var(--pico-muted-border-color);
+                     color:var(--pico-muted-color);padding:0.05rem 0.4rem;
+                     border-radius:3px;margin-left:0.5rem;">delegate</span>
+        {% endif %}
+        {% if entry.is_admin_view %}
+        <span style="font-size:0.8em;border:1px solid var(--pico-muted-border-color);
+                     color:var(--pico-muted-color);padding:0.05rem 0.4rem;
+                     border-radius:3px;margin-left:0.5rem;">admin view</span>
+        {% endif %}
+    </summary>
+
+    {% if not _has_any %}
+    {# 2026-05-11 — the per-account "AI learns from your past replies"
+       toggle moved off the account-edit Integrations tab onto this
+       row (see below). Empty-state copy no longer links anywhere;
+       the toggle is right under this paragraph. #}
+    <div class="et-style-empty" style="margin-top:0.75rem;">
+        <p>
+            <strong>Nothing saved for this account yet.</strong>
+            No writing-style summary, no reply examples, no captured
+            edits. To start collecting style data, turn on the toggle
+            below.
+        </p>
+    </div>
+
+    {# ── AI-learns toggle (relocated from /accounts/<id>/edit) ──────
+       AUDIENCE: end-user. End-user-facing checkbox; no "RAG", no
+       "embedding". Renders inline so the operator can flip it from
+       the same page that shows the data the toggle governs.
+       HIPAA-flagged accounts without the per-account opt-in render
+       the checkbox disabled with a reason chip. #}
+    {% set _rag_on = entry.rag_enabled_resolved %}
+    {% set _rag_disabled_ui = entry.rag_toggle_disabled %}
+    <form method="post"
+          action="/profile/style-data/toggle-rag?account_id={{ entry.account.id }}"
+          style="margin:0.5rem 0 0 0;">
+        {{ csrf_input(request) }}
+        {# Hidden marker so the handler can tell "checkbox unchecked"
+           apart from "form not rendered" — same shape as the
+           hipaa_submitted pattern in accounts/_edit.html. #}
+        <input type="hidden" name="rag_submitted" value="1">
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox"
+                   name="rag_sent_index_enabled"
+                   value="1"
+                   {% if _rag_on and not _rag_disabled_ui %}checked{% endif %}
+                   {% if _rag_disabled_ui %}disabled{% endif %}
+                   onchange="this.form.submit()"
+                   style="margin:0;">
+            <span>AI learns from your past replies{{ m.help("Lets AI look at messages you've sent in the past so its drafts match your voice. Example: when AI drafts a reply, it pulls 3-5 of your most-similar past replies as examples — so a quick 'thanks!' from you stays 'thanks!' instead of becoming 'Thank you for your message.'") }}</span>
+            {% if _rag_disabled_ui %}
+            <span style="display:inline-block;padding:0.05rem 0.4rem;font-size:0.75em;
+                         border:1px solid var(--pico-muted-border-color);
+                         border-radius:0.5rem;color:var(--pico-muted-color);
+                         margin-left:0.4rem;">
+                HIPAA — opt-in required first
+            </span>
+            {% endif %}
+        </label>
+    </form>
+
+    {# ── Auto-scan toggle (#161 item 2) ────────────────────────────
+       AUDIENCE: end-user. Operator opts the account out of the
+       background capture loop while keeping the on-demand "Mine
+       Now" button. HIPAA accounts without the M-1+M-2 opt-in render
+       disabled (same gate as the AI-learns toggle above). #}
+    {% set _auto_on = entry.auto_scan_enabled_resolved %}
+    {% set _auto_disabled_ui = entry.auto_scan_toggle_disabled %}
+    <form method="post"
+          action="/profile/style-data/toggle-auto-scan?account_id={{ entry.account.id }}"
+          style="margin:0.5rem 0 0 0;">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="auto_scan_submitted" value="1">
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox"
+                   name="auto_scan_enabled"
+                   value="1"
+                   {% if _auto_on and not _auto_disabled_ui %}checked{% endif %}
+                   {% if _auto_disabled_ui %}disabled{% endif %}
+                   onchange="this.form.submit()"
+                   style="margin:0;">
+            <span>Auto-scan on schedule{{ m.help("When on, this account gets scanned automatically every " ~ capture_interval_hours ~ " hours. When off, you control timing with the Mine the Sent Items Now button. Example: turn off to avoid auto-scans during a busy week; click Mine Now when ready.") }}</span>
+        </label>
+    </form>
+
+    {# ── Sent folders to mine (2026-05-11 multi-select) ────────────
+       AUDIENCE: end-user with non-standard mail server layout. Multi-
+       select dropdown filtered to folders whose names contain "sent"
+       (case-insensitive). The auto-discovered default is marked inline
+       so the operator knows which one is the AI's auto-pick. Picking
+       zero folders clears the override (falls back to discovery). #}
+    <form method="post"
+          action="/profile/style-data/sent-folder-override?account_id={{ entry.account.id }}"
+          style="margin:0.6rem 0 0 0;display:flex;flex-direction:column;gap:0.25rem;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;font-size:0.9em;">
+            Sent folders to mine{{ m.help("Pick one or more folders the AI should learn from. Default is just the auto-discovered Sent folder. Add others (drafts you finished, archived sent mail) if your style appears there too. Example: tick 'Sent' + 'Sent Items' if your provider splits them.") }}
+        </label>
+        <div style="display:flex;align-items:flex-start;gap:0.5rem;flex-wrap:wrap;">
+            <select name="sent_folder_override" multiple
+                    data-multiselect
+                    data-placeholder="Pick one or more folders…"
+                    size="6"
+                    style="min-width:18rem;max-width:30rem;padding:0.2rem 0.4rem;font-size:0.9em;margin:0;">
+                {% for f in entry.sent_folder_candidates %}
+                <option value="{{ f.name }}"
+                        {% if f.name in entry.sent_folder_override_list %}selected{% endif %}>
+                    {{ f.name }}{% if f.is_discovered %} (auto-discovered){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="outline"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Save folders
+            </button>
+        </div>
+    </form>
+
+    {# ── Messages to mine (#161 item 4) ────────────────────────────
+       AUDIENCE: end-user. Per-account override for the inline mine
+       size. Placeholder shows the install-wide default so the
+       operator can see what an empty submit falls back to. Values
+       above the inline ceiling route through the bulk-runs page at
+       mine time. #}
+    <form method="post"
+          action="/profile/style-data/mine-limit-override?account_id={{ entry.account.id }}"
+          style="margin:0.4rem 0 0 0;display:flex;align-items:flex-end;gap:0.4rem;flex-wrap:wrap;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;font-size:0.9em;display:flex;flex-direction:column;gap:0.2rem;">
+            Messages to mine{{ m.help("How many recent sent messages the AI looks at when you click Mine the Sent Items Now or Preview. Empty means use the install-wide default (shown as the placeholder). Example: 100 = mine the most-recent 100 sent messages — values over " ~ inline_limit_ceiling ~ " run in the background and appear under Triage → Bulk runs.") }}
+            <input type="number"
+                   name="mine_limit_override"
+                   value="{% if entry.mine_limit_override_value != '' %}{{ entry.mine_limit_override_value }}{% endif %}"
+                   placeholder="{{ mine_limit_install_default }}"
+                   min="1" max="500" step="1"
+                   style="margin:0;width:7rem;padding:0.2rem 0.4rem;font-size:0.9em;">
+        </label>
+        <button type="submit" class="outline"
+                style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+            Save limit
+        </button>
+    </form>
+
+    {# #162 alias-aware learning — surfaces per-alias picker when the
+       account carries 2+ declared addresses. Hidden for single-address
+       accounts (no UI noise). #}
+    {% include "profile/_style_data_alias_section.html" %}
+
+    {# #157 — even on empty accounts the operator should be able to
+       Preview (dry-run) and Mine the Sent folder. Render the controls
+       block here so the action buttons appear before any data exists. #}
+    <div class="et-style-actions">
+        <form hx-post="/profile/style-data/preview?account_id={{ entry.account.id }}"
+              hx-target="#mine-result-{{ entry.account.id }}"
+              hx-swap="innerHTML">
+            {{ csrf_input(request) }}
+            <button type="submit" class="outline"
+                    {% if _mine_disabled %}disabled{% endif %}>
+                Preview what would be learned{{ m.help("Shows the writing-style summary the AI would build from this account's Sent folder, without saving it. Example: see whether the summary looks privacy-clean before turning learning on. Preview is always capped at the " ~ inline_limit_ceiling ~ " most-recent messages even if your Messages-to-mine setting is higher — click Mine the Sent Items Now to scan the full setting. Nothing is written to your stored profile.") }}
+            </button>
+        </form>
+        <form hx-post="/profile/style-data/mine-now?account_id={{ entry.account.id }}"
+              hx-target="#mine-result-{{ entry.account.id }}"
+              hx-swap="innerHTML"
+              hx-confirm="Mine the Sent folder now? This will read recent sent mail, build a new writing-style summary, and save it.">
+            {{ csrf_input(request) }}
+            <button type="submit"
+                    {% if _mine_disabled %}disabled{% endif %}>
+                Mine the Sent Items Now{{ m.help("Pulls your most recent sent messages, asks the AI to extract a small writing-style summary, and saves it. Example: refresh after a big style shift (new job, new tone) without waiting for the nightly tick.") }}
+            </button>
+        </form>
+        {% if _mine_disabled %}
+        <small style="display:inline-flex;align-items:center;padding:0.05rem 0.4rem;
+                      border:1px solid var(--pico-muted-border-color);
+                      border-radius:0.5rem;color:var(--pico-muted-color);
+                      font-size:0.8em;">
+            {{ _mine_disabled_reason }}
+        </small>
+        {% endif %}
+    </div>
+    <div id="mine-result-{{ entry.account.id }}" style="margin-top:0.5rem;"></div>
+    {% endif %}
+
+    {% if _has_any %}
+
+    {# ── AI-learns toggle + auto-scan + sent-folder + mine-limit
+       (mirror of the empty-state branch above). Operator caught
+       2026-05-13: the mirror previously omitted the auto-scan
+       toggle + the Messages-to-mine override box, so once an
+       account had any data those settings became invisible until
+       the operator deleted everything. End-user audience; no
+       admin paths. #}
+    {% set _rag_on = entry.rag_enabled_resolved %}
+    {% set _rag_disabled_ui = entry.rag_toggle_disabled %}
+    <form method="post"
+          action="/profile/style-data/toggle-rag?account_id={{ entry.account.id }}"
+          style="margin:0.5rem 0 0 0;">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="rag_submitted" value="1">
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox"
+                   name="rag_sent_index_enabled"
+                   value="1"
+                   {% if _rag_on and not _rag_disabled_ui %}checked{% endif %}
+                   {% if _rag_disabled_ui %}disabled{% endif %}
+                   onchange="this.form.submit()"
+                   style="margin:0;">
+            <span>AI learns from your past replies{{ m.help("Lets AI look at messages you've sent in the past so its drafts match your voice. Example: when AI drafts a reply, it pulls 3-5 of your most-similar past replies as examples — so a quick 'thanks!' from you stays 'thanks!' instead of becoming 'Thank you for your message.'") }}</span>
+            {% if _rag_disabled_ui %}
+            <span style="display:inline-block;padding:0.05rem 0.4rem;font-size:0.75em;
+                         border:1px solid var(--pico-muted-border-color);
+                         border-radius:0.5rem;color:var(--pico-muted-color);
+                         margin-left:0.4rem;">
+                HIPAA — opt-in required first
+            </span>
+            {% endif %}
+        </label>
+    </form>
+
+    {# ── Auto-scan toggle (#161 item 2) — mirror ───────────────── #}
+    {% set _auto_on = entry.auto_scan_enabled_resolved %}
+    {% set _auto_disabled_ui = entry.auto_scan_toggle_disabled %}
+    <form method="post"
+          action="/profile/style-data/toggle-auto-scan?account_id={{ entry.account.id }}"
+          style="margin:0.5rem 0 0 0;">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="auto_scan_submitted" value="1">
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+            <input type="checkbox"
+                   name="auto_scan_enabled"
+                   value="1"
+                   {% if _auto_on and not _auto_disabled_ui %}checked{% endif %}
+                   {% if _auto_disabled_ui %}disabled{% endif %}
+                   onchange="this.form.submit()"
+                   style="margin:0;">
+            <span>Auto-scan on schedule{{ m.help("When on, this account gets scanned automatically every " ~ capture_interval_hours ~ " hours. When off, you control timing with the Mine the Sent Items Now button. Example: turn off to avoid auto-scans during a busy week; click Mine Now when ready.") }}</span>
+        </label>
+    </form>
+
+    <form method="post"
+          action="/profile/style-data/sent-folder-override?account_id={{ entry.account.id }}"
+          style="margin:0.6rem 0 0 0;display:flex;flex-direction:column;gap:0.25rem;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;font-size:0.9em;">
+            Sent folders to mine{{ m.help("Pick one or more folders the AI should learn from. Default is just the auto-discovered Sent folder. Add others (drafts you finished, archived sent mail) if your style appears there too. Example: tick 'Sent' + 'Sent Items' if your provider splits them.") }}
+        </label>
+        <div style="display:flex;align-items:flex-start;gap:0.5rem;flex-wrap:wrap;">
+            <select name="sent_folder_override" multiple
+                    data-multiselect
+                    data-placeholder="Pick one or more folders…"
+                    size="6"
+                    style="min-width:18rem;max-width:30rem;padding:0.2rem 0.4rem;font-size:0.9em;margin:0;">
+                {% for f in entry.sent_folder_candidates %}
+                <option value="{{ f.name }}"
+                        {% if f.name in entry.sent_folder_override_list %}selected{% endif %}>
+                    {{ f.name }}{% if f.is_discovered %} (auto-discovered){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="outline"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Save folders
+            </button>
+        </div>
+    </form>
+
+    {# ── Messages to mine (#161 item 4) — mirror ───────────────── #}
+    <form method="post"
+          action="/profile/style-data/mine-limit-override?account_id={{ entry.account.id }}"
+          style="margin:0.4rem 0 0 0;display:flex;align-items:flex-end;gap:0.4rem;flex-wrap:wrap;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;font-size:0.9em;display:flex;flex-direction:column;gap:0.2rem;">
+            Messages to mine{{ m.help("How many recent sent messages the AI looks at when you click Mine the Sent Items Now or Preview. Empty means use the install-wide default (shown as the placeholder). Example: 100 = mine the most-recent 100 sent messages — values over " ~ inline_limit_ceiling ~ " run in the background and appear under Triage → Bulk runs.") }}
+            <input type="number"
+                   name="mine_limit_override"
+                   value="{% if entry.mine_limit_override_value != '' %}{{ entry.mine_limit_override_value }}{% endif %}"
+                   placeholder="{{ mine_limit_install_default }}"
+                   min="1" max="500" step="1"
+                   style="margin:0;width:7rem;padding:0.2rem 0.4rem;font-size:0.9em;">
+        </label>
+        <button type="submit" class="outline"
+                style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+            Save limit
+        </button>
+    </form>
+
+    {% include "profile/_style_data_alias_section.html" %}
+
+    {# ── Writing-style summary (M-3) ───────────────────────── #}
+    <section class="et-style-section">
+        <h4>Writing-style summary{{ m.help("Example: 'Persona: friendly and concise; opens with first name, signs Thanks, Alex; avoids hedging language.' This is a small text description (about 1-2KB) — never the body of any email — built from your past sent mail and used to keep AI-drafted replies sounding like you.") }}</h4>
+        {% if _profile_present %}
+        <p class="meta">
+            Last built:
+            <strong>{{ entry.profile_built_at_short or "(no timestamp)" }}</strong>
+            &middot; size: <strong>{{ entry.profile_char_count }}</strong> characters
+            &middot; built from <strong>{{ entry.profile_sample_count }}</strong>
+            past sent messages
+        </p>
+        {% if entry.profile_preview %}
+        <details style="margin-top:0.5rem;">
+            <summary style="cursor:pointer;color:var(--pico-muted-color);font-size:0.9em;">
+                Show full summary
+            </summary>
+            <pre style="white-space:pre-wrap;background:var(--pico-card-background-color);padding:0.5rem;border-radius:4px;font-size:0.85em;max-height:32rem;overflow:auto;">{{ entry.profile_full or entry.profile_preview }}</pre>
+        </details>
+        {% endif %}
+        {% else %}
+        <p class="meta"><em>No writing-style summary saved.</em></p>
+        {% endif %}
+    </section>
+
+    {# ── Recent reply examples (M-4) ──────────────────────── #}
+    {% if entry.index_summary and entry.index_summary.available %}
+    <section class="et-style-section">
+        <h4>Recent reply examples{{ m.help("Example: when you reply to a meeting-request email, AI looks up the 3 most-similar past replies you sent (e.g. 'I can do Tues 2pm', 'sorry, slammed this week — let's aim for Thursday') and uses them to make the new draft sound like your voice. Stored as the AI's similarity store, kept on this server, never sent to a third party.") }}</h4>
+        <p class="meta">
+            Saved replies on file: <strong>{{ entry.index_summary.count }}</strong>
+            {% if entry.index_summary.count %}
+            &middot; oldest: <strong>{{ entry.index_oldest_short or "(unknown)" }}</strong>
+            &middot; newest: <strong>{{ entry.index_newest_short or "(unknown)" }}</strong>
+            {% if entry.index_summary.embedding_model %}
+            &middot; AI model used: <strong>{{ entry.index_summary.embedding_model }}</strong>
+            {% endif %}
+            {% endif %}
+        </p>
+        {% if entry.account.hipaa %}
+        <p class="meta">
+            <em>HIPAA-flagged account &mdash; sample subjects are
+            hidden from this view.</em>
+        </p>
+        {% elif entry.sample_subjects_display %}
+        <details style="margin-top:0.5rem;">
+            <summary style="cursor:pointer;color:var(--pico-muted-color);font-size:0.9em;">
+                Show a few recent subjects
+            </summary>
+            <ul style="margin:0.25rem 0 0 1rem;">
+                {% for subj in entry.sample_subjects_display %}
+                <li style="font-size:0.9em;">{{ subj }}</li>
+                {% endfor %}
+            </ul>
+        </details>
+        {% endif %}
+    </section>
+
+    {# ── Captured edit pairs (M-6) ────────────────────────── #}
+    <section class="et-style-section">
+        <h4>Captured edit pairs{{ m.help("Example: AI drafts 'Hello Robert, I hope this finds you well' and you change it to 'Hi Bob, quick note' before sending. The pair (draft + your edit) is saved so AI learns to skip the formal opener for Bob next time.") }}</h4>
+        <p class="meta">
+            Saved edit pairs:
+            <strong>{{ entry.captured_pair_count }}</strong>
+        </p>
+        {% if entry.captured_pair_count == 0 %}
+        <p class="meta"><em>No edit pairs captured yet for this account.</em></p>
+        {% endif %}
+    </section>
+    {% endif %}
+
+    {# ── #157 mine-now / preview controls ───────────────────────
+       Two on-demand surfaces sit alongside the existing
+       download/delete actions. Both render disabled with a reason
+       chip when ``mine_button_disabled`` is true (HIPAA + no
+       per-account opt-in). The HTMX response targets a results
+       container under the buttons so the operator sees the output
+       inline rather than navigating away.
+       ────────────────────────────────────────────────────────── #}
+    <div class="et-style-actions">
+        <form hx-post="/profile/style-data/preview?account_id={{ entry.account.id }}"
+              hx-target="#mine-result-{{ entry.account.id }}"
+              hx-swap="innerHTML">
+            {{ csrf_input(request) }}
+            <button type="submit" class="outline"
+                    {% if _mine_disabled %}disabled{% endif %}>
+                Preview what would be learned{{ m.help("Shows the writing-style summary the AI would build from this account's Sent folder, without saving it. Example: see whether the summary looks privacy-clean before turning learning on. Preview is always capped at the " ~ inline_limit_ceiling ~ " most-recent messages even if your Messages-to-mine setting is higher — click Mine the Sent Items Now to scan the full setting. Nothing is written to your stored profile.") }}
+            </button>
+        </form>
+        <form hx-post="/profile/style-data/mine-now?account_id={{ entry.account.id }}"
+              hx-target="#mine-result-{{ entry.account.id }}"
+              hx-swap="innerHTML"
+              hx-confirm="Mine the Sent folder now? This will read recent sent mail, build a new writing-style summary, and save it. Existing summary will be replaced.">
+            {{ csrf_input(request) }}
+            <button type="submit"
+                    {% if _mine_disabled %}disabled{% endif %}>
+                Mine the Sent Items Now{{ m.help("Pulls your most recent sent messages, asks the AI to extract a small writing-style summary, and saves it. Example: refresh after a big style shift (new job, new tone) without waiting for the nightly tick.") }}
+            </button>
+        </form>
+        {% if _mine_disabled %}
+        <small style="display:inline-flex;align-items:center;padding:0.05rem 0.4rem;
+                      border:1px solid var(--pico-muted-border-color);
+                      border-radius:0.5rem;color:var(--pico-muted-color);
+                      font-size:0.8em;">
+            {{ _mine_disabled_reason }}
+        </small>
+        {% endif %}
+        <form method="post"
+              action="/profile/style-data/export?account_id={{ entry.account.id }}">
+            {{ csrf_input(request) }}
+            <button type="submit" class="outline secondary">
+                Download a copy
+            </button>
+        </form>
+        {% if _profile_present %}
+        <form method="post"
+              action="/profile/style-data/delete-profile?account_id={{ entry.account.id }}"
+              onsubmit="return confirm('Delete the writing-style summary for {{ entry.account.name|e }}? You can rebuild it later from the account\'s Integrations tab.');">
+            {{ csrf_input(request) }}
+            <button type="submit" class="outline secondary"
+                    style="color:var(--pico-del-color);border-color:var(--pico-del-color);">
+                Delete writing-style summary
+            </button>
+        </form>
+        {% endif %}
+        {% if _index_count %}
+        <form method="post"
+              action="/profile/style-data/delete-index?account_id={{ entry.account.id }}"
+              onsubmit="return confirm('Delete all {{ _index_count }} saved reply examples for {{ entry.account.name|e }}? You can rebuild from your Sent folder later.');">
+            {{ csrf_input(request) }}
+            <button type="submit" class="outline secondary"
+                    style="color:var(--pico-del-color);border-color:var(--pico-del-color);">
+                Delete reply examples
+            </button>
+        </form>
+        {% endif %}
+        {% if _has_any %}
+        <form method="post"
+              action="/profile/style-data/delete-all?account_id={{ entry.account.id }}"
+              onsubmit="return confirm('Delete EVERYTHING (writing-style summary, reply examples, captured edits) for {{ entry.account.name|e }}? This cannot be undone.');">
+            {{ csrf_input(request) }}
+            <button type="submit"
+                    style="background:var(--pico-del-color);border-color:var(--pico-del-color);">
+                Delete everything for this account
+            </button>
+        </form>
+        {% endif %}
+    </div>
+
+    {% if entry.action_msg %}
+    <article style="border-left:3px solid var(--pico-ins-color);padding:0.4rem 0.8rem;margin-top:0.75rem;">
+        <small>{{ entry.action_msg }}</small>
+    </article>
+    {% endif %}
+    {% if entry.action_err %}
+    <article style="border-left:3px solid var(--pico-del-color);padding:0.4rem 0.8rem;margin-top:0.75rem;">
+        <small style="color:var(--pico-del-color);">{{ entry.action_err }}</small>
+    </article>
+    {% endif %}
+
+    {# #157 — HTMX target for the preview / mine-now fragments. The
+       same container is also rendered in the empty-state branch above
+       (one per account). HTMX targets it by id; rendering it here in
+       the _has_any branch keeps the empty-vs-populated layouts
+       parallel without depending on the HTMX swap to find the right
+       node when both branches' controls coexist (they don't — the
+       outer if/elif guarantees only one branch renders per account). #}
+    <div id="mine-result-{{ entry.account.id }}" style="margin-top:0.5rem;"></div>
+
+    {% endif %}{# end _has_any #}
+</details>
+{% endfor %}
+
+{% if save_msg %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin-top:1rem;">
+    {{ save_msg }}
+</article>
+{% endif %}
+
+<p style="margin-top:1.5rem;">
+    <a href="/profile" role="button" class="outline">&larr; Back to My Settings</a>
+</p>
+{% endblock %}

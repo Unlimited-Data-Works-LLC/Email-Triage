@@ -1,0 +1,60 @@
+{# View-mode row partial for one rule on /rules.
+
+   Context required (passed by include OR by a route-handler render):
+     * lst   — dict-like with .id (the containing list's id).
+     * rule  — dict-like with .id, .rule_type, .pattern, .skip_ai,
+               .adds_labels_list.
+     * request — for the csrf_input() helper.
+
+   The Edit button hx-gets the matching `_rule_edit.html` partial,
+   swapping the row's outerHTML for the inline edit form. Cancel
+   from edit mode hx-gets `/rules/<lst>/rules/<rule>/row` and swaps
+   back to this partial. Save POSTs to
+   `/rules/<lst>/rules/<rule>/save` and returns the updated view-mode
+   row (this partial again, re-rendered with the new values).
+   Mirrors the categories/_row.html + _edit.html pattern.
+#}
+<tr id="rule-{{ lst.id }}-{{ rule.id }}">
+    <td><code>{{ rule.rule_type }}</code></td>
+    <td>{{ rule.pattern }}</td>
+    <td>
+        {% if rule.skip_ai %}
+        <span style="color:var(--pico-color-amber-500);font-weight:600;">Force</span>
+        {% else %}
+        <span style="color:var(--pico-muted-color);">Hint</span>
+        {% endif %}
+    </td>
+    <td>
+        {% if rule.adds_labels_list %}
+            {% for slug in rule.adds_labels_list %}
+            <code style="margin-right:0.3rem;">{{ slug }}</code>
+            {% endfor %}
+        {% else %}
+        <small style="color:var(--pico-muted-color);">—</small>
+        {% endif %}
+    </td>
+    <td>
+        {# Pico's role="group" connects adjacent direct children with a
+           shared border, BUT it treats a wrapping <form> as one child
+           and styles the form (not the button inside) — making the
+           Edit button outlined and the Remove button look flat /
+           differently shaped. Side-by-side inline buttons with a
+           small gap keep the two buttons visually identical. #}
+        <div style="display:inline-flex;gap:0.35rem;align-items:center;">
+            <button type="button" class="outline secondary"
+                    style="padding:0.25rem 0.6rem;font-size:0.85em;margin:0;"
+                    hx-get="/rules/{{ lst.id }}/rules/{{ rule.id }}/edit"
+                    hx-target="#rule-{{ lst.id }}-{{ rule.id }}"
+                    hx-swap="outerHTML">Edit</button>
+            <form method="post"
+                  action="/rules/{{ lst.id }}/rules/{{ rule.id }}/delete"
+                  style="margin:0;display:inline;">
+                {{ csrf_input(request) }}
+                <button type="submit" class="outline secondary"
+                        style="padding:0.25rem 0.6rem;font-size:0.85em;margin:0;">
+                    Remove
+                </button>
+            </form>
+        </div>
+    </td>
+</tr>

@@ -1,0 +1,732 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Not end users.
+   TECH-SKILL:  medium — comfortable with backends, throughput,
+                configuration files; runs the install.
+   COPY RULES:  user-facing terms still apply on this admin page
+                because the labels surface in tooltips that match
+                the rest of the UI. Use "AI" not "LLM" / "language
+                model" in operator-visible labels and help text.
+                Backend / protocol detail stays as-is.
+                See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+{% import "_macros.html" as m %}
+
+{# #125 partial -- version + schema-compat banner. ``version_status``
+   is built by the /config route handler via
+   ``email_triage.version.gather_version_status``. Display-only; no
+   update mechanism wired. #}
+{% include "admin/_version_banner.html" %}
+
+{% if save_msg %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    {{ save_msg }}
+</article>
+{% endif %}
+
+{% if save_error %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    {{ save_error }}
+</article>
+{% endif %}
+
+<form method="post" action="/config/save">
+    {{ csrf_input(request) }}
+
+{# ── Runtime Settings ──────────────────────────────────────────────── #}
+<section>
+    <h3>Runtime Settings</h3>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Dry Run</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="checkbox" name="dry_run" value="1"
+                               {% if runtime.dry_run %}checked{% endif %}
+                               style="margin:0;">
+                        Enabled
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Log what actions <em>would</em> fire (classify, determine route) but don't
+                    execute them. Useful for validating rules and categories before going live.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Log Level</strong></td>
+                <td>
+                    <select name="log_level" style="margin:0;width:auto;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {% for lv in ['DEBUG', 'INFO', 'WARNING', 'ERROR'] %}
+                        <option value="{{ lv }}" {% if runtime.log_level == lv %}selected{% endif %}>{{ lv }}</option>
+                        {% endfor %}
+                    </select>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Minimum log level shown in the admin log viewer and console.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>HIPAA Mode</strong></td>
+                <td>
+                    {% if hipaa_mode %}
+                    <strong style="color:var(--pico-ins-color);">ON</strong>
+                    {% else %}
+                    <span style="color:var(--pico-muted-color);">off</span>
+                    {% endif %}
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Read-only here. Toggle on
+                    <a href="/admin/security">/admin/security</a>.
+                    Strips PHI from logs / notifications; locks every
+                    account created while on.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Bulk Triage Rate</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="number" name="bulk_triage_rate_msg_per_min"
+                               value="{{ runtime.bulk_triage_rate_msg_per_min or 30 }}"
+                               min="1" max="600" step="1"
+                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        msg / min
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Token-bucket cadence for whole-mailbox triage runs (Run Triage &rarr; "All matches"). Higher values risk overrunning the local AI backend's throughput. Default 30. Range 1&ndash;600.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Bulk Triage Concurrency</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="number" name="bulk_triage_concurrency"
+                               value="{{ runtime.bulk_triage_concurrency or 1 }}"
+                               min="1" max="8" step="1"
+                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        parallel
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Maximum messages classified in parallel during a bulk run. Single-GPU AI boxes saturate at low values; default 1, max 8.
+                </small></td>
+            </tr>
+            {# #145.2 — burst depth for the per-job rate-limit bucket. #}
+            <tr>
+                <td>
+                    <strong>Bulk Triage Burst</strong>
+                    {{ m.help("Allow up to N triage runs to fire back-to-back without pausing. Higher = faster startup; lower = smoother pace. Example: burst=3 lets your morning catch-up sweep three messages before the per-second limit kicks in.") }}
+                </td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="number" name="bulk_triage_burst"
+                               value="{{ runtime.bulk_triage_burst or 1 }}"
+                               min="1" max="100" step="1"
+                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        msgs
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    How many messages can fire back-to-back at the start of a bulk run before the per-minute rate kicks in. Default 1 (no burst, smoothest pace). Range 1&ndash;100.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# ── Classifier ────────────────────────────────────────────────────── #}
+<section>
+    <h3>Classifier</h3>
+
+    {% if classifier_baa_status %}
+    {# Privacy chip — at-a-glance is the configured backend local
+       (PHI-safe) or external (PHI-egress, BAA required). #}
+    <article style="padding:0.6rem 0.9rem;margin-bottom:0.75rem;
+                    border-left:4px solid {% if classifier_baa_status.is_local %}var(--pico-ins-color){% else %}var(--pico-color-amber-500){% endif %};
+                    background:var(--pico-card-background-color);font-size:0.9rem;">
+        <strong>
+            {% if classifier_baa_status.is_local %}
+            🔒 Local classifier — PHI never leaves this install.
+            {% else %}
+            ⚠ External classifier — PHI would egress to
+            <code>{{ classifier_baa_status.host }}</code>.
+            BAA acknowledgment {% if classifier_baa_status.baa_acked %}<em>on file</em>{% else %}<strong style="color:var(--pico-del-color);">NOT on file</strong>{% endif %}.
+            {% endif %}
+        </strong>
+
+        {% if not classifier_baa_status.is_local %}
+        <p style="margin:0.3rem 0 0;font-size:0.85rem;">
+            HIPAA §164.308(b)(1) requires a Business Associate
+            Agreement with any subprocessor that handles PHI. Until
+            a BAA is in force with the vendor at
+            <code>{{ classifier_baa_status.host }}</code>, mail from
+            HIPAA-flagged accounts will refuse to classify (fail-closed).
+        </p>
+        <form hx-post="/config/baa-ack"
+              hx-target="closest article"
+              hx-swap="outerHTML"
+              style="margin-top:0.4rem;">
+            <input type="hidden" name="backend" value="{{ classifier_baa_status.backend }}">
+            <input type="hidden" name="host" value="{{ classifier_baa_status.host }}">
+            <label style="font-size:0.85rem;">
+                <input type="checkbox" name="acked" value="1"
+                       {% if classifier_baa_status.baa_acked %}checked{% endif %}>
+                I confirm a Business Associate Agreement is in place
+                with the operator of <code>{{ classifier_baa_status.host }}</code>
+                authorising PHI processing.
+            </label>
+            <button type="submit" class="outline" style="padding:0.2rem 0.7rem;font-size:0.8rem;margin:0.3rem 0 0;">
+                Save acknowledgment
+            </button>
+        </form>
+        {% endif %}
+    </article>
+    {% endif %}
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Backend</strong></td>
+                <td>
+                    <select name="classifier_backend" style="margin:0;width:auto;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {% for b in ['ollama', 'openai', 'gemini'] %}
+                        <option value="{{ b }}" {% if config.classifier.backend == b %}selected{% endif %}>{{ b }}</option>
+                        {% endfor %}
+                    </select>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    AI backend for email classification.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Model</strong></td>
+                <td>
+                    <input type="text" name="classifier_model" value="{{ config.classifier.model }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Model name (e.g. <code>[local-llm-model] <code>gpt-4o</code>, <code>gemini-2.0-flash</code>).
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Ollama URL</strong></td>
+                <td>
+                    <input type="text" name="classifier_ollama_url" value="{{ config.classifier.ollama_url }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Base URL for the Ollama API server.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>OpenAI Base URL</strong></td>
+                <td>
+                    <input type="text" name="classifier_openai_base_url" value="{{ config.classifier.openai_base_url }}"
+                           placeholder="https://api.openai.com/v1"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    For OpenAI/Azure backend. Leave blank for default OpenAI endpoint.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>OpenAI Model</strong></td>
+                <td>
+                    <input type="text" name="classifier_openai_model" value="{{ config.classifier.openai_model }}"
+                           placeholder="(uses Model above)"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Override model name for OpenAI backend. Leave blank to use the Model field above.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Gemini Model</strong></td>
+                <td>
+                    <input type="text" name="classifier_gemini_model" value="{{ config.classifier.gemini_model }}"
+                           placeholder="gemini-2.0-flash"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Model name for Gemini backend.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# ── Outbound email (SMTP) ─────────────────────────────────────────
+   Single SMTP transport used for OTP login mails, newsletter
+   digests, recipient digests, escalation notifications, and the
+   admin health-email digest. Labelled "Login OTP" historically;
+   renamed 2026-05-10 since the transport serves every outbound. #}
+<section>
+    <h3>Outbound email (SMTP)</h3>
+    <p style="margin:0 0 0.5rem;"><small style="color:var(--pico-muted-color);">
+        Single transport for every outbound email this install sends:
+        login OTP codes, newsletter digests, recipient digests,
+        escalation alerts, and the admin health digest. The
+        <strong>From</strong> identity below appears on all of them
+        unless an action overrides it.
+    </small></p>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Host</strong></td>
+                <td>
+                    <input type="text" name="smtp_host" value="{{ config.smtp.host }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    SMTP server hostname.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Port</strong></td>
+                <td>
+                    <input type="number" name="smtp_port" value="{{ config.smtp.port }}"
+                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    SMTP port (25, 465, 587).
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Username</strong></td>
+                <td>
+                    <input type="text" name="smtp_username" value="{{ config.smtp.username }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    SMTP login username (often the same as From address).
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>From Address</strong></td>
+                <td>
+                    <input type="text" name="smtp_from_addr" value="{{ config.smtp.from_addr }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Envelope sender address for OTP emails.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>From Name</strong></td>
+                <td>
+                    <input type="text" name="smtp_from_name" value="{{ config.smtp.from_name }}"
+                           placeholder="(blank = bare address)"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Display name for the <code>From:</code> header — e.g.
+                    <code>Email Triage</code> renders as
+                    <code>"Email Triage" &lt;addr&gt;</code>. Leave blank for
+                    a bare address.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>TLS</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="checkbox" name="smtp_use_tls" value="1"
+                               {% if config.smtp.use_tls %}checked{% endif %}
+                               style="margin:0;">
+                        Enabled
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Use STARTTLS for SMTP connection.
+                </small></td>
+            </tr>
+            {# ── Newsletter digest defaults ─────────────────────────
+               Digest signature was previously nested in the Health
+               Email section, but its description correctly notes
+               it appears on newsletter digests (not the admin
+               health digest). Moved 2026-05-10 to its proper
+               outbound-email neighbour. #}
+            <tr>
+                <td colspan="3" style="background:var(--pico-card-background-color);padding:0.4rem 0.75rem;">
+                    <strong>Newsletter digest defaults</strong>
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Digest signature</strong></td>
+                <td>
+                    <input type="text" name="summary_email_signature"
+                           value="{{ config.summary_email.signature }}"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Appears at the bottom of every newsletter digest
+                    email. Supports <code>{category}</code> — rendered
+                    per-digest with the classifier bucket name.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# Google OAuth + Office 365 OAuth install-wide credentials moved to
+   /admin/integrations on 2026-05-10. Inbound Gmail Pub/Sub + O365
+   Graph push config + outbound OpenClaw webhook already lived there;
+   the OAuth client credentials joined the same page so every
+   integration-related setting is in one home. #}
+
+{# ── Ingestion cadence ─────────────────────────────────────────────── #}
+<section>
+    <h3>Ingestion cadence</h3>
+    <p style="margin:0 0 0.5rem;"><small style="color:var(--pico-muted-color);">
+        Every account runs on two independent knobs: <strong>push</strong>
+        (IMAP IDLE / Gmail Pub/Sub) for instant delivery and
+        <strong>poll</strong> for a cheap safety-net sweep at the
+        configured cadence. The default below applies to new accounts;
+        existing accounts keep their per-account value.
+    </small></p>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Default poll interval</strong></td>
+                <td>
+                    <input type="number" name="ingestion_default_poll_interval_minutes"
+                           value="{{ config.ingestion.default_poll_interval_minutes }}"
+                           min="{{ config.ingestion.POLL_MIN }}"
+                           max="{{ config.ingestion.POLL_MAX }}"
+                           step="{{ config.ingestion.POLL_STEP }}"
+                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    {{ config.ingestion.POLL_MIN }}–{{ config.ingestion.POLL_MAX }} min in {{ config.ingestion.POLL_STEP }}-min steps.
+                    Applied to new accounts; per-account overrides live on each account's edit form.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Push-mode interval</strong> <small>(legacy)</small></td>
+                <td>
+                    <input type="number" name="ingestion_push_poll_interval_min"
+                           value="{{ config.ingestion.push_poll_interval_min }}"
+                           min="{{ config.ingestion.PUSH_MIN }}"
+                           max="{{ config.ingestion.PUSH_MAX }}"
+                           step="{{ config.ingestion.STEP }}"
+                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Legacy B3 field retained for YAML round-trip. No longer drives ingestion.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Poll-mode interval</strong> <small>(legacy)</small></td>
+                <td>
+                    <input type="number" name="ingestion_poll_poll_interval_min"
+                           value="{{ config.ingestion.poll_poll_interval_min }}"
+                           min="{{ config.ingestion.POLL_MIN }}"
+                           max="{{ config.ingestion.POLL_MAX }}"
+                           step="{{ config.ingestion.STEP }}"
+                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Legacy B3 field retained for YAML round-trip. No longer drives ingestion.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# ── Style learning (#161 items 3 + 4) — re-inserted on the
+   2026-05-13 /config consolidation cherry-pick. The agent's
+   worktree base was pre-#161 so this section was missing from
+   the lifted general.html. ──────────────────────────────────── #}
+<section>
+    <h3>Style learning</h3>
+    <p style="margin:0 0 0.5rem;"><small style="color:var(--pico-muted-color);">
+        Email Triage refreshes each user's writing-style summary on a
+        regular cadence so AI-drafted replies stay in their voice.
+        The cadence + the default mine size live here; per-account
+        overrides live on each user's Style data page.
+    </small></p>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>
+                    <strong>Auto-scan cadence</strong>
+                    {{ m.help("Hours between auto-scans of opted-in accounts. Default 6. Example: 12 = scan twice a day (lighter load); 1 = scan every hour (fresher style data, higher AI cost).") }}
+                </td>
+                <td>
+                    <input type="number" name="style_learning_capture_interval_hours"
+                           value="{{ style_learning_capture_interval_hours or 6 }}"
+                           min="1" max="72" step="1"
+                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> hours
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Range 1&ndash;72 hours. Cadence applies to every account that has Auto-scan on schedule turned on.
+                </small></td>
+            </tr>
+            <tr>
+                <td>
+                    <strong>Default mine size</strong>
+                    {{ m.help("Default number of sent messages each mine press reads when no per-account override is set. Default 50. Example: 100 = pull twice as many sent messages on a one-click refresh (over " ~ (inline_limit_ceiling or 50) ~ " runs in the background on the Bulk runs page).") }}
+                </td>
+                <td>
+                    <input type="number" name="style_learning_mine_limit_default"
+                           value="{{ style_learning_mine_limit_default or 50 }}"
+                           min="1" max="500" step="1"
+                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> messages
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Range 1&ndash;500. Each user can override this from their Style data page; values over {{ inline_limit_ceiling or 50 }} hand off to a background job so the browser doesn't sit waiting.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# ── Logging & Storage ─────────────────────────────────────────────── #}
+<section>
+    <h3>Logging &amp; Storage</h3>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Log Format</strong></td>
+                <td>
+                    <select name="logging_format" style="margin:0;width:auto;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {% for fmt in ['json', 'text'] %}
+                        <option value="{{ fmt }}" {% if config.logging.format == fmt %}selected{% endif %}>{{ fmt }}</option>
+                        {% endfor %}
+                    </select>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Log output format. JSON for machine parsing, text for humans.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>DB Path</strong></td>
+                <td>
+                    <code style="font-size:0.9rem;">{{ config.persistence.db_path }}</code>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    SQLite database location. Not editable at runtime.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Secrets Backend</strong></td>
+                <td>
+                    <code style="font-size:0.9rem;">{{ config.secrets.backend }}</code>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Secrets storage backend. Not editable at runtime.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+</section>
+
+{# ── Admin Email (CR-2c — renamed from Health Email) ────────────────── #}
+<section>
+    <h3>Admin Email</h3>
+    <p style="margin:0 0 0.5rem;"><small style="color:var(--pico-muted-color);">
+        Notifications targeted at the operator: daily health digest,
+        update-failed alerts, and any future admin-targeted channel. One
+        recipient list serves all of them. <strong>PHI-safe:</strong>
+        no message-level content is ever included; when system HIPAA mode
+        is on, the HIPAA-events section is dropped entirely.
+    </small></p>
+    <table>
+        <thead>
+            <tr>
+                <th style="width:14rem;">Setting</th>
+                <th>Value</th>
+                <th style="width:20rem;">Description</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td><strong>Daily health email enabled</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="checkbox" name="health_email_enabled" value="1"
+                               {% if config.health_email.enabled %}checked{% endif %}
+                               style="margin:0;">
+                        Enabled
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Master switch for the daily digest. Update-failed
+                    alerts fire regardless (you always want to know an
+                    update rolled back).
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Admin email recipients</strong></td>
+                <td>
+                    <input type="text" name="admin_email_recipients"
+                           value="{{ config.admin_email.recipients | join(', ') if config.admin_email.recipients else config.health_email.recipients | join(', ') }}"
+                           placeholder="ops@example.com, admin@example.com"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Comma-separated list. Used for: daily health digest,
+                    update-failed alerts, future admin notifications.
+                    Admin-only edit.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Send at</strong></td>
+                <td>
+                    <input type="text" name="health_email_send_at"
+                           value="{{ config.health_email.send_at }}"
+                           placeholder="07:15"
+                           pattern="[0-2][0-9]:[0-5][0-9]"
+                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    HH:MM in container local time.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Release notes URL</strong></td>
+                <td>
+                    <input type="text" name="admin_email_release_check_url"
+                           value="{{ config.admin_email.release_check_url }}"
+                           placeholder="https://api.github.com/repos/unlimited-data-works-llc/email-triage/releases/latest"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    GitHub Releases API endpoint. Used for the "update
+                    available" section in the daily digest. Override
+                    if you track a fork or private mirror; leave blank
+                    to keep the public default.
+                </small></td>
+            </tr>
+            <tr>
+                <td colspan="3" style="background:var(--pico-card-background-color);padding:0.4rem 0.75rem;">
+                    <strong>Content toggles</strong>
+                </td>
+            </tr>
+            {% for key, label in [
+                ('include_health', 'Gateway / container health'),
+                ('include_watchers', 'Watcher states'),
+                ('include_triage', 'Triage activity (last 24h)'),
+                ('include_errors', 'ERROR / WARNING log tail'),
+                ('include_hipaa_events', 'HIPAA access events'),
+                ('include_api_key_events', 'API key lifecycle'),
+                ('include_pubsub', 'Pub/Sub push deliveries'),
+                ('include_update_available', 'Update available section'),
+            ] %}
+            <tr>
+                <td><strong>{{ label }}</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="checkbox" name="health_email_{{ key }}" value="1"
+                               {% if config.health_email[key] %}checked{% endif %}
+                               style="margin:0;">
+                        On
+                    </label>
+                </td>
+                <td></td>
+            </tr>
+            {% endfor %}
+            <tr>
+                <td><strong>Quiet mode</strong></td>
+                <td>
+                    <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
+                        <input type="checkbox" name="health_email_quiet_mode" value="1"
+                               {% if config.health_email.quiet_mode %}checked{% endif %}
+                               style="margin:0;">
+                        Skip if nothing interesting
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    No email on boring days — suppress when no errors,
+                    no attention reasons, no HIPAA or API-key activity.
+                </small></td>
+            </tr>
+            <tr>
+                <td><strong>Error-rate threshold</strong></td>
+                <td>
+                    <input type="number" name="health_email_error_rate_threshold_pct"
+                           value="{{ config.health_email.error_rate_threshold_pct }}"
+                           min="0" max="100"
+                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> %
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Triage error rate above this flips the subject to
+                    <code>⚠ Attention</code>. 0 = any error flips it.
+                </small></td>
+            </tr>
+        </tbody>
+    </table>
+    <p style="margin:0.5rem 0;">
+        <button type="submit" formaction="/config/health-email/send-now"
+                formmethod="post"
+                style="margin:0;padding:0.25rem 0.75rem;font-size:0.85rem;">
+            Send now (test)
+        </button>
+        <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
+            Fires the same codepath as the scheduled run, bypassing quiet mode.
+        </small>
+    </p>
+</section>
+
+{# ── Anti-AI style guide (install-wide) ────────────────────────────── #}
+<section>
+    <h3>Anti-AI style guide (install-wide){{ m.help("A list of AI-mannerisms every draft reply should AVOID — applies to every user on this install. Concrete examples: 'Never start with Certainly! or Of course; never use em-dashes for narrative pause; avoid the phrase I hope this email finds you well.' Each user can add their own additional list on /profile?tab=writing, or opt out of this install-wide list.") }}</h3>
+    <p style="margin:0 0 0.5rem;"><small style="color:var(--pico-muted-color);">
+        Plain text. The system reads this verbatim before drafting each
+        reply. By default each user's own list is stacked on top of this
+        one; users can choose to use only their own list.
+    </small></p>
+    <label style="display:block;max-width:50rem;">
+        <textarea name="anti_ai_style_guide_global" rows="6" cols="60"
+                  maxlength="4000"
+                  placeholder="Example: Never open with 'Certainly!' or 'Of course'. Never use em-dashes for narrative pause. Avoid the phrase 'I hope this email finds you well'."
+                  style="width:100%;font-family:var(--pico-font-family);">{{ anti_ai_style_guide_global or "" }}</textarea>
+        <small style="color:var(--pico-muted-color);display:block;">
+            Up to 4000 characters. Applies to every user on this install.
+        </small>
+    </label>
+</section>
+
+<button type="submit" style="margin-top:0.5rem;">Save All Settings</button>
+
+</form>

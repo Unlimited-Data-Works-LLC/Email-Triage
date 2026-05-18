@@ -1,0 +1,54 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / medical-researcher persona).
+                Inherits from help/tasks.html.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+     - No protocol jargon — "AI" not "language model", "watch
+       folder" not "IMAP IDLE", "folder" not "mailbox".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+   PARAMS:
+     - num    — 1-based task number (drives heading + anchor id).
+     - slug   — short kebab-case anchor target ("route-by-sender").
+     - title  — short imperative phrase ("Route all BCBSM mail to FYI").
+     - when   — single-line "When to use this" sentence.
+     - steps  — list of {label, body} dicts. ``body`` is the step's
+                paragraph; ``label`` is a one-phrase summary used in
+                the numbered marker. ``body`` may contain the
+                ``{{ m.help(...) }}`` macro inline; that's why the
+                template renders body raw via ``|safe``.
+     - gotchas — list of plain-text strings rendered as a "What can
+                go wrong" bullet list. Pass an empty list to omit
+                the section.
+   ─────────────────────────────────────────────────────────── #}
+<section id="task-{{ slug }}" class="help-task" style="margin:2rem 0;padding-top:0.5rem;border-top:1px solid var(--pico-muted-border-color);">
+    <h3 style="margin-bottom:0.25rem;">
+        <span style="display:inline-block;min-width:1.6rem;padding:0.1rem 0.45rem;margin-right:0.5rem;border-radius:4px;background:var(--pico-primary-background);color:var(--pico-primary-inverse);font-size:0.85em;font-weight:bold;">{{ num }}</span>
+        {{ title }}
+    </h3>
+
+    <p style="font-style:italic;color:var(--pico-muted-color);margin-top:0.25rem;">
+        <strong>When to use this:</strong> {{ when }}
+    </p>
+
+    <ol style="padding-left:1.5rem;">
+        {% for step in steps %}
+        <li style="margin-bottom:0.6rem;">
+            {% if step.label %}<strong>{{ step.label }}.</strong> {% endif %}{{ step.body|safe }}
+            {% if step.screenshot_hint %}
+            {# TODO #128: screenshot here — see {{ step.screenshot_hint }} #}
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ol>
+
+    {% if gotchas %}
+    <details>
+        <summary style="cursor:pointer;color:var(--pico-muted-color);font-size:0.9em;">What can go wrong</summary>
+        <ul style="padding-left:1.5rem;margin-top:0.5rem;">
+            {% for g in gotchas %}<li>{{ g }}</li>{% endfor %}
+        </ul>
+    </details>
+    {% endif %}
+</section>

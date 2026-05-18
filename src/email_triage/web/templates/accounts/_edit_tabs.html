@@ -1,0 +1,48 @@
+{# Tab-strip for the account edit page.
+
+   Pass active="X" + acct (the account dict).
+
+   Six tabs (#154 retired the per-account Watches tab — Watches now
+   lives at /profile/watches with a multi-account picker):
+     provider     — basics + auth (default)
+     watch        — Real-Time Watch fieldset
+     digests      — recipient digest fieldset
+     integrations — Gmail Pub/Sub + OpenClaw + Calendar
+     delegates    — per-account delegation
+     routing      — separate page /accounts/{id}/routes
+
+   Tabs navigate to /accounts/{id}/edit?tab=<slug> using ABSOLUTE
+   hrefs so the include works correctly from sibling pages.
+   /accounts/{id}/routes also embeds this strip (Routing tab),
+   and a relative ``?tab=`` href would resolve to
+   ``/routes?tab=X`` which silently 404s the tab intent —
+   operator pre-fix saw the URL change but no navigation. The
+   Routing tab itself stays as a cross-page link to /routes.
+#}
+<nav style="margin:0 0 1rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
+    <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
+        {% set _edit_base = "/accounts/" ~ acct.id ~ "/edit" %}
+        {% set _tabs = [
+            ("provider",     _edit_base ~ "?tab=provider",     "Provider + Auth"),
+            ("watch",        _edit_base ~ "?tab=watch",        "Watch + Push"),
+            ("digests",      _edit_base ~ "?tab=digests",      "Digests"),
+            ("integrations", _edit_base ~ "?tab=integrations", "Integrations"),
+            ("delegates",    _edit_base ~ "?tab=delegates",    "Delegates"),
+            ("routing",      "/accounts/" ~ acct.id ~ "/routes", "Routing"),
+        ] %}
+        {% for slug, href, label in _tabs %}
+        {% set is_active = (active == slug) %}
+        <li style="margin:0;">
+            <a href="{{ href }}"
+               style="display:inline-block;padding:0.4rem 0.85rem;
+                      text-decoration:none;font-size:0.9em;
+                      border:1px solid transparent;
+                      border-bottom:none;
+                      border-radius:6px 6px 0 0;
+                      {% if is_active %}background:var(--pico-card-background-color, #1f2530);border-color:var(--pico-muted-border-color);color:var(--pico-color);font-weight:600;margin-bottom:-1px;{% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+</nav>

@@ -1,0 +1,80 @@
+{# ─── AUDIENCE ───
+   END-USER (account owner / operator setting up their own mailbox).
+   TECH-SKILL: low. Many of these users have never configured an email
+   integration before — they know "my email is on Gmail" or "I use
+   Outlook at work" and not much else.
+   COPY RULES:
+     - No protocol-level jargon (RFC, OData, IMAP IDLE, OAuth scopes,
+       Pub/Sub topic). "IMAP" is unavoidable as a provider label
+       since the user has to recognise it from their mail-app docs.
+     - Use plain language framing for choices. Examples on every input.
+     - Tooltips via m.help() with concrete examples — this is the
+       FIRST page of the FIRST flow; tooltips here teach the operator
+       the rest of the app's tooltip pattern.
+     - No "ask your administrator" or admin-path hints; if the user
+       is here they have permission already.
+   #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Add Account — Step 1 of 5{% endblock %}
+{% block content %}
+<h2>Add an email account</h2>
+
+{% set current_step = 1 %}
+{% include "account_wizard/_progress.html" %}
+
+<p>
+    Welcome — let's connect a mailbox. This first step is just a
+    label and which email service it lives on. The next steps will
+    walk you through signing in and picking how email-triage should
+    work for this account.
+</p>
+
+{% if error %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    <small style="color:var(--pico-del-color);">{{ error }}</small>
+</article>
+{% endif %}
+
+<form method="post" action="/accounts/new/step1">
+    {{ csrf_input(request) }}
+    <div class="grid">
+        <label>
+            Account name{{ m.help("Just a friendly label for you to recognise this mailbox in lists. Example: 'Work Outlook' or 'Personal Gmail'. You can change it later.") }}
+            <input type="text" name="name" value="{{ name or '' }}"
+                   placeholder="e.g. Personal Gmail, Work Outlook"
+                   required>
+            <small>This is just a label. It doesn't have to match the email address.</small>
+        </label>
+        <label>
+            Email service{{ m.help("Which provider hosts this mailbox. Pick Gmail for any @gmail.com or Google Workspace mailbox; Outlook / Office 365 for any @outlook.com / @hotmail.com / company-on-Microsoft mailbox; IMAP for everything else (most third-party mail hosts).") }}
+            <select name="provider_type" required>
+                <option value="imap" {% if (provider_type or 'imap') == 'imap' %}selected{% endif %}>IMAP — most other mail providers</option>
+                <option value="gmail_api" {% if provider_type == 'gmail_api' %}selected{% endif %}>Gmail or Google Workspace</option>
+                <option value="office365" {% if provider_type == 'office365' %}selected{% endif %}>Outlook or Office 365</option>
+            </select>
+            <small>Pick once per account. Changing later means signing in again.</small>
+        </label>
+    </div>
+
+    {% if is_admin and assignable_users %}
+    <label style="margin-top:0.75rem;">
+        Owner{{ m.help("Admin-only: assign this account to another user (e.g. setting up someone else's mailbox on their behalf). Defaults to you.") }}
+        <select name="user_id">
+            {% for u in assignable_users %}
+            <option value="{{ u.id }}" {% if u.id == default_owner_id %}selected{% endif %}>
+                {{ u.email }} ({{ u.name }})
+            </option>
+            {% endfor %}
+        </select>
+        <small>Admin-only: assign the account to another user.</small>
+    </label>
+    {% endif %}
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Next: Sign in →</button>
+        <a href="/accounts" role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">Cancel</a>
+    </div>
+</form>
+{% endblock %}

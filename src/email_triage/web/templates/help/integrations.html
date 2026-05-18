@@ -1,0 +1,986 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    install operator / homelab admin. NOT end users.
+                The reader is comfortable with Google Cloud Console
+                + Azure Portal, knows what OAuth + a tenant ID is,
+                will copy values back into Email Triage's
+                /admin/integrations page.
+   TECH-SKILL:  developer / IT admin. Protocol jargon (Pub/Sub,
+                Graph API, OAuth scopes, AADSTS codes) is fine.
+   COPY RULES:
+     - Reference exact UI labels in Google Cloud / Azure Portal
+       (e.g. "App registrations" not "the app config page").
+     - AADSTS / Google API error codes shown verbatim so operators
+       can search for them.
+     - No operator identifiers in examples — use
+       `your-project-id`, `your-tenant.onmicrosoft.com`,
+       `noreply@example.com` placeholders.
+     - Each setup path is independent — operator may use Gmail
+       push OR poll, O365 push OR poll, mixed across accounts.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Setup guides — Gmail + Office 365 — Email Triage{% endblock %}
+{% block content %}
+
+<h2>Setup guides — Gmail + Office 365</h2>
+
+<p style="color:var(--pico-muted-color);">
+    Step-by-step walkthroughs for connecting Email Triage to a Gmail
+    or Office 365 account. Each integration has TWO paths: a "push"
+    path (real-time delivery — provider notifies Email Triage the
+    instant new mail arrives) and a "poll" path (Email Triage asks
+    the provider every N minutes). Push is faster + cheaper but
+    requires more setup; poll is simpler + works everywhere.
+</p>
+
+<article style="border-left:3px solid var(--pico-color-amber-500);
+                padding:0.6rem 1rem;margin:1rem 0;
+                background:var(--pico-card-background-color);">
+    <strong>Hobbyist note — connecting an Outlook.com / Hotmail.com
+    account without an Azure tenant.</strong>
+    <p style="margin:0.4rem 0 0;">
+        Microsoft killed the "register an app without a directory"
+        path in 2024 (see walkthroughs 1-2). For a personal MS
+        account, the cheapest path WITH a predictable cost ceiling
+        is the $6/mo M365 Business Basic subscription. If that's
+        not the right trade-off for you, Email Triage has a fifth
+        path: <strong>add your Outlook.com / Hotmail.com mailbox
+        as an IMAP account</strong> — bypassing Azure entirely.
+        Push via IMAP IDLE, folder move, sent-mail mining all
+        work. See <a href="#outlook-imap">walkthrough 5</a>.
+    </p>
+</article>
+
+<nav aria-label="Walkthrough index"
+     style="margin:1.5rem 0;padding:1rem;
+            background:var(--pico-card-background-color);
+            border-radius:6px;">
+    <strong>Jump to a walkthrough:</strong>
+    <ol style="margin:0.5rem 0 0 1.5rem;padding:0;">
+        <li><a href="#o365-push">Office 365 — push (Microsoft Graph subscription)</a></li>
+        <li><a href="#o365-poll">Office 365 — poll (OAuth only)</a></li>
+        <li><a href="#gmail-push">Gmail — push (Google Cloud Pub/Sub)</a></li>
+        <li><a href="#gmail-poll">Gmail — poll (OAuth only)</a></li>
+        <li><a href="#outlook-imap">Outlook.com / Hotmail via IMAP (no Azure tenant needed)</a></li>
+    </ol>
+</nav>
+
+<p style="color:var(--pico-muted-color);font-size:0.9em;">
+    Before any walkthrough: have admin access to Email Triage's
+    <a href="/config?tab=integrations">Integrations tab</a> open in
+    one browser tab; you'll paste values into it as you go.
+</p>
+
+{# ═══════════════════════════════════════════════════════════════
+   OFFICE 365 — PUSH (operator priority — they're testing now)
+   ═══════════════════════════════════════════════════════════════ #}
+
+<section id="o365-push" class="help-task"
+         style="margin:2rem 0;padding-top:0.5rem;
+                border-top:1px solid var(--pico-muted-border-color);">
+    <h3>1. Office 365 — push (Microsoft Graph subscription)</h3>
+
+    <p>
+        Real-time delivery via Microsoft Graph's
+        <code>/subscriptions</code> endpoint. Microsoft posts a
+        notification to Email Triage's webhook within seconds of new
+        mail arriving. Email Triage then fetches the message via
+        Graph.
+    </p>
+
+    <p><strong>You'll need:</strong></p>
+    <ul>
+        <li>Admin access to the Azure portal (
+            <a href="https://portal.azure.com" target="_blank" rel="noopener">portal.azure.com</a>)
+            for the Microsoft account you want to read mail from.
+        </li>
+        <li><strong>A directory (tenant)</strong> to register the
+            app in. As of 2024 Microsoft deprecated registering
+            apps outside a directory; personal Outlook / Hotmail
+            accounts no longer get a free path. You'll see this on
+            <strong>Register an application</strong>:
+            <blockquote style="border-left:3px solid var(--pico-del-color);padding:0.4rem 0.8rem;margin:0.5rem 0;color:var(--pico-muted-color);font-size:0.9em;">
+                "The ability to create applications outside of a
+                directory has been deprecated. You may get a new
+                directory by joining the M365 Developer Program or
+                signing up for Azure."
+            </blockquote>
+            Four ways to satisfy the gate (see <a href="#o365-push-step-0">Step 0</a>
+            below; install-admin task, one-time). Recommended:
+            paid M365 Business Basic ($6/mo) if you have a personal
+            Outlook account + want a no-landmines tenant.
+            Alternatives: existing org account, "Azure free" (real
+            traps — read), or M365 Dev Program if you qualify.
+        </li>
+        <li>Email Triage's public hostname (e.g.
+            <code>triage.example.com</code>). Microsoft must be able
+            to reach a webhook at <code>https://&lt;your-host&gt;/webhooks/office365</code>
+            over the public internet. LAN-only installs can't use
+            push — fall back to poll (walkthrough 2).
+        </li>
+        <li>A valid TLS certificate on Email Triage (Microsoft
+            won't post to self-signed). Email Triage's
+            <a href="/config?tab=tls">TLS tab</a> can mint one via
+            Let's Encrypt if you don't already have one.</li>
+    </ul>
+
+    <h4 id="o365-push-step-0">Step 0 — Get a directory (install admin only)</h4>
+
+    <p>
+        Microsoft requires you to register apps inside a directory
+        (tenant). Org / workplace mail comes with one
+        (<code>yourcompany.onmicrosoft.com</code>); personal
+        Outlook.com / Hotmail.com accounts do NOT. If you see the
+        "create apps outside a directory has been deprecated"
+        error on <strong>App registrations → + New registration</strong>,
+        you need a directory first.
+    </p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        <strong>Who actually needs to do this:</strong> the install
+        admin (the operator running the Email Triage server) does
+        Step 0 once. Once the app is registered + its credentials
+        are pasted into Email Triage's
+        <a href="/config?tab=integrations">Integrations tab</a>,
+        every end user can connect their own O365 account against
+        the shared app via the OAuth device-code flow (Step 5).
+        End users don't touch Azure Portal at all. So if you're
+        adding YOUR account to someone else's Email Triage install
+        — skip this whole step.
+    </p>
+
+    <p>
+        Three viable paths. Honest read on each:
+    </p>
+
+    <p><strong>Option A — Buy M365 Business Basic ($6/month, RECOMMENDED):</strong></p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Most-honest path. Predictable $6/month flat, real tenant
+        with full Exchange Online + Entra ID, no spending-limit
+        dance, no 30-day clock. The cheapest "actually free of
+        landmines" path for a personal-account install admin who
+        wants O365 push working in production.
+    </p>
+
+    <ol>
+        <li>Go to <a href="https://www.microsoft.com/en-us/microsoft-365/business/microsoft-365-business-basic" target="_blank" rel="noopener">microsoft.com/microsoft-365-business-basic</a>
+            → buy with the personal Microsoft account you want as
+            the install admin (or create a fresh one — your call).</li>
+        <li>Microsoft provisions a tenant
+            (<code>youremail&lt;hash&gt;.onmicrosoft.com</code>)
+            during checkout. Skip the optional steps about adding
+            users / setting up domains — you can do those later
+            or never.</li>
+        <li>Sign in to
+            <a href="https://portal.azure.com" target="_blank" rel="noopener">portal.azure.com</a>
+            with the same account → Switch directory → pick the new
+            tenant. App registrations is available; continue with
+            Step 1.</li>
+    </ol>
+
+    <p><strong>Option B — Existing org / school / association
+        Microsoft account:</strong></p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Zero cost if you already have one. Caveat: the app belongs
+        to that org's tenant, so the org's admin can see it. Ask
+        permission first. Some orgs block self-service app
+        registration (admin must register on your behalf).
+    </p>
+
+    <ol>
+        <li>Sign in to
+            <a href="https://portal.azure.com" target="_blank" rel="noopener">portal.azure.com</a>
+            with the org account.</li>
+        <li>The org's directory is already there. Continue with
+            Step 1.</li>
+    </ol>
+
+    <p><strong>Option C — Azure free sign-up (read the trap
+        terms carefully):</strong></p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Microsoft's
+        <a href="https://azure.microsoft.com/en-us/pricing/offers/ms-azr-0044p" target="_blank" rel="noopener">"Azure free account" offer terms</a>
+        layer the trap in three pieces:
+    </p>
+    <ol style="font-size:0.9em;color:var(--pico-muted-color);">
+        <li><strong>30-day promo credit</strong> ($200) expires.
+            <em>"Within 30 days of sign-up or upon exhaustion of
+            the credits (whichever occurs first), you must upgrade
+            to a pay-as-you-go subscription by removing the
+            spending limit."</em> Card is now live for charges.</li>
+        <li><strong>"12 months free" services</strong> revert to
+            pay-as-you-go after 12 months. From Microsoft's terms:
+            <em>"For the services that are free for 12 months,
+            any services you're using after 12 months has expired
+            will continue to run and you'll be billed for them at
+            pay-as-you-go rates."</em></li>
+        <li><strong>"Always-free" services</strong> ARE free at
+            $0 within specified monthly quotas — but Microsoft
+            controls the list + the quota tables, and can
+            reclassify a service off the always-free list any
+            time. App registrations + Microsoft Entra ID free
+            tier sit here today; what they'll do tomorrow is
+            Microsoft's call.</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Net: this option leaves a card on file for an undefined
+        future cost. Card + auto-billing means a mis-click in
+        Azure Portal (or a Microsoft policy change you don't
+        notice) can charge you. Most installs probably stay at
+        $0 for years — but nobody outside Microsoft can promise
+        it.
+    </p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Pick this if you accept the uncertainty + watch Azure
+        Cost Management alerts. The signup:
+        <a href="https://azure.microsoft.com/free" target="_blank" rel="noopener">azure.microsoft.com/free</a>
+        → Start free → personal MS account → identity + card
+        verification ($1 temporary hold, reverses) → Azure
+        provisions the directory → return to portal.azure.com →
+        Switch directory.
+    </p>
+
+    <p><strong>Option D — M365 Developer Program (only if you qualify):</strong></p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Microsoft tightened this in 2024. The "Join now" button
+        now requires one of:
+    </p>
+    <ul style="font-size:0.9em;color:var(--pico-muted-color);">
+        <li>Active <strong>Visual Studio Enterprise</strong>
+            subscription</li>
+        <li>Eligible <strong>Microsoft Partner Network</strong>
+            membership</li>
+        <li><strong>AI Cloud Partner Program</strong> enrolment</li>
+    </ul>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Without one of these you'll land on a "Welcome — you don't
+        currently qualify for a sandbox subscription" page. If you
+        have one: sign in at
+        <a href="https://developer.microsoft.com/microsoft-365/dev-program" target="_blank" rel="noopener">developer.microsoft.com/microsoft-365/dev-program</a>,
+        click <strong>Set up subscription</strong>, pick a region
+        + admin username + password, wait ~5 min, then sign in to
+        portal.azure.com as
+        <code>admin@&lt;your-domain&gt;.onmicrosoft.com</code> +
+        switch directory.
+    </p>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        <strong>Honest TL;DR:</strong> Option A ($6/mo paid tenant)
+        is the only path with a <strong>predictable cost
+        ceiling</strong> for a personal-account install admin.
+        Option B is free if you have an org account. Option C
+        starts at $0 today but the future cost is whatever
+        Microsoft decides + whatever you accidentally click on.
+        Option D is the cleanest if you qualify; most operators
+        don't.
+    </p>
+
+    <p><strong>After Step 0:</strong> you're signed in to Azure
+        Portal inside a real directory. Continue with Step 1. The
+        Tenant ID for this app will be the directory's GUID
+        (visible in <strong>Microsoft Entra ID → Overview →
+        Tenant ID</strong>), NOT the <code>consumers</code> /
+        <code>common</code> literals from the pre-2024 path.</p>
+
+    <h4 id="o365-push-step-1">Step 1 — Register an app in Azure Portal</h4>
+
+    <ol>
+        <li>Go to <a href="https://portal.azure.com" target="_blank" rel="noopener">portal.azure.com</a>
+            → <strong>Microsoft Entra ID</strong> (formerly Azure AD)
+            → <strong>App registrations</strong> → <strong>+ New registration</strong>.</li>
+        <li>Name it whatever you like ("Email Triage" works). Keep
+            it short — this name appears on the consent screen when
+            you authorize the app later.</li>
+        <li><strong>Supported account types</strong>:
+            <ul>
+                <li><strong>If you'll only authenticate accounts
+                    from this directory</strong> (sandbox-tenant users,
+                    or your org's M365 users): pick "Accounts in
+                    this organizational directory only".</li>
+                <li><strong>If you'll authenticate a personal
+                    Outlook.com / Hotmail.com account against this
+                    app</strong> (common when you set up the
+                    directory in Step 0 only to satisfy the gate
+                    + actually want to read your personal mailbox):
+                    pick "Accounts in any organizational directory
+                    and personal Microsoft accounts". This is the
+                    safe choice for most personal-account operators.</li>
+            </ul>
+        </li>
+        <li><strong>Redirect URI</strong>: leave blank for now.
+            We'll add it after we have the right value.</li>
+        <li>Click <strong>Register</strong>.</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        After registration you land on the app's Overview page. Two
+        values you'll copy from here:
+    </p>
+    <ul>
+        <li><strong>Application (client) ID</strong> — the GUID at
+            the top of Overview. This is the <em>Client ID</em>.</li>
+        <li><strong>Directory (tenant) ID</strong> — the other GUID.
+            This is the <em>Tenant ID</em>.
+            <ul>
+                <li><strong>"Accounts in this organizational
+                    directory only"</strong>: paste the GUID
+                    verbatim.</li>
+                <li><strong>"Accounts in any directory and personal
+                    accounts"</strong>: use the literal word
+                    <code>common</code> as the Tenant ID (NOT the
+                    GUID). This routes the auth through
+                    Microsoft's common endpoint so personal
+                    Outlook + org users can both sign in.</li>
+            </ul>
+            <small style="color:var(--pico-muted-color);">
+                Pre-2024 the "Personal Microsoft accounts only"
+                option let you use the literal <code>consumers</code>
+                Tenant ID without a directory. Microsoft deprecated
+                that path; if you went through Step 0 you now have
+                a directory + use <code>common</code> or the GUID
+                instead.
+            </small>
+        </li>
+    </ul>
+
+    <h4 id="o365-push-step-2">Step 2 — Mint a client secret</h4>
+
+    <ol>
+        <li>Inside the app: <strong>Certificates &amp; secrets</strong>
+            → <strong>Client secrets</strong> tab → <strong>+ New
+            client secret</strong>.</li>
+        <li>Description: anything ("Email Triage primary"). Expires:
+            pick 24 months (Azure caps at 24). Click <strong>Add</strong>.</li>
+        <li><strong>Copy the Value column immediately.</strong> Not
+            the Secret ID — the Value. Azure hides it on next page
+            load + there's no way to retrieve it. You'll paste this
+            into Email Triage as the <em>Client Secret</em>.</li>
+    </ol>
+
+    <h4 id="o365-push-step-3">Step 3 — Add Graph permissions</h4>
+
+    <ol>
+        <li>Inside the app: <strong>API permissions</strong> →
+            <strong>+ Add a permission</strong> → <strong>Microsoft
+            Graph</strong> → <strong>Delegated permissions</strong>.</li>
+        <li>Tick these scopes:
+            <ul>
+                <li><code>offline_access</code> — refresh token
+                    issuance (required; without it the app must
+                    re-auth every hour)</li>
+                <li><code>Mail.ReadWrite</code> — read messages,
+                    mark read/unread, move, label, draft replies</li>
+                <li><code>Mail.Send</code> — send draft replies +
+                    digests via SMTP-equivalent</li>
+                <li><code>User.Read</code> — fetch the signed-in
+                    user's display name + email</li>
+                <li><strong>Optional</strong>
+                    <code>Calendars.ReadWrite</code> — only if you
+                    want calendar features (free-slot finder, RSVP).
+                    Skip if mail-only.</li>
+            </ul>
+        </li>
+        <li>Click <strong>Add permissions</strong>.</li>
+        <li><strong>Org admin only</strong>: click <strong>Grant
+            admin consent for &lt;your tenant&gt;</strong>. Personal
+            account: skip — consent happens at first sign-in.</li>
+    </ol>
+
+    <h4 id="o365-push-step-4">Step 4 — Paste into Email Triage</h4>
+
+    <ol>
+        <li>Open Email Triage's
+            <a href="/config?tab=integrations">Integrations tab</a>
+            → <strong>Office 365 OAuth</strong> section.</li>
+        <li>Paste:
+            <ul>
+                <li><strong>Client ID</strong> — from Step 1 (the
+                    Application (client) ID GUID)</li>
+                <li><strong>Tenant ID</strong> — <code>consumers</code>,
+                    <code>common</code>, or the GUID, per Step 1</li>
+                <li><strong>Client Secret</strong> — the Value from
+                    Step 2</li>
+            </ul>
+        </li>
+        <li>Click <strong>Save</strong>. The "Office 365 OAuth"
+            card flips green.</li>
+    </ol>
+
+    <h4 id="o365-push-step-5">Step 5 — Add the account + authorize</h4>
+
+    <ol>
+        <li>Go to <a href="/accounts/new">Add account</a> → pick
+            <strong>Office 365</strong> as the provider.</li>
+        <li>Enter the mailbox name (anything — "Work" works) +
+            your O365 email address. Submit.</li>
+        <li>Email Triage shows a device-code page: a short code +
+            a URL (<code>microsoft.com/devicelogin</code>). Click
+            the link, paste the code on Microsoft's page, sign in
+            to your O365 account, approve the requested permissions
+            (the scopes from Step 3).</li>
+        <li>Return to Email Triage. Within ~30s the page advances
+            — "✓ Authenticated as &lt;your@email&gt;".</li>
+    </ol>
+
+    <h4 id="o365-push-step-6">Step 6 — Subscribe to push notifications</h4>
+
+    <ol>
+        <li>Go to
+            <a href="/config?tab=integrations">Integrations</a> →
+            <strong>Office 365 Push Subscriptions</strong> section.</li>
+        <li>Find your account row → click <strong>Start push</strong>.
+            Email Triage POSTs to Graph's
+            <code>/subscriptions</code> endpoint asking Microsoft
+            to deliver notifications to
+            <code>https://&lt;your-host&gt;/webhooks/office365</code>.
+        </li>
+        <li>Microsoft validates the webhook (synchronous round-trip
+            to confirm the endpoint responds). If your TLS cert is
+            valid + the host is reachable, the row flips to
+            "Active, expires &lt;timestamp&gt;".</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Subscriptions expire in 71 hours (Graph maximum). Email
+        Triage's renewer task refreshes every 24 hours
+        automatically; no operator action needed.
+    </p>
+
+    <h4 id="o365-push-failure-modes">Common failure modes</h4>
+
+    <details>
+        <summary>AADSTS50059 — "No tenant-identifying information found"</summary>
+        <p>Post-2024: this almost always means the Tenant ID
+        doesn't match the supported-account-types choice from
+        Step 1. Common fix:</p>
+        <ul>
+            <li>If app supports "any directory + personal accounts":
+                Tenant ID should be the literal word
+                <code>common</code>.</li>
+            <li>If app is "this directory only": Tenant ID should
+                be the directory's GUID (visible in Azure Portal
+                → Microsoft Entra ID → Overview → Tenant ID).</li>
+            <li>If you see this on a personal Outlook account +
+                you skipped Step 0, you're hitting the deprecated
+                "register outside a directory" path. Complete
+                Step 0 (M365 Developer Program) first, then
+                re-register the app inside the new tenant.</li>
+        </ul>
+    </details>
+
+    <details>
+        <summary>AADSTS65001 — "Admin consent required"</summary>
+        <p>Org tenant requires an admin to consent to the
+        permissions before any user can. Have an admin sign in to
+        Azure Portal → your app → API permissions →
+        <strong>Grant admin consent for &lt;tenant&gt;</strong>.
+        Then retry the device-code flow.</p>
+    </details>
+
+    <details>
+        <summary>AADSTS700016 — "Application not found in directory"</summary>
+        <p>Client ID is wrong (typo when copying) OR the app is in
+        a different tenant than the user. Re-verify the GUID on
+        Azure Portal's app Overview page.</p>
+    </details>
+
+    <details>
+        <summary>AADSTS9002313 — "invalid_request: token request body is malformed"</summary>
+        <p>Usually a stale Client Secret. Mint a new one in Azure
+        Portal (Step 2) + paste the new Value into Email Triage.</p>
+    </details>
+
+    <details>
+        <summary>"Subscription validation failed" on Step 6</summary>
+        <p>Microsoft couldn't reach Email Triage's webhook. Three
+        causes:</p>
+        <ol>
+            <li><strong>TLS cert not trusted</strong> — Microsoft
+                rejects self-signed. Use Let's Encrypt via the
+                <a href="/config?tab=tls">TLS tab</a>.</li>
+            <li><strong>Host not publicly reachable</strong> — push
+                requires Microsoft → your install. If you're
+                LAN-only, switch to poll (walkthrough 2).</li>
+            <li><strong>Firewall blocking inbound HTTPS</strong> —
+                Microsoft's outbound IPs are documented at
+                <a href="https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges" target="_blank" rel="noopener">learn.microsoft.com</a>.
+                Open 443 inbound or skip push.</li>
+        </ol>
+    </details>
+</section>
+
+{# ═══════════════════════════════════════════════════════════════
+   OFFICE 365 — POLL
+   ═══════════════════════════════════════════════════════════════ #}
+
+<section id="o365-poll" class="help-task"
+         style="margin:2rem 0;padding-top:0.5rem;
+                border-top:1px solid var(--pico-muted-border-color);">
+    <h3>2. Office 365 — poll (OAuth only)</h3>
+
+    <p>
+        Simpler than push: Email Triage asks Graph every N minutes
+        (configurable, default 5 min) "any new messages since the
+        last poll?" No Azure subscription, no webhook reachability,
+        no public hostname needed. Works for LAN-only installs +
+        installs with self-signed TLS certs.
+    </p>
+
+    <p><strong>You'll need:</strong></p>
+    <ul>
+        <li>Same Azure app registration as push (Steps 1-3 of
+            walkthrough 1). The poll path uses the same Client ID
+            / Tenant ID / Client Secret.</li>
+        <li>Same Graph permissions (Step 3 of walkthrough 1).</li>
+        <li>No public hostname requirement.</li>
+    </ul>
+
+    <h4>Setup</h4>
+
+    <ol>
+        <li>Complete Steps 1-5 of walkthrough 1 (Azure app + paste
+            into Email Triage + add account + device-code auth).</li>
+        <li><strong>Skip Step 6.</strong> Don't start the
+            subscription.</li>
+        <li>Go to the account's edit page → <strong>Ingestion</strong>
+            tab → tick <strong>Poll enabled</strong>. Set the
+            interval (default 5 minutes — anywhere from 1 to 60
+            works; lower = fresher mail but more API calls).</li>
+        <li>Click Save. The watcher starts within ~30s and begins
+            polling.</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Poll latency = the interval you set. New mail arriving 30s
+        after a poll waits ~5 min (default) until the next tick.
+        Push latency is ~5s. Pick poll when push isn't reachable.
+    </p>
+</section>
+
+{# ═══════════════════════════════════════════════════════════════
+   GMAIL — PUSH (Pub/Sub)
+   ═══════════════════════════════════════════════════════════════ #}
+
+<section id="gmail-push" class="help-task"
+         style="margin:2rem 0;padding-top:0.5rem;
+                border-top:1px solid var(--pico-muted-border-color);">
+    <h3>3. Gmail — push (Google Cloud Pub/Sub)</h3>
+
+    <p>
+        Real-time delivery via Google Cloud Pub/Sub. Gmail publishes
+        a notification to a Pub/Sub topic each time the user's
+        mailbox changes; a Pub/Sub push subscription posts that to
+        Email Triage's webhook. Email Triage then fetches the new
+        message via the Gmail API.
+    </p>
+
+    <p><strong>You'll need:</strong></p>
+    <ul>
+        <li>A Google Cloud project (free tier is fine — Pub/Sub
+            usage for one mailbox is well below the always-free
+            allotment).</li>
+        <li>Email Triage's public hostname + valid TLS — same
+            reachability requirement as O365 push. LAN-only ⇒ use
+            poll (walkthrough 4).</li>
+    </ul>
+
+    <h4 id="gmail-push-step-1">Step 1 — Create a Google Cloud project (or reuse)</h4>
+
+    <ol>
+        <li>Go to <a href="https://console.cloud.google.com" target="_blank" rel="noopener">console.cloud.google.com</a>.</li>
+        <li>Top bar → project selector → <strong>New Project</strong>.
+            Name it ("Email Triage"). Skip the org if you don't have
+            one. Click <strong>Create</strong>.</li>
+        <li>Note the <strong>Project ID</strong> (looks like
+            <code>email-triage-123456</code>) — you'll paste it into
+            Email Triage later.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-2">Step 2 — Enable Gmail API + Pub/Sub API</h4>
+
+    <ol>
+        <li>Nav: <strong>APIs &amp; Services</strong> →
+            <strong>Library</strong>.</li>
+        <li>Search for "Gmail API" → click → <strong>Enable</strong>.</li>
+        <li>Back to Library. Search for "Cloud Pub/Sub API" → click
+            → <strong>Enable</strong>.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-3">Step 3 — Configure OAuth consent</h4>
+
+    <ol>
+        <li>Nav: <strong>APIs &amp; Services</strong> →
+            <strong>OAuth consent screen</strong>.</li>
+        <li>User type: <strong>External</strong> (unless you have a
+            Google Workspace org and want Internal). Click
+            <strong>Create</strong>.</li>
+        <li>App name: anything ("Email Triage"). User support email:
+            yours. Developer contact: yours. Click
+            <strong>Save and Continue</strong>.</li>
+        <li>Scopes: click <strong>Add or Remove Scopes</strong>.
+            Add:
+            <ul>
+                <li><code>https://www.googleapis.com/auth/gmail.modify</code>
+                    (read mail, mark read, label, move, draft)</li>
+                <li><code>https://www.googleapis.com/auth/gmail.send</code>
+                    (send drafts + digests)</li>
+                <li><code>https://www.googleapis.com/auth/userinfo.email</code>
+                    (sign-in email)</li>
+                <li><strong>Optional</strong>
+                    <code>https://www.googleapis.com/auth/calendar</code>
+                    (calendar features)</li>
+            </ul>
+        </li>
+        <li>Test users (External-mode only): add your Gmail address.
+            Without this you'll hit "blocked: This app's request is
+            invalid" at sign-in.</li>
+        <li>Save.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-4">Step 4 — Create OAuth client credentials</h4>
+
+    <ol>
+        <li>Nav: <strong>APIs &amp; Services</strong> →
+            <strong>Credentials</strong> → <strong>+ Create
+            Credentials</strong> → <strong>OAuth client ID</strong>.</li>
+        <li>Application type: <strong>Desktop app</strong>. Name:
+            anything. Click Create.</li>
+        <li>Copy the <strong>Client ID</strong> + <strong>Client
+            secret</strong> from the popup.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-5">Step 5 — Create a Pub/Sub topic + push subscription</h4>
+
+    <ol>
+        <li>Nav: <strong>Pub/Sub</strong> → <strong>Topics</strong>
+            → <strong>+ Create Topic</strong>.</li>
+        <li>Topic ID: <code>email-triage-gmail</code> (or anything;
+            you'll paste this into Email Triage). Leave defaults.
+            Create.</li>
+        <li>Click the topic → <strong>Permissions</strong> →
+            <strong>+ Add Principal</strong>.</li>
+        <li>Add principal: <code>gmail-api-push@system.gserviceaccount.com</code>
+            (this is Google's Gmail Push service account — verbatim
+            string, no typos). Role: <strong>Pub/Sub Publisher</strong>.
+            Save. <em>Without this, Gmail can't publish to your
+            topic — most common silent failure.</em></li>
+        <li>Back to the topic → <strong>+ Create Subscription</strong>.</li>
+        <li>Subscription ID: <code>email-triage-push</code>. Delivery
+            type: <strong>Push</strong>. Endpoint URL:
+            <code>https://&lt;your-host&gt;/webhooks/gmail</code>.
+            Auth: <strong>Enable authentication</strong> → pick a
+            service account that exists in your project (or create
+            one with "Pub/Sub Publisher" role).</li>
+        <li>Audience: leave blank (default uses the URL).</li>
+        <li>Acknowledgement deadline: 60 seconds (default 10 is too
+            tight for cold-start). Click Create.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-6">Step 6 — Paste into Email Triage</h4>
+
+    <ol>
+        <li>Open Email Triage's
+            <a href="/config?tab=integrations">Integrations tab</a>
+            → <strong>Google OAuth</strong> section.</li>
+        <li>Paste:
+            <ul>
+                <li>Client ID + Client Secret from Step 4</li>
+                <li>Pub/Sub topic name:
+                    <code>projects/&lt;your-project-id&gt;/topics/&lt;your-topic-name&gt;</code>
+                    — full path, not just the topic id.</li>
+            </ul>
+        </li>
+        <li>Save.</li>
+    </ol>
+
+    <h4 id="gmail-push-step-7">Step 7 — Add the account + start the watch</h4>
+
+    <ol>
+        <li><a href="/accounts/new">Add account</a> →
+            <strong>Gmail</strong> as provider. Enter mailbox name
+            + your Gmail address. Submit.</li>
+        <li>Device-code page appears with the URL
+            <code>google.com/device</code> + a short code. Sign in,
+            paste the code, approve the scopes from Step 3.</li>
+        <li>Back to Email Triage → "✓ Authenticated as
+            &lt;your@gmail&gt;".</li>
+        <li>Account edit page → <strong>Ingestion</strong> tab → tick
+            <strong>Push enabled</strong>. Save. Email Triage calls
+            <code>users.watch</code> on the Gmail API, telling
+            Gmail to publish to your Pub/Sub topic.</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Gmail watch expires every 7 days. Email Triage's renewer
+        re-calls <code>users.watch</code> every 24 hours; no
+        operator action needed.
+    </p>
+
+    <h4 id="gmail-push-failure-modes">Common failure modes</h4>
+
+    <details>
+        <summary>"Pub/Sub: User does not have permission to publish"</summary>
+        <p>Forgot Step 5 #4 — add
+        <code>gmail-api-push@system.gserviceaccount.com</code> as
+        Pub/Sub Publisher on the topic. Without this, Gmail can't
+        deliver notifications.</p>
+    </details>
+
+    <details>
+        <summary>Webhook returns 401 / 403</summary>
+        <p>The Pub/Sub push subscription is signing requests with a
+        service-account-issued JWT; Email Triage verifies it.
+        Mismatch causes (rare): wrong audience config in Step 5 #7,
+        or the service account doesn't actually have
+        <code>roles/iam.serviceAccountTokenCreator</code> on
+        itself. See Google's
+        <a href="https://cloud.google.com/pubsub/docs/push#authentication" target="_blank" rel="noopener">Pub/Sub auth docs</a>.</p>
+    </details>
+
+    <details>
+        <summary>"This app is blocked" at sign-in (External mode)</summary>
+        <p>Test user not added in Step 3 #5. Go back to OAuth
+        consent → Test users → add your Gmail address.</p>
+    </details>
+
+    <details>
+        <summary>Mail flowing in but Email Triage shows zero new messages</summary>
+        <p>Test the subscription end-to-end:
+        Pub/Sub topic → Subscriptions → Trigger → Pull a sample
+        message manually. Look for the message ID + a payload
+        with <code>emailAddress</code> + <code>historyId</code>.
+        If empty, Gmail isn't publishing — verify the watch is
+        active via <code>users.getProfile</code> from any Gmail
+        API explorer.</p>
+    </details>
+</section>
+
+{# ═══════════════════════════════════════════════════════════════
+   GMAIL — POLL
+   ═══════════════════════════════════════════════════════════════ #}
+
+<section id="gmail-poll" class="help-task"
+         style="margin:2rem 0;padding-top:0.5rem;
+                border-top:1px solid var(--pico-muted-border-color);">
+    <h3>4. Gmail — poll (OAuth only)</h3>
+
+    <p>
+        No Pub/Sub. Email Triage calls
+        <code>users.messages.list</code> + <code>users.history.list</code>
+        every N minutes. Simpler than push; works for LAN-only
+        installs. The trade-off is latency (poll interval) +
+        slightly higher Gmail API quota usage on busy mailboxes.
+    </p>
+
+    <p><strong>You'll need:</strong></p>
+    <ul>
+        <li>Steps 1-4 of walkthrough 3 (project, Gmail API
+            enabled, OAuth consent, OAuth client). <strong>Skip
+            Step 5</strong> (no Pub/Sub topic needed).</li>
+    </ul>
+
+    <h4>Setup</h4>
+
+    <ol>
+        <li>Complete walkthrough 3 Steps 1-4 (Google Cloud project,
+            APIs enabled, OAuth consent, OAuth client credentials).</li>
+        <li>Email Triage Integrations tab → Google OAuth: paste
+            Client ID + Client Secret. Leave the Pub/Sub topic
+            field blank.</li>
+        <li>Add account → Gmail → device-code auth.</li>
+        <li>Account edit → Ingestion → tick <strong>Poll
+            enabled</strong>. Set interval (default 5 min). Save.</li>
+    </ol>
+
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Push + poll are independent toggles. You can run both
+        ("belt and suspenders" — if push delivery flakes, poll
+        catches up). Most installs run one or the other.
+    </p>
+</section>
+
+{# ═══════════════════════════════════════════════════════════════
+   OUTLOOK / HOTMAIL via IMAP (hobbyist fallback)
+   ═══════════════════════════════════════════════════════════════ #}
+
+<section id="outlook-imap" class="help-task"
+         style="margin:2rem 0;padding-top:0.5rem;
+                border-top:1px solid var(--pico-muted-border-color);">
+    <h3>5. Outlook.com / Hotmail via IMAP (no Azure tenant)</h3>
+
+    <p>
+        Microsoft killed the "register an app without a directory"
+        path in 2024 + tightened the M365 Developer Program
+        eligibility. For personal Outlook / Hotmail accounts
+        without a paid M365 subscription, walkthroughs 1-2 (the
+        full O365 / Graph path) require a $6/mo tenant or Azure's
+        card-on-file gate.
+    </p>
+
+    <p>
+        Email Triage has a fallback that bypasses Azure entirely:
+        add your Outlook.com / Hotmail.com mailbox as an <strong>IMAP
+        account</strong>. Personal Outlook accounts still support
+        IMAP + app passwords. Email Triage's IMAP code path is
+        feature-complete for mail-read + actions; you keep most of
+        what the full O365 path offers, give up some of the
+        Graph-specific extras.
+    </p>
+
+    <h4 id="outlook-imap-coverage">What you get vs. give up</h4>
+    <table style="margin-bottom:1rem;">
+        <thead>
+            <tr>
+                <th>Feature</th>
+                <th>O365 (Graph)</th>
+                <th>Outlook via IMAP</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>Real-time push</td><td>Graph subscription</td><td>IMAP IDLE (also real-time)</td></tr>
+            <tr><td>Poll fallback</td><td>Graph</td><td>IMAP poll</td></tr>
+            <tr><td>Folder move (actions)</td><td>Yes</td><td>Yes</td></tr>
+            <tr><td>Labels / tags</td><td>Outlook categories</td><td>IMAP keywords (operator's IMAP keyword sweep covers this)</td></tr>
+            <tr><td>Draft replies</td><td>Yes (Graph)</td><td>Yes (IMAP APPEND to Drafts folder)</td></tr>
+            <tr><td>Sent-mail mining (style learning)</td><td>Yes</td><td>Yes (IMAP Sent folder)</td></tr>
+            <tr><td>Calendar (free-slot, RSVP)</td><td>Yes</td><td><strong>No</strong> — IMAP has no calendar surface; use a Google calendar surrogate or skip calendar features</td></tr>
+            <tr><td>Rich attachment metadata</td><td>Graph payload</td><td>IMAP FETCH (works, slightly thinner)</td></tr>
+        </tbody>
+    </table>
+
+    <h4 id="outlook-imap-step-1">Step 1 — Enable 2FA + generate an app password</h4>
+
+    <ol>
+        <li>Sign in to
+            <a href="https://account.microsoft.com/security" target="_blank" rel="noopener">account.microsoft.com/security</a>
+            with your Outlook.com / Hotmail.com account.</li>
+        <li><strong>Two-step verification</strong> must be on. If
+            it's off, Microsoft won't expose the App-passwords
+            surface. Enable it first (works with any TOTP app or
+            SMS).</li>
+        <li>Once 2FA is on: <strong>Advanced security options</strong>
+            → scroll to <strong>App passwords</strong> →
+            <strong>Create a new app password</strong>.</li>
+        <li>Microsoft generates a 16-character password. Copy it
+            immediately — you can't view it again. Paste into a
+            password manager.</li>
+    </ol>
+
+    <h4 id="outlook-imap-step-2">Step 2 — Add the account in Email Triage</h4>
+
+    <ol>
+        <li>Go to <a href="/accounts/new">Add account</a>. Provider
+            type: <strong>IMAP</strong> (not Office 365).</li>
+        <li>Fill in:
+            <ul>
+                <li><strong>Display name</strong>: anything ("Outlook
+                    personal").</li>
+                <li><strong>Email address</strong>: your full
+                    Outlook / Hotmail / Live address.</li>
+                <li><strong>IMAP host</strong>:
+                    <code>outlook.office365.com</code></li>
+                <li><strong>IMAP port</strong>: <code>993</code></li>
+                <li><strong>Use TLS</strong>: yes</li>
+                <li><strong>Username</strong>: same as email
+                    address</li>
+                <li><strong>Password</strong>: the 16-character app
+                    password from Step 1 (NOT your regular Outlook
+                    password — Microsoft rejects basic-auth with
+                    the regular password)</li>
+                <li><strong>Sent folder</strong>: typically
+                    <code>Sent</code>. The Mine-now picker on
+                    /profile/style-data will surface the actual
+                    name if it's different.</li>
+                <li><strong>SMTP</strong> (optional, if you want
+                    Email Triage to send digests / drafts back):
+                    host <code>smtp.office365.com</code>, port
+                    <code>587</code>, STARTTLS, same username +
+                    app password.</li>
+            </ul>
+        </li>
+        <li>Save. Email Triage opens an IMAP connection within
+            ~10s; the account row flips to "✓ Connected" on
+            success.</li>
+    </ol>
+
+    <h4 id="outlook-imap-step-3">Step 3 — Pick push or poll</h4>
+
+    <ol>
+        <li>Account edit page → <strong>Ingestion</strong> tab.</li>
+        <li><strong>Push enabled</strong>: tick to run IMAP IDLE.
+            Microsoft's IMAP server supports IDLE; new mail
+            triggers a push from the server within ~5s.</li>
+        <li><strong>Poll enabled</strong>: tick to fall back to
+            polling every N minutes (default 5). Safe alongside
+            push as a belt-and-suspenders backstop.</li>
+        <li>Save.</li>
+    </ol>
+
+    <h4 id="outlook-imap-failure-modes">Common failure modes</h4>
+
+    <details>
+        <summary>"LOGIN failed" / "Authentication unsuccessful"</summary>
+        <p>Microsoft rejects basic-auth with your regular Outlook
+        password — modern auth only. You MUST use an
+        app-password (Step 1). If app-passwords aren't visible
+        under Advanced security options, enable two-step
+        verification first; Microsoft hides the surface
+        otherwise.</p>
+    </details>
+
+    <details>
+        <summary>"App passwords" doesn't appear in account settings</summary>
+        <p>Two-step verification isn't on yet. Enable it at
+        <code>account.microsoft.com/security</code> → Two-step
+        verification → On. App passwords then appears under
+        Advanced security options.</p>
+    </details>
+
+    <details>
+        <summary>Mail arrives but Email Triage shows nothing</summary>
+        <p>IDLE may have stalled. Check Admin → Stats → Ingestion
+        rollup; if <code>uncovered</code> is non-zero for IMAP,
+        the watcher is failing. Restart the container OR toggle
+        Push off + on in the account edit page to force a
+        reconnect.</p>
+    </details>
+
+    <details>
+        <summary>Some folders don't show up in the move-action picker</summary>
+        <p>IMAP folder visibility lives in your Outlook web client
+        settings — IMAP only sees folders flagged "show in IMAP".
+        Open outlook.live.com → folder list → right-click the
+        folder → "Show in IMAP". The next Email Triage folder
+        refresh picks it up.</p>
+    </details>
+</section>
+
+{# ═══════════════════════════════════════════════════════════════
+   FOOTER
+   ═══════════════════════════════════════════════════════════════ #}
+
+<aside style="margin-top:2rem;padding-top:1rem;
+              border-top:1px solid var(--pico-muted-border-color);">
+    <h4>More help</h4>
+    <ul>
+        <li><a href="/help/tasks">Common operator tasks</a> — routing
+            mail by sender, pausing accounts, adding delegates, etc.</li>
+        <li><a href="/config?tab=integrations">Admin → Integrations
+            tab</a> — paste OAuth + push values here.</li>
+        <li><a href="/admin/stats">Admin → Stats</a> — verify
+            ingestion is healthy after setup (per-provider rollup
+            shows push/poll/uncovered counts).</li>
+        <li><a href="/logs">Admin → System Log</a> — Filter to
+            ERROR to see exactly what Microsoft / Google sent back
+            on a failed auth or push subscribe.</li>
+    </ul>
+</aside>
+
+{% endblock %}

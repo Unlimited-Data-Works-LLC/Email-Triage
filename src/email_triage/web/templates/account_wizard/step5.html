@@ -1,0 +1,92 @@
+{# ─── AUDIENCE ───
+   END-USER (mid-flow setup wizard, final step). TECH-SKILL: low.
+   COPY RULES:
+     - "Daily summary" not "recipient digest" — internal name only.
+     - "Alerts" not "escalations" — operator-friendly.
+     - HIPAA reminder is plain text, no §164.x citations.
+     - Tooltips with examples on every input.
+     - No "ask your administrator" copy.
+   #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Add Account — Step 5 of 5: Daily summary{% endblock %}
+{% block content %}
+<h2>Add an email account: {{ acct.name }}</h2>
+
+{% set current_step = 5 %}
+{% include "account_wizard/_progress.html" %}
+
+<p>
+    Last step — pick how you want to be kept informed about what
+    email-triage is doing. The daily summary lands in your inbox
+    once a day; alerts page you immediately for mail in the
+    categories you choose.
+</p>
+
+<form method="post" action="/accounts/new/step5">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="account_id" value="{{ acct.id }}">
+
+    <fieldset>
+        <legend>Daily summary{{ m.help("A short email to yourself summarising the day's triage activity for this mailbox. Lands in your own inbox so you don't have to log into email-triage to see what happened. Owner-only — only you receive it.") }}</legend>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="checkbox" name="recipient_digest_enabled" value="1" style="margin:0;">
+            <span><strong>Email me a daily summary</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— delivered to <code>{{ account_email or '(no address yet)' }}</code>
+                </small>
+            </span>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <span>Send time:{{ m.help("When the daily summary lands. Examples: 07:10 (early — read with morning coffee); 17:10 (end of day — review what happened); 12:10 (lunchtime). Times are server local time.") }}</span>
+            <select name="recipient_digest_send_at" style="margin:0;width:auto;">
+                {% for h in range(24) %}
+                    {% set bucket = '%02d:10' % h %}
+                    <option value="{{ bucket }}" {% if bucket == '08:10' %}selected{% endif %}>{{ bucket }}</option>
+                {% endfor %}
+            </select>
+            <small style="color:var(--pico-muted-color);">(server local time)</small>
+        </label>
+    </fieldset>
+
+    {% if categories %}
+    <fieldset style="margin-top:1rem;">
+        <legend>Alert categories{{ m.help("Mail sorted into a checked category triggers an immediate alert (push notification or SMS) to the address on your My Settings page. Pick conservatively — too many alerts and you'll start ignoring them. Examples worth alerting on: 'urgent', 'family'. Examples NOT to check: 'newsletter', 'promotional'.") }}</legend>
+        <p style="color:var(--pico-muted-color);">
+            <small>This setting follows you across all your mailboxes.
+            Set the address alerts go to on
+            <a href="/profile">My Settings</a>.</small>
+        </p>
+        <table>
+            <thead>
+                <tr>
+                    <th style="width:3rem;">Alert</th>
+                    <th>Category</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for cat in categories %}
+                <tr>
+                    <td style="text-align:center;">
+                        <input type="checkbox" name="escalate_{{ cat.slug }}" value="1"
+                               {% if cat.slug in escalation_categories %}checked{% endif %}
+                               style="margin:0;">
+                    </td>
+                    <td><code>{{ cat.slug }}</code></td>
+                    <td><small>{{ cat.description }}</small></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </fieldset>
+    {% endif %}
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Finish ✓</button>
+        <a href="/accounts/new?step=4&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+{% endblock %}

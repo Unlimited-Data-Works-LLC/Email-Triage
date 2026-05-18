@@ -1,0 +1,56 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Hidden from non-admin
+                users — the route handler gates rendering on the
+                user's role. Not end users.
+   TECH-SKILL:  medium — comfortable with deploy / rollback flow.
+   COPY RULES:  the wording lives in version.describe_status() so
+                it stays in sync with the CLI ``version-check``
+                output. Avoid raw migration version numbers in the
+                prose; integer detail is parenthetical "(database
+                version N)" only — see feedback_audience_per_page.md.
+   #125 partial -- shipped 2026-05-15. Display-only; no update
+   mechanism wired. Cross-ref docs/update-strategy-investigation-2026-05-13.md
+   for the full plan (#166 covers the remaining managed-deployment work).
+   ─────────────────────────────────────────────────────────── #}
+{% if version_status %}
+{# Border colour mirrors the BAA-chip pattern on the same page:
+   ins (green) for up-to-date, amber for forward-compat update,
+   del (red) for incompatible-rollback / downgrade. #}
+{% set _vs = version_status %}
+{% if _vs.status == "up_to_date" %}
+    {% set _border = "var(--pico-ins-color)" %}
+    {% set _label = "Up to date" %}
+{% elif _vs.status == "update_available" %}
+    {% set _border = "var(--pico-color-amber-500)" %}
+    {% set _label = "Update available" %}
+{% elif _vs.status == "incompatible_rollback" %}
+    {% set _border = "var(--pico-del-color)" %}
+    {% set _label = "Update available -- rollback NOT safe" %}
+{% elif _vs.status == "downgrade_not_supported" %}
+    {% set _border = "var(--pico-del-color)" %}
+    {% set _label = "Database newer than this version" %}
+{% else %}
+    {% set _border = "var(--pico-muted-color)" %}
+    {% set _label = "Version status unknown" %}
+{% endif %}
+<article id="version-banner"
+         data-status="{{ _vs.status }}"
+         style="padding:0.6rem 0.9rem;margin-bottom:1rem;
+                border-left:4px solid {{ _border }};
+                background:var(--pico-card-background-color);
+                font-size:0.9rem;">
+    <strong>{{ _label }}</strong> --
+    running v<code>{{ _vs.app_version }}</code>
+    (database version {{ _vs.db_schema_version }};
+    this build knows up to {{ _vs.target_schema_caps }}{% if _vs.previous_schema_caps is not none %};
+    previous image knew up to {{ _vs.previous_schema_caps }}{% endif %}).
+    <p style="margin:0.3rem 0 0;font-size:0.85rem;">
+        {{ _vs.explanation }}
+    </p>
+    <p style="margin:0.3rem 0 0;font-size:0.8rem;color:var(--pico-muted-color);">
+        Updates are still applied manually from your workstation
+        (<code>scripts/deploy.sh</code>). This banner is informational
+        only.
+    </p>
+</article>
+{% endif %}

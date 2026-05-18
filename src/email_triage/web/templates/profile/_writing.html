@@ -1,0 +1,208 @@
+{# ─── AUDIENCE ───────────────────────────────────────────────────────
+   AUDIENCE:    end-user
+   TECH-SKILL:  low
+   COPY RULES:  no developer / protocol jargon. Never say "LLM",
+                "language model", "RFC", "ISO 8601", "OData",
+                "AND-combined", "substring match", "system log",
+                "Ask your administrator". Never link to /config or
+                /admin/*. Use "AI-drafted replies" not "LLM replies".
+                Examples in tooltips MUST use placeholder identities
+                (Operator A, Person, user@example.com) — never real
+                names, emails, or organisations.
+   ─────────────────────────────────────────────────────────────────── #}
+{% import "_macros.html" as m %}
+<section id="writing">
+    <h3>How AI drafts replies for you{{ m.help("These settings shape every draft reply the system writes for you. They are YOUR explicit preferences — the system also has a separate, automatic profile it learns from your own sent mail. Both are used together when a draft is created. HIPAA-flagged mail accounts always ignore these settings.") }}</h3>
+
+    <p>
+        When the system drafts a reply for you, two things shape how
+        it sounds: the preferences you set here (your explicit voice),
+        and an automatic profile the system builds by reading your own
+        sent mail (your inferred voice). Your explicit preferences
+        come first; the automatic profile fills in the gaps.
+    </p>
+
+    {% if writing_hipaa_blocked %}
+    <article style="border-left:3px solid var(--pico-muted-border-color);padding:0.5rem 1rem;margin:0 0 1rem 0;background:var(--pico-card-background-color);">
+        <strong style="display:block;margin-bottom:0.25rem;">HIPAA mode</strong>
+        <small style="color:var(--pico-muted-color);">
+            Writing-style preferences are turned off for accounts that
+            handle protected health information. Drafts on those
+            accounts use a neutral, non-personal tone regardless of
+            what's set below. You can still update these settings —
+            they will apply only to non-HIPAA accounts.
+        </small>
+    </article>
+    {% endif %}
+
+    {% if not writing_master_enabled %}
+    <article style="border-left:3px solid var(--pico-muted-border-color);padding:0.5rem 1rem;margin:0 0 1rem 0;background:var(--pico-card-background-color);">
+        <strong style="display:block;margin-bottom:0.25rem;">Style learning is OFF for this install</strong>
+        <small style="color:var(--pico-muted-color);">
+            An administrator has disabled writing-style influence on
+            drafts. The form below is read-only. Your saved values are
+            preserved for when style learning is re-enabled.
+        </small>
+    </article>
+    {% endif %}
+
+    {% set form_disabled = writing_hipaa_blocked or not writing_master_enabled %}
+
+    <form method="post" action="/profile/writing/save">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="active_tab" value="writing">
+
+        {# ── Tone (M-2) ─────────────────────────────────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %}>
+            <legend>
+                <strong>Tone{{ m.help("How AI-drafted replies should sound. Example: 'casual' picks 'Hey, sure thing!' over 'Thank you for your message — I would be glad to help.' Pick the one that matches how you'd answer a friendly colleague.") }}</strong>
+            </legend>
+            {% set _tones = [
+                ("formal",  "Formal",  "Thank you for your message regarding the project update."),
+                ("neutral", "Neutral", "Thanks for the note. I'll take a look and get back to you."),
+                ("casual",  "Casual",  "Hey, sure thing — let me check and circle back."),
+                ("terse",   "Terse",   "Got it."),
+            ] %}
+            {% for slug, label, example in _tones %}
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_tone" value="{{ slug }}"
+                       {% if knobs.style_tone == slug %}checked{% endif %}>
+                <strong>{{ label }}</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    Example: <em>{{ example }}</em>
+                </small>
+            </label>
+            {% endfor %}
+        </fieldset>
+
+        {# ── Length (M-2) ────────────────────────────────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            <legend>
+                <strong>Length{{ m.help("How much the AI should write. Example: 'brief' answers a yes/no question with a single sentence; 'full' adds context and proposed next steps. Drafts are always editable before you send.") }}</strong>
+            </legend>
+            {% set _lengths = [
+                ("brief",  "Brief",  "1-2 sentences. Best for quick acknowledgements."),
+                ("medium", "Medium", "A short paragraph (2-4 sentences)."),
+                ("full",   "Full",   "A complete reply with context, answer, and next steps."),
+            ] %}
+            {% for slug, label, example in _lengths %}
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_length" value="{{ slug }}"
+                       {% if knobs.style_length == slug %}checked{% endif %}>
+                <strong>{{ label }}</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    {{ example }}
+                </small>
+            </label>
+            {% endfor %}
+        </fieldset>
+
+        {# ── Greeting (M-2) ──────────────────────────────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            <legend>
+                <strong>Greeting line{{ m.help("How the draft opens. Example: 'first-name' produces 'Hi Person,' — 'formal-name' produces 'Dear Person,' — 'none' goes straight into the reply with no greeting line. Pick 'custom' if you always open the same way (e.g. 'Hey there,').") }}</strong>
+            </legend>
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_greeting" value="none"
+                       {% if knobs.style_greeting == "none" %}checked{% endif %}>
+                <strong>None</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    Skip the greeting and go straight into the reply.
+                </small>
+            </label>
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_greeting" value="first-name"
+                       {% if knobs.style_greeting == "first-name" %}checked{% endif %}>
+                <strong>First name</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    Example: <em>Hi Person,</em>
+                </small>
+            </label>
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_greeting" value="formal-name"
+                       {% if knobs.style_greeting == "formal-name" %}checked{% endif %}>
+                <strong>Formal name</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    Example: <em>Dear Person,</em>
+                </small>
+            </label>
+            <label style="display:block;margin:0.25rem 0;">
+                <input type="radio" name="style_greeting" value="custom"
+                       {% if knobs.style_greeting == "custom" %}checked{% endif %}>
+                <strong>Custom</strong>
+                <small style="color:var(--pico-muted-color);display:block;margin-left:1.7rem;">
+                    Use the exact greeting you type below.
+                </small>
+            </label>
+            <label style="margin-left:1.7rem;display:block;max-width:25rem;">
+                <small>Custom greeting</small>
+                <input type="text" name="style_greeting_custom"
+                       value="{{ knobs.style_greeting_custom }}"
+                       placeholder="Hey there,"
+                       maxlength="120">
+            </label>
+        </fieldset>
+
+        {# ── Signature (M-2) ─────────────────────────────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            <legend>
+                <strong>Sign-off line{{ m.help("The closing line on every draft. Leave blank to let the AI pick something matching the tone. Example: '— Operator A' is a one-line sign-off; the AI adds it verbatim at the end of the draft.") }}</strong>
+            </legend>
+            <label style="display:block;max-width:30rem;">
+                <input type="text" name="style_signature"
+                       value="{{ knobs.style_signature }}"
+                       placeholder="(leave blank for an automatic sign-off)"
+                       maxlength="200">
+            </label>
+            <small style="color:var(--pico-muted-color);display:block;">
+                One short line. Example: <em>— Operator A</em>
+            </small>
+        </fieldset>
+
+        {# ── Free-text guide (M-1) ───────────────────────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            <legend>
+                <strong>In your own words{{ m.help("Anything the radio buttons miss. Example: 'I almost never use exclamation points and I avoid the phrase \"I hope this finds you well\".' This text gets read by the AI exactly as you write it, so be specific.") }}</strong>
+            </legend>
+            <p style="margin:0 0 0.5rem 0;color:var(--pico-muted-color);font-size:0.9rem;">
+                A short paragraph describing how you write. The AI reads
+                this verbatim before drafting each reply.
+            </p>
+            <textarea name="style_guide" rows="6" maxlength="2000"
+                      placeholder="Example: I keep replies short. I avoid exclamation points. I sign off with my first name only."
+                      style="width:100%;max-width:50rem;font-family:var(--pico-font-family);">{{ knobs.style_guide }}</textarea>
+            <small style="color:var(--pico-muted-color);display:block;">
+                Up to 2000 characters.
+            </small>
+        </fieldset>
+
+        {# ── Anti-AI style guide (per-user override) ─────────────── #}
+        <fieldset {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            <legend>
+                <strong>Things the AI should never do (yours){{ m.help("A list of AI-mannerisms YOU want the system to avoid in your drafts. Example: \"Never start with 'Certainly!' or 'Of course'; never use em-dashes for narrative pause; avoid the phrase 'I hope this email finds you well'.\" The system reads this verbatim before drafting each reply.") }}</strong>
+            </legend>
+            <p style="margin:0 0 0.5rem 0;color:var(--pico-muted-color);font-size:0.9rem;">
+                Anything the AI does that sounds robotic — list it here.
+                One rule per line works well. By default these are added
+                on top of the install-wide list set by your administrator.
+            </p>
+            <textarea name="anti_ai_style_guide_user" rows="4" cols="60"
+                      maxlength="4000"
+                      placeholder="Example: Never start with 'Certainly!' or 'Of course'. Never use em-dashes for narrative pause. Avoid the phrase 'I hope this email finds you well'."
+                      style="width:100%;max-width:50rem;font-family:var(--pico-font-family);">{{ anti_ai_user_text }}</textarea>
+            <small style="color:var(--pico-muted-color);display:block;">
+                Up to 4000 characters.
+            </small>
+            <label style="display:block;margin-top:0.5rem;">
+                <input type="checkbox" name="anti_ai_style_guide_disable_global"
+                       value="1"
+                       {% if anti_ai_user_disable_global %}checked{% endif %}>
+                Use only my list above (skip the install-wide AI-mannerisms list){{ m.help("By default the install-wide list (set by your administrator) is combined with yours. Tick this to use ONLY the list you typed above — the install-wide list is ignored for your account.") }}
+            </label>
+        </fieldset>
+
+        <button type="submit" {% if form_disabled %}disabled{% endif %} style="margin-top:1rem;">
+            Save writing preferences
+        </button>
+    </form>
+</section>

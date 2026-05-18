@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}All watches — Email Triage{% endblock %}
+{% block content %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (operator with cross-account visibility).
+                Tech-skill medium-high.
+   COPY RULES:
+     - Admin page — protocol terms allowed but kept light.
+     - Tooltips lead with concrete examples.
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>All watches{{ m.help("Cross-account view of every match-and-fire watch on this install. One row per watch, with the scope (single account or every account) and what fires when it matches. Edit jumps to the account-scoped editor.") }}</h2>
+
+<p style="color:var(--pico-muted-color);">
+    Watches let users get a text or webhook ping when a particular kind
+    of mail arrives. This page lists them across every account so admins
+    can audit what is configured. Editing happens in the account where
+    the watch lives.
+</p>
+
+{% if items|length == 0 %}
+<p>No watches are configured on this install.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Scope</th>
+            <th>State</th>
+            <th>Filter</th>
+            <th>Actions</th>
+            <th>Updated</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for it in items %}
+        {% set w = it.w %}
+        <tr>
+            <td>{{ w.name }}</td>
+            <td>{{ it.scope_label }}</td>
+            <td>
+                {% if w.enabled %}
+                <span style="color:var(--pico-ins-color);">On</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">Off</span>
+                {% endif %}
+            </td>
+            <td style="font-size:0.88em;">
+                {% set f = w.filter %}
+                {% set parts = [] %}
+                {% if f.from_addr %}{% set _ = parts.append("from " ~ f.from_addr) %}{% endif %}
+                {% if f.from_domain %}{% set _ = parts.append("@" ~ f.from_domain) %}{% endif %}
+                {% if f.subject_contains %}{% set _ = parts.append("subject " ~ f.subject_contains) %}{% endif %}
+                {% if f.keyword %}{% set _ = parts.append("kw " ~ f.keyword) %}{% endif %}
+                {% if f.advanced %}{% set _ = parts.append("advanced") %}{% endif %}
+                {{ parts | join(" · ") if parts else "(matches every email)" }}
+            </td>
+            <td style="font-size:0.88em;">
+                {% set acts = [] %}
+                {% if w.actions.escalate.enabled %}{% set _ = acts.append("text alert") %}{% endif %}
+                {% if w.actions.webhook.enabled %}{% set _ = acts.append("webhook") %}{% endif %}
+                {{ acts | join(" + ") if acts else "(none)" }}
+            </td>
+            <td style="font-size:0.85em;color:var(--pico-muted-color);">
+                {{ w.updated_at[:19] }}
+            </td>
+            <td>
+                {% if w.account_id %}
+                <a href="/accounts/{{ w.account_id }}/watches/{{ w.watch_id }}/edit"
+                   role="button" class="outline secondary"
+                   style="padding:0.2rem 0.5rem;font-size:0.85em;margin:0;">
+                    Edit
+                </a>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}My Settings - API Keys - Email Triage{% endblock %}
+{% block content %}
+<h2>My Settings</h2>
+{% set active = "api-keys" %}
+{% include "_settings_tabs.html" %}
+
+<h3>API Keys (Access Tokens)</h3>
+<p>
+    Tokens let an external tool — for example, an AI assistant — read your
+    mail and manage your calendar on your behalf. Each token is a long,
+    random code. Keep it secret like a password. If a token is lost or
+    shared by mistake, revoke it here and create a new one.
+    {% if is_admin %}
+    <small style="color:var(--pico-muted-color);">
+        Admin view — showing every user's tokens.
+    </small>
+    {% else %}
+    <small style="color:var(--pico-muted-color);">
+        Showing only your tokens.
+    </small>
+    {% endif %}
+</p>
+
+<p><a href="/accounts" role="button" class="outline secondary">&larr; Back to Accounts</a></p>
+
+{# ── Create new token ─────────────────────────────────────────────── #}
+<section>
+    <details {% if new_key_open %}open{% endif %}>
+        <summary role="button" class="outline">Create a token</summary>
+        <form hx-post="/accounts/api-keys" hx-target="#new-key-result" hx-swap="innerHTML">
+            <div class="grid">
+                <label>
+                    Name this token
+                    <input type="text" name="name" required
+                           placeholder="e.g. &quot;My AI assistant&quot; or &quot;Work laptop&quot;">
+                    <small style="color:var(--pico-muted-color);">
+                        Just a label for you — helps you remember which tool uses which token.
+                    </small>
+                </label>
+                <label>
+                    Your alias
+                    <input type="text" name="alias"
+                           value="{{ user.email.split('@')[0] | lower }}"
+                           pattern="[a-zA-Z0-9_-]+"
+                           placeholder="{{ user.email.split('@')[0] | lower }}">
+                    <small style="color:var(--pico-muted-color);">
+                        The short name your AI assistant calls you by. Usually
+                        your first name or email prefix. If your administrator
+                        told you a specific alias to use, type that.
+                    </small>
+                </label>
+                {% if is_admin %}
+                <label>
+                    Owner
+                    <select name="user_email">
+                        {% for u in all_users %}
+                        <option value="{{ u.email }}" {% if u.id == user.id %}selected{% endif %}>{{ u.name if u.name else u.email }}{% if u.name %} ({{ u.email }}){% endif %}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                {% else %}
+                <input type="hidden" name="user_email" value="{{ user.email }}">
+                {% endif %}
+                <label>
+                    Expires
+                    <select name="expires">
+                        <option value="never" selected>Never</option>
+                        <option value="30d">30 days</option>
+                        <option value="90d">90 days</option>
+                        <option value="365d">1 year</option>
+                    </select>
+                </label>
+            </div>
+            <button type="submit">Create token</button>
+        </form>
+        <div id="new-key-result" style="margin-top:0.75rem;"></div>
+    </details>
+</section>
+
+{# ── Existing tokens ──────────────────────────────────────────────── #}
+<section style="margin-top:1.5rem;">
+    <h3>Your tokens</h3>
+    {% if keys %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                {% if is_admin %}<th>Owner</th>{% endif %}
+                <th>Created</th>
+                <th>Last used</th>
+                <th>Expires</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody id="api-keys-tbody">
+            {% for k in keys %}
+            <tr id="api-key-row-{{ k.id }}">
+                <td>{{ k.name }}</td>
+                {% if is_admin %}<td><small title="{{ k.email }}">{{ k.user_name if k.user_name else k.email }}</small></td>{% endif %}
+                <td><small>{{ k.created_at[:19] }}</small></td>
+                <td><small>{{ k.last_used_at[:19] if k.last_used_at else '—' }}</small></td>
+                <td><small>{{ k.expires_at[:19] if k.expires_at else 'Never' }}</small></td>
+                <td>
+                    <button class="outline secondary"
+                            style="padding:0.1rem 0.5rem;font-size:0.85rem;color:var(--pico-del-color);"
+                            hx-delete="/accounts/api-keys/{{ k.id }}"
+                            hx-target="#api-key-row-{{ k.id }}"
+                            hx-swap="outerHTML"
+                            hx-confirm="Revoke token '{{ k.name }}'? Whatever tool is using this token will immediately lose access.">
+                        Revoke
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>You don't have any tokens yet. Create one above when you want to connect an outside tool to your mail or calendar.</em></p>
+    {% endif %}
+</section>
+
+{% endblock %}

@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}My Settings - Rules - Email Triage{% endblock %}
+{% block content %}
+<h2>My Settings</h2>
+{% set active = "rules" %}
+{% include "_settings_tabs.html" %}
+
+<h3>Rules</h3>
+{% set active = "my-rules" %}
+{% include "_rules_tabs.html" %}
+
+<h3>My Classification Lists{{ m.help("Soft hints the AI uses, not hard rules. Each list pairs a label (e.g. 'VIP senders') with a suggested category and a set of email-address or domain entries; the AI weighs these against message content. Example: a 'VIP senders' list with boss@example.com suggesting category 'urgent' nudges mail from that address toward 'urgent' but the AI can still pick a different category if the body clearly says otherwise. For a hard override, use a per-account route on the Accounts page instead.") }}</h3>
+<p>Lists provide hints to the AI to improve classification accuracy. They are not hard overrides — the AI considers them alongside email content. For an entry to fire, the message must match the list AND the AI must agree the suggested category fits.</p>
+
+<section>
+    <details>
+        <summary role="button" class="outline">Create List</summary>
+        <p style="margin-top:0.5rem;color:var(--pico-muted-color);font-size:0.9em;">
+            A list groups one or more rules under a suggested category. A new list does
+            nothing by itself — add at least one rule below (sender, sender domain, or
+            subject phrase) so the list can match incoming mail. You can fill in the first
+            rule here, or leave the rule fields blank and add rules later from each list.
+        </p>
+        <form method="post" action="/rules/create">
+            {{ csrf_input(request) }}
+            <input type="hidden" name="is_global" value="0">
+            <div class="grid">
+                <label>
+                    Name
+                    <input type="text" name="name" placeholder="VIP Senders" required>
+                </label>
+                <label>
+                    Suggested Category{{ m.help("Which category this list nudges matching mail toward. Example: a 'VIP Senders' list set to 'to-respond' nudges mail from anyone on the list toward 'to-respond' so it surfaces in your action queue. The AI can still pick a different category if the body clearly says otherwise. Hover any category here for its description.") }}
+                    {# #159.4 — option text is the slug only. Long
+                       descriptions blew the native picker out to two
+                       monitors. Descriptions move to the per-option
+                       title attribute (browser native tooltip), plus a
+                       full-list legend below for non-hover surfaces. #}
+                    <select name="category">
+                        {% for cat, desc in categories.items() %}
+                        <option value="{{ cat }}" title="{{ desc }}">{{ cat }}</option>
+                        {% endfor %}
+                    </select>
+                    <small style="color:var(--pico-muted-color);display:block;margin-top:0.25rem;">
+                        Hover each option for its description.
+                    </small>
+                </label>
+            </div>
+
+            <p style="margin-top:1rem;margin-bottom:0.25rem;"><strong>First rule (optional)</strong></p>
+            <p style="margin-top:0;color:var(--pico-muted-color);font-size:0.9em;">
+                Adds one rule to the list right away so it starts matching mail. Leave
+                Pattern blank to create the list with no rules — you can add rules later.
+            </p>
+            <div class="grid">
+                <label>
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (boss@example.com). sender_domain matches the part after @ (hospital.org) — useful for catching everyone at a company. subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    <select name="rule_type">
+                        {% for rt in rule_types %}
+                        <option value="{{ rt }}">{{ rt }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Pattern{{ m.help("What to look for. For sender: a full email address like boss@example.com. For sender_domain: the domain only, like hospital.org (no @). For subject: a phrase like Invoice or Re: Patient. Leave blank to skip adding a first rule.") }}
+                    <input type="text" name="pattern" placeholder="boss@example.com">
+                </label>
+            </div>
+            <label>
+                <input type="checkbox" name="skip_ai" value="1">
+                Force category — bypass the AI when this rule matches{{ m.help("Checked = every matching email is filed under the list's category, no exceptions. The AI is not asked. Example: a sender_domain rule of your-vendor.example with Force on routes every email from that domain into the chosen category. Unchecked = the rule is advisory; the AI sees the suggestion but may pick a different category based on the email body. If you've created a rule and the AI keeps overriding it, switch to Force here.") }}
+            </label>
+
+            {# #129 — "Also adds labels" multi-select. The fieldset
+               renders even when the catalog is empty (#159.1) so the
+               operator sees the surface exists + knows where to create
+               a label first; previously the gate hid the whole section
+               and the "Rule-driven" doc on /labels pointed at a
+               surface that wasn't visible.
+               Each checkbox carries the same form-field name
+               (`adds_labels`), so the POST handler reads via getlist. #}
+            <fieldset style="margin:0.5rem 0;padding:0.5rem 0.75rem;
+                             border:1px solid var(--pico-muted-border-color);
+                             border-radius:var(--pico-border-radius);">
+                <legend style="font-size:0.9em;padding:0 0.4rem;">
+                    Also adds labels{{ m.help("Attach one or more labels to matching messages — checked labels are added to every message that matches this rule. Example: 'vendor-action-required' to mark mail needing follow-up. The AI's category is unchanged.") }}
+                </legend>
+                {% if all_labels %}
+                {% for label in all_labels %}
+                <label style="display:inline-flex;align-items:center;gap:0.4rem;margin-right:1rem;">
+                    <input type="checkbox" name="adds_labels" value="{{ label.slug }}">
+                    <span style="display:inline-block;padding:0.1rem 0.5rem;border-radius:0.7rem;background:{{ label.color }};color:#fff;font-size:0.8rem;">{{ label.name }}</span>
+                </label>
+                {% endfor %}
+                {% else %}
+                <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+                    No labels yet — create one on the
+                    <a href="/labels">Labels tab</a> first, then come back
+                    here to attach it.
+                </p>
+                {% endif %}
+            </fieldset>
+
+            <button type="submit">Create List</button>
+        </form>
+    </details>
+</section>
+
+{% for lst in personal_lists %}
+<section>
+    <h3>{{ lst.name }} <small>({{ lst.category }})</small></h3>
+
+    {% if lst.rules %}
+    <table>
+        <thead>
+            <tr>
+                <th>Type</th>
+                <th>Pattern</th>
+                <th>Mode{{ m.help("Force = matching mail is filed under this list's category, no exceptions (AI is bypassed). Hint = the rule is advisory; AI weighs it against the email body and may override. Edit the rule to flip between the two.") }}</th>
+                <th>Labels</th>
+                <th style="width:11rem;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {# #160 — per-row Edit affordance. The row partial
+               renders the view-mode row with Edit + Remove buttons;
+               the Edit button hx-gets the edit form partial, which
+               swaps the row's outerHTML for an inline edit form.
+               Same pattern as categories/_row.html + _edit.html. #}
+            {% for rule in lst.rules %}
+                {% include "rules/_rule_row.html" %}
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div role="alert"
+         style="background:var(--pico-color-amber-100, #fef3c7);
+                border-left:4px solid var(--pico-color-amber-500, #f59e0b);
+                color:var(--pico-color-amber-900, #78350f);
+                padding:0.75rem 1rem;
+                margin:0.5rem 0;
+                border-radius:4px;">
+        <strong>This list isn't matching anything yet</strong> — add a rule below to start.
+    </div>
+    {% endif %}
+
+    <details>
+        <summary>Add Rule</summary>
+        <form method="post" action="/rules/{{ lst.id }}/add-rule">
+            {{ csrf_input(request) }}
+            <div class="grid">
+                <label>
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (boss@example.com). sender_domain matches the part after @ (hospital.org) — useful for catching everyone at a company. subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    <select name="rule_type">
+                        {% for rt in rule_types %}
+                        <option value="{{ rt }}">{{ rt }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Pattern{{ m.help("What to look for. For sender: a full email address like boss@example.com. For sender_domain: the domain only, like hospital.org (no @). For subject: a phrase like Invoice or Re: Patient.") }}
+                    <input type="text" name="pattern" placeholder="boss@example.com" required>
+                </label>
+            </div>
+            <label>
+                <input type="checkbox" name="skip_ai" value="1">
+                Force category — bypass the AI when this rule matches{{ m.help("Checked = every matching email is filed under the list's category, no exceptions. The AI is not asked. Example: a sender_domain rule of your-vendor.example with Force on routes every email from that domain. Unchecked = the rule is advisory; the AI may override based on email body.") }}
+            </label>
+
+            {# #129 — per-list add-rule labels picker. Same pattern
+               as the create-list form above. #159.1: render even
+               when the catalog is empty so the surface is visible. #}
+            <fieldset style="margin:0.5rem 0;padding:0.5rem 0.75rem;
+                             border:1px solid var(--pico-muted-border-color);
+                             border-radius:var(--pico-border-radius);">
+                <legend style="font-size:0.9em;padding:0 0.4rem;">
+                    Also adds labels{{ m.help("Attach one or more labels to matching messages — checked labels are added to every message that matches this rule. Example: 'vendor-action-required' for follow-up tracking.") }}
+                </legend>
+                {% if all_labels %}
+                {% for label in all_labels %}
+                <label style="display:inline-flex;align-items:center;gap:0.4rem;margin-right:1rem;">
+                    <input type="checkbox" name="adds_labels" value="{{ label.slug }}">
+                    <span style="display:inline-block;padding:0.1rem 0.5rem;border-radius:0.7rem;background:{{ label.color }};color:#fff;font-size:0.8rem;">{{ label.name }}</span>
+                </label>
+                {% endfor %}
+                {% else %}
+                <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+                    No labels yet — create one on the
+                    <a href="/labels">Labels tab</a> first, then come back
+                    here to attach it.
+                </p>
+                {% endif %}
+            </fieldset>
+
+            <button type="submit">Add Rule</button>
+        </form>
+    </details>
+
+    <form method="post" action="/rules/{{ lst.id }}/delete"
+          onsubmit="return confirm('Delete list {{ lst.name }}?')"
+          style="margin-top:0.5rem">
+        <button type="submit" class="outline secondary">Delete List</button>
+    </form>
+</section>
+{% endfor %}
+
+{% if not personal_lists %}
+<p>No personal lists yet. Create one above to start hinting the classifier.</p>
+{% endif %}
+
+{% if global_lists %}
+<section>
+    <h3>Global Lists (read-only)</h3>
+    {% for lst in global_lists %}
+    <details>
+        <summary>{{ lst.name }} ({{ lst.category }}) — {{ lst.rules|length }} rules</summary>
+        {% if lst.rules %}
+        <table>
+            <thead>
+                <tr><th>Type</th><th>Pattern</th><th>Mode</th></tr>
+            </thead>
+            <tbody>
+                {% for rule in lst.rules %}
+                <tr>
+                    <td><code>{{ rule.rule_type }}</code></td>
+                    <td>{{ rule.pattern }}</td>
+                    <td>
+                        {% if rule.skip_ai %}
+                        <span style="color:var(--pico-color-amber-500);font-weight:600;">Force</span>
+                        {% else %}
+                        <span style="color:var(--pico-muted-color);">Hint</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p><small>No rules.</small></p>
+        {% endif %}
+    </details>
+    {% endfor %}
+</section>
+{% endif %}
+{% endblock %}

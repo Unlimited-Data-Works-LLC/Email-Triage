@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / admin). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Rules - Discover Categories - Email Triage{% endblock %}
+{% block content %}
+<h2>Rules</h2>
+
+{# Discover Categories moved from the Triage cluster to the Rules
+   cluster. Same neighbourhood as Categories + Personal Categories
+   ("what categories does my mail actually need?"). URL stays
+   /triage/discover so existing links don't break. #}
+{% set active = "discover" %}
+{% include "_rules_tabs.html" %}
+
+<div class="page-hero" style="
+    height:90px;margin:-0.5rem 0 1.25rem;border-radius:8px;
+    background:url('/static/hero-discover.png') center/cover no-repeat;
+    position:relative;overflow:hidden;
+">
+    <div style="
+        position:absolute;inset:0;
+        background:linear-gradient(90deg, var(--pico-background-color) 50%, rgba(0,0,0,0) 100%);
+    "></div>
+    <h3 style="position:relative;margin:0;padding:1.25rem 1.5rem;">Discover Categories</h3>
+</div>
+<p>Scan messages from a mailbox and let the AI suggest natural categories based on actual content.</p>
+
+{% if visible_owners %}
+<form method="get" action="/triage/discover" style="margin:0 0 1rem 0;">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Filter by owner:
+        <select name="owner_filter" onchange="this.form.submit()" style="margin:0;width:auto;">
+            <option value="all" {% if owner_filter == "all" %}selected{% endif %}>All users</option>
+            {% for o in visible_owners %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                {{ o.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+{% endif %}
+
+{% if not accounts %}
+<article style="border-left: 3px solid var(--pico-color-amber-500); padding: 0.5rem 1rem;">
+    <p>No email accounts configured. <a href="/accounts">Add an account</a> first.</p>
+</article>
+{% else %}
+<form hx-post="/triage/discover/run"
+      hx-target="#discover-results"
+      hx-swap="innerHTML"
+      hx-indicator="#discover-spinner">
+    <div class="grid">
+        <label>
+            Account
+            <select name="account_id" required
+                    hx-get="/triage/discover/folders"
+                    hx-target="#folder-picker"
+                    hx-swap="innerHTML"
+                    hx-trigger="change"
+                    hx-indicator="#folder-loading">
+                {% for acct in accounts %}
+                <option value="{{ acct.id }}" {% if not acct.is_active %}disabled{% endif %}>
+                    {{ acct.name }} ({{ acct.provider_type }}{% if acct.config.get('username') %} - {{ acct.config.get('username') }}{% endif %}){% if not acct.is_active %} [disabled]{% endif %}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Limit
+            <select name="limit">
+                <option value="10">10 messages</option>
+                <option value="25" selected>25 messages</option>
+                <option value="50">50 messages</option>
+                <option value="100">100 messages</option>
+            </select>
+        </label>
+    </div>
+    <div class="grid">
+        <label>
+            Search Query
+            <input type="text" name="query" value="ALL" placeholder="IMAP: ALL / Gmail: newer_than:30d">
+            <small>Use ALL to scan a representative sample. IMAP uses SEARCH syntax. Gmail uses Gmail query syntax.</small>
+        </label>
+    </div>
+
+    {# ── Folder selection ── #}
+    <fieldset style="margin-bottom:1rem;">
+        <legend>Scan Scope</legend>
+        <div style="display:flex;gap:1.5rem;align-items:flex-start;flex-wrap:wrap;">
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer;">
+                <input type="radio" name="scan_scope" value="inbox" checked
+                       onchange="document.getElementById('folder-checkboxes').style.display='none';"
+                       style="margin:0;">
+                INBOX only
+            </label>
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer;">
+                <input type="radio" name="scan_scope" value="all"
+                       onchange="document.getElementById('folder-checkboxes').style.display='none';"
+                       style="margin:0;">
+                All folders
+            </label>
+            <label style="display:flex;align-items:center;gap:0.35rem;cursor:pointer;">
+                <input type="radio" name="scan_scope" value="selected"
+                       onchange="document.getElementById('folder-checkboxes').style.display='block';
+                                 var sel=document.querySelector('select[name=account_id]');
+                                 if(sel.value) htmx.trigger(sel, 'change');"
+                       style="margin:0;">
+                Selected folders
+            </label>
+            <span id="folder-loading" class="htmx-indicator" style="font-size:0.85rem;">
+                Loading folders...
+            </span>
+        </div>
+        <div id="folder-checkboxes" style="display:none;margin-top:0.75rem;max-height:200px;overflow-y:auto;border:1px solid var(--pico-muted-border-color);border-radius:4px;padding:0.5rem;">
+            <div id="folder-picker">
+                <small style="color:var(--pico-muted-color);">Select an account to load folders.</small>
+            </div>
+        </div>
+        <small style="color:var(--pico-muted-color);margin-top:0.25rem;display:block;">
+            Emails may already be sorted into subfolders. "All folders" samples across the entire mailbox for the best category discovery.
+        </small>
+    </fieldset>
+
+    <button type="submit">
+        Discover Categories
+    </button>
+    <span id="discover-spinner" class="htmx-indicator" style="margin-left:1rem;">
+        Scanning messages... this may take a minute
+    </span>
+</form>
+
+<section id="discover-results" style="margin-top:2rem;">
+    <!-- Results will be swapped in here via HTMX -->
+</section>
+{% endif %}
+{% endblock %}

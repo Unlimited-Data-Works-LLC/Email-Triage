@@ -1,0 +1,51 @@
+[Unit]
+Description=email-triage web + background workers
+Documentation=https://github.com/Unlimited-Data-Works-LLC/Email-Triage
+Wants=network-online.target
+After=network-online.target podman.socket
+
+[Container]
+# Image by name; built via `sudo podman build` on host before restart.
+# The systemd unit does NOT build — it only runs the already-tagged
+# :latest image. Deploy loop: `podman build -t email-triage:latest ...`
+# then `systemctl restart email-triage.service`.
+Image=localhost/email-triage:latest
+ContainerName=email-triage
+
+# Per-user CLAUDE.md guidance: SearXNG owns 8080 on DeployHost, email-triage
+# owns 8081. Hard-code the mapping so a future operator can't
+# accidentally publish on the wrong port.
+PublishPort=8081:8080
+
+# Timezone — log formatter at src/email_triage/triage_logging.py reads
+# container TZ; without these two lines it silently falls back to UTC.
+# Matches the original `-e TZ=America/Detroit` + `-v /etc/localtime`
+# bind from the podman-run recipe.
+Environment=TZ=America/Detroit
+Volume=/etc/localtime:/etc/localtime:ro
+
+# Persistent data + config volumes. Layout matches the pre-quadlet
+# deploy so triage.db + email-triage.yaml survive the cutover without
+# touching host paths.
+Volume=/srv/email-triage/data:/app/data
+Volume=/srv/email-triage/config:/app/config
+
+# Master key — same Podman secret used before. Missing secret causes
+# the app lifespan to raise SecretNotFound and the container exits.
+Secret=ET_MASTER_KEY
+
+# Graceful shutdown cap. WatcherManager.stop_all caps per-watcher
+# shutdown at ~3s and the IMAP logout caps at 2s, so a clean drain
+# finishes well inside 30s even with multiple slow watchers + Pub/Sub
+# flush. systemd will SIGKILL after this elapses.
+StopTimeout=30
+
+[Service]
+# Restart semantics — survive transient crashes, but back off so a
+# broken config doesn't crash-loop at maximum rate.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+# Start at boot and when reaching default.target.
+WantedBy=multi-user.target default.target

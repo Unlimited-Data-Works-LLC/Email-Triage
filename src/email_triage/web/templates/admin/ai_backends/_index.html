@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}AI Backends — Email Triage{% endblock %}
+{% block content %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Manages the catalog of
+                external LLM services email-triage can talk to.
+   TECH-SKILL:  medium-to-high — admin-only page; technical
+                vocabulary (Ollama, Azure OpenAI, BAA, API key)
+                is fine here.
+   COPY RULES:  plain English where possible. "Vendor agreement
+                on file" not "BAA certification per HIPAA
+                §164.314(a)". Concrete examples in tooltips.
+   ─────────────────────────────────────────────────────────── #}
+
+{# #171-D — BAA-expiry banner moved to base.html (auto-injected ctx
+   in ``_shared._render`` for admin users). Renders above the page
+   content on EVERY admin page, not just here. #}
+
+{% if save_msg %}
+<p style="padding:0.5rem 0.75rem;margin:0 0 1rem 0;
+          border-left:3px solid var(--pico-ins-color);
+          background:var(--pico-card-background-color);">
+    <strong>{{ save_msg }}</strong>
+</p>
+{% endif %}
+{% if save_error %}
+<p style="padding:0.5rem 0.75rem;margin:0 0 1rem 0;
+          border-left:3px solid var(--pico-del-color);
+          background:var(--pico-card-background-color);">
+    <strong>Could not save:</strong> {{ save_error }}
+</p>
+{% endif %}
+
+<h2 style="margin:0 0 0.5rem 0;">AI Backends{{ m.help("LLM services email-triage can use for style-learning + classification. Each row is one vendor configuration: name, vendor type (Ollama / Azure OpenAI / OpenAI / Gemini), endpoint URL, model, optional API key, and whether you have a Business Associate Agreement (BAA) on file with that vendor. Per-account selectors only show enabled backends. HIPAA-flagged accounts only see BAA-certified backends.") }}</h2>
+<p style="color:var(--pico-muted-color);max-width:60ch;">
+    Catalog of LLM services available for selection on a per-account
+    basis. Accounts without a custom selection fall back to the install
+    default (the local Ollama configured in the system YAML).
+</p>
+
+<p style="margin:1rem 0;">
+    <a href="/config/ai-backends/new" role="button" class="contrast"
+       style="text-decoration:none;">
+        Add backend
+    </a>
+    <a href="/config?tab=ai_backends" role="button" class="secondary outline"
+       style="text-decoration:none;margin-left:0.5rem;">
+        Embedding settings
+    </a>
+</p>
+
+{% if items|length == 0 %}
+<article class="et-card" style="padding:1rem;">
+    <p style="margin:0;color:var(--pico-muted-color);">
+        No AI backends configured yet. Hit
+        <strong>Add backend</strong> above to add one.
+    </p>
+    <p style="margin:0.5rem 0 0 0;color:var(--pico-muted-color);font-size:0.9em;">
+        Accounts without a backend selected use the install default
+        (the local Ollama instance configured in
+        <code>email-triage.yaml</code>). Adding a backend here is
+        only needed when you want a per-account override — e.g. routing
+        one HIPAA account through Azure OpenAI under a BAA while
+        leaving non-HIPAA accounts on the local model.
+    </p>
+</article>
+{% else %}
+<table style="width:100%;">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Endpoint</th>
+            <th>Vendor agreement</th>
+            <th>Expires</th>
+            <th>Enabled</th>
+            <th>In use by</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for item in items %}
+        <tr>
+            <td>
+                <strong>{{ item.name }}</strong>
+                {% if item.model %}
+                <br><small style="color:var(--pico-muted-color);">
+                    model: <code>{{ item.model }}</code>
+                </small>
+                {% endif %}
+            </td>
+            <td><code>{{ item.type }}</code></td>
+            <td style="font-size:0.9em;">
+                <code>{{ item.endpoint }}</code>
+                <br>
+                {% if item.api_key_secret_ref %}
+                <small style="color:var(--pico-ins-color);">Key is set</small>
+                {% else %}
+                <small style="color:var(--pico-muted-color);">No key</small>
+                {% endif %}
+            </td>
+            <td>
+                {% if item.baa_certified %}
+                <strong style="color:var(--pico-ins-color);">On file</strong>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">Not on file</span>
+                {% endif %}
+            </td>
+            <td style="font-size:0.9em;">
+                {% if item.baa_expires_at %}
+                {% set _bucket = item.bucket %}
+                {% if _bucket == "expired" %}
+                <strong style="color:var(--pico-del-color);">
+                    Expired ({{ item.baa_expires_at }})
+                </strong>
+                {% elif _bucket == "expiring_urgent" %}
+                <strong style="color:var(--pico-del-color);">
+                    {{ item.baa_expires_at }}
+                    ({{ item.days_until_expiry }} days)
+                </strong>
+                {% elif _bucket == "expiring_soon" %}
+                <span style="color:var(--pico-mark-color, orange);">
+                    {{ item.baa_expires_at }}
+                    ({{ item.days_until_expiry }} days)
+                </span>
+                {% else %}
+                {{ item.baa_expires_at }}
+                {% endif %}
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if item.enabled %}
+                <span style="color:var(--pico-ins-color);">On</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">Off</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if item.in_use_count %}
+                {{ item.in_use_count }}
+                account{{ "" if item.in_use_count == 1 else "s" }}
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td>
+                <a href="/config/ai-backends/{{ item.id }}/edit"
+                   role="button" class="outline secondary"
+                   style="padding:0.2rem 0.5rem;font-size:0.85em;margin:0;">
+                    Edit
+                </a>
+                <form method="post"
+                      action="/config/ai-backends/{{ item.id }}/delete"
+                      style="display:inline-block;margin:0 0 0 0.3rem;"
+                      onsubmit="return confirm('Delete backend {{ item.name }}?{% if item.in_use_count %}\n\n{{ item.in_use_count }} account{{ "" if item.in_use_count == 1 else "s" }} currently use this backend and will revert to the install default.{% endif %}');">
+                    {{ csrf_input(request) }}
+                    <button type="submit"
+                            class="outline"
+                            style="padding:0.2rem 0.5rem;font-size:0.85em;margin:0;
+                                   color:var(--pico-del-color);
+                                   border-color:var(--pico-del-color);">
+                        Delete
+                    </button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<p style="margin:2rem 0 0 0;color:var(--pico-muted-color);font-size:0.85em;
+          max-width:60ch;">
+    The install default is the local Ollama instance configured in
+    <code>email-triage.yaml</code> &mdash; it is always available and
+    does not need a vendor agreement (PHI never leaves the install).
+    Backends added here let HIPAA-flagged accounts route to a vendor
+    you have a BAA with when the local model is not large enough for
+    the draft prompt.
+</p>
+{% endblock %}

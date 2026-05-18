@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / admin). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Classify Email - Email Triage{% endblock %}
+{% block content %}
+<h2>Triage</h2>
+
+{% set active = "classify" %}
+{% include "triage/_tabs.html" %}
+
+<h3>Test Classification</h3>
+<p>Paste a raw email (with headers) to see how the AI classifies it.</p>
+
+<form hx-post="/classify/run" hx-target="#result" hx-swap="innerHTML" hx-indicator="#classify-spinner">
+    <label>
+        Raw Email
+        <textarea name="raw_email" rows="16" required
+                  placeholder="Paste a complete email here, including headers (From, To, Subject, Date, etc.) and body..."></textarea>
+    </label>
+    <button type="submit">
+        Classify
+        <span id="classify-spinner" class="htmx-indicator" aria-busy="true" style="display:none;"> Classifying...</span>
+    </button>
+</form>
+
+<div id="result" style="margin-top: 1.5rem;">
+    {% if classification %}
+    {% set effective_hipaa = hipaa_mode or (parsed.hipaa if parsed and parsed.hipaa is defined else False) %}
+    <article>
+        <header><strong>Classification Result</strong></header>
+        <table>
+            <tr><td><strong>Category</strong></td><td><code>{{ classification.category }}</code></td></tr>
+            <tr><td><strong>Confidence</strong></td><td>{{ "%.0f%%"|format(classification.confidence * 100) }}</td></tr>
+            <tr><td><strong>Reason</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else classification.reason }}</td></tr>
+            <tr><td><strong>Source</strong></td><td>{{ classification.source }}</td></tr>
+        </table>
+        <details>
+            <summary>Parsed email fields</summary>
+            <table>
+                <tr><td><strong>From</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.sender }}</td></tr>
+                <tr><td><strong>To</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.recipients|join(", ") }}</td></tr>
+                <tr><td><strong>Subject</strong></td><td>{{ "[redacted — HIPAA]" if effective_hipaa else parsed.subject }}</td></tr>
+                <tr><td><strong>Date</strong></td><td>{{ parsed.date }}</td></tr>
+                <tr><td><strong>Body (first 500 chars)</strong></td><td>
+                    {% if effective_hipaa %}
+                    <em style="color:var(--pico-muted-color);">[redacted — HIPAA]</em>
+                    {% else %}
+                    <pre style="white-space:pre-wrap;font-size:0.85em;">{{ parsed.body_text[:500] }}</pre>
+                    {% endif %}
+                </td></tr>
+            </table>
+        </details>
+    </article>
+    {% endif %}
+</div>
+{% endblock %}

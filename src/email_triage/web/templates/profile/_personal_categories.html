@@ -1,0 +1,80 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional. No terminal, no
+                protocol jargon, no internal symbols.
+   COPY RULES:
+     - "Category name" not "slug" in user-rendered text. The
+       internal Jinja loop var + form input name="slug" stays
+       (server-side contract); only the column header + form
+       label + hx-confirm dialog text are user-facing.
+     - See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+{# Partial: personal categories list + add form. HTMX swap target #personal-cats-block. #}
+<div id="personal-cats-block">
+
+{% if error %}
+<article style="border-left:3px solid var(--pico-color-red-500);padding:0.4rem 0.75rem;font-size:0.9rem;margin-bottom:0.5rem;">
+    {{ error }}
+</article>
+{% endif %}
+
+{% if personal_categories %}
+<table style="margin-top:0.5rem;">
+    <thead>
+        <tr>
+            <th>Category Name</th>
+            <th>Description</th>
+            <th style="width:6rem;">Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for cat in personal_categories %}
+        <tr>
+            <td><code>{{ cat.slug }}</code></td>
+            <td>{{ cat.description }}</td>
+            <td>
+                <button class="secondary outline" style="padding:0.2rem 0.6rem;font-size:0.8rem;"
+                        hx-delete="/profile/personal-categories/{{ cat.id }}"
+                        hx-target="#personal-cats-block"
+                        hx-swap="outerHTML"
+                        hx-confirm="Delete personal category '{{ cat.slug }}' (category name)? Routes using it will fall back to default classification.">Del</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p style="color:var(--pico-muted-color);margin:0.5rem 0;">
+    No personal categories yet. Add one below — it applies to your mail only.
+</p>
+{% endif %}
+
+<form hx-post="/profile/personal-categories/create"
+      hx-target="#personal-cats-block"
+      hx-swap="outerHTML"
+      style="margin-top:0.5rem;">
+    <div class="grid">
+        <label>
+            Category Name
+            <input type="text" name="slug" required
+                   pattern="[a-z0-9][a-z0-9_\-]*"
+                   placeholder="e.g. woodworking-news"
+                   {% if personal_categories|length >= personal_cap %}disabled{% endif %}>
+        </label>
+        <label>
+            Description (what this catches)
+            <input type="text" name="description" required
+                   placeholder="Newsletters from woodworking sites"
+                   {% if personal_categories|length >= personal_cap %}disabled{% endif %}>
+        </label>
+    </div>
+    <button type="submit"
+            {% if personal_categories|length >= personal_cap %}disabled{% endif %}>
+        Add personal category
+    </button>
+    <small style="color:var(--pico-muted-color);">
+        {{ personal_categories|length }} / {{ personal_cap }} personal categories used
+    </small>
+</form>
+
+</div>

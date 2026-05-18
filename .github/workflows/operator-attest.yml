@@ -1,0 +1,248 @@
+name: Operator attestation
+
+# Manual operator workflow: stamp a cosign in-toto custom attestation
+# onto a released image, declaring that a human has validated the
+# build for the install profile in question (HIPAA-safe or not).
+#
+# This is the SECOND of two distinct OIDC subjects that ship with a
+# release. The first is `release.yml`'s build-provenance subject
+# (proves "this image came out of the CI pipeline"). This workflow's
+# subject is INDEPENDENT — a human-gated review step run after the
+# build. Customer-side verifier in HIPAA install mode requires BOTH
+# subjects on the same image digest before allowing pull.
+#
+# Why split into two workflows:
+#   * Distinct OIDC identities. Pinning the verifier to two separate
+#     subject patterns means a compromise of the build pipeline can't
+#     also forge the human-validated attestation (the operator would
+#     have to also dispatch THIS workflow from the compromised repo,
+#     which is gated on the `operator-approval` GitHub environment +
+#     a required-reviewer click).
+#   * Re-runnable. The operator can re-attest an image at any time
+#     (e.g. after a deeper HIPAA audit) without retriggering the
+#     build pipeline.
+#   * Trigger isolation. `release.yml` fires on push; this one fires
+#     ONLY on manual `workflow_dispatch`. There is no way to attach
+#     an operator attestation as a side-effect of a code change.
+#
+# Environment gate (`environment: operator-approval`) is a GitHub
+# Environments feature: workflow execution pauses until a designated
+# reviewer clicks "Approve" in the Actions UI. The reviewer list lives
+# in the repo Settings -> Environments -> operator-approval pane;
+# until the operator wires that up post-fork, the workflow will hang
+# at the gate (intentional — fail-safe).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Released image tag to attest (e.g. v0.1.0). Must already exist in GHCR.'
+        required: true
+        type: string
+      hipaa_safe:
+        description: 'Has this build been validated as HIPAA-safe for medical installs?'
+        required: true
+        type: boolean
+        default: false
+      validation_notes:
+        description: 'Free-form notes on what was validated (e.g. "ran privacy invariants + audit chain inspection on v0.1.0")'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: email-triage
+  GHCR_NAMESPACE: ${{ vars.GHCR_NAMESPACE || 'unlimited-data-works-llc' }}
+
+jobs:
+  attest:
+    name: Stamp operator attestation
+    runs-on: ubuntu-latest
+    # The required-reviewer gate. Until the operator creates the
+    # environment in repo Settings, the workflow stalls here — that
+    # is the intended fail-safe: no attestation can ship without a
+    # human approval step.
+    environment: operator-approval
+    permissions:
+      contents: write       # update GitHub Release body with the attestation note
+      packages: write       # cosign writes the attestation artifact alongside the image
+      id-token: write       # keyless OIDC (DISTINCT subject from release.yml)
+
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image digest
+        # Always pin the attestation to the IMMUTABLE digest, never to
+        # the tag. If someone later force-pushes the tag to a
+        # different image, this attestation is left attached to the
+        # original digest where it belongs — the new image at the
+        # same tag is unattested until the operator re-runs this
+        # workflow against it.
+        #
+        # 2026-05-17 bug fix: this step previously ran ``cosign
+        # triangulate --type digest`` and treated the output as a
+        # bare ``sha256:...`` digest. But ``cosign triangulate
+        # --type digest`` actually returns the FULL pinned image
+        # ref (``ghcr.io/<ns>/<name>@sha256:<hex>``), so naïvely
+        # concatenating ``ghcr.io/<ns>/<name>@${digest}`` produced
+        # a doubled path:
+        #   ghcr.io/<ns>/<name>@ghcr.io/<ns>/<name>@sha256:<hex>
+        # which cosign attest rejects with "could not parse
+        # reference". Fix: extract only the digest portion via
+        # ``${digest##*@}`` (the part after the LAST ``@``). Works
+        # whether cosign returns the full ref or just the bare
+        # ``sha256:<hex>`` — robust to future cosign versions that
+        # might trim the prefix.
+        #
+        # The ``inputs.image_tag`` can carry either the v-prefixed
+        # form (``v0.1.0``) or the bare semver form (``0.1.0``).
+        # Both are valid image tags post the ``type=semver,pattern=
+        # {{raw}}`` addition in release.yml's metadata-action.
+        id: resolve
+        run: |
+          ref="${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}"
+          echo "Resolving digest for ${ref}..."
+          raw=$(cosign triangulate --type digest "${ref}")
+          # `cosign triangulate --type digest` may not be available on
+          # older cosign builds; fall back to `crane digest` if so.
+          if [ -z "${raw}" ]; then
+            echo "cosign triangulate returned empty; falling back to crane"
+            curl -sSL -o /tmp/crane.tgz \
+              https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz
+            mkdir -p /tmp/crane && tar -xzf /tmp/crane.tgz -C /tmp/crane
+            raw=$(/tmp/crane/crane digest "${ref}")
+          fi
+          if [ -z "${raw}" ]; then
+            echo "ERROR: could not resolve digest for ${ref}" >&2
+            echo "Verify the image tag exists at ${ref} before re-running." >&2
+            exit 1
+          fi
+          # Extract the bare digest portion. Strip everything up to
+          # and including the last ``@`` — handles BOTH shapes:
+          #   ghcr.io/<ns>/<name>@sha256:<hex>  -> sha256:<hex>
+          #   sha256:<hex>                       -> sha256:<hex>
+          digest="${raw##*@}"
+          if ! printf '%s' "${digest}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: digest extraction produced unexpected value: '${digest}'" >&2
+            echo "Raw cosign output was: '${raw}'" >&2
+            exit 1
+          fi
+          echo "Resolved digest: ${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image-ref=${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Build predicate JSON
+        id: predicate
+        # The predicate is what the operator is actually attesting.
+        # Schema is INTENTIONALLY small + stable: customer-side
+        # verifier parses it to decide whether to allow pull in
+        # HIPAA mode. Don't extend without coordinating with
+        # docs/release-process.md verifier section.
+        run: |
+          ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # jq builds the JSON to avoid shell-quoting hazards on the
+          # free-form notes field.
+          jq -n \
+            --arg version "${{ inputs.image_tag }}" \
+            --argjson hipaa_safe ${{ inputs.hipaa_safe }} \
+            --arg validated_by "${{ github.actor }}" \
+            --arg validated_at "${ts}" \
+            --arg notes "${{ inputs.validation_notes }}" \
+            --arg attestation_run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+               predicateType: "https://email-triage.local/attestations/operator-approval/v1",
+               version: $version,
+               hipaa_safe: $hipaa_safe,
+               validated_by: $validated_by,
+               validated_at: $validated_at,
+               notes: $notes,
+               attestation_run: $attestation_run
+             }' > operator-approval.json
+          echo "Predicate:"
+          cat operator-approval.json
+          echo "validated_at=${ts}" >> "$GITHUB_OUTPUT"
+
+      - name: Cosign attest (custom predicate, keyless OIDC)
+        # `--type custom` -> the predicate type comes from the JSON
+        # itself, not from one of cosign's built-in types. This is
+        # the right shape for an operational attestation that doesn't
+        # match any of cosign's standard predicates (SLSA, vuln, etc.).
+        #
+        # OIDC subject for this attestation is the operator-attest.yml
+        # workflow identity, DISTINCT from release.yml's subject. The
+        # customer-side verifier pattern is:
+        #
+        #   cosign verify-attestation \
+        #     --certificate-identity-regexp \
+        #       'operator-attest\.yml@refs/heads/main' \
+        #     --certificate-oidc-issuer \
+        #       'https://token.actions.githubusercontent.com' \
+        #     <image-ref>
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign attest --yes \
+            --predicate operator-approval.json \
+            --type custom \
+            "${{ steps.resolve.outputs.image-ref }}"
+
+      - name: Update GitHub Release body
+        # Idempotent: re-running this workflow against the same tag
+        # replaces the previous "Operator-attested" footer rather
+        # than appending. The managed region is bracketed by HTML
+        # comment markers; everything outside the markers is left
+        # untouched so a human-authored Release body survives.
+        #
+        # Python is used here (not bash) to avoid heredoc + YAML
+        # block-scalar interactions — heredoc bodies at column 0
+        # would terminate the YAML pipe scalar.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+          INPUT_HIPAA_SAFE: ${{ inputs.hipaa_safe }}
+          INPUT_NOTES: ${{ inputs.validation_notes }}
+          ACTOR: ${{ github.actor }}
+          VALIDATED_AT: ${{ steps.predicate.outputs.validated_at }}
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          ATTESTATION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Existence-check the Release first. The cosign attestation
+          # is already attached to the image digest above; missing
+          # Release just means we can't update its body. Soft-skip.
+          if ! gh release view "${INPUT_TAG}" >/dev/null 2>&1; then
+            echo "WARN: GitHub Release ${INPUT_TAG} does not exist yet; skipping body update."
+            echo "      The cosign attestation is still attached to the image digest."
+            exit 0
+          fi
+          current_body=$(gh release view "${INPUT_TAG}" --json body --jq .body)
+          new_body=$(printf '%s' "${current_body}" | python3 "${GITHUB_WORKSPACE}/.github/scripts/update_release_attestation_block.py")
+          tmpfile=$(mktemp)
+          printf '%s\n' "${new_body}" > "${tmpfile}"
+          gh release edit "${INPUT_TAG}" --notes-file "${tmpfile}"
+          rm -f "${tmpfile}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Operator attestation stamped"
+            echo
+            echo "- Image: \`${{ steps.resolve.outputs.image-ref }}\`"
+            echo "- HIPAA-safe: \`${{ inputs.hipaa_safe }}\`"
+            echo "- Validated by: \`${{ github.actor }}\`"
+            echo "- Validated at: \`${{ steps.predicate.outputs.validated_at }}\`"
+            echo
+            echo "Customer-side verification: see \`docs/release-process.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+{% block title %}TLS / CSR - Email Triage{% endblock %}
+{% block content %}
+
+<h2>TLS Certificate (CSR / Import)</h2>
+<p>
+    Manual certificate workflow for institutional CAs (Sectigo,
+    DigiCert, internal PKI, etc.) and self-signed certs. For
+    ACME / Let's Encrypt, use
+    <a href="/admin/acme-status">/admin/acme-status</a> instead.
+</p>
+
+{% if saved %}
+<p style="color:var(--pico-ins-color);"><small>Action completed.</small></p>
+{% endif %}
+{% if error %}
+<p style="color:var(--pico-del-color);"><small>{{ error }}</small></p>
+{% endif %}
+
+<p><small style="color:var(--pico-muted-color);">
+    Cert directory: <code>{{ cert_dir }}</code>
+</small></p>
+
+{# ─────────────────────────────────────────────────────────────────
+   Active state — server.crt + server.key in place
+   ───────────────────────────────────────────────────────────────── #}
+{% if state == "active" %}
+<article style="border-left:3px solid var(--pico-ins-color);
+                padding:0.75rem 1rem;margin:1rem 0;">
+    <h3 style="margin:0 0 0.5rem 0;">Active certificate</h3>
+    {% if active_cert %}
+    <table>
+        <tbody>
+            <tr><td>Subject CN</td><td><code>{{ active_cert.subject_cn }}</code></td></tr>
+            <tr><td>Issuer</td><td><code>{{ active_cert.issuer_cn }}</code></td></tr>
+            <tr><td>Not before</td><td><code>{{ active_cert.not_before }}</code></td></tr>
+            <tr><td>Not after</td><td><code>{{ active_cert.not_after }}</code></td></tr>
+            <tr>
+                <td>Days until expiry</td>
+                <td>
+                    {% if active_cert.days_until_expiry <= 7 %}
+                    <strong style="color:var(--pico-del-color);">{{ active_cert.days_until_expiry }}d ⚠ urgent renew</strong>
+                    {% elif active_cert.days_until_expiry <= 30 %}
+                    <strong style="color:var(--pico-color-amber-500);">{{ active_cert.days_until_expiry }}d — plan renewal</strong>
+                    {% else %}
+                    <strong style="color:var(--pico-ins-color);">{{ active_cert.days_until_expiry }}d</strong>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td>Subject Alt Names</td>
+                <td>
+                    {% for s in active_cert.sans %}
+                    <code style="font-size:0.8em;">{{ s }}</code>{% if not loop.last %}, {% endif %}
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">(none)</small>
+                    {% endfor %}
+                </td>
+            </tr>
+            <tr><td>Chain length</td><td>{{ active_cert.chain_length }} cert(s)</td></tr>
+        </tbody>
+    </table>
+    {% else %}
+    <p><small style="color:var(--pico-muted-color);">
+        Cert files exist on disk but couldn't be parsed for metadata.
+        Inspect <code>{{ cert_dir }}/server.crt</code> directly.
+    </small></p>
+    {% endif %}
+</article>
+{% endif %}
+
+{# ─────────────────────────────────────────────────────────────────
+   Pending state — CSR generated, awaiting CA-signed cert
+   ───────────────────────────────────────────────────────────────── #}
+{% if state == "pending" %}
+<article style="border-left:3px solid var(--pico-color-amber-500);
+                padding:0.75rem 1rem;margin:1rem 0;">
+    <h3 style="margin:0 0 0.5rem 0;">CSR pending</h3>
+    <p>
+        A keypair was generated and a CSR is waiting for a CA-signed
+        cert. Submit the CSR to your institutional CA, then paste the
+        signed PEM (or upload the file) below to complete the rotation.
+    </p>
+
+    <form method="post" action="/admin/tls/csr/download" style="display:inline;">
+        {{ csrf_input(request) }}
+        <button type="submit" class="outline secondary">
+            Re-download CSR
+        </button>
+    </form>
+    <form method="post" action="/admin/tls/csr/cancel" style="display:inline;"
+          onsubmit="return confirm('Discard the pending keypair and CSR? If you have already submitted the CSR to your CA, the eventual signed cert will be unusable.');">
+        <button type="submit" class="outline secondary"
+                style="color:var(--pico-del-color);">
+            Cancel pending CSR
+        </button>
+    </form>
+</article>
+
+<h3>Import CA-signed cert</h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+        Paste the PEM your CA returned (leaf + intermediates concatenated
+        is fine) OR upload the <code>.pem</code> / <code>.crt</code>
+        file. The imported cert's public key must match the held private
+        key — wrong cert paste fails the validation, no swap.
+    </small>
+</p>
+<form method="post" action="/admin/tls/csr/import" enctype="multipart/form-data">
+    {{ csrf_input(request) }}
+    <label>
+        Paste PEM
+        <textarea name="cert_pem" rows="10"
+                  placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+                  style="font-family:monospace;font-size:0.85em;"></textarea>
+    </label>
+    <label>
+        Or upload PEM file
+        <input type="file" name="cert_file" accept=".pem,.crt,.cer">
+    </label>
+    <button type="submit">Import + activate</button>
+</form>
+{% endif %}
+
+{# ─────────────────────────────────────────────────────────────────
+   Idle state OR active state — both can start a new CSR or self-sign
+   ───────────────────────────────────────────────────────────────── #}
+{% if state != "pending" %}
+<hr style="margin:2rem 0;">
+
+<h3>Make a new CSR</h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+        Generate an RSA-2048 keypair + CSR. The private key stays on
+        this host (written to <code>{{ cert_dir }}/server.key.pending</code>);
+        the CSR downloads to your browser. Submit the CSR to your CA;
+        come back here to import the signed cert.
+        {% if state == "active" %}
+        <br><strong>Active cert is in place.</strong> Generating a new
+        CSR doesn't disturb it — the new keypair lives under
+        <code>.pending</code> until you import. The active cert keeps
+        serving requests until the swap.
+        {% endif %}
+    </small>
+</p>
+
+<form method="post" action="/admin/tls/csr/make">
+    {{ csrf_input(request) }}
+    <label>
+        Hostname (CN + first SAN)
+        <input type="text" name="hostname" required
+               placeholder="triage.example.com"
+               value="{{ active_cert.subject_cn if active_cert and active_cert.subject_cn != '(unset)' else '' }}">
+    </label>
+    <label>
+        Extra SANs (comma-separated, DNS or IP)
+        <input type="text" name="extra_sans"
+               placeholder="alt.example.com, 10.0.0.5">
+    </label>
+    <label>
+        Organization (O=)
+        <input type="text" name="organization"
+               value="email-triage">
+    </label>
+    <button type="submit">Make CSR + download</button>
+</form>
+
+<hr style="margin:2rem 0;">
+
+<h3>Self-sign now</h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+        Generate + install a self-signed cert directly. Useful for
+        bring-up: get a working TLS listener for browser pinning /
+        WebAuthn testing before issuing a real institutional cert.
+        Browser warns about the self-signed cert; operator clicks
+        through. Later, replace via "Make a new CSR" + import.
+    </small>
+</p>
+
+<form method="post" action="/admin/tls/csr/self-sign"
+      onsubmit="return confirm('Generate a self-signed cert and overwrite the active cert in cert_dir?');">
+    <div class="grid">
+        <label>
+            Hostname
+            <input type="text" name="hostname" required
+                   placeholder="triage.example.com">
+        </label>
+        <label>
+            Valid for (days)
+            <input type="number" name="valid_days" value="365" min="1" max="3650">
+        </label>
+    </div>
+    <label>
+        Extra SANs (comma-separated)
+        <input type="text" name="extra_sans"
+               placeholder="alt.example.com, 10.0.0.5">
+    </label>
+    <button type="submit" class="secondary">Self-sign + activate</button>
+</form>
+{% endif %}
+
+<hr style="margin:2rem 0;">
+
+<h3>Notes</h3>
+<ul>
+    <li>
+        <small style="color:var(--pico-muted-color);">
+            Cert + key swaps trigger the TLS hot-reload watcher within
+            ~30 seconds. No service restart needed.
+        </small>
+    </li>
+    <li>
+        <small style="color:var(--pico-muted-color);">
+            Daily-health email warns at 30 / 14 / 7 days before expiry
+            for the manually-managed cert. ACME-managed certs renew
+            automatically; this UI doesn't know about them.
+        </small>
+    </li>
+    <li>
+        <small style="color:var(--pico-muted-color);">
+            Operator-private runbook (recovery, lost private key,
+            paired CSR misplaced, etc.) lives in
+            <code>docs/backup-restore.md</code> alongside the bundle
+            workflow.
+        </small>
+    </li>
+</ul>
+
+{% endblock %}

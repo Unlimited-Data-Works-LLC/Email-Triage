@@ -1,0 +1,75 @@
+{# ─── AUDIENCE ───
+   END-USER (mid-flow setup wizard). TECH-SKILL: low.
+   COPY RULES:
+     - "Categories" is a familiar word — it stays. "Routes" is the
+       internal term for category-to-action mapping; we explain it
+       in plain language ("what should email-triage DO with mail in
+       each category").
+     - No "ask your administrator" copy.
+     - Tooltips with examples on every choice.
+   #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Add Account — Step 4 of 5: Categories{% endblock %}
+{% block content %}
+<h2>Add an email account: {{ acct.name }}</h2>
+
+{% set current_step = 4 %}
+{% include "account_wizard/_progress.html" %}
+
+<p>
+    email-triage sorts incoming mail into categories (Work, Personal,
+    Newsletter, etc.) and can take an action on each one — move the
+    mail to a folder, add a label, draft a reply. You can copy the
+    setup from another mailbox you already configured, or start
+    fresh and tweak it later on the Routing page.
+</p>
+
+<form method="post" action="/accounts/new/step4">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="account_id" value="{{ acct.id }}">
+
+    {% if other_accounts %}
+    <fieldset>
+        <legend>Pick a starting point{{ m.help("Copying from another mailbox gives you a working setup you can edit. We only copy the rules; the categories themselves are shared system-wide.") }}</legend>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="radio" name="route_source" value="fresh" checked style="margin:0;">
+            <span><strong>Start fresh</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— mail will still be sorted into categories,
+                    but no actions fire until you add rules on the
+                    Routing page.
+                </small>
+            </span>
+        </label>
+
+        {% for other in other_accounts %}
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="radio" name="route_source"
+                   value="copy:{{ other.id }}" style="margin:0;">
+            <span><strong>Copy from {{ other.name }}</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— {{ other.route_count }} rule{% if other.route_count != 1 %}s{% endif %}
+                    ({{ other.provider_type }})
+                </small>
+            </span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    {% else %}
+    <p style="color:var(--pico-muted-color);">
+        <small>No other mailbox is set up yet, so we'll start fresh.
+        You can add rules on the Routing page once the wizard finishes.</small>
+    </p>
+    <input type="hidden" name="route_source" value="fresh">
+    {% endif %}
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Next: Daily summary →</button>
+        <a href="/accounts/new?step=3&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+{% endblock %}

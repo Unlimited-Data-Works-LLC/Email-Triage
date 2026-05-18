@@ -1,0 +1,61 @@
+# Email Triage — Medical Researcher Configuration Example
+#
+# This example is designed for a medical/research environment:
+# - IMAP provider (works with any mail server)
+# - HIPAA mode enabled (strips all PHI from logs and notifications)
+# - Local Ollama for classification (no cloud LLM — email stays local)
+# - OS keyring for secrets (Windows Credential Locker / macOS Keychain)
+# - No push notifications (simple polling mode)
+#
+# Copy this to ./email-triage.yaml and adjust to match your setup.
+# Store secrets via: email-triage secrets set IMAP_PASSWORD
+
+provider:
+  type: imap
+  imap:
+    host: mail.institution.edu
+    port: 993
+    username: researcher@institution.edu
+    password: ""                          # Loaded from secrets store
+    use_ssl: true
+    mailbox: INBOX
+
+classifier:
+  backend: ollama
+  model: llama3.1:8b                     # Smaller model for desktop
+  ollama_url: http://localhost:11434      # Ollama running locally
+
+  categories:
+    to-respond: "Emails that need a reply from you"
+    fyi: "Informational, no action needed"
+    newsletters: "Subscriptions and recurring content"
+    notifications: "System alerts and automated messages"
+    action-required: "Tasks, requests, deadlines"
+    meetings: "Meeting invites, agenda, scheduling"
+    grant-related: "Grant applications, reviews, funding communications"
+    invoices: "Bills, receipts, and payment-related emails"
+
+routes:
+  to-respond: [notify, label]
+  action-required: [notify, label]
+  grant-related: [notify, label]
+  meetings: [notify, label]
+  invoices: [label, queue_summary]
+  newsletters: [queue_summary]
+
+escalation:
+  enabled: false                         # Disabled — no SMS gateway needed
+
+logging:
+  level: INFO
+  format: text                           # Human-readable for desktop use
+  hipaa: true                            # CRITICAL: Strips all PHI from logs
+
+secrets:
+  backend: keyring                       # OS keyring (Windows/macOS)
+
+persistence:
+  db_path: ./data/triage.db              # Local data directory
+
+# No push section — use polling mode:
+#   email-triage watch --interval 300

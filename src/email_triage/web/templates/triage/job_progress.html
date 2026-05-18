@@ -1,0 +1,104 @@
+{# Bulk-triage job progress page (#101).
+
+   Page chrome stays put; the inner block live-refreshes every 2s
+   via HTMX poll into _job_progress_fragment.html. Cancel is a
+   plain HTML POST (full reload) — operator action, no need for
+   the polling cadence on cancel. #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional. The job-id +
+                rate / concurrency facts surface here, but the
+                explanatory copy stays plain English.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+     - No protocol jargon ("language model" → "AI"; no
+       "system log"; no "RFC"; no "ISO 8601"; no "OData").
+     - Disabled controls speak via their disabled state.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Triage job {{ job.job_id }} - Email Triage{% endblock %}
+{% block content %}
+<h2>Triage</h2>
+{% set active = "jobs" %}
+{% include "triage/_tabs.html" %}
+
+<h3>
+    Bulk run on
+    <code>{{ acct.name }}</code>
+    <small style="color:var(--pico-muted-color);font-weight:normal;">
+        — job <code>{{ job.job_id }}</code>
+    </small>
+</h3>
+
+<p style="margin:0.5rem 0 0.25rem;">
+    This page tracks a background sweep over your mailbox. The
+    counters below update every couple of seconds. The job paces
+    itself ({{ job.rate_msg_per_min }} messages a minute, up to
+    {{ job.concurrency }} at once) so the AI isn't overloaded —
+    leave it open or come back later. Hit <strong>Cancel run</strong>
+    to stop early; messages already classified stay processed.
+</p>
+<p>
+    <small style="color:var(--pico-muted-color);">
+        Query: <code>{{ job.query or "(empty — all messages)" }}</code>
+        &nbsp;·&nbsp; Rate: {{ job.rate_msg_per_min }} msg/min
+        &nbsp;·&nbsp; Concurrency: {{ job.concurrency }}
+        {% if job.actor_user_id and user.id == job.actor_user_id %}
+        &nbsp;·&nbsp; You started this job
+        {% endif %}
+    </small>
+</p>
+
+{# Live-refreshing block — fragment renders status, progress bar,
+   counters, ETA, and the recent-classifications feed. Polls every
+   2 s while the job is non-terminal; the fragment itself returns
+   without any hx-trigger when the job is terminal so the polling
+   stops on its own. #}
+<div id="job-progress-block"
+     hx-get="/triage/jobs/{{ job.job_id }}/progress"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML">
+    {% include "triage/_job_progress_fragment.html" %}
+</div>
+
+<p style="margin-top:1.5rem;">
+    <a href="/triage/jobs" role="button" class="outline secondary"
+       style="padding:0.3rem 0.8rem;">
+        &larr; Back to Bulk runs
+    </a>
+</p>
+
+{# UTC → local conversion for any .local-datetime span the
+   fragment emits. Runs on initial render + after every HTMX swap
+   (the progress fragment re-renders every 2s while the job is
+   non-terminal). The script tolerates both the ISO + "Z" form
+   and the +HH:MM form. #}
+<script>
+(function() {
+    function convert(root) {
+        var scope = root && root.querySelectorAll
+            ? root : document;
+        scope.querySelectorAll('.local-datetime').forEach(function(el) {
+            var utc = el.getAttribute('data-utc');
+            if (!utc) return;
+            try {
+                var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
+                var d = new Date(hastz ? utc : utc + 'Z');
+                el.textContent = d.toLocaleString(undefined, {
+                    month: 'short', day: 'numeric',
+                    hour: 'numeric', minute: '2-digit',
+                });
+            } catch (e) { /* leave the original UTC string */ }
+        });
+    }
+    convert();
+    if (document.body) {
+        document.body.addEventListener('htmx:afterSwap', function(ev) {
+            convert(ev.target || document);
+        });
+    }
+})();
+</script>
+{% endblock %}

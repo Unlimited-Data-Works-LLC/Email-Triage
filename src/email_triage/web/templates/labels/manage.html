@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (operator / account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:
+     - Use "label" / "tag" — never "slug" in user-rendered copy
+       (the input field is still labelled with the canonical word
+       since the input shape is a slug pattern, but the table +
+       prose use plain English).
+     - No "AI" / "LLM" — labels are independent of classification.
+     - No admin-only-path links ("/config", "/admin/*", "Ask your
+       administrator"). This page is operator-scope; nothing here
+       requires admin.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}My Settings - Labels - Email Triage{% endblock %}
+{% block content %}
+<h2>My Settings</h2>
+{% set active = "labels" %}
+{% include "_settings_tabs.html" %}
+
+<h3>Labels{{ m.help("Operator-curated tags applied to messages independently of the AI's classification. A message can have one category from the AI plus any number of labels. Example: a 'vendor-action-required' label sits next to the AI's chosen category — useful when you want to track follow-up state without changing how the message is filed.") }}</h3>
+<p>
+    Labels are tags you attach to messages. The AI's category stays as
+    chosen; labels are extra information you control. Use them for
+    follow-up state, cross-cutting themes ("tax-related" across both
+    receipts and statements), or routing hints that don't fit a
+    category.
+</p>
+
+{% if error %}
+<article aria-label="Error" style="border-left: 3px solid var(--pico-color-red-500); padding: 0.5rem 1rem;">
+    <p>{{ error }}</p>
+</article>
+{% endif %}
+
+{% if success %}
+<article aria-label="Success" style="border-left: 3px solid var(--pico-color-green-500); padding: 0.5rem 1rem;">
+    <p>{{ success }}</p>
+</article>
+{% endif %}
+
+<table>
+    <thead>
+        <tr>
+            <th>Label</th>
+            <th>Name</th>
+            <th>Color</th>
+            <th>In use</th>
+            <th style="width:8rem;">Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for label in labels %}
+        <tr>
+            <td>
+                <span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:0.7rem;background:{{ label.color }};color:#fff;font-size:0.85rem;">
+                    {{ label.name }}
+                </span>
+                <br>
+                <small style="color:var(--pico-muted-color);"><code>{{ label.slug }}</code></small>
+            </td>
+            <td>{{ label.name }}</td>
+            <td>
+                <span aria-hidden="true" style="display:inline-block;width:1.2rem;height:1.2rem;border-radius:0.25rem;background:{{ label.color }};vertical-align:middle;"></span>
+                <code style="margin-left:0.4rem;">{{ label.color }}</code>
+            </td>
+            <td>{{ label.usage_count }}</td>
+            <td>
+                <form method="post" action="/labels/{{ label.slug }}/delete" style="margin:0">
+                    {{ csrf_input(request) }}
+                    <button type="submit" class="outline secondary"
+                            onclick="return confirm('Remove label {{ label.slug }}? It will also be removed from the {{ label.usage_count }} message(s) it is currently on.')">
+                        Remove
+                    </button>
+                </form>
+            </td>
+        </tr>
+        {% else %}
+        <tr>
+            <td colspan="5">
+                <em style="color:var(--pico-muted-color);">No labels yet. Add one below.</em>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<p>Total: {{ labels|length }} label{{ "s" if labels|length != 1 else "" }}.</p>
+
+<details>
+    <summary>Add a new label</summary>
+    <form method="post" action="/labels/create">
+        {{ csrf_input(request) }}
+        <div class="grid">
+            <label>
+                Label (short code){{ m.help("A short, lowercase identifier for the label. Example: vendor-action-required, tax-2026, followup-friday. Use dashes between words; no spaces. This is how the label is referred to in rules and bulk actions.") }}
+                <input type="text" name="slug" required
+                       pattern="[a-z0-9][a-z0-9\-]*"
+                       placeholder="vendor-action-required">
+            </label>
+            <label>
+                Display name{{ m.help("How the label appears as a chip next to messages. Example: 'Vendor: action required', 'Tax (2026)', 'Follow up Friday'.") }}
+                <input type="text" name="name" required
+                       placeholder="Vendor: action required">
+            </label>
+            <label>
+                Color{{ m.help("Color shows as a chip next to messages. Pick something distinctive — example: red for 'urgent', green for 'paid-attention', amber for 'follow-up'.") }}
+                <input type="color" name="color" value="#6c757d">
+            </label>
+        </div>
+        <button type="submit">Add label</button>
+    </form>
+</details>
+
+<aside style="margin-top:2rem;border-top:1px solid var(--pico-muted-border-color);padding-top:1rem;">
+    <h4>How labels are applied</h4>
+    <ul>
+        <li>
+            <strong>Bulk on triage results</strong> — pick a label from the
+            dropdown above the results table, check the messages you want
+            tagged, click "Tag selected".
+        </li>
+        <li>
+            <strong>Rule-driven</strong> — every label you create on
+            this page appears as a checkbox in the rule editor. Tick
+            it on any rule to attach the label to every message that
+            rule matches, on top of the rule's suggested category.
+            Multiple labels per rule are fine — tick any number, all
+            ticked labels attach at fire time.
+        </li>
+        <li>
+            <strong>Where the rule editor lives</strong> —
+            <a href="/rules">My Settings → Rules</a>.
+        </li>
+    </ul>
+</aside>
+{% endblock %}

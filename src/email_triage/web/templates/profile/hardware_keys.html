@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}My Settings - Hardware keys - Email Triage{% endblock %}
+{% block content %}
+
+<h2>My Settings</h2>
+
+{% set active = "hardware-keys" %}
+{% include "_settings_tabs.html" %}
+
+<h3>Hardware keys</h3>
+<p>
+    Register a FIDO2 / WebAuthn hardware key (YubiKey, SoloKey, Titan,
+    Apple/Windows passkey) to skip the OTP step on login. Touch the
+    key when prompted; the credential is bound to this site by your
+    browser and can't be used elsewhere.
+</p>
+<p>
+    OTP login keeps working alongside hardware keys — pick &ldquo;Send
+    OTP instead&rdquo; on the login page if your key is unavailable.
+</p>
+
+{% if visible_owners %}
+{# Owner filter shown to admins only — they can see other users'
+   keys (e.g. for forensic review) but default to their own. #}
+<form method="get" action="/profile/hardware-keys" style="margin:0 0 1rem 0;">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Filter by owner:
+        <select name="owner_filter" onchange="this.form.submit()" style="margin:0;width:auto;">
+            <option value="all" {% if owner_filter == "all" %}selected{% endif %}>All users</option>
+            {% for o in visible_owners %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                {{ o.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+{% endif %}
+
+<section>
+    <h3>Register a new key</h3>
+    <form id="hw-register-form" onsubmit="return false;">
+        <label>
+            Nickname
+            <input type="text" id="hw-nickname" placeholder="YubiKey blue" required>
+        </label>
+        <button id="hw-register-btn" type="button">
+            Touch key to register
+        </button>
+        <p id="hw-register-status" style="margin-top:0.5rem;"></p>
+    </form>
+</section>
+
+<section style="margin-top:1.5rem;">
+    <h3>Registered keys</h3>
+    {% set active = keys | selectattr("revoked_at", "none") | list %}
+    {% if active %}
+    <table>
+        <thead>
+            <tr>
+                <th>Nickname</th>
+                <th>Created</th>
+                <th>Last used</th>
+                <th>Sign count</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for k in active %}
+            <tr>
+                <td>{{ k.nickname }}</td>
+                <td><small>{{ k.created_at[:19] }}</small></td>
+                <td><small>{{ k.last_used_at[:19] if k.last_used_at else '—' }}</small></td>
+                <td><small>{{ k.sign_count }}</small></td>
+                <td>
+                    <form method="post" action="/profile/hardware-keys/{{ k.id }}/revoke" style="margin:0;">
+                        {{ csrf_input(request) }}
+                        <button class="outline secondary"
+                                style="padding:0.1rem 0.5rem;font-size:0.85rem;color:var(--pico-del-color);">
+                            Revoke
+                        </button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>You haven't registered any hardware keys yet.</em></p>
+    {% endif %}
+
+    {% set revoked = keys | rejectattr("revoked_at", "none") | list %}
+    {% if revoked %}
+    <details>
+        <summary>Revoked keys ({{ revoked | length }})</summary>
+        <table>
+            {% for k in revoked %}
+            <tr style="opacity:0.55;">
+                <td>{{ k.nickname }}</td>
+                <td><small>revoked {{ k.revoked_at[:19] }}</small></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </details>
+    {% endif %}
+</section>
+
+<p style="margin-top:1.5rem;">
+    <a href="/dashboard" role="button" class="outline">&larr; Dashboard</a>
+</p>
+
+<script src="/static/webauthn.js"></script>
+<script>
+document.getElementById("hw-register-btn").addEventListener("click", async () => {
+    const status = document.getElementById("hw-register-status");
+    const nickname = document.getElementById("hw-nickname").value.trim();
+    if (!nickname) {
+        status.textContent = "Nickname required.";
+        status.style.color = "var(--pico-del-color)";
+        return;
+    }
+    status.textContent = "Touch your key…";
+    status.style.color = "var(--pico-muted-color)";
+    try {
+        await ETWebAuthn.registerHardwareKey(nickname);
+        status.textContent = "✓ Registered. Reloading…";
+        status.style.color = "var(--pico-ins-color)";
+        setTimeout(() => location.reload(), 600);
+    } catch (e) {
+        status.textContent = "✗ " + (e.message || "Registration failed");
+        status.style.color = "var(--pico-del-color)";
+    }
+});
+</script>
+
+{% endblock %}

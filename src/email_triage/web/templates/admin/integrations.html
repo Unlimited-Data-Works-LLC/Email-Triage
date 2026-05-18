@@ -1,0 +1,794 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Integrations - Email Triage{% endblock %}
+{% block content %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (install operator). Not end users.
+   TECH-SKILL:  medium — comfortable with Pub/Sub, Microsoft Graph,
+                webhook URLs, JWT audiences. Technical jargon
+                (RFC numbers, OData, JWKS, OIDC) is allowed here.
+   COPY RULES:  no copy rule lifted from end-user pages applies;
+                this page is intentionally protocol-aware. Do NOT
+                copy this header onto end-user templates.
+                See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>Integrations</h2>
+<p>
+    Install-level OAuth client credentials, inbound provider push
+    config (Gmail Pub/Sub + Microsoft Graph), and the outbound
+    OpenClaw webhook destination.
+</p>
+
+{% if saved %}
+<p style="color:var(--pico-ins-color);"><small>Settings saved.</small></p>
+{% endif %}
+{% if err %}
+<p style="color:var(--pico-del-color);"><small>{{ err }}</small></p>
+{% endif %}
+
+<form method="post" action="/admin/integrations/save">
+    {{ csrf_input(request) }}
+
+<div class="et-cards">
+
+{# ── Google OAuth (install-wide client credentials, B1 lift) ──── #}
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Google OAuth <small style="color:var(--pico-muted-color);">(install-wide)</small></h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            Shared across all Gmail accounts on this install. Two client pairs
+            because Google's <strong>Web application</strong> and <strong>Desktop</strong>
+            OAuth clients have incompatible redirect-URI rules. Accounts authenticate
+            using the pair that matches the chosen flow.
+            Create clients at the
+            <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console</a>.
+        </small>
+    </header>
+    <div class="et-card-body">
+        <div class="et-card-section">
+            <div style="padding:0.5rem 0.75rem;border:1px dashed var(--pico-muted-border-color);border-radius:4px;">
+                <label style="display:flex;align-items:center;gap:0.5rem;margin:0;">
+                    <strong>Import from JSON</strong>
+                    <input type="file" id="oauth-json-import" accept="application/json,.json"
+                           style="margin:0;padding:0.1rem;font-size:0.85rem;flex:1;min-width:0;">
+                </label>
+                <small style="color:var(--pico-muted-color);display:block;margin-top:0.25rem;">
+                    Drop in the <code>client_secret_*.json</code> you downloaded from
+                    Google Cloud Console. Auto-detected as Web (<code>web</code> top-level
+                    key) or Desktop (<code>installed</code>) and populates the matching
+                    fields below. The file is parsed in your browser — nothing is uploaded
+                    until you click <strong>Save</strong> at the bottom of the page.
+                </small>
+                <div id="oauth-json-import-msg" role="status" style="font-size:0.85rem;margin-top:0.25rem;"></div>
+            </div>
+            <script>
+            (function() {
+                var fileInput = document.getElementById('oauth-json-import');
+                var msgEl = document.getElementById('oauth-json-import-msg');
+                if (!fileInput) return;
+                fileInput.addEventListener('change', function(e) {
+                    var file = e.target.files[0];
+                    if (!file) return;
+                    var reader = new FileReader();
+                    reader.onload = function(ev) {
+                        try {
+                            var data = JSON.parse(ev.target.result);
+                            var pair = null, label = null;
+                            if (data && data.installed) { pair = 'desktop'; label = 'Fallback (Desktop)'; data = data.installed; }
+                            else if (data && data.web) { pair = 'web'; label = 'Primary (Web app)'; data = data.web; }
+                            else {
+                                msgEl.textContent = '✗ Unrecognised JSON — expected an "installed" or "web" top-level key.';
+                                msgEl.style.color = 'var(--pico-del-color)';
+                                return;
+                            }
+                            var idEl = document.querySelector('[name=google_oauth_' + pair + '_client_id]');
+                            var secEl = document.querySelector('[name=google_oauth_' + pair + '_client_secret]');
+                            if (idEl && data.client_id) idEl.value = data.client_id;
+                            if (secEl && data.client_secret) secEl.value = data.client_secret;
+                            msgEl.textContent = '✓ Loaded ' + label + ' client — review the fields below and click Save.';
+                            msgEl.style.color = 'var(--pico-ins-color)';
+                        } catch (err) {
+                            msgEl.textContent = '✗ Invalid JSON: ' + err.message;
+                            msgEl.style.color = 'var(--pico-del-color)';
+                        }
+                    };
+                    reader.readAsText(file);
+                });
+            })();
+            </script>
+        </div>
+        <div class="et-card-section">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:14rem;">Setting</th>
+                        <th>Value</th>
+                        <th style="width:20rem;">Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td colspan="3" style="background:var(--pico-card-background-color);padding:0.4rem 0.75rem;">
+                            <strong>Primary — push-enabled</strong>
+                            <small style="color:var(--pico-muted-color);">&nbsp;(Web application client)</small>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client ID</strong></td>
+                        <td>
+                            <input type="text" name="google_oauth_web_client_id"
+                                   value="{{ config.google_oauth.web_client_id }}"
+                                   placeholder="xxxx-xxxx.apps.googleusercontent.com"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            Registered redirect URI must be
+                            <code>{{ config.push.public_url or '<public_url>' }}/oauth/google/callback</code>.
+                        </small></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client Secret</strong></td>
+                        <td>
+                            {% set has_web_secret = config.google_oauth.web_client_secret %}
+                            <input type="password" name="google_oauth_web_client_secret"
+                                   placeholder="{{ '•••••• (stored — leave blank to keep)' if has_web_secret else 'GOCSPX-...' }}"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            Required — Google's token exchange rejects the request without it.
+                            {% if has_web_secret %}A secret is stored; leave blank to keep.{% endif %}
+                        </small></td>
+                    </tr>
+                    <tr>
+                        <td colspan="3" style="background:var(--pico-card-background-color);padding:0.4rem 0.75rem;">
+                            <strong>Fallback — manual paste</strong>
+                            <small style="color:var(--pico-muted-color);">&nbsp;(Desktop client)</small>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client ID</strong></td>
+                        <td>
+                            <input type="text" name="google_oauth_desktop_client_id"
+                                   value="{{ config.google_oauth.desktop_client_id }}"
+                                   placeholder="xxxx-xxxx.apps.googleusercontent.com"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            No redirect URI registration needed — Google auto-allows loopback
+                            for Desktop clients.
+                        </small></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client Secret</strong></td>
+                        <td>
+                            {% set has_desk_secret = config.google_oauth.desktop_client_secret %}
+                            <input type="password" name="google_oauth_desktop_client_secret"
+                                   placeholder="{{ '•••••• (stored — leave blank to keep)' if has_desk_secret else 'GOCSPX-...' }}"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            Required for Desktop clients too. Google requires the secret on
+                            the token exchange regardless of client type.
+                            {% if has_desk_secret %}A secret is stored; leave blank to keep.{% endif %}
+                        </small></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</article>
+
+{# ── Office 365 OAuth (install-wide) ─────────────────────────── #}
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Office 365 OAuth <small style="color:var(--pico-muted-color);">(install-wide)</small></h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            One Microsoft Entra (Azure AD) app registration shared across every
+            Office 365 account on this install. End-users picking
+            <em>Personal Microsoft account</em> on their integration page route
+            to Microsoft's shared <code>common</code> endpoint; everyone else
+            routes to the tenant below. Register the app in
+            <a href="https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps" target="_blank" rel="noopener">Azure Portal</a>
+            with <code>Mail.Read</code>, <code>Mail.ReadWrite</code>, <code>Mail.Send</code>,
+            and <code>offline_access</code> permissions, then paste the three
+            values below.
+        </small>
+    </header>
+    <div class="et-card-body">
+        <div class="et-card-section">
+            <details style="padding:0.5rem 0.75rem;
+                            border-left:3px solid var(--pico-muted-border-color);
+                            background:var(--pico-card-background-color, transparent);">
+                <summary style="cursor:pointer;font-weight:600;">
+                    How do I find these values?
+                </summary>
+                <ol style="margin:0.5rem 0 0 1.25rem;padding:0;font-size:0.9em;line-height:1.55;">
+                    <li>
+                        <strong>Tenant ID.</strong>
+                        Azure Portal → <em>Microsoft Entra ID</em> (formerly
+                        Azure Active Directory) → <em>Overview</em> →
+                        <em>Tenant ID</em>. Or use <code>organizations</code> if
+                        you want to accept sign-ins from any work or school
+                        account. Never use <code>common</code> here — that's
+                        reserved for individual personal Microsoft accounts on
+                        a per-user basis.
+                    </li>
+                    <li>
+                        <strong>Client ID.</strong>
+                        Azure Portal → <em>App Registrations</em> → your app →
+                        <em>Overview</em> → <em>Application (client) ID</em>.
+                    </li>
+                    <li>
+                        <strong>Client Secret.</strong>
+                        Azure Portal → <em>App Registrations</em> → your app →
+                        <em>Certificates &amp; secrets</em> → <em>New client
+                        secret</em>. Copy the secret <strong>value</strong>
+                        immediately — Microsoft only shows it once.
+                    </li>
+                    <li>
+                        <strong>Required permissions.</strong>
+                        <code>Mail.Read</code> + <code>Mail.ReadWrite</code> +
+                        <code>Mail.Send</code> + <code>offline_access</code>
+                        (delegated). Add via the <em>API permissions</em> tab;
+                        <em>Grant admin consent</em> if your tenant requires it.
+                    </li>
+                </ol>
+            </details>
+        </div>
+        <div class="et-card-section">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width:14rem;">Setting</th>
+                        <th>Value</th>
+                        <th style="width:20rem;">Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Tenant ID</strong></td>
+                        <td>
+                            <input type="text" name="office365_oauth_tenant_id"
+                                   value="{{ config.office365_oauth.tenant_id }}"
+                                   placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or organizations"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            Org tenant GUID, or <code>organizations</code> for
+                            any work or school account. Don't use <code>common</code> —
+                            that's the per-account "Personal Microsoft account"
+                            routing, set on each account's own integration page.
+                        </small></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client ID</strong></td>
+                        <td>
+                            <input type="text" name="office365_oauth_client_id"
+                                   value="{{ config.office365_oauth.client_id }}"
+                                   placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            Application (client) ID from the app's Overview page.
+                        </small></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Client Secret</strong></td>
+                        <td>
+                            {% set has_o365_secret = config.office365_oauth.client_secret %}
+                            <input type="password" name="office365_oauth_client_secret"
+                                   placeholder="{{ '•••••• (stored — leave blank to keep)' if has_o365_secret else 'Microsoft client secret value' }}"
+                                   style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        </td>
+                        <td><small style="color:var(--pico-muted-color);">
+                            The secret VALUE (not the secret ID) from Certificates
+                            &amp; secrets. {% if has_o365_secret %}A secret is stored;
+                            leave blank to keep.{% endif %}
+                        </small></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</article>
+
+{# ── Gmail Pub/Sub ───────────────────────────────────────────── #}
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Gmail Pub/Sub</h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            Google sends an OIDC-signed JWT to the public webhook URL whenever
+            a watched mailbox changes. The webhook validates the signature
+            (RS256 against Google's JWKS), the issuer, the audience claim, and
+            the service-account email. All four fields below must match what
+            you set on the Pub/Sub subscription, or every push is rejected at
+            JWT-verify time.
+        </small>
+    </header>
+    <div class="et-card-body">
+        <label>
+            Public webhook base URL
+            <input type="url" name="public_url"
+                   value="{{ push.public_url }}"
+                   placeholder="https://deployhost.your-tailnet.ts.net">
+        </label>
+        <p><small style="color:var(--pico-muted-color);">
+            The base URL Google's Pub/Sub push servers can reach (no path, no
+            trailing slash). The webhook lives at
+            <code>{{ push.public_url or '&lt;public_url&gt;' }}/webhooks/gmail</code>.
+            For the homelab default, this is the Tailscale Funnel hostname
+            (e.g.&nbsp;<code>https://deployhost.&lt;tailnet&gt;.ts.net</code>).
+            Internal UI stays at the private domain; the webhook is the only
+            path Funnel exposes publicly.
+        </small></p>
+
+        <label>
+            Pub/Sub topic name
+            <input type="text" name="gmail_topic_name"
+                   value="{{ push.gmail_topic_name }}"
+                   placeholder="projects/your-project-id/topics/gmail-push">
+        </label>
+        <p><small style="color:var(--pico-muted-color);">
+            Fully-qualified topic resource name. Must already exist in GCP and
+            have Gmail's publisher service account
+            (<code>gmail-api-push@system.gserviceaccount.com</code>) bound as
+            <code>roles/pubsub.publisher</code>.
+        </small></p>
+
+        <label>
+            Push subscription service-account email
+            <input type="email" name="gmail_subscription_sa_email"
+                   value="{{ push.gmail_subscription_sa_email }}"
+                   placeholder="gmail-push-pusher@your-project-id.iam.gserviceaccount.com">
+        </label>
+        <p><small style="color:var(--pico-muted-color);">
+            The service account whose identity Pub/Sub uses to mint OIDC
+            tokens for each push. The webhook's
+            <code>email</code>-claim check rejects anything else, even other
+            valid Google-signed JWTs.
+        </small></p>
+
+        <label>
+            Audience claim
+            <input type="url" name="gmail_audience"
+                   value="{{ push.gmail_audience }}"
+                   placeholder="https://deployhost.your-tailnet.ts.net">
+        </label>
+        <p><small style="color:var(--pico-muted-color);">
+            Must equal the Pub/Sub subscription's
+            <code>--push-auth-token-audience</code>. Leave blank to default to
+            the public webhook base URL above. Trailing slashes are stripped
+            automatically; mismatched slashes are the most common cause of
+            "every push gets rejected" mystery.
+        </small></p>
+    </div>
+</article>
+
+{# ── Outbound webhook (OpenClaw) ─────────────────────────────── #}
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Outbound webhook (OpenClaw)</h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            Email-triage emits HMAC-SHA256-signed POSTs to a single destination
+            when triage outcomes land. Set the URL to enable; clear the URL to
+            turn it off entirely. Per-account on/off + quiet-hours chips on
+            each account's Integrations tab gate the emit at fire time.
+        </small>
+    </header>
+    <div class="et-card-body">
+        <div class="et-card-section">
+            <label>
+                Destination URL
+                <input type="url" name="outbound_webhook_url"
+                       value="{{ outbound_target.url if outbound_target else '' }}"
+                       placeholder="https://openclaw.your-tailnet.ts.net/email-triage/notify">
+            </label>
+            <p><small style="color:var(--pico-muted-color);">
+                Leave blank to disable outbound emit entirely. The receiver verifies
+                the HMAC signature in the <code>X-Email-Triage-Signature</code>
+                header against the shared secret below.
+            </small></p>
+        </div>
+
+        <div class="et-card-section">
+            <fieldset>
+                <legend><small><strong>Events to send</strong></small></legend>
+                {% for event_name, label, desc in outbound_event_catalogue %}
+                <label style="display:flex;align-items:flex-start;gap:0.5rem;margin:0.25rem 0;">
+                    <input type="checkbox"
+                           name="outbound_webhook_event_{{ event_name }}"
+                           value="1"
+                           style="margin-top:0.2rem;"
+                           {% if event_name in outbound_events_subscribed %}checked{% endif %}>
+                    <span>
+                        <strong>{{ label }}</strong>
+                        &nbsp;<code style="font-size:0.8em;">{{ event_name }}</code>
+                        <br><small style="color:var(--pico-muted-color);">{{ desc }}</small>
+                    </span>
+                </label>
+                {% endfor %}
+            </fieldset>
+            <p><small style="color:var(--pico-muted-color);">
+                Tick zero events to keep the destination configured but stop all
+                emits — useful for a temporary mute without losing the URL +
+                secret. Per-account pause chips do the same at finer granularity.
+            </small></p>
+        </div>
+
+        <div class="et-card-section">
+            <label>
+                Shared secret
+                <input type="password" name="outbound_webhook_secret"
+                       placeholder="{{ '•••••• (stored — leave blank to keep)' if outbound_secret_set else 'paste a long random string' }}">
+            </label>
+            <p><small style="color:var(--pico-muted-color);">
+                Used to compute the HMAC-SHA256 signature on every emit. Paste the
+                same value into your OpenClaw side. {% if outbound_secret_set %}A
+                secret is stored; leave blank to keep.{% endif %}
+            </small></p>
+
+            <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;">
+                <input type="checkbox" name="webhooks_allow_external" value="1"
+                       {% if webhooks_allow_external %}checked{% endif %}>
+                <span><strong>Allow public-internet destinations</strong></span>
+            </label>
+            <p><small style="color:var(--pico-muted-color);">
+                Off by default. When off, only local URLs (loopback, RFC1918,
+                <code>.local</code>, or any configured local-URL suffix) are
+                delivered to. Turning this on lets the install ship signed events
+                to any HTTPS endpoint — required if your OpenClaw lives off-LAN.
+            </small></p>
+        </div>
+    </div>
+</article>
+
+{# ── Classification cache (#151) ─────────────────────────────── #}
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Classification cache <small style="color:var(--pico-muted-color);">(optional — Redis / valkey)</small></h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            Skip the LLM call when the same email subject+sender+body has
+            already been classified by the same model. Big token savings on
+            repetitive inbound mail (Iperius backups, monitor alerts, list
+            mail). Default OFF — paste a Redis URL to opt in. The protocol is
+            plain Redis 5+; a <code>valkey</code> server speaks the identical
+            wire protocol and works unchanged.
+            <br><br>
+            <strong>On-LAN only.</strong> The URL must point at the operator's
+            audited LAN host (e.g. <code>redis://your-redis-host.example.local:6379/0</code>)
+            — cached values carry classifier metadata, never leave the install
+            boundary. <strong>HIPAA-flagged accounts skip the cache</strong>
+            regardless of this setting (defence-in-depth: sender + subject are
+            PHI shape even if the key is hashed).
+        </small>
+    </header>
+    <div class="et-card-body">
+        <div class="et-card-section">
+            <label>
+                Redis URL{{ m.help("Connection URL for the cache backend. Format: redis://host:port/db. Leave blank to disable caching entirely. Example: redis://your-redis-host.example.local:6379/0 — the trailing /0 selects logical database 0; bump to /2 (or any 0-15) if other services share the same Redis. Use rediss:// (two s's) for TLS.") }}
+                <input type="text" name="redis_cache_url"
+                       value="{{ redis_cache_url }}"
+                       placeholder="redis://your-redis-host.example.local:6379/0">
+            </label>
+            <p><small style="color:var(--pico-muted-color);">
+                Blank to disable. Lazy connection — nothing connects until the first
+                classification. Failures fall through to the live LLM call.
+            </small></p>
+
+            <label style="display:block;max-width:24rem;">
+                TTL (seconds){{ m.help("How long a cached classification stays valid. Default 2592000 seconds = 30 days, a good fit for repetitive inbound traffic where the same backup mail or monitor alert arrives daily. Shorter TTLs (e.g. 86400 = 1 day) make sense when your classifier rules change often. The classifier model name is part of the cache key, so a model upgrade auto-invalidates without flushing. Range: 3600 (1 hour) to 7776000 (90 days); values outside snap to the nearest bound.") }}
+                <input type="number" name="redis_cache_ttl_secs"
+                       value="{{ redis_cache_ttl }}"
+                       min="3600" max="7776000" step="3600"
+                       placeholder="2592000">
+            </label>
+            <p><small style="color:var(--pico-muted-color);">
+                Default 30 days = 2592000 seconds. Range: 1 hour (3600) to 90 days (7776000).
+            </small></p>
+        </div>
+
+        <div class="et-card-section">
+            <p style="margin:0;"><small style="color:var(--pico-muted-color);">
+                Counters this process:
+                <strong>{{ redis_cache_counters.hits }}</strong> hits,
+                <strong>{{ redis_cache_counters.misses }}</strong> misses,
+                <strong>{{ redis_cache_counters.errors }}</strong> errors.
+                Resets on every restart. Surfaced live on <code>/health/detail</code>
+                as <code>classification_cache</code>.
+            </small></p>
+        </div>
+    </div>
+</article>
+
+</div>{# /.et-cards #}
+
+<button type="submit" style="margin-top:1rem;">Save</button>
+</form>
+
+{# Manual flush — separate form so a stray click here doesn't
+   accidentally save the rest of the integrations page. CSRF token
+   on every state-changing POST. Disabled when the cache URL is
+   empty — flushing an unconfigured cache is a no-op + the button
+   shouldn't suggest the action is meaningful. #}
+<form method="post" action="/admin/integrations/cache/flush"
+      style="margin-top:0.5rem;"
+      onsubmit="return confirm('Drop every cached classification across every account? Next classifications will re-call the language model until the cache warms up again. This cannot be undone.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="secondary outline"
+            {% if not redis_cache_url %}disabled{% endif %}>
+        Flush cached classifications
+    </button>
+    <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
+        Drops every <code>et:cls:*</code> key. Other services sharing
+        this Redis instance are unaffected.{{ m.help("Use after changing your categories, classifier model, or rules — anything that would make old cached classifications wrong. Without a flush, stale entries roll off naturally over the TTL (default 30 days).") }}
+    </small>
+</form>
+{% if flushed is defined and flushed %}
+<p style="color:var(--pico-ins-color);margin-top:0.5rem;">
+    <small>Flushed {{ flushed }} cached classification{% if flushed != 1 %}s{% endif %}.</small>
+</p>
+{% endif %}
+{% if flush_err %}
+<p style="color:var(--pico-del-color);margin-top:0.5rem;">
+    <small>Flush failed: {{ flush_err }}</small>
+</p>
+{% endif %}
+
+{% if webhook_url %}
+<p style="margin-top:1rem;">
+    <small style="color:var(--pico-muted-color);">
+    Hint: register the subscription with
+    <code>--push-endpoint={{ webhook_url }}</code>
+    and
+    <code>--push-auth-token-audience={{ push.gmail_audience or push.public_url }}</code>.
+    </small>
+</p>
+{% endif %}
+
+{# ── Watch status tables (outside the save form) ─────────────── #}
+<div class="et-cards" style="margin-top:2rem;">
+
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Watch status — per account</h3>
+        {% if not watches %}
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            One row per Gmail account showing the live Pub/Sub watch lease.
+            Empty until at least one Gmail account is registered.
+        </small>
+        {% endif %}
+    </header>
+    <div class="et-card-body">
+        {% if watches %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Account</th>
+                    <th>Owner</th>
+                    <th>Topic</th>
+                    <th>Expires</th>
+                    <th>Status</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for w in watches %}
+                <tr>
+                    <td><code>{{ w.email_address }}</code></td>
+                    <td>
+                        {% if w.owner_email %}
+                            {{ w.owner_name or w.owner_email }}<br>
+                            <small style="color:var(--pico-muted-color);">{{ w.owner_email }}</small>
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">(unknown)</small>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if w.topic_name %}
+                            <code style="font-size:0.8em;">{{ w.topic_name }}</code>
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">(none — placeholder row)</small>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if w.hours_until_expiry is not none %}
+                            {% if w.hours_until_expiry > 0 %}
+                                ~{{ "%.1f"|format(w.hours_until_expiry) }}h
+                            {% else %}
+                                expired
+                            {% endif %}
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">—</small>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if w.status == "healthy" %}
+                            <span style="color:var(--pico-ins-color);">healthy</span>
+                        {% elif w.status == "renewable" %}
+                            <span style="color:var(--pico-muted-color);">renewable</span>
+                        {% elif w.status == "stale" %}
+                            <span style="color:#c80;">stale</span>
+                        {% elif w.status == "expired" %}
+                            <span style="color:var(--pico-del-color);">expired</span>
+                        {% else %}
+                            <span style="color:var(--pico-del-color);">unconfigured</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <button type="button"
+                                class="renew-btn"
+                                data-account-id="{{ w.account_id }}"
+                                {% if not push.gmail_topic_name %}disabled
+                                title="Set the topic name above first."{% endif %}>
+                            Renew now
+                        </button>
+                        <span class="renew-result"
+                              data-account-id="{{ w.account_id }}"
+                              style="margin-left:0.5rem;font-size:0.85em;"></span>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p><small style="color:var(--pico-muted-color);">
+            No Gmail accounts registered yet. Add one via
+            <a href="/accounts">/accounts</a>.
+        </small></p>
+        {% endif %}
+    </div>
+</article>
+
+<article class="et-card et-card-stack">
+    <header class="et-card-header">
+        <h3>Office 365 Push Subscriptions</h3>
+        <small class="et-card-desc" style="color:var(--pico-muted-color);">
+            Microsoft Graph delivers change notifications for
+            <code>me/mailFolders('Inbox')/messages</code> to the canonical
+            receiver path
+            <code>{{ o365_webhook_url or '&lt;public_url&gt;/webhooks/office365' }}</code>.
+            Each subscription lasts up to ~3 days (Graph's max for mail
+            resources) and is authenticated by a per-subscription
+            <code>clientState</code> secret that the receiver compares
+            constant-time. The legacy <code>/webhooks/graph</code> alias
+            still works for older subscriptions registered before the canonical
+            path landed.
+        </small>
+    </header>
+    <div class="et-card-body">
+        {% if o365_subscriptions %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Account</th>
+                    <th>Owner</th>
+                    <th>Subscription</th>
+                    <th>Resource</th>
+                    <th>Expires</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for s in o365_subscriptions %}
+                <tr>
+                    <td>{{ s.account_label }}</td>
+                    <td>
+                        {% if s.owner_email %}
+                            {{ s.owner_name or s.owner_email }}<br>
+                            <small style="color:var(--pico-muted-color);">{{ s.owner_email }}</small>
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">(unknown)</small>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <code style="font-size:0.8em;">{{ s.subscription_id or '(none)' }}</code>
+                    </td>
+                    <td>
+                        <code style="font-size:0.8em;">me/mailFolders('Inbox')/messages</code>
+                    </td>
+                    <td>
+                        {% if s.hours_until_expiry is not none %}
+                            {% if s.hours_until_expiry > 0 %}
+                                ~{{ "%.1f"|format(s.hours_until_expiry) }}h
+                            {% else %}
+                                expired
+                            {% endif %}
+                        {% else %}
+                            <small style="color:var(--pico-muted-color);">—</small>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if s.status_bucket == "healthy" %}
+                            <span style="color:var(--pico-ins-color);">healthy</span>
+                        {% elif s.status_bucket == "renewable" %}
+                            <span style="color:var(--pico-muted-color);">renewable</span>
+                        {% elif s.status_bucket == "stale" %}
+                            <span style="color:#c80;">stale</span>
+                        {% elif s.status_bucket == "expired" %}
+                            <span style="color:var(--pico-del-color);">expired</span>
+                        {% elif s.status_bucket == "errored" %}
+                            <span style="color:var(--pico-del-color);">errored</span>
+                        {% else %}
+                            <span style="color:var(--pico-muted-color);">{{ s.status_bucket }}</span>
+                        {% endif %}
+                        {% if s.error_count and s.error_count > 0 %}
+                            <br><small style="color:var(--pico-del-color);">
+                                errors: {{ s.error_count }}
+                            </small>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p><small style="color:var(--pico-muted-color);">
+            No active Office 365 push subscriptions. Owners can start one
+            from the per-account edit page (Integrations tab).
+        </small></p>
+        {% endif %}
+    </div>
+</article>
+
+</div>{# /.et-cards #}
+
+<script>
+(function () {
+    document.querySelectorAll(".renew-btn").forEach(function (btn) {
+        btn.addEventListener("click", async function () {
+            var accountId = btn.getAttribute("data-account-id");
+            var resultEl = document.querySelector(
+                ".renew-result[data-account-id=\"" + accountId + "\"]"
+            );
+            if (resultEl) {
+                resultEl.style.color = "var(--pico-muted-color)";
+                resultEl.textContent = "Renewing...";
+            }
+            btn.disabled = true;
+            try {
+                // csrf.js's window.fetch shim auto-attaches the
+                // X-CSRF-Token header on state-changing methods.
+                // No need for a hand-rolled cookie reader here --
+                // earlier draft read the wrong cookie name
+                // (__Host-csrf vs the actual et_csrf) and a global
+                // (ETCsrfToken) the shim didn't expose, so the
+                // header value silently came through empty.
+                var resp = await fetch(
+                    "/admin/integrations/" + accountId + "/renew-watch",
+                    {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        credentials: "same-origin",
+                    }
+                );
+                var body = await resp.json().catch(function () { return {}; });
+                if (!resp.ok) {
+                    var msg = body.message || body.error
+                              || ("HTTP " + resp.status);
+                    if (resultEl) {
+                        resultEl.style.color = "var(--pico-del-color)";
+                        resultEl.textContent = "Failed: " + msg;
+                    }
+                } else {
+                    if (resultEl) {
+                        resultEl.style.color = "var(--pico-ins-color)";
+                        resultEl.textContent = "Renewed (expires "
+                            + (body.expires_at || "soon") + ")";
+                    }
+                    setTimeout(function () { location.reload(); }, 1200);
+                }
+            } catch (e) {
+                if (resultEl) {
+                    resultEl.style.color = "var(--pico-del-color)";
+                    resultEl.textContent = "Error: " + (e.message || e);
+                }
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    });
+})();
+</script>
+
+{% endblock %}

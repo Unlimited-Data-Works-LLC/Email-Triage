@@ -1,0 +1,194 @@
+{# Live progress fragment for a bulk-triage job (#101).
+
+   Re-rendered every 2s via the parent page's hx-trigger. Outer
+   div carries the same id so the swap replaces in place. When the
+   job is terminal (done / cancelled / failed) the fragment omits
+   the hx-get attributes so polling stops on its own. #}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work). Same audience as the parent
+                job_progress.html — this fragment swaps into the
+                live block on that page.
+   TECH-SKILL:  computer-literate professional. Counters, ETA,
+                per-message status pills.
+   COPY RULES:
+     - No protocol jargon. Keep status pills plain ("queued",
+       "running", "done", "cancelled", "failed").
+     - Cancel button copy stays human ("Cancel run") — no
+       admin-path / system-log references.
+     - Per-message rows render category + confidence; HIPAA
+       redaction is enforced at WRITE time so this template
+       doesn't need a PHI guard.
+   ─────────────────────────────────────────────────────────── #}
+{% set is_terminal = job.status in ("done", "cancelled", "failed") %}
+{# Style-mine jobs produce ONE logical output (the writing-style
+   descriptor) for a batch of N seen messages — the per-message
+   "processed" axis used by triage jobs doesn't apply. Branch the
+   counter labels + the progress bar so the operator doesn't read
+   "1 / 100" as "99 failures" on a successful style-mine. #}
+{% set is_style_mine = (job.kind or "triage") == "style_mine" %}
+<div id="job-progress-block"
+{% if not is_terminal %}
+     hx-get="/triage/jobs/{{ job.job_id }}/progress"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"
+{% endif %}
+>
+    {# Status pill + counters. #}
+    <div style="display:flex;flex-wrap:wrap;align-items:center;
+                gap:0.75rem;margin:0.5rem 0;">
+        <span style="display:inline-block;padding:0.2rem 0.6rem;
+                     border-radius:999px;font-size:0.85em;
+                     {% if job.status == 'done' %}background:var(--pico-ins-color);color:white;
+                     {% elif job.status == 'failed' %}background:var(--pico-del-color);color:white;
+                     {% elif job.status == 'cancelled' %}background:var(--pico-color-amber-500);color:white;
+                     {% elif job.status == 'running' %}background:var(--pico-primary);color:white;
+                     {% else %}background:var(--pico-muted-color);color:white;
+                     {% endif %}">
+            {{ job.status | upper }}
+        </span>
+        {% if is_style_mine %}
+        {# For style-mine, "seen" = messages mined; "processed" = 1
+           when the descriptor was successfully written, 0 otherwise.
+           Show messages-mined as the primary counter + a green
+           "descriptor saved" chip on success. #}
+        <span><strong>{{ job.total_seen }}</strong> messages mined</span>
+        {% if is_terminal and job.status == 'done' and job.total_processed %}
+        <span style="color:var(--pico-ins-color);">
+            ✓ writing-style descriptor saved
+        </span>
+        {% endif %}
+        {% else %}
+        <span><strong>{{ job.total_processed }}</strong> processed</span>
+        <span><strong>{{ job.total_seen }}</strong> seen</span>
+        {% if job.total_skipped %}
+        <span><strong>{{ job.total_skipped }}</strong> skipped</span>
+        {% endif %}
+        {% if job.total_errors %}
+        <span style="color:var(--pico-del-color);">
+            <strong>{{ job.total_errors }}</strong> errors
+        </span>
+        {% endif %}
+        {% endif %}
+        {% if eta_secs is not none and not is_terminal %}
+        <span><small style="color:var(--pico-muted-color);">
+            ETA ~{{ (eta_secs // 60) }}m {{ eta_secs % 60 }}s
+        </small></span>
+        {% endif %}
+    </div>
+
+    {% if is_style_mine %}
+    {# Style-mine progress: indeterminate-style bar while running
+       (the M-3 distill is one logical step over the whole batch);
+       100% when done. No "X of Y" because that axis doesn't
+       apply. #}
+    {% if is_terminal %}
+    <progress value="{% if job.status == 'done' %}1{% else %}0{% endif %}"
+              max="1" style="width:100%;margin:0 0 0.75rem 0;"></progress>
+    {% else %}
+    <progress style="width:100%;margin:0 0 0.75rem 0;"></progress>
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Mining {{ job.total_seen or "your" }} sent messages — the AI
+        is reading them to learn your writing style. One pass over
+        the whole batch; the page updates when it finishes.
+    </p>
+    {% endif %}
+    {% elif job.total_seen %}
+    {# Progress bar — denominator = total_seen so far (provider
+       streams pages), so the bar fills as the runner catches up
+       to the seen count. Shows "indeterminate" feel during the
+       early seen-grows-faster-than-processed phase. #}
+    {% set pct = ((job.total_processed * 100) // (job.total_seen if job.total_seen else 1)) %}
+    <progress value="{{ job.total_processed }}"
+              max="{{ job.total_seen }}"
+              style="width:100%;margin:0 0 0.75rem 0;"></progress>
+    <small style="color:var(--pico-muted-color);">
+        {{ pct }}% of seen ({{ job.total_processed }} / {{ job.total_seen }})
+    </small>
+    {% else %}
+    <p style="color:var(--pico-muted-color);font-size:0.9em;">
+        Waiting for the provider to return the first batch…
+    </p>
+    {% endif %}
+
+    {# Cancel button — only when actionable. Plain POST form so
+       the operator gets a full-page reload + 303 round-trip; no
+       point poll-cancel-poll. #}
+    {% if job.status in ("queued", "running") %}
+    <form method="post" action="/triage/jobs/{{ job.job_id }}/cancel"
+          style="display:inline-block;margin:0.25rem 0;">
+        {{ csrf_input(request) }}
+        <button type="submit" class="outline secondary"
+                style="padding:0.3rem 0.8rem;font-size:0.9em;
+                       border-color:var(--pico-color-amber-500);
+                       color:var(--pico-color-amber-500);"
+                onclick="return confirm('Cancel this bulk run? Messages already classified stay processed.');">
+            Cancel run
+        </button>
+    </form>
+    {% endif %}
+
+    {# Terminal status footnote. Timestamps use .local-datetime so
+       client JS converts the UTC ISO string the server emits to the
+       operator's wall clock. The literal "UTC" suffix on display
+       was operator-noted 2026-05-12 as inconsistent with the rest
+       of the UI (logs, calendar, dashboard) which all convert. #}
+    {% if is_terminal %}
+    <p style="margin:0.5rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+        {% if job.status == 'done' %}
+            ✓ Finished at
+            <span class="local-datetime"
+                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+        {% elif job.status == 'cancelled' %}
+            Cancelled at
+            <span class="local-datetime"
+                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+            Messages already processed are saved; the rest were not touched.
+        {% elif job.status == 'failed' %}
+            Failed at
+            <span class="local-datetime"
+                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+            {% if job.error_text %}
+            <br><code style="font-size:0.85em;">{{ job.error_text }}</code>
+            {% endif %}
+        {% endif %}
+    </p>
+    {% endif %}
+
+    {# Live feed — last 20 classifications written by this job's
+       per-message triage_runs rows. Renders each as a one-line
+       chip showing message id (last 8 chars), category, and a
+       tiny timestamp. HIPAA-flagged accounts have sender + subject
+       redacted at write time so this template doesn't need its own
+       PHI guard. #}
+    {% if feed %}
+    <details open style="margin-top:1rem;">
+        <summary style="cursor:pointer;font-weight:600;">
+            Recent classifications ({{ feed | length }})
+        </summary>
+        <ul style="list-style:none;padding:0;margin:0.5rem 0 0;
+                   font-family:var(--pico-font-family-monospace);
+                   font-size:0.85em;">
+            {% for row in feed %}
+            {% set first = row['results'][0] if row['results'] else {} %}
+            <li style="padding:0.2rem 0;border-bottom:1px solid var(--pico-muted-border-color);">
+                <small style="color:var(--pico-muted-color);">
+                    {{ (row.created_at or "")[11:19] }}
+                </small>
+                <code>{{ (first.get('message_id', '?'))[-12:] }}</code>
+                {% if first.get('status') == 'skipped' %}
+                <em>skipped</em>
+                {% elif first.get('status') == 'error' %}
+                <strong style="color:var(--pico-del-color);">error</strong>
+                {% else %}
+                <strong>{{ first.get('category', '?') }}</strong>
+                {% if first.get('confidence') %}
+                <small>({{ "%.2f" | format(first.get('confidence')) }})</small>
+                {% endif %}
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+    </details>
+    {% endif %}
+</div>

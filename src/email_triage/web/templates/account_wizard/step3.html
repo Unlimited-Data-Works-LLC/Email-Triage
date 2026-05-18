@@ -1,0 +1,78 @@
+{# ─── AUDIENCE ───
+   END-USER (mid-flow setup wizard). TECH-SKILL: low.
+   COPY RULES:
+     - "Real-time watch" not "IMAP IDLE" / "Pub/Sub topic" / "Graph
+       subscription". Provider names are OK as parenthetical hints
+       once you've already framed the choice in plain language.
+     - "Pick up new mail right away" rather than "subscribe to
+       push notifications".
+     - Tooltips with concrete examples on every checkbox + input.
+     - No "ask your administrator" copy.
+   #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Add Account — Step 3 of 5: Real-time mail watch{% endblock %}
+{% block content %}
+<h2>Add an email account: {{ acct.name }}</h2>
+
+{% set current_step = 3 %}
+{% include "account_wizard/_progress.html" %}
+
+{% if auth_success %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    <small><strong>✓ Signed in.</strong> Now choose how email-triage picks up new mail.</small>
+</article>
+{% endif %}
+
+<p>
+    How quickly should email-triage notice new mail? "Push" picks
+    up new mail in seconds; "poll" checks on a schedule and is the
+    safety net for when push has a hiccup. Most mailboxes run both.
+</p>
+
+<form method="post" action="/accounts/new/step3">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="account_id" value="{{ acct.id }}">
+
+    <fieldset>
+        <legend>How to pick up new mail{{ m.help("'Push' tells email-triage about new mail in seconds (your mail provider notifies us). 'Poll' is a steady recheck on a schedule; it catches anything push misses. Most mailboxes use both. Turn both off if you only want manual triage.") }}</legend>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">
+            <input type="checkbox" name="push_enabled" value="1" style="margin:0;"
+                   {% if push_enabled_default %}checked{% endif %}
+                   {% if push_blocked_reason %}disabled{% endif %}>
+            <span><strong>Push (instant)</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— picks up new mail in a few seconds.
+                    {% if acct.provider_type == "imap" %}Uses IMAP's built-in change notifications.
+                    {% elif acct.provider_type == "gmail_api" %}Uses Gmail's notification service.
+                    {% elif acct.provider_type == "office365" %}Microsoft real-time push isn't available yet — leave off.
+                    {% endif %}
+                </small>
+                {% if push_blocked_reason %}
+                <br><em style="color:var(--pico-muted-color);">{{ push_blocked_reason }}</em>
+                {% endif %}
+            </span>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;flex-wrap:wrap;">
+            <input type="checkbox" name="poll_enabled" value="1" style="margin:0;" checked>
+            <span><strong>Poll every</strong></span>
+            <input type="number" name="poll_interval_minutes"
+                   value="60" min="10" max="240" step="10"
+                   style="width:6rem;margin:0;padding:0.25rem 0.5rem;">
+            <small style="color:var(--pico-muted-color);">
+                minutes{{ m.help("How often email-triage checks for new mail. Examples: 60 = once an hour (a good default); 15 = every 15 minutes (busy mailboxes); 240 = every 4 hours (low-volume mailboxes).") }} —
+                catches anything push misses; the main check when push is off.
+            </small>
+        </label>
+    </fieldset>
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Next: Categories →</button>
+        <a href="/accounts/new?step=2&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+{% endblock %}

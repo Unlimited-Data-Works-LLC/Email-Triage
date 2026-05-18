@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}My Settings - Accounts - Email Triage{% endblock %}
+{% block content %}
+<style>
+    /* Hide the column headers while any row is in edit mode — the
+       full-width edit panel doesn't relate to the columns and the
+       visual mismatch was confusing. Uses :has() (modern browsers). */
+    table:has(tr.editing) thead { display: none; }
+</style>
+<h2>My Settings</h2>
+{% set active = "accounts" %}
+{% include "_settings_tabs.html" %}
+
+<h3>Email Accounts</h3>
+<p>Configure email accounts for fetching and managing messages. Each user can have multiple accounts across different providers.</p>
+{# Access Tokens button removed — discoverability is now the
+   "API Keys" tab on the My Settings strip above. #}
+
+{% if error %}
+<article style="border-left: 3px solid var(--pico-color-red-500); padding: 0.5rem 1rem;">
+    <p>{{ error }}</p>
+</article>
+{% endif %}
+{% if success %}
+<article style="border-left: 3px solid var(--pico-color-green-500); padding: 0.5rem 1rem;">
+    <p>{{ success }}</p>
+</article>
+{% endif %}
+
+<section style="margin-bottom:1rem;">
+    <a href="/accounts/new" role="button" style="margin-right:0.5rem;">
+        ✨ Add Email Account
+    </a>
+    <small style="color:var(--pico-muted-color);">
+        Guided 5-step setup: provider, authentication, watch,
+        categories, digests.
+    </small>
+</section>
+
+<section>
+    <details>
+        <summary role="button" class="outline secondary">All settings on one page (advanced)</summary>
+        <p><small style="color:var(--pico-muted-color);">
+            Single-page form with every option visible at once.
+            The guided setup above covers the same options in
+            order; use this when you want to see everything
+            simultaneously.
+        </small></p>
+        <form method="post" action="/accounts/create">
+            {{ csrf_input(request) }}
+            {% if is_admin %}
+            <label>
+                Owner
+                <select name="user_id">
+                    {% for u in all_users %}
+                    <option value="{{ u.id }}">{{ u.name }} ({{ u.email }})</option>
+                    {% endfor %}
+                </select>
+            </label>
+            {% endif %}
+            <div class="grid">
+                <label>
+                    Account Name
+                    <input type="text" name="name" placeholder="e.g. Work IMAP, Personal Gmail" required>
+                </label>
+                <label>
+                    Provider Type
+                    <select name="provider_type" id="new-provider-type"
+                            hx-get="/accounts/form-fields"
+                            hx-target="#new-provider-fields"
+                            hx-swap="innerHTML"
+                            hx-include="[name='provider_type']">
+                        <option value="imap">IMAP</option>
+                        <option value="gmail_api">Gmail (native)</option>
+                        <option value="office365">Office 365 (Microsoft Graph)</option>
+                    </select>
+                </label>
+            </div>
+            <div id="new-provider-fields">
+                {% include "accounts/_fields_imap.html" %}
+            </div>
+            <label title="When enabled, mail data for this account is treated as HIPAA-protected (PHI scrubbed from logs and notifications) regardless of the system HIPAA setting.">
+                <input type="checkbox" name="hipaa" value="1"
+                       {% if hipaa_mode %}checked disabled{% endif %}>
+                HIPAA mode for this account
+                {% if hipaa_mode %}
+                <small style="color:var(--pico-muted-color);display:block;">
+                    System HIPAA is active — new accounts are auto-flagged
+                    and will remain flagged until system HIPAA is turned off.
+                </small>
+                {% endif %}
+            </label>
+            <label style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;">
+                <input type="checkbox" name="start_watch" value="1" checked>
+                <span><strong>Start watching for new mail right away</strong>
+                <small style="color:var(--pico-muted-color);">
+                    — fetches, classifies, and routes new messages as they arrive.
+                    You can turn this off later on the Routes page.
+                </small></span>
+            </label>
+            <button type="submit">Create Account</button>
+        </form>
+    </details>
+</section>
+
+<section>
+    {% if is_admin %}
+    <form method="get" action="/accounts" style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;margin:0.75rem 0;">
+        <label style="margin:0;">
+            Filter by owner
+            <select name="owner" onchange="this.form.submit()">
+                <option value="all" {% if selected_owner == "all" %}selected{% endif %}>All users</option>
+                {% for u in all_users %}
+                <option value="{{ u.id }}" {% if selected_owner == u.id %}selected{% endif %}>
+                    {{ u.name if u.name else u.email }}{% if u.name %} ({{ u.email }}){% endif %}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+        <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+        <small style="color:var(--pico-muted-color);">
+            Showing {{ shown_accounts }} of {{ total_accounts }} accounts
+        </small>
+    </form>
+    {% endif %}
+    {% if accounts %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Type</th>
+                {% if is_admin %}<th>Owner</th>{% endif %}
+                <th>Server / Detail</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="accounts-table">
+            {% for acct in accounts %}
+            {% include "accounts/_row.html" %}
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No email accounts configured yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

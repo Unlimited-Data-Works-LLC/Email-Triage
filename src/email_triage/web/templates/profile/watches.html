@@ -1,0 +1,382 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}My Settings - Watches - Email Triage{% endblock %}
+{% block content %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner managing their own
+                "match-and-fire" mail watches). Admins viewing their
+                own watches land here too — same plain-language copy.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Comfortable with email + dashboards;
+                no terminal, no protocol RFCs, no provider internals.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*). Disabled controls
+       speak via their disabled state — no "Ask your administrator"
+       copy.
+     - No protocol or framework jargon: avoid "RFC", "ISO 8601",
+       "OData", "AND-combined", "substring match", "language model",
+       "system log". Say "AI" not "language model" / "LLM".
+     - Tooltips lead with a concrete example.
+     - HIPAA accounts surface as disabled checkboxes with a reason
+       chip ("Protected health info — separate watch needed").
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>My Settings</h2>
+
+{% set active = "watches" %}
+{% include "_settings_tabs.html" %}
+
+<h3>Watches{{ m.help("Tell email-triage to watch for a specific kind of mail across one or more of your accounts and take an action when one arrives — example: a text alert when your boss writes, or a webhook ping to your home assistant when an invoice lands.") }}</h3>
+
+<p style="color:var(--pico-muted-color);">
+    A watch is a match-and-fire rule. Pick what to look for (sender,
+    subject, keyword), pick the accounts to watch, then pick what to
+    do when a match arrives. You can add as many watches as you like.
+</p>
+
+{% if save_msg %}
+<article style="border-left:3px solid var(--pico-ins-color);
+                padding:0.4rem 0.8rem;margin:0 0 0.75rem 0;">
+    {{ save_msg }}
+</article>
+{% endif %}
+
+{% if errors %}
+<article style="border-left:3px solid var(--pico-del-color);
+                padding:0.4rem 0.8rem;margin:0 0 0.75rem 0;">
+    <strong>Please fix:</strong>
+    <ul style="margin:0.3rem 0 0 1.2rem;">
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+{# ─── EDITOR (new or existing group) ─────────────────────── #}
+
+{% set editing = (group is defined and group is not none) %}
+{% set save_action = "/profile/watches/" ~ (group.group_id if editing else "new") ~ "/save" %}
+{% set rep = group.representative if editing else w %}
+
+<form method="POST" action="{{ save_action }}">
+    {{ csrf_input(request) }}
+
+    <fieldset>
+        <legend>{% if editing %}Editing: {{ rep.name or "Watch" }}{% else %}New watch{% endif %}</legend>
+
+        <label>
+            Name{{ m.help("A short label for this watch — example: 'Boss VIP' or 'Invoice arrived'. Shown on this page and in the audit trail. The recipient never sees this name.") }}
+            <input type="text" name="name" value="{{ rep.name }}"
+                   placeholder="e.g. Boss VIP" required>
+        </label>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+            <input type="checkbox" name="enabled" value="1" style="margin:0;"
+                   {% if rep.enabled %}checked{% endif %}>
+            <span>Enabled</span>
+            {{ m.help("Off pauses the watch without deleting it — example: turn it off while you're on vacation, leave it on otherwise. Disabled watches stay in the list so you can flip them back on later.") }}
+        </label>
+    </fieldset>
+
+    <fieldset>
+        <legend>Accounts — which mailboxes to watch</legend>
+
+        <p style="color:var(--pico-muted-color);font-size:0.9em;">
+            Tick every account this watch should fire on. Example:
+            tick both your Gmail and your work mailbox to catch
+            invoices that arrive at either address.
+        </p>
+
+        {% set ticked_ids = (group.account_ids if editing else []) %}
+
+        {% if user_accounts and user_accounts|length > 0 %}
+            <div style="display:flex;gap:0.4rem;margin:0 0 0.5rem 0;">
+                <button type="button" id="watches-select-all"
+                        class="outline secondary"
+                        style="padding:0.2rem 0.7rem;font-size:0.85em;">
+                    Select all
+                </button>
+                <button type="button" id="watches-select-none"
+                        class="outline secondary"
+                        style="padding:0.2rem 0.7rem;font-size:0.85em;">
+                    Select none
+                </button>
+                {{ m.help("Select all ticks every non-HIPAA account you can choose. Accounts marked Protected Health Info stay unticked even on your own mailboxes — tick those one at a time so the choice is explicit. Example: Select all your work + personal Gmail accounts in one click; then individually tick any HIPAA-flagged mailbox you also want covered.") }}
+            </div>
+
+            <ul style="list-style:none;padding:0;margin:0;">
+                {% for a in user_accounts %}
+                {% set is_ticked = a.id in ticked_ids %}
+                {# HIPAA gate: owner of own HIPAA mailbox is first-party
+                   per §164.502(a) self-disclosure — checkbox enabled.
+                   Non-owner (admin viewing someone else's account) or
+                   delegate cannot tick. 2026-05-11 fix: previous
+                   `a.is_hipaa or a.is_delegate` blocked owner from
+                   ever creating a watch on their own HIPAA mailbox,
+                   and #154 had removed the per-account Watches tab —
+                   so the operator had zero path. See
+                   feedback_hipaa_actor_owner_gate.md. #}
+                {% set is_disabled = (a.is_hipaa and not a.is_owner) or a.is_delegate %}
+                <li style="margin:0.25rem 0;">
+                    <label style="display:flex;align-items:center;gap:0.5rem;margin:0;">
+                        <input type="checkbox" name="account_ids" value="{{ a.id }}"
+                               class="watches-account-checkbox"
+                               style="margin:0;"
+                               {% if is_ticked %}checked{% endif %}
+                               {% if is_disabled %}disabled{% endif %}
+                               {% if a.is_hipaa %}data-hipaa="1"{% endif %}>
+                        <span>
+                            <strong>{{ a.name }}</strong>
+                            {% if a.email_address %}
+                            <small style="color:var(--pico-muted-color);">
+                                ({{ a.email_address }})
+                            </small>
+                            {% endif %}
+                            {% if a.is_hipaa and a.is_owner %}
+                            <span style="display:inline-block;padding:0.05rem 0.4rem;
+                                         margin-left:0.4rem;font-size:0.75em;
+                                         background:var(--pico-card-background-color);
+                                         border:1px solid var(--pico-muted-border-color);
+                                         border-radius:6px;
+                                         color:var(--pico-muted-color);">
+                                Protected health info — your own mailbox, tick to enable
+                            </span>
+                            {% elif a.is_hipaa %}
+                            <span style="display:inline-block;padding:0.05rem 0.4rem;
+                                         margin-left:0.4rem;font-size:0.75em;
+                                         background:var(--pico-card-background-color);
+                                         border:1px solid var(--pico-muted-border-color);
+                                         border-radius:6px;
+                                         color:var(--pico-muted-color);">
+                                Protected health info — owner-only on this surface
+                            </span>
+                            {% elif a.is_delegate %}
+                            <span style="display:inline-block;padding:0.05rem 0.4rem;
+                                         margin-left:0.4rem;font-size:0.75em;
+                                         background:var(--pico-card-background-color);
+                                         border:1px solid var(--pico-muted-border-color);
+                                         border-radius:6px;
+                                         color:var(--pico-muted-color);">
+                                Shared with you — owner controls watches
+                            </span>
+                            {% endif %}
+                        </span>
+                    </label>
+                </li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p style="color:var(--pico-muted-color);">
+                You don't have any accounts yet. Add one from the
+                Accounts tab first, then come back to set up a watch.
+            </p>
+        {% endif %}
+    </fieldset>
+
+    <fieldset>
+        <legend>Filter — what to look for</legend>
+
+        <p style="color:var(--pico-muted-color);font-size:0.9em;">
+            Add at least one filter. Multiple filters combine — every
+            field you fill in has to match for the watch to fire.
+        </p>
+
+        <label>
+            Sender contains{{ m.help("Match the sender's email address — example: typing 'boss@' matches 'boss@company.com'. Capital letters don't matter. Leave blank to skip this filter.") }}
+            <input type="text" name="from_addr"
+                   value="{{ rep.filter.from_addr }}"
+                   placeholder="e.g. boss@">
+        </label>
+
+        <label>
+            Sender domain{{ m.help("Match just the company part of the sender — example: typing 'acme.com' matches anyone @acme.com. Capital letters don't matter. Leave blank to skip this filter.") }}
+            <input type="text" name="from_domain"
+                   value="{{ rep.filter.from_domain }}"
+                   placeholder="e.g. acme.com">
+        </label>
+
+        <label>
+            Subject contains{{ m.help("Match a word or phrase in the subject — example: typing 'invoice' matches 'Invoice #123' and 'invoice from Acme'. Capital letters don't matter. Leave blank to skip this filter.") }}
+            <input type="text" name="subject_contains"
+                   value="{{ rep.filter.subject_contains }}"
+                   placeholder="e.g. invoice">
+        </label>
+
+        <label>
+            Keyword anywhere{{ m.help("Match a word or phrase in either the subject or the body — example: typing 'urgent' matches mail with 'urgent' anywhere in the subject or body. Capital letters don't matter. Leave blank to skip this filter.") }}
+            <input type="text" name="keyword"
+                   value="{{ rep.filter.keyword }}"
+                   placeholder="e.g. urgent">
+        </label>
+
+        <label>
+            Advanced query (optional){{ m.help("Provider-native search, for power users — example for Gmail: 'from:boss@ has:attachment'. Sent straight to your mail server. Leave blank if the structured filters above already cover what you need.") }}
+            <input type="text" name="advanced"
+                   value="{{ rep.filter.advanced }}"
+                   placeholder="e.g. from:boss@ has:attachment">
+        </label>
+    </fieldset>
+
+    <fieldset>
+        <legend>Actions — what to do</legend>
+
+        <p style="color:var(--pico-muted-color);font-size:0.9em;">
+            Pick at least one action. Both can run together.
+        </p>
+
+        <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+            <input type="checkbox" name="escalate_enabled" value="1" style="margin:0;"
+                   {% if rep.actions.escalate.enabled %}checked{% endif %}>
+            <span><strong>Send a text alert</strong></span>
+            {{ m.help("Send a short alert to your notification address — example: when an invoice arrives or your boss writes. Set your notification address on the My Settings → Profile tab. The alert is one line: category + sender + subject. Accounts marked Protected Health Info get a redacted version (first name only, no subject).") }}
+        </label>
+
+        {# Webhook is power-user plumbing — hide behind a disclosure so
+           non-technical operators don't have to think about HMAC
+           signatures, JSON bodies, or URLs. The default-collapsed
+           pattern matches admin/integrations.html "How do I find these
+           values?". #}
+        <details style="margin:0.5rem 0 0.25rem 0;
+                        padding:0.5rem 0.75rem;
+                        border-left:3px solid var(--pico-muted-border-color);
+                        background:var(--pico-card-background-color, transparent);">
+            <summary style="cursor:pointer;font-weight:600;">
+                Advanced — call a webhook
+            </summary>
+
+            <p style="color:var(--pico-muted-color);font-size:0.88em;
+                      margin:0.5rem 0 0.4rem 0;">
+                For power users. Send a signed JSON ping to a URL when
+                the watch fires — example: notify your home assistant
+                when an invoice lands. Leave the box unchecked if you
+                don't need this.
+            </p>
+
+            <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+                <input type="checkbox" name="webhook_enabled" value="1" style="margin:0;"
+                       {% if rep.actions.webhook.enabled %}checked{% endif %}>
+                <span><strong>Call a webhook</strong></span>
+                {{ m.help("Send a signed JSON ping to a URL when the watch fires — example: ping your home assistant at http://192.168.1.10:8080/hook when an invoice lands. The body has the sender, subject, and category. Accounts marked Protected Health Info get a redacted body. The signature header is X-Signature-256 using your watch secret.") }}
+            </label>
+
+            <label style="margin-left:1.5rem;">
+                <small>URL</small>
+                <input type="url" name="webhook_url"
+                       value="{{ rep.actions.webhook.url }}"
+                       placeholder="e.g. http://192.168.1.10:8080/hook"
+                       style="max-width:32rem;">
+            </label>
+        </details>
+    </fieldset>
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit" style="margin:0;">
+            {% if editing %}Save changes{% else %}Create watch{% endif %}
+        </button>
+        <a href="/profile/watches" role="button"
+           class="secondary outline"
+           style="margin:0;text-decoration:none;line-height:2;">
+            Cancel
+        </a>
+    </div>
+</form>
+
+{% if editing %}
+<form method="POST" action="/profile/watches/{{ group.group_id }}/delete"
+      style="margin-top:1rem;"
+      onsubmit="return confirm('Delete this watch? This cannot be undone.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="outline secondary"
+            style="padding:0.25rem 0.7rem;font-size:0.9em;">
+        Delete this watch
+    </button>
+</form>
+{% endif %}
+
+{# ─── EXISTING WATCHES — listed below the editor for new + alongside on edit. ─── #}
+
+{% if groups and groups|length > 0 %}
+<h3 style="margin-top:1.75rem;">Your watches</h3>
+
+{% for g in groups %}
+{% set r = g.representative %}
+<article style="margin:0 0 0.6rem 0;padding:0.7rem 0.9rem;
+                border-left:3px solid {% if r.enabled %}var(--pico-primary){% else %}var(--pico-muted-border-color){% endif %};">
+    <header style="display:flex;align-items:center;gap:0.6rem;flex-wrap:wrap;margin:0 0 0.4rem 0;">
+        <strong>{{ r.name }}</strong>
+        <small style="color:var(--pico-muted-color);">
+            {{ g.account_ids|length }}
+            {% if g.account_ids|length == 1 %}account{% else %}accounts{% endif %} ·
+            {% if r.enabled %}On{% else %}Off{% endif %}
+        </small>
+        <span style="margin-left:auto;">
+            <a href="/profile/watches/{{ g.group_id }}/edit"
+               role="button" class="outline secondary"
+               style="padding:0.15rem 0.55rem;font-size:0.82em;margin:0;">
+                Edit
+            </a>
+        </span>
+    </header>
+    <div style="font-size:0.88em;color:var(--pico-muted-color);">
+        {% set f = r.filter %}
+        <div>
+            Looking for:
+            {% set parts = [] %}
+            {% if f.from_addr %}{% set _ = parts.append("from contains '" ~ f.from_addr ~ "'") %}{% endif %}
+            {% if f.from_domain %}{% set _ = parts.append("sender domain '" ~ f.from_domain ~ "'") %}{% endif %}
+            {% if f.subject_contains %}{% set _ = parts.append("subject contains '" ~ f.subject_contains ~ "'") %}{% endif %}
+            {% if f.keyword %}{% set _ = parts.append("keyword '" ~ f.keyword ~ "'") %}{% endif %}
+            {% if f.advanced %}{% set _ = parts.append("advanced query") %}{% endif %}
+            {% if parts %}{{ parts | join(" · ") }}{% else %}<em>any email</em>{% endif %}
+        </div>
+        <div>
+            Doing:
+            {% set acts = [] %}
+            {% if r.actions.escalate.enabled %}{% set _ = acts.append("text alert") %}{% endif %}
+            {% if r.actions.webhook.enabled %}{% set _ = acts.append("webhook → " ~ r.actions.webhook.url) %}{% endif %}
+            {% if acts %}{{ acts | join(" + ") }}{% else %}<em>nothing</em>{% endif %}
+        </div>
+    </div>
+</article>
+{% endfor %}
+{% endif %}
+
+<script>
+    // Select-all / select-none for the multi-account picker.
+    //
+    // Selection rules:
+    //  * Select-all skips disabled checkboxes (non-owner HIPAA + delegate).
+    //  * Select-all ALSO skips owner's own HIPAA accounts (data-hipaa="1").
+    //    The owner CAN tick their own HIPAA mailbox manually — bulk
+    //    convenience just doesn't surface it implicitly. Explicit
+    //    per-account opt-in keeps the §164.502(a) self-disclosure
+    //    decision visible to the operator instead of silent.
+    //  * Select-none clears every box including HIPAA-ticked ones
+    //    so the operator can undo a mis-tick without re-rendering.
+    document.addEventListener("DOMContentLoaded", function () {
+        const all = document.getElementById("watches-select-all");
+        const none = document.getElementById("watches-select-none");
+        const enabledSelector = ".watches-account-checkbox:not([disabled])";
+        function selectAll() {
+            // Tick every enabled non-HIPAA checkbox; skip owner's
+            // own HIPAA accounts so the choice stays explicit.
+            document
+                .querySelectorAll(enabledSelector)
+                .forEach(cb => {
+                    if (cb.dataset.hipaa === "1") return;
+                    cb.checked = true;
+                });
+        }
+        function selectNone() {
+            // Untick every box (HIPAA + non-HIPAA alike). Disabled
+            // boxes are already unchecked + browser ignores writes
+            // to them anyway, so no need to filter.
+            document
+                .querySelectorAll(".watches-account-checkbox")
+                .forEach(cb => { cb.checked = false; });
+        }
+        if (all) all.addEventListener("click", selectAll);
+        if (none) none.addEventListener("click", selectNone);
+    });
+</script>
+
+{% endblock %}

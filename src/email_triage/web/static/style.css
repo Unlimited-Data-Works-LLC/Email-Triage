@@ -1,0 +1,608 @@
+/* Minimal overrides on Pico CSS for Email Triage */
+
+/* Error text */
+.error {
+    color: var(--pico-del-color);
+}
+
+/* Tighter table rows */
+table td, table th {
+    padding: 0.5rem 0.75rem;
+}
+
+/* Nav spacing */
+nav li small {
+    opacity: 0.7;
+}
+
+/* Footer */
+footer {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--pico-muted-border-color);
+    text-align: center;
+    opacity: 0.6;
+}
+
+/* Details edit forms in user table */
+details form {
+    margin-top: 0.5rem;
+}
+
+/* ===========================================================
+ * Primary navigation
+ * Two layouts: top (default) and sidebar. Toggle via the ☰/✕
+ * button in the upper-left; preference persists in localStorage.
+ * =========================================================== */
+
+#primary-nav {
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+}
+
+/* The upper-left cluster holds the toggle + brand. Stays there in
+   both modes so the button is always in the same place. */
+#primary-nav .nav-brand-cluster {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Toggle button shows ☰ in top mode, ✕ in sidebar mode */
+body.nav-top #nav-toggle::before { content: "☰"; }
+body.nav-sidebar #nav-toggle::before { content: "✕"; }
+#nav-toggle, #theme-toggle {
+    padding: 0.1rem 0.5rem;
+    font-size: 0.95rem;
+    min-width: auto;
+    line-height: 1.4;
+    margin: 0;
+}
+/* Theme toggle: sun in dark mode (to indicate "click for light"),
+   moon in light mode (to indicate "click for dark"). */
+html[data-theme="light"] #theme-toggle::before { content: "🌙"; }
+html[data-theme="dark"] #theme-toggle::before { content: "☀"; }
+
+/* ===========================================================
+ * Dark mode tuning — nudge Pico's defaults toward a Claude-Code
+ * feel: deeper near-black background, slightly warmer cards,
+ * dimmer borders. Pico's primary colour stays blue (matches the
+ * uDataWorks logo) so we don't override it.
+ * =========================================================== */
+html[data-theme="dark"] {
+    --pico-background-color: #0e0f11;
+    --pico-card-background-color: #17181b;
+    --pico-card-sectioning-background-color: #1c1d21;
+    --pico-muted-border-color: #2a2b30;
+    --pico-card-border-color: #26272b;
+    --pico-color: #e3e3e3;
+    --pico-muted-color: #8a8d93;
+    --pico-code-background-color: #1f2024;
+    --pico-code-color: #e3e3e3;
+}
+/* Submenu background: must be fully opaque so page content
+   beneath the dropdown doesn't bleed through. Pico's
+   --pico-card-background-color in dark theme is rgba-based +
+   semi-transparent, which let underlying tabs show through.
+   Force an explicit dark solid that matches Pico's dark page
+   background instead. */
+html[data-theme="dark"] #primary-nav .submenu {
+    background: #11191f;
+    border-color: var(--pico-card-border-color);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+}
+html[data-theme="dark"] #primary-nav .submenu a:hover {
+    background: #23252a;
+}
+
+/* Which nav list is visible. Selectors include #primary-nav to beat
+   the ID-scoped rules further down the stylesheet. */
+body.nav-top #primary-nav .nav-flat { display: none; }
+body.nav-sidebar #primary-nav .nav-grouped { display: none; }
+
+/* --- Top-nav dropdowns (grouped list) --------------------- */
+
+#primary-nav .nav-grouped {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+#primary-nav .nav-grouped > li {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+/* Menu trigger button — styled to look like a nav link */
+#primary-nav .menu-trigger {
+    background: none;
+    border: none;
+    color: var(--pico-primary);
+    font: inherit;
+    font-size: inherit;
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    line-height: 1.5;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.15rem;
+    margin: 0;
+    box-shadow: none;
+    white-space: nowrap;
+}
+#primary-nav .menu-trigger:hover,
+#primary-nav .menu-trigger:focus {
+    color: var(--pico-primary-hover);
+    background: transparent;
+    outline: none;
+}
+#primary-nav .menu-trigger .caret {
+    font-size: 0.75em;
+    opacity: 0.7;
+    line-height: 1;
+}
+
+/* The submenu itself — floating dropdown */
+#primary-nav .submenu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin: 0;
+    padding: 0.35rem 0;
+    min-width: 160px;
+    background: var(--pico-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    z-index: 100;
+    list-style: none;
+}
+#primary-nav .submenu li {
+    /* Force block — Pico's default `nav ul li` is inline-block, which
+       would let short items share a line and wrap oddly in a dropdown. */
+    display: block;
+    padding: 0;
+    margin: 0;
+    list-style: none;
+    width: 100%;
+}
+#primary-nav .submenu a {
+    display: block;
+    padding: 0.35rem 1rem;
+    text-decoration: none;
+    white-space: nowrap;
+}
+#primary-nav .submenu a:hover {
+    background: var(--pico-muted-border-color);
+}
+
+/* Open on hover (desktop) and on keyboard focus (a11y via focus-within) */
+#primary-nav .has-menu:hover .submenu,
+#primary-nav .has-menu:focus-within .submenu {
+    display: block;
+}
+
+/* --- Sidebar layout --------------------------------------- */
+
+body.nav-sidebar #primary-nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 220px;
+    height: 100vh;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    padding: 1rem 0.75rem;
+    border-right: 1px solid var(--pico-muted-border-color);
+    background: var(--pico-background-color);
+    overflow-y: auto;
+    z-index: 100;
+    gap: 0.25rem;
+}
+
+body.nav-sidebar #primary-nav ul {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    gap: 0.1rem;
+    display: flex;
+}
+
+body.nav-sidebar #primary-nav li {
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    list-style: none;
+}
+
+/* Upper-left cluster in sidebar: toggle stays at top, alongside brand */
+body.nav-sidebar #primary-nav .nav-brand-cluster {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--pico-muted-border-color);
+    margin-bottom: 0.5rem;
+}
+
+/* Flat nav items: just a stack of links */
+body.nav-sidebar #primary-nav .nav-flat {
+    display: flex;
+}
+body.nav-sidebar #primary-nav .nav-flat a {
+    display: block;
+    padding: 0.2rem 0.25rem;
+}
+
+/* User info + logout at the bottom of the sidebar */
+body.nav-sidebar #primary-nav .nav-user {
+    margin-top: auto;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--pico-muted-border-color);
+}
+
+/* Shift main content and footer to accommodate the sidebar */
+body.nav-sidebar main.container,
+body.nav-sidebar footer.container {
+    margin-left: 240px;
+    max-width: calc(100% - 260px);
+}
+
+/*
+ * #64 help tooltips — full-replacement engine.
+ *
+ * Earlier passes shipped Pico's data-tooltip pseudo-element + a
+ * JS-stamped data-tip-anchor classifier to handle viewport-edge
+ * clipping. Pseudo-element tooltips have three failure surfaces no
+ * CSS hack solves:
+ *
+ *   1. Ancestor `overflow: hidden / auto / scroll` clips the
+ *      absolute-positioned ::before/::after at THAT ancestor's
+ *      edge regardless of viewport math. fieldset legends, modal
+ *      bodies, articles with overflow set — all clip.
+ *   2. Ancestor `transform`, `will-change`, `contain`, `filter`
+ *      creates a new containing block, breaking absolute
+ *      positioning math relative to the viewport.
+ *   3. Stacking context: pseudo-elements share the trigger's
+ *      stacking, so siblings can land on top depending on the
+ *      page's z-index ordering.
+ *
+ * Replacement: render the tooltip into a single shared `<div
+ * id="et-tooltip">` mounted at body scope. The engine in
+ * base.html populates + positions via fixed coordinates on
+ * mouseenter/focusin, hides on mouseleave/focusout/Escape.
+ * `position: fixed` is viewport-relative so ancestor overflow +
+ * transform contexts don't apply; z-index 99999 wins every
+ * stacking battle.
+ *
+ * Strip Pico's pseudo-element rendering for [data-tooltip] —
+ * `content: none` removes the pseudo entirely, no display:none
+ * fallback needed.
+ */
+[data-tooltip]::before,
+[data-tooltip]::after {
+    content: none !important;
+}
+
+/* Trigger element styling — keyboard focus indicator + cursor
+ * affordance. The macro adds tabindex=0 so triggers reach via Tab. */
+[data-tooltip]:focus-visible {
+    outline: 2px solid var(--pico-primary);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+
+/* Singleton tooltip rendered at body scope. Hidden by default;
+ * the engine flips display + computes top/left on hover. */
+#et-tooltip {
+    position: fixed;
+    z-index: 99999;
+    max-width: min(24rem, calc(100vw - 2rem));
+    width: max-content;
+    padding: 0.4rem 0.6rem;
+    border-radius: var(--pico-border-radius);
+    background: var(--pico-tooltip-background-color, #1f2530);
+    color: var(--pico-tooltip-color, #fff);
+    font-size: 0.875rem;
+    font-weight: var(--pico-font-weight);
+    line-height: 1.4;
+    text-align: left;
+    word-break: break-word;
+    pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    /* Engine sets display:block + top/left on show. */
+}
+#et-tooltip[hidden] {
+    display: none !important;
+}
+
+/* ─── Multi-select widget (#163 follow-up) ─────────────────────
+   Closed-state chip pill control + dropdown popup. Wraps a native
+   <select multiple data-multiselect>; JS in static/multiselect.js
+   injects the host elements + keeps the underlying <select>
+   selection in sync so form submission shape is unchanged. */
+.ms-host {
+    position: relative;
+    display: inline-block;
+    width: 100%;
+    max-width: 32rem;
+    margin: 0.25rem 0;
+}
+
+.ms-trigger {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    min-height: 2.4rem;
+    width: 100%;
+    padding: 0.3rem 0.5rem;
+    margin: 0;
+    background: var(--pico-form-element-background-color, var(--pico-card-background-color));
+    border: 1px solid var(--pico-form-element-border-color, var(--pico-muted-border-color));
+    border-radius: var(--pico-border-radius, 4px);
+    color: var(--pico-color);
+    font-size: 0.9em;
+    text-align: left;
+    cursor: pointer;
+}
+
+.ms-host[data-ms-open] .ms-trigger {
+    border-color: var(--pico-primary);
+    box-shadow: 0 0 0 0.125rem var(--pico-primary-focus, rgba(74, 144, 226, 0.25));
+}
+
+.ms-chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+    flex: 1;
+}
+
+.ms-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.5rem;
+    background: var(--pico-code-background-color);
+    border-radius: 0.7rem;
+    font-size: 0.85em;
+    line-height: 1.3;
+}
+
+.ms-chip-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.1rem;
+    height: 1.1rem;
+    padding: 0;
+    margin: 0;
+    background: var(--pico-muted-color);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    font-size: 0.85em;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.ms-chip-x:hover {
+    background: var(--pico-del-color, #c0392b);
+}
+
+.ms-placeholder {
+    flex: 1;
+    color: var(--pico-muted-color);
+    font-size: 0.9em;
+}
+
+.ms-caret {
+    margin-left: 0.4rem;
+    font-size: 0.85em;
+    color: var(--pico-muted-color);
+}
+
+.ms-popup {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    margin-top: 0.25rem;
+    padding: 0.4rem;
+    max-height: 18rem;
+    overflow-y: auto;
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius, 4px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.ms-filter {
+    display: block;
+    width: 100%;
+    padding: 0.3rem 0.5rem;
+    margin: 0 0 0.4rem 0;
+    font-size: 0.9em;
+    background: var(--pico-form-element-background-color, var(--pico-card-background-color));
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius, 4px);
+    color: var(--pico-color);
+}
+
+.ms-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.ms-option {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.9em;
+}
+
+.ms-option:hover,
+.ms-option.ms-highlight {
+    background: var(--pico-primary);
+    color: #fff;
+}
+
+.ms-option[aria-selected="true"] {
+    font-weight: 600;
+}
+
+.ms-check {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1rem;
+    color: var(--pico-primary);
+    font-weight: 600;
+}
+
+.ms-option:hover .ms-check,
+.ms-option.ms-highlight .ms-check {
+    color: #fff;
+}
+
+.ms-empty {
+    padding: 0.5rem;
+    color: var(--pico-muted-color);
+    font-size: 0.9em;
+    font-style: italic;
+}
+
+/* ─── Shared card layout (lifted from routes 2026-05-12) ─────────
+   Pattern: each conceptual unit (a route, an account section, an
+   integration, a dashboard tile) is a self-sized card. CSS grid
+   inside the card splits header + body when both fit horizontally;
+   stacks on narrow viewports.
+
+   Class hierarchy:
+     .et-cards         — flex column container; gap between cards
+     .et-card          — single card; grid header/body or stacked
+     .et-card-header   — left/top: title + description
+     .et-card-body     — right/main: content
+     .et-card-section  — sub-block inside a card body
+
+   The routes-specific .route-card / .route-cards classes carry
+   on as aliases (composed into the same rules below) so the
+   prior commit's markup keeps working unchanged. New consumers
+   (account-edit, admin/integrations, dashboard) use .et-card
+   directly. */
+.et-cards,
+.route-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin: 0.5rem 0;
+}
+
+.et-card,
+.route-card {
+    display: grid;
+    grid-template-columns: minmax(11rem, 18rem) 1fr;
+    gap: 0.75rem 1rem;
+    align-items: start;
+    padding: 0.6rem 0.85rem;
+    margin: 0;
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius, 4px);
+}
+
+/* Use this modifier when the card content is wide enough to want
+   the full row (settings sections with long forms). Header sits
+   stacked above body. */
+.et-card.et-card-stack {
+    grid-template-columns: 1fr;
+}
+
+/* 2026-05-13 — Pico applies its own ``:where(article) > header``
+   styling that turns the header into a discrete "sectioning" box
+   with its own background + border-bottom + negative side margins.
+   Operator (2026-05-13): they want the flush look on EVERY card
+   variant, not just the 2-col grid one. The sectioning background
+   + border-bottom + negative margins make the title region read as
+   visually outside the card box even in stack mode (operator caught
+   the bleed on the dashboard Health + Ingestion cards). Override
+   Pico globally for any .et-card-header / .route-card-header. */
+.et-card > .et-card-header,
+.route-card > .route-card-header {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+}
+
+.et-card-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+.et-card-header h2,
+.et-card-header h3,
+.et-card-header h4 {
+    margin: 0;
+    font-size: 1.05em;
+    line-height: 1.3;
+}
+.et-card-header code {
+    font-size: 0.95em;
+}
+.et-card-desc {
+    color: var(--pico-muted-color);
+    font-size: 0.85em;
+    line-height: 1.35;
+}
+
+.et-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin: 0;
+    min-width: 0;  /* allow long inputs / dropdowns to shrink */
+}
+
+.et-card-section {
+    /* Optional internal divider for cards with multiple sub-blocks
+       (e.g. an account-edit card that has provider + OAuth + watch
+       sub-sections; they get a dim top border without becoming
+       their own cards). */
+    padding-top: 0.4rem;
+    margin-top: 0.2rem;
+    border-top: 1px solid var(--pico-muted-border-color);
+}
+.et-card-section:first-child {
+    padding-top: 0;
+    margin-top: 0;
+    border-top: none;
+}
+
+/* Active / pending accent (used by routes; reusable). */
+.et-card.et-card-pending,
+.route-row.route-pending {
+    border-left: 3px solid var(--pico-primary);
+    padding-left: calc(0.85rem - 3px);
+}
+
+/* Narrow-viewport stacking: header above body, single column. */
+@media (max-width: 720px) {
+    .et-card,
+    .route-card {
+        grid-template-columns: 1fr;
+    }
+}

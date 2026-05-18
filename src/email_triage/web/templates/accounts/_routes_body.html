@@ -1,0 +1,809 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work). NOT developers.
+   TECH-SKILL:  computer-literate professional (exec, doctor, lawyer,
+                researcher). Not terminal users; not protocol readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC numbers, ISO 8601, OData, "language
+       model", "AND-combined", "substring match"). Plain English.
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — don't
+       say "Ask your administrator".
+   ─────────────────────────────────────────────────────────── #}
+{# Shared body partial for the routes table.
+
+   Two render paths:
+     * GET /accounts/{id}/routes — full page wrapper (routes.html)
+       renders the per-account Edit tab strip on top, then this body.
+     * GET /routes?account_id=N — top-level page (routes_top.html)
+       renders an account-picker dropdown on top, then this body.
+
+   The picker page also re-renders ONLY this body (no full page) on
+   HTMX swaps when the operator switches accounts via the dropdown.
+
+   Required context: ``acct``, ``categories``, ``routes_by_cat``,
+   ``folders``, ``all_folder_count``, ``excluded_count``,
+   ``available_actions``. ``folder_msg`` optional (flash from folder
+   prefs save). ``autosave_paused`` optional (operator preference;
+   defaults to False = auto-save mode).
+#}
+
+<h3>Routes &mdash; Category {{ "&rarr;" | safe }} Action mappings{{ m.help("Set what happens to each category of email for this account. Categories come from the Classification Categories page (system-wide) plus your personal ones on the Profile page.") }}</h3>
+<p>
+    Pick one or more actions per category. Changes save automatically
+    as you make them. Switch to manual mode below if you want to
+    stage several edits and apply them all at once.
+</p>
+
+<div id="route-messages">
+    {% if folder_msg %}
+    <article style="padding:0.5rem 1rem;background:var(--pico-ins-color);color:white;margin-bottom:1rem;">
+        &#x2713; Folder preferences saved. {{ folder_msg | replace('+', ' ') }}.
+    </article>
+    {% endif %}
+</div>
+
+{% if folders or all_folder_count %}
+<section>
+    <div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:0.75rem;">
+        <a href="/accounts/{{ acct.id }}/folders/prefs" role="button" class="outline"
+           style="padding:0.35rem 0.75rem;font-size:0.875rem;">
+            Manage Folder Visibility
+        </a>
+        <small style="color:var(--pico-muted-color);">
+            {{ folders|length }} folder{{ "s" if folders|length != 1 else "" }} visible
+            {% if excluded_count > 0 %}
+            ({{ excluded_count }} hidden &mdash; <a href="/accounts/{{ acct.id }}/folders/prefs">configure</a>)
+            {% endif %}
+        </small>
+    </div>
+
+    {# ── Create New Folder ──────────────────────────────────────
+       On submit, the response targets #folder-create-result with a
+       confirmation chip AND fires the "et:folder-created" event so
+       every per-row move-folder dropdown picks up the new option
+       without a page reload. ──────────────────────────────────── #}
+    <details style="margin-bottom:1rem;">
+        <summary role="button" class="outline secondary" style="padding:0.3rem 0.75rem;font-size:0.85rem;">
+            Create New Folder
+        </summary>
+        <form hx-post="/accounts/{{ acct.id }}/folders/create"
+              hx-target="#folder-create-result"
+              hx-swap="innerHTML"
+              style="display:flex;gap:0.5rem;align-items:end;margin-top:0.5rem;flex-wrap:wrap;">
+            <label style="flex:0 0 auto;margin-bottom:0;">
+                <small>Parent</small>
+                <select name="parent" style="margin-bottom:0;padding:0.3rem 0.5rem;font-size:0.85rem;min-width:10rem;">
+                    <option value="">(top level)</option>
+                    {% for f in folders %}
+                    <option value="{{ f }}">{{ f }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label style="flex:1;min-width:8rem;margin-bottom:0;">
+                <small>Folder Name</small>
+                <input type="text" name="folder" placeholder="e.g. Triage" required
+                       style="margin-bottom:0;padding:0.3rem 0.5rem;font-size:0.85rem;">
+            </label>
+            <button type="submit" class="outline" style="padding:0.3rem 0.75rem;margin-bottom:0;font-size:0.85rem;">Create</button>
+        </form>
+        <div id="folder-create-result" style="margin-top:0.35rem;"></div>
+    </details>
+</section>
+{% endif %}
+
+<section>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;">
+        <h3 style="margin:0;">Category {{ "&rarr;" | safe }} Action Mappings</h3>
+        <label style="display:inline-flex;align-items:center;gap:0.4rem;margin:0;cursor:pointer;font-size:0.9em;">
+            <input type="checkbox" id="autosave-pause-toggle" style="margin:0;"
+                   {% if autosave_paused %}checked{% endif %}>
+            <span><strong>Pause auto-save</strong></span>
+            {{ m.help("Auto-save means changes apply as you make them — no Save button needed. Switch to manual mode if you want to stage several edits and apply them all at once. Example: switching three categories at the same time.") }}
+        </label>
+    </div>
+    <p>For each category, tick actions to perform and pick a folder for "move." Empty rows mean "no action" — emails in that category pass through untouched.</p>
+    <p style="font-size:0.9em;color:var(--pico-muted-color);">
+        Tip: tick <strong>add-label</strong> to tag matching emails with one
+        or more labels. Example: a route that catches receipts could add
+        the <code>Tax 2026</code> label so they're easy to find later.
+        Pick labels from the chip picker (managed on the
+        <a href="/labels">Labels page</a>); to also tag the upstream
+        mailbox with a Gmail / Outlook label, type its name(s) into
+        the free-text field, separated by commas.
+    </p>
+
+    {# Operator caught 2026-05-13: changes to route cards left the
+       pending-dot indicator on but never POSTed. Root cause: the
+       outer wrapper element used to be a <form> (legacy bulk-save
+       envelope) but the inner per-row <form>s nested inside it
+       — HTML5 forbids nested forms, browsers silently strip the
+       inner association, the inner row form's inputs detach,
+       hx-trigger fires on the orphaned form + the POST never
+       reaches the server.
+
+       Fix: outer is a plain <div> now. Bulk save-all still works
+       via the Save All button's manual JS fetch handler at the
+       bottom of this file (it builds FormData from row state
+       directly + posts via fetch — never used the outer form's
+       <submit> path). Per-row auto-save now lands cleanly. #}
+    <div id="routes-bulk-form">
+    {# Card-based layout (#163-spacing operator pick, Option 4).
+       Replaces the prior 4-column table that left wide vertical
+       dead zones between Category + Actions when descriptions
+       wrapped. Each category is a self-sized card with header
+       (slug + description) + per-action rows where the action's
+       config (folder / label picker) sits inline on the same row
+       as its checkbox. The old #routes-table id is preserved on
+       the wrapper div so the existing auto-save / pause-toggle /
+       save-all JS continues to find its anchor without change. #}
+    <div id="routes-table" data-account-id="{{ acct.id }}"
+         class="route-cards">
+        {% for slug, description in categories.items() %}
+        {% set route = routes_by_cat.get(slug) %}
+        {% set route_actions = route.actions if route else [] %}
+        {% set action_names = [] %}
+        {% for a in route_actions %}{% if action_names.append(a.action or a.get('action', '')) %}{% endif %}{% endfor %}
+        {# Namespace bag for stateful values lifted out of the inner for-loop
+           (Jinja2 scoping). ``move_folder`` is the persisted folder for the
+           move action. #129 tail adds ``add_label_internal`` + ``add_label_provider``
+           — persisted state for the per-row add-label picker so the chips +
+           free-text input re-render with the operator's last choices. #}
+        {% set ns = namespace(
+            move_folder='',
+            add_label_internal=[],
+            add_label_provider=[],
+        ) %}
+        {% for a in route_actions %}
+            {% set _act = a.action if a.action is defined else a.get('action', '') %}
+            {% set _cfg = a.config if a.config is defined else a.get('config', {}) %}
+            {% if _act == 'move' %}
+                {% set _fm = _cfg.get('folder_map', {}) %}
+                {% if _fm.get(slug) %}{% set ns.move_folder = _fm[slug] %}{% endif %}
+            {% elif _act == 'add-label' %}
+                {# #129 tail — pull persisted internal slug + provider
+                   label lists off the action config so the picker
+                   re-renders with the operator's saved choices.
+                   Defensive .get() so legacy rows without the keys
+                   (or with non-list payloads) fall back to empty
+                   instead of templating an error. #}
+                {% set _internal = _cfg.get('labels', []) %}
+                {% if _internal is iterable and _internal is not string %}
+                    {% set ns.add_label_internal = _internal %}
+                {% endif %}
+                {% set _provider = _cfg.get('provider_labels', []) %}
+                {% if _provider is iterable and _provider is not string %}
+                    {% set ns.add_label_provider = _provider %}
+                {% endif %}
+            {% endif %}
+        {% endfor %}
+        <article id="route-row-{{ slug }}" class="route-row route-card"
+                 data-slug="{{ slug }}">
+            <header class="route-card-header">
+                <strong><code>{{ slug }}</code></strong>
+                <small class="route-card-desc">{{ description }}</small>
+            </header>
+            <form class="route-row-form route-card-body"
+                  data-slug="{{ slug }}"
+                  hx-post="/accounts/{{ acct.id }}/routes/save"
+                  hx-target="#route-msg-{{ slug }}"
+                  hx-swap="innerHTML"
+                  hx-trigger="change from:closest article delay:500ms"
+                  id="route-form-{{ slug }}">
+                <input type="hidden" name="category" value="{{ slug }}">
+
+                {# move — inline folder dropdown lives on the same
+                   row as the checkbox. When unticked, the folder
+                   select is hidden entirely (operator caught the
+                   prior greyed-but-visible shape as visual clutter
+                   on the empty rows; mirrors the label-picker
+                   hide-when-unticked pattern below). #}
+                <div class="route-action-row">
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="move"
+                               {% if 'move' in action_names %}checked{% endif %}
+                               onclick="var s = document.getElementById('move-sel-{{ slug }}'); if (s) { s.style.display = this.checked ? '' : 'none'; s.disabled = !this.checked; }">
+                        <span>move</span>
+                    </label>
+                    {% if folders %}
+                    <select name="move_folder" id="move-sel-{{ slug }}"
+                            class="move-folder-select route-action-config"
+                            data-current="{{ ns.move_folder }}"
+                            {% if 'move' not in action_names %}disabled style="display:none;"{% endif %}>
+                        <option value="">— folder —</option>
+                        {% for f in folders %}
+                        <option value="{{ f }}" {% if f == ns.move_folder %}selected{% endif %}>{{ f }}</option>
+                        {% endfor %}
+                        {% if ns.move_folder and ns.move_folder not in folders %}
+                        <option value="{{ ns.move_folder }}" selected>{{ ns.move_folder }} (not on server)</option>
+                        {% endif %}
+                    </select>
+                    {% else %}
+                    <small class="route-action-na">no folder list for this account</small>
+                    {% endif %}
+                </div>
+
+                {# label — inline picker next to the checkbox when
+                   the account exposes provider labels. Picker is
+                   hidden when label is unticked + when the account
+                   has none to offer (IMAP / HIPAA / unauthenticated
+                   → picker absent, label action falls back to
+                   category-as-label). #}
+                <div class="route-action-row">
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="label"
+                               {% if 'label' in action_names %}checked{% endif %}
+                               onclick="var p = document.getElementById('label-pick-{{ slug }}'); if (p) p.style.display = this.checked ? 'block' : 'none';">
+                        <span>label</span>
+                    </label>
+                    {% if provider_labels_for_account %}
+                    {% set _selected_for_row = selected_labels_by_cat.get(slug, []) %}
+                    <div id="label-pick-{{ slug }}"
+                         class="route-action-config route-label-pick"
+                         style="display:{% if 'label' in action_names %}block{% else %}none{% endif %};">
+                        <select multiple
+                                name="label_targets"
+                                data-multiselect
+                                data-placeholder="Pick label(s) to attach…"
+                                size="{{ [provider_labels_for_account|length, 6] | min }}">
+                            {% for label in provider_labels_for_account %}
+                            <option value="{{ label.slug }}"
+                                    {% if label.slug in _selected_for_row %}selected{% endif %}>
+                                {{ label.name }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                        <small class="route-action-hint">
+                            Empty → apply the category name
+                            (<code>{{ slug }}</code>) as the label.
+                        </small>
+                    </div>
+                    {% else %}
+                    <small class="route-action-na">
+                        no label picker — category name
+                        (<code>{{ slug }}</code>) used as the label
+                    </small>
+                    {% endif %}
+                </div>
+
+                {# notify + draft_reply + suggest_meeting_times —
+                   no config; chips on their own row. #}
+                <div class="route-action-row">
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="notify"
+                               {% if 'notify' in action_names %}checked{% endif %}>
+                        <span>notify</span>
+                    </label>
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="draft_reply"
+                               {% if 'draft_reply' in action_names %}checked{% endif %}>
+                        <span>draft_reply</span>
+                    </label>
+                    {# 2026-05-13 — explicit picker for the calendar-
+                       aware meeting-request intercept. Also fires
+                       automatically on category=meeting-request when
+                       calendar + meeting preferences are wired, so most
+                       operators don't need to tick this box. Tick it to
+                       force the calendar-aware draft on a different
+                       category (e.g. to-respond), or to combine with
+                       move / label / notify on the meeting-request row
+                       without producing two competing drafts. #}
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions"
+                               value="suggest_meeting_times"
+                               {% if 'suggest_meeting_times' in action_names %}checked{% endif %}>
+                        <span>suggest_meeting_times{{ m.help("Drafts a calendar-aware reply listing your next free windows in business hours. Reads your meeting preferences (length, count, business hours, timezone) from the Profile → Meeting tab. Fires automatically on category=meeting-request when calendar is enabled, so most setups don't need this box. Tick it to use the calendar-aware draft on a different category, or alongside move / label / notify on meeting-request without producing two drafts.") }}</span>
+                    </label>
+                </div>
+
+                {# #129 tail — add-label action. Checkbox toggles the
+                   panel below open / closed. Panel carries two pickers:
+                   internal labels (chip checkboxes, install-local rows
+                   from /labels), and a free-text provider-native field
+                   (Gmail / Outlook label names sent back to the
+                   mailbox). HIPAA-flagged accounts skip the provider
+                   portion at apply time; internal labels still apply.
+                   AUDIENCE: end user — copy avoids backend terms. #}
+                <div class="route-action-row">
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="add-label"
+                               {% if 'add-label' in action_names %}checked{% endif %}
+                               onclick="var d = document.getElementById('add-label-panel-{{ slug }}'); if (d) d.open = this.checked;">
+                        <span>add-label</span>
+                    </label>
+                </div>
+                <details id="add-label-panel-{{ slug }}"
+                         class="route-action-config"
+                         style="margin:0 0 0 0;font-size:0.875rem;"
+                         {% if 'add-label' in action_names %}open{% endif %}>
+                    <summary style="cursor:pointer;color:var(--pico-muted-color);font-size:0.85em;">
+                        Labels to add{{ m.help("These labels get attached to any email that matches this category. The label chips come from your install's Labels page (visible only inside email-triage). The free-text field below sends Gmail / Outlook label names back to your mailbox so they show up there too.") }}
+                    </summary>
+                    <fieldset style="margin:0.4rem 0 0 0;padding:0.5rem 0.75rem;
+                                     border:1px solid var(--pico-muted-border-color);
+                                     border-radius:var(--pico-border-radius);">
+                        <legend style="font-size:0.85em;padding:0 0.4rem;">
+                            Labels (shown only inside email-triage)
+                        </legend>
+                        {% if all_labels %}
+                            {% for label in all_labels %}
+                            <label style="display:inline-flex;align-items:center;gap:0.35rem;margin-right:0.75rem;margin-bottom:0.25rem;">
+                                <input type="checkbox"
+                                       name="add_label_internal"
+                                       value="{{ label.slug }}"
+                                       {% if label.slug in ns.add_label_internal %}checked{% endif %}
+                                       style="margin:0;">
+                                <span style="display:inline-block;padding:0.05rem 0.45rem;border-radius:0.7rem;background:{{ label.color }};color:#fff;font-size:0.8rem;">{{ label.name }}</span>
+                            </label>
+                            {% endfor %}
+                        {% else %}
+                            <p style="margin:0;color:var(--pico-muted-color);font-size:0.9em;">
+                                No labels yet. Add one on the
+                                <a href="/labels">Labels page</a> to use here.
+                            </p>
+                        {% endif %}
+                    </fieldset>
+                    <label style="display:block;margin:0.4rem 0 0 0;">
+                        <small>Also tag in your mailbox (optional)
+                            {{ m.help("Type one or more label names exactly as you'd want them in Gmail or Outlook, separated by commas. Example: Receipts/2026, Tax. Leave blank to keep the label only inside email-triage. (Skipped on HIPAA-marked accounts so labels don't leak subject info upstream.)") }}
+                        </small>
+                        <input type="text"
+                               name="add_label_provider"
+                               placeholder="e.g. Receipts/2026, Tax"
+                               value="{{ ns.add_label_provider | join(', ') }}"
+                               style="margin-bottom:0;padding:0.25rem 0.5rem;font-size:0.85rem;">
+                    </label>
+                </details>
+
+                <div id="route-msg-{{ slug }}" class="route-msg route-card-msg"></div>
+            </form>
+        </article>
+        {% endfor %}
+    </div>
+    </div>{# /#routes-bulk-form (plain div, not a <form>) #}
+
+    {# Manual-mode controls — hidden when auto-save is active. #}
+    <div id="routes-manual-controls"
+         style="display:{% if autosave_paused %}flex{% else %}none{% endif %};
+                gap:0.5rem;align-items:center;margin-top:0.75rem;">
+        <button type="button" id="routes-save-all-btn"
+                style="padding:0.35rem 0.85rem;margin:0;">
+            Save All Routes
+        </button>
+        <button type="button" id="routes-reset-btn"
+                class="outline secondary"
+                style="padding:0.35rem 0.85rem;margin:0;">
+            Reset
+        </button>
+        <span id="routes-bulk-msg" style="font-size:0.85em;"></span>
+    </div>
+</section>
+
+{% if folders %}
+<section>
+    <details>
+        <summary>Visible folders ({{ folders|length }})</summary>
+        <ul>
+            {% for f in folders %}
+            <li><code>{{ f }}</code></li>
+            {% endfor %}
+        </ul>
+        {% if excluded_count > 0 %}
+        <p><small>{{ excluded_count }} folder{{ "s" if excluded_count != 1 else "" }} hidden.
+        <a href="/accounts/{{ acct.id }}/folders/prefs">Manage visibility</a></small></p>
+        {% endif %}
+    </details>
+</section>
+{% endif %}
+
+<style>
+/* Card layout (#163 spacing redesign, Option 4).
+   Each route is a self-sized card; flex/grid sizing means no
+   column-alignment dead space when descriptions wrap. */
+.route-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin: 0.5rem 0;
+}
+.route-card {
+    display: grid;
+    grid-template-columns: minmax(11rem, 18rem) 1fr;
+    gap: 0.75rem 1rem;
+    align-items: start;
+    padding: 0.6rem 0.85rem;
+    margin: 0;
+    background: var(--pico-card-background-color);
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius, 4px);
+}
+.route-card-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+.route-card-header code {
+    font-size: 0.95em;
+}
+.route-card-desc {
+    color: var(--pico-muted-color);
+    font-size: 0.85em;
+    line-height: 1.35;
+}
+.route-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin: 0;
+}
+.route-action-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+}
+.route-action-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin: 0;
+    font-size: 0.9em;
+    min-width: 6rem;
+}
+.route-action-toggle input[type="checkbox"] {
+    margin: 0;
+}
+.route-action-config {
+    flex: 1;
+    min-width: 0;
+}
+.route-action-config select {
+    margin: 0;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.85em;
+}
+.route-label-pick {
+    max-width: 28rem;
+}
+.route-action-hint {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--pico-muted-color);
+    font-size: 0.75em;
+}
+.route-action-na {
+    color: var(--pico-muted-color);
+    font-size: 0.8em;
+    font-style: italic;
+}
+.route-card-msg {
+    min-height: 1em;
+    font-size: 0.85em;
+    margin-top: 0.25rem;
+}
+
+/* Pending state — left-border accent during the debounce window. */
+.route-row.route-pending {
+    border-left: 3px solid var(--pico-primary);
+    padding-left: calc(0.85rem - 3px);
+}
+
+/* Saved chip fades after 3s. Class added on htmx:afterRequest. */
+.route-msg.fade-out {
+    opacity: 0;
+    transition: opacity 0.6s ease-out;
+}
+
+/* Narrow-viewport stacking: header above body, no two-column grid. */
+@media (max-width: 720px) {
+    .route-card {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+
+<script>
+(function() {
+    /*
+     * Routes-table behaviour:
+     *   - Auto-save: each route-row form fires its own POST after a
+     *     500ms debounced change event. Fade chip in #route-msg-{slug}.
+     *   - Pause toggle: when on, removes hx-trigger from per-row forms
+     *     (auto-save off) and shows the Save-All / Reset controls. The
+     *     bulk Save button serialises the table state and POSTs to
+     *     /accounts/{id}/routes/save-all in one transaction.
+     *   - Reset reverts every row to its server-rendered state.
+     *   - Pending dot appears on a row while it has unsaved changes.
+     *
+     * Re-runs after HTMX swaps too — initial load via the dropdown's
+     * hx-target also includes this script.
+     */
+    var tbl = document.getElementById('routes-table');
+    if (!tbl) return;
+    var accountId = tbl.getAttribute('data-account-id');
+    var pauseToggle = document.getElementById('autosave-pause-toggle');
+    var manualControls = document.getElementById('routes-manual-controls');
+    var saveAllBtn = document.getElementById('routes-save-all-btn');
+    var resetBtn = document.getElementById('routes-reset-btn');
+    var bulkMsg = document.getElementById('routes-bulk-msg');
+
+    function snapshot(form) {
+        // Snapshot of a form's current values so Reset can restore.
+        var data = {
+            actions: [], move_folder: '',
+            add_label_internal: [], add_label_provider: '',
+        };
+        form.querySelectorAll('input[name="actions"]').forEach(function(cb) {
+            cb.dataset.initial = cb.checked ? '1' : '0';
+            if (cb.checked) data.actions.push(cb.value);
+        });
+        var sel = document.getElementById('move-sel-' + form.dataset.slug);
+        if (sel) {
+            sel.dataset.initial = sel.value;
+            data.move_folder = sel.value;
+        }
+        // #129 tail — snapshot the add-label picker so Reset reverts
+        // both the internal chip selection AND the provider free-text.
+        form.querySelectorAll('input[name="add_label_internal"]').forEach(function(cb) {
+            cb.dataset.initial = cb.checked ? '1' : '0';
+            if (cb.checked) data.add_label_internal.push(cb.value);
+        });
+        var prov = form.querySelector('input[name="add_label_provider"]');
+        if (prov) {
+            prov.dataset.initial = prov.value || '';
+            data.add_label_provider = prov.value || '';
+        }
+        form.dataset.snapshot = JSON.stringify(data);
+    }
+    document.querySelectorAll('.route-row-form').forEach(snapshot);
+
+    function setPaused(on) {
+        document.querySelectorAll('.route-row-form').forEach(function(f) {
+            if (on) {
+                f.setAttribute('data-paused', '1');
+                f.removeAttribute('hx-trigger');
+            } else {
+                f.removeAttribute('data-paused');
+                // Card-layout root is <article> (was <tr> pre-card-refactor).
+                // setPaused(false) runs on EVERY page load (line ~469
+                // restores the pref) — leaving `closest tr` here meant
+                // HTMX rebound the trigger to a non-existent ancestor on
+                // every render, so save NEVER fired even on a fresh load.
+                // Operator caught 2026-05-13.
+                f.setAttribute('hx-trigger', 'change from:closest article delay:500ms');
+            }
+        });
+        if (manualControls) {
+            manualControls.style.display = on ? 'flex' : 'none';
+        }
+        // Re-process so HTMX picks up attribute changes.
+        if (window.htmx) {
+            document.querySelectorAll('.route-row-form').forEach(function(f) {
+                window.htmx.process(f);
+            });
+        }
+        try { localStorage.setItem('routesAutosavePaused', on ? '1' : '0'); } catch (e) {}
+    }
+    if (pauseToggle) {
+        // Restore pref on load.
+        try {
+            var pref = localStorage.getItem('routesAutosavePaused');
+            if (pref === '1' && !pauseToggle.checked) pauseToggle.checked = true;
+        } catch (e) {}
+        setPaused(pauseToggle.checked);
+        pauseToggle.addEventListener('change', function() {
+            setPaused(this.checked);
+        });
+    }
+
+    // Pending-dot indicator: any input change inside a row marks
+    // it pending until the htmx-after-request fires for that form.
+    document.addEventListener('change', function(ev) {
+        var row = ev.target.closest && ev.target.closest('.route-row');
+        if (!row) return;
+        if (!tbl.contains(row)) return;
+        row.classList.add('route-pending');
+    });
+
+    // Saved-chip fade: 3s after a successful auto-save, fade the chip.
+    document.addEventListener('htmx:afterRequest', function(ev) {
+        var form = ev.target;
+        if (!form || !form.classList || !form.classList.contains('route-row-form')) return;
+        var slug = form.dataset.slug;
+        var row = document.getElementById('route-row-' + slug);
+        if (row) row.classList.remove('route-pending');
+        // Re-snapshot on success so Reset baseline matches latest saved state.
+        if (ev.detail && ev.detail.successful) snapshot(form);
+        var chip = document.getElementById('route-msg-' + slug);
+        if (chip) {
+            chip.classList.remove('fade-out');
+            setTimeout(function() { chip.classList.add('fade-out'); }, 3000);
+        }
+    });
+
+    // Save All — serialise every row's state into one POST.
+    if (saveAllBtn) {
+        saveAllBtn.addEventListener('click', function() {
+            var rows = [];
+            document.querySelectorAll('.route-row-form').forEach(function(f) {
+                var slug = f.dataset.slug;
+                var actions = [];
+                f.querySelectorAll('input[name="actions"]:checked').forEach(function(cb) {
+                    actions.push(cb.value);
+                });
+                var sel = document.getElementById('move-sel-' + slug);
+                // #163 follow-up — per-row provider-label multi-
+                // select. Grab every selected <option> from this
+                // row's label-picker (the multiselect.js widget
+                // mirrors selection back onto the underlying
+                // <select multiple>, so this read is source-of-truth
+                // regardless of widget state).
+                var labelTargets = [];
+                var labelPick = document.getElementById('label-pick-' + slug);
+                if (labelPick) {
+                    var pickSelect = labelPick.querySelector(
+                        'select[name="label_targets"]'
+                    );
+                    if (pickSelect) {
+                        Array.prototype.forEach.call(
+                            pickSelect.selectedOptions || [],
+                            function(opt) { labelTargets.push(opt.value); }
+                        );
+                    }
+                }
+                // #129 tail — serialise per-row add-label config so
+                // the Save-All path carries the same picker state the
+                // per-row auto-save POST would. Internal slugs are
+                // chip checkboxes; provider names are a single text
+                // input. Both fields live inside the row's form,
+                // scoped via the row element.
+                var row = document.getElementById('route-row-' + slug);
+                var addLabelInternal = [];
+                if (row) {
+                    row.querySelectorAll(
+                        'input[name="add_label_internal"]:checked'
+                    ).forEach(function(cb) { addLabelInternal.push(cb.value); });
+                }
+                var addLabelProvider = '';
+                if (row) {
+                    var prov = row.querySelector('input[name="add_label_provider"]');
+                    if (prov) addLabelProvider = prov.value || '';
+                }
+                rows.push({
+                    category: slug,
+                    actions: actions,
+                    move_folder: sel ? sel.value : '',
+                    label_targets: labelTargets,
+                    add_label_internal: addLabelInternal,
+                    add_label_provider: addLabelProvider,
+                });
+            });
+            // Build a form-encoded payload: rows[i].category, rows[i].actions[],
+            // rows[i].move_folder, rows[i].label_targets[],
+            // rows[i].add_label_internal[], rows[i].add_label_provider.
+            // Server reads keys with `getlist()` / `get()` keyed by index.
+            var fd = new FormData();
+            rows.forEach(function(r, i) {
+                fd.append('row_' + i + '_category', r.category);
+                r.actions.forEach(function(a) {
+                    fd.append('row_' + i + '_actions', a);
+                });
+                fd.append('row_' + i + '_move_folder', r.move_folder);
+                r.label_targets.forEach(function(lt) {
+                    fd.append('row_' + i + '_label_targets', lt);
+                });
+                r.add_label_internal.forEach(function(s) {
+                    fd.append('row_' + i + '_add_label_internal', s);
+                });
+                fd.append(
+                    'row_' + i + '_add_label_provider', r.add_label_provider,
+                );
+            });
+            fd.append('row_count', String(rows.length));
+
+            // Get CSRF token from cookie shim if loaded.
+            var headers = {};
+            if (window.fetch) {
+                fetch('/accounts/' + accountId + '/routes/save-all', {
+                    method: 'POST',
+                    body: fd,
+                    credentials: 'same-origin',
+                    headers: headers
+                }).then(function(resp) {
+                    return resp.text().then(function(t) { return { ok: resp.ok, text: t }; });
+                }).then(function(r) {
+                    if (bulkMsg) bulkMsg.innerHTML = r.text;
+                    if (r.ok) {
+                        // Clear pending markers + re-snapshot.
+                        document.querySelectorAll('.route-row.route-pending')
+                                .forEach(function(row) { row.classList.remove('route-pending'); });
+                        document.querySelectorAll('.route-row-form').forEach(snapshot);
+                    }
+                });
+            }
+        });
+    }
+
+    // Reset — revert every row to its last-saved snapshot.
+    if (resetBtn) {
+        resetBtn.addEventListener('click', function() {
+            document.querySelectorAll('.route-row-form').forEach(function(f) {
+                if (!f.dataset.snapshot) return;
+                var snap;
+                try { snap = JSON.parse(f.dataset.snapshot); } catch (e) { return; }
+                f.querySelectorAll('input[name="actions"]').forEach(function(cb) {
+                    cb.checked = snap.actions.indexOf(cb.value) !== -1;
+                });
+                var sel = document.getElementById('move-sel-' + f.dataset.slug);
+                if (sel) {
+                    sel.value = snap.move_folder || '';
+                    sel.disabled = snap.actions.indexOf('move') === -1;
+                }
+                // #129 tail — restore add-label picker state. Defensive
+                // ``|| []`` / ``|| ''`` for snapshots written before
+                // the add-label fields existed (pre-#129 saved state).
+                var snapInternal = snap.add_label_internal || [];
+                f.querySelectorAll('input[name="add_label_internal"]').forEach(function(cb) {
+                    cb.checked = snapInternal.indexOf(cb.value) !== -1;
+                });
+                var prov = f.querySelector('input[name="add_label_provider"]');
+                if (prov) prov.value = snap.add_label_provider || '';
+                var row = document.getElementById('route-row-' + f.dataset.slug);
+                if (row) row.classList.remove('route-pending');
+            });
+            if (bulkMsg) bulkMsg.innerHTML = '<small style="color:var(--pico-muted-color);">Reset.</small>';
+        });
+    }
+
+    // Folder-create propagation: when the create form posts back, a
+    // small JSON blob is encoded in a data attribute on the response.
+    // Easier approach: listen for the htmx:afterRequest on the create
+    // form, parse the path from the form action to decide "this was a
+    // create," and check for a data-new-folder attribute on the
+    // returned chip — then APPEND a new <option> to every move-folder
+    // dropdown plus the parent select.
+    document.addEventListener('htmx:afterRequest', function(ev) {
+        var form = ev.target;
+        if (!form || !form.matches || !form.matches('form[hx-post*="/folders/create"]')) return;
+        if (!ev.detail || !ev.detail.successful) return;
+        // Server emits the new folder name as a hidden span#et-new-folder
+        // in the response so clients can pick it up regardless of chip
+        // copy. Fall back to no-op when absent.
+        var marker = document.getElementById('et-new-folder');
+        if (!marker) return;
+        var name = marker.getAttribute('data-name') || '';
+        if (!name) return;
+        // Append to each move-folder select (skip duplicates).
+        document.querySelectorAll('.move-folder-select').forEach(function(sel) {
+            var exists = false;
+            for (var i = 0; i < sel.options.length; i++) {
+                if (sel.options[i].value === name) { exists = true; break; }
+            }
+            if (!exists) {
+                var opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                sel.appendChild(opt);
+            }
+        });
+        // Also append to the "Parent" select inside the create form so
+        // the operator can immediately use this folder as a parent.
+        var parentSel = form.querySelector('select[name="parent"]');
+        if (parentSel) {
+            var pExists = false;
+            for (var j = 0; j < parentSel.options.length; j++) {
+                if (parentSel.options[j].value === name) { pExists = true; break; }
+            }
+            if (!pExists) {
+                var pOpt = document.createElement('option');
+                pOpt.value = name;
+                pOpt.textContent = name;
+                parentSel.appendChild(pOpt);
+            }
+        }
+    });
+})();
+</script>

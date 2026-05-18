@@ -1,0 +1,46 @@
+{# Shared tab-strip nav for the /config admin cluster.
+
+   Five tabs collapse the five legacy admin pages (/config,
+   /admin/integrations, /admin/tls, /admin/backup, /admin/dev-keys +
+   /admin/compliance-security) onto a single /config?tab=<slug> page.
+   The legacy URLs 303-redirect to the matching tab so bookmarks +
+   tests + log links keep resolving.
+
+   Pass active="X" from the parent page where X is one of:
+   general | integrations | tls | backup | security
+
+   Active tab gets bold styling. No JS; no ARIA tablist. Pattern
+   matches _settings_tabs.html / _rules_tabs.html / triage/_tabs.html
+   (single top-nav entry, tab strip on the cluster's pages).
+
+   Top-nav Admin submenu carries: Users / Config / Stats / Backup /
+   Logs. Config drops you on /config (General); Backup is also a
+   tab inside /config (per operator: keep the top-nav slot AND the
+   inline tab — Backup-the-tab is /config?tab=backup).
+#}
+<nav style="margin:0 0 1.5rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
+    <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
+        {% set _config_tabs = [
+            ("general",      "/config",                    "General"),
+            ("integrations", "/config?tab=integrations",   "Integrations"),
+            ("ai_backends",  "/config?tab=ai_backends",    "AI Backends"),
+            ("tls",          "/config?tab=tls",            "TLS"),
+            ("backup",       "/config?tab=backup",         "Backup"),
+            ("security",     "/config?tab=security",       "Security"),
+        ] %}
+        {% for slug, href, label in _config_tabs %}
+        {% set is_active = (active == slug) %}
+        <li style="margin:0;">
+            <a href="{{ href }}"
+               style="display:inline-block;padding:0.5rem 1rem;
+                      text-decoration:none;
+                      border:1px solid transparent;
+                      border-bottom:none;
+                      border-radius:6px 6px 0 0;
+                      {% if is_active %}background:var(--pico-card-background-color, #1f2530);border-color:var(--pico-muted-border-color);color:var(--pico-color);font-weight:600;margin-bottom:-1px;{% else %}color:var(--pico-muted-color);{% endif %}">
+                {{ label }}
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+</nav>

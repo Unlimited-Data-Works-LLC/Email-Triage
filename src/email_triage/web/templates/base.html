@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Email Triage{% endblock %}</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png">
+    {# #94 — PWA install plumbing. Manifest + theme-color trip the
+       Chrome/Edge/Brave install heuristic; apple-touch-icon is the
+       iOS Safari Add-to-Home-Screen icon. The matching service
+       worker is registered from the bottom-of-body script block.
+       Manifest is unauthenticated (StaticFiles route) so the install
+       prompt also surfaces on the login page. #}
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <meta name="theme-color" content="#13171f">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+    {# #58 — Pico CSS vendored locally (was a jsdelivr CDN load that
+       leaked Referer + IP + UA on every admin page hit). Bundled
+       into the container image via Containerfile's static copy. #}
+    <link rel="stylesheet" href="/static/pico.min.css">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="/static/htmx.min.js"></script>
+    {# CSRF shim — auto-attach X-CSRF-Token header on every
+       state-changing fetch(). Loaded for authenticated callers only;
+       skipped on the login page so unauthenticated /api/csrf-token
+       fetches don't 401-loop. #}
+    {% if user %}<script src="/static/csrf.js"></script>{% endif %}
+    {# #124 — PWA install-prompt surface. The script wires up any
+       host page that includes a [data-pwa-install] block (currently
+       the dashboard install card). Logged-in only because the install
+       card lives on /dashboard; loading on /login would be inert. #}
+    {% if user %}<script src="/static/pwa-install.js" defer></script>{% endif %}
+    {# #163 follow-up — multi-select dropdown widget. Enhances any
+       <select multiple data-multiselect> into a chip-pill control
+       with a filterable popup (closed-state chips + click-to-open
+       dropdown + checkmark on selected + Esc / arrow / Enter
+       keyboard). Falls back to native <select multiple> when JS
+       fails — server-side form submission shape unchanged. Logged-
+       in only since the only consumer right now is /rules. #}
+    {% if user %}<script src="/static/multiselect.js" defer></script>{% endif %}
+    {# Apply saved nav + theme preferences before paint to avoid flicker.
+       Nav pref is only honored when the user is logged in — otherwise
+       the login page would render an empty sidebar shell (the {% if user %}
+       block below skips emitting the toggle + nav items). Theme pref is
+       global. #}
+    <script>
+      (function() {
+        try {
+          {% if user %}
+          var pref = localStorage.getItem('navPref') === 'sidebar' ? 'sidebar' : 'top';
+          document.documentElement.setAttribute('data-nav-init', pref);
+          {% endif %}
+          var theme = localStorage.getItem('themePref');
+          if (theme !== 'dark' && theme !== 'light') {
+            theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      /* Inline early so the pref class applies before the stylesheet loads.
+         Removed by JS on DOM ready so runtime toggles don't re-trigger it. */
+      html[data-nav-init="sidebar"] body { visibility: hidden; }
+    </style>
+</head>
+<body class="nav-top">
+    {% if user %}
+    {# Subtle site-wide texture behind logged-in pages (7% opacity).
+       Login page has its own heavier background at 12% — skip it there. #}
+    <div aria-hidden="true" style="
+        position:fixed;inset:0;z-index:-1;pointer-events:none;
+        background:url('/static/hero-login.png') center/cover no-repeat;
+        opacity:0.07;
+    "></div>
+    {% endif %}
+    <nav class="container-fluid" id="primary-nav">
+        {# Upper-left cluster: toggle button + brand. Toggle stays here in
+           both modes — most predictable spot. #}
+        <ul class="nav-brand-cluster">
+            {% if user %}
+            <li><button type="button" id="nav-toggle" class="outline" aria-label="Toggle sidebar"></button></li>
+            {% endif %}
+            <li><button type="button" id="theme-toggle" class="outline" aria-label="Toggle dark mode" title="Toggle dark mode"></button></li>
+            <li class="brand">
+                <img src="/static/logo-icon.png" alt="" width="28" height="28"
+                     style="vertical-align:middle;border-radius:4px;margin-right:0.4rem;">
+                <strong>Email Triage</strong>
+                {% if hipaa_mode %}
+                <span title="HIPAA mode is active" aria-label="HIPAA mode"
+                      style="margin-left:0.35rem;font-size:0.85rem;opacity:0.7;">🔒</span>
+                {% endif %}
+            </li>
+        </ul>
+        {% if user %}
+
+        {# ── Top-nav layout ──
+           Each user-facing cluster (Triage, Rules, My Settings) is
+           a single link to the cluster's landing page; cross-page
+           navigation inside the cluster lives on the page itself
+           (Pico tab strip — see _rules_tabs.html, _settings_tabs.html,
+           triage/_tabs.html, accounts/_edit_tabs.html). One pattern,
+           no submenu duplication.
+
+           Admin keeps its dropdown — heterogeneous tools. /config
+           is now a five-tab cluster (General / Integrations / TLS /
+           Backup / Security) that absorbed the standalone
+           /admin/integrations, /admin/tls, /admin/backup,
+           /admin/dev-keys, /admin/compliance-security pages. Those
+           URLs 303-redirect into the matching /config tab so
+           bookmarks + tests + log links keep resolving. The Admin
+           submenu carries Users / Config / Stats / Backup / Logs;
+           Backup is also a top-level entry because operators need
+           it under stress (disaster recovery), not buried inside
+           a config-tab strip. #}
+        {# #158 (2026-05-11) — Labels + Rules moved into the
+           "My Settings" cluster tab strip (see _settings_tabs.html);
+           top-nav surface keeps mail-touching surfaces only. The
+           /labels + /rules URLs still resolve directly; the tab
+           strip is the discovery affordance now. #}
+        <ul class="nav-items nav-grouped">
+            <li><a href="/dashboard">Dashboard</a></li>
+            <li><a href="/triage">Triage</a></li>
+            <li><a href="/routes">Routes</a></li>
+            <li><a href="/accounts">My Settings</a></li>
+            <li><a href="/help/tasks">Help</a></li>
+
+            {% if user.role == "admin" %}
+            <li class="has-menu">
+                <button type="button" class="menu-trigger" onclick="this.blur()">Admin <span class="caret">▾</span></button>
+                <ul class="submenu">
+                    <li><a href="/users">Users</a></li>
+                    <li><a href="/config">Config</a></li>
+                    <li><a href="/config/ai-backends">AI Backends</a></li>
+                    <li><a href="/admin/stats">Stats</a></li>
+                    <li><a href="/compliance">Compliance</a></li>
+                    <li><a href="/config?tab=backup">Backup</a></li>
+                    <li><a href="/admin/retry-queue">Retry queue</a></li>
+                    <li><a href="/logs">Logs</a></li>
+                </ul>
+            </li>
+            {% endif %}
+        </ul>
+
+        {# ── Sidebar layout — same cluster slots as top-nav. ── #}
+        <ul class="nav-items nav-flat">
+            <li><a href="/dashboard">Dashboard</a></li>
+            <li><a href="/triage">Triage</a></li>
+            <li><a href="/routes">Routes</a></li>
+            <li><a href="/accounts">My Settings</a></li>
+            <li><a href="/help/tasks">Help</a></li>
+            {% if user.role == "admin" %}<li><a href="/users">Users</a></li>{% endif %}
+            {% if user.role == "admin" %}<li><a href="/config">Config</a></li>{% endif %}
+            {% if user.role == "admin" %}<li><a href="/admin/stats">Stats</a></li>{% endif %}
+            {% if user.role == "admin" %}<li><a href="/compliance">Compliance</a></li>{% endif %}
+            {% if user.role == "admin" %}<li><a href="/config?tab=backup">Backup</a></li>{% endif %}
+            {% if user.role == "admin" %}<li><a href="/logs">Logs</a></li>{% endif %}
+        </ul>
+
+        <ul class="nav-user">
+            <li><small>{{ user.email }} ({{ user.role }})</small></li>
+            <li><a href="/logout" role="button" class="outline secondary">Logout</a></li>
+        </ul>
+        {% endif %}
+    </nav>
+
+    <main class="container">
+        {# #171-D — universal admin BAA-expiry banner. The partial
+           self-guards on ``baa_banner is defined and baa_banner and
+           baa_banner.severity != "silent"``, so non-admin renders +
+           clean-state admin renders emit zero markup. The ctx is
+           auto-injected for admin users by ``_shared._render`` (see
+           :func:`_inject_baa_banner_ctx`); user-facing pages get
+           ``None`` and the partial short-circuits to no output, so
+           the admin-path link inside the partial never bleeds into
+           non-admin copy (per feedback_no_admin_path_in_user_copy). #}
+        {% include "admin/_baa_expiry_banner.html" %}
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="container">
+        <small>Email Triage &mdash; Portable AI-powered email classification</small>
+    </footer>
+
+    {# Singleton tooltip surface for the help-tooltip engine in the
+       script block below. One element shared across every
+       [data-tooltip] trigger on the page; the engine populates +
+       positions it on hover/focus and hides it on out/Escape. Lives
+       at body scope so it escapes every ancestor's overflow +
+       transform contexts that pseudo-element tooltips kept
+       getting clipped by. #}
+    <div id="et-tooltip" role="tooltip" hidden></div>
+
+    <script>
+      (function() {
+        var btn = document.getElementById('nav-toggle');
+        // Only apply the saved nav pref when the toggle is in the DOM
+        // (i.e. user is logged in). Otherwise the login page would
+        // inherit a sidebar shell with nothing in it.
+        if (btn) {
+          var pref = document.documentElement.getAttribute('data-nav-init') === 'sidebar' ? 'sidebar' : 'top';
+          document.body.classList.remove('nav-top', 'nav-sidebar');
+          document.body.classList.add('nav-' + pref);
+        } else {
+          // Logged out: force top nav posture so any stale class set by
+          // a server template can't leave an empty sidebar visible.
+          document.body.classList.remove('nav-sidebar');
+          document.body.classList.add('nav-top');
+        }
+        // Remove pre-paint hint so runtime toggles don't re-trigger it.
+        document.documentElement.removeAttribute('data-nav-init');
+
+        if (btn) {
+          btn.addEventListener('click', function() {
+            var current = document.body.classList.contains('nav-sidebar') ? 'sidebar' : 'top';
+            var next = current === 'top' ? 'sidebar' : 'top';
+            try { localStorage.setItem('navPref', next); } catch (e) {}
+            document.body.classList.remove('nav-' + current);
+            document.body.classList.add('nav-' + next);
+          });
+        }
+
+        var themeBtn = document.getElementById('theme-toggle');
+        if (themeBtn) {
+          themeBtn.addEventListener('click', function() {
+            var current = document.documentElement.getAttribute('data-theme') || 'light';
+            var next = current === 'dark' ? 'light' : 'dark';
+            try { localStorage.setItem('themePref', next); } catch (e) {}
+            document.documentElement.setAttribute('data-theme', next);
+          });
+        }
+
+        // Global keyboard shortcuts: g-then-X jumps to a page.
+        // Skipped when the user is typing (inputs/contenteditable) so
+        // an email address with "gl" or "ga" doesn't hijack.
+        var navShortcuts = {
+          'l': '/logs',
+          'a': '/accounts',
+          's': '/admin/stats',
+          'u': '/users',
+          'c': '/config',
+        };
+        var pending = false;
+        var pendingTimer = null;
+        function isTyping(ev) {
+          var t = ev.target;
+          if (!t) return false;
+          var tag = (t.tagName || '').toLowerCase();
+          return tag === 'input' || tag === 'textarea' || tag === 'select' ||
+                 t.isContentEditable;
+        }
+        document.addEventListener('keydown', function(ev) {
+          if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+          if (isTyping(ev)) return;
+          if (pending) {
+            var dest = navShortcuts[ev.key];
+            pending = false;
+            if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+            if (dest) {
+              ev.preventDefault();
+              window.location.href = dest;
+            }
+            return;
+          }
+          if (ev.key === 'g') {
+            pending = true;
+            pendingTimer = setTimeout(function() { pending = false; }, 1200);
+          }
+        });
+      })();
+
+      /*
+       * Help-tooltip engine (#64 — full replacement).
+       *
+       * Replaces Pico's CSS-pseudo-element data-tooltip rendering.
+       * Pseudo-element tooltips have three failure modes no CSS
+       * hack solves:
+       *   1. Ancestor overflow:hidden / auto / scroll clips the
+       *      pseudo at THAT ancestor's edge regardless of
+       *      viewport math (fieldset legends, modal bodies,
+       *      articles with overflow set).
+       *   2. Ancestor transform / will-change / contain / filter
+       *      creates a new containing block, breaking absolute
+       *      positioning relative to the viewport.
+       *   3. Stacking context: pseudo-elements share the
+       *      trigger's stacking, so siblings can land on top
+       *      depending on z-index ordering.
+       *
+       * Engine renders into a single shared `#et-tooltip` div at
+       * body scope, positioned via fixed coordinates. position:
+       * fixed is viewport-relative so ancestor overflow + transform
+       * don't apply; z-index 99999 wins every stacking battle.
+       *
+       * Behaviour:
+       *  - mouseenter / focusin on [data-tooltip] -> populate +
+       *    position + show
+       *  - mouseleave / focusout / Escape / scroll -> hide
+       *  - touch: click toggles (no hover on touch devices)
+       *  - HTMX swaps: event delegation on document means newly
+       *    inserted triggers are wired automatically; no
+       *    rebind hook needed.
+       *  - Position: prefer below trigger, flip above if no room.
+       *    Horizontally clamp into viewport with a 0.5rem gutter.
+       *
+       * Single closure shared with the keyboard-shortcut handler
+       * above; this IIFE runs after DOM ready (the surrounding
+       * <body>-end script position guarantees that).
+       */
+      (function() {
+        var GUTTER = 8;          // viewport-edge buffer in px
+        var OFFSET = 6;          // gap between trigger + tooltip
+        var tip = document.getElementById('et-tooltip');
+        if (!tip) return;        // engine inert without the singleton
+
+        var current = null;      // active trigger element
+
+        function show(trigger) {
+          var text = trigger.getAttribute('data-tooltip') || '';
+          if (!text) return;
+          current = trigger;
+          tip.textContent = text;
+          tip.hidden = false;
+          // Reset previous position so width measures naturally.
+          tip.style.top = '0px';
+          tip.style.left = '0px';
+          position(trigger);
+        }
+
+        function hide() {
+          if (!current) return;
+          current = null;
+          tip.hidden = true;
+        }
+
+        function position(trigger) {
+          var r = trigger.getBoundingClientRect();
+          var vw = window.innerWidth || document.documentElement.clientWidth;
+          var vh = window.innerHeight || document.documentElement.clientHeight;
+          // Measure tooltip after content is set.
+          var tw = tip.offsetWidth;
+          var th = tip.offsetHeight;
+
+          // Vertical: prefer below trigger; flip above if no room.
+          var top = r.bottom + OFFSET;
+          if (top + th > vh - GUTTER && r.top - th - OFFSET >= GUTTER) {
+            top = r.top - th - OFFSET;
+          }
+          if (top < GUTTER) top = GUTTER;
+          if (top + th > vh - GUTTER) top = vh - th - GUTTER;
+
+          // Horizontal: align with trigger's center, clamp to viewport.
+          var left = r.left + r.width / 2 - tw / 2;
+          if (left < GUTTER) left = GUTTER;
+          if (left + tw > vw - GUTTER) left = vw - tw - GUTTER;
+
+          tip.style.top = top + 'px';
+          tip.style.left = left + 'px';
+        }
+
+        // Event delegation: bind once on document. Catches both
+        // existing triggers and any HTMX-swapped DOM that lands later.
+        document.addEventListener('mouseover', function(ev) {
+          var t = ev.target;
+          if (!t || typeof t.closest !== 'function') return;
+          var trigger = t.closest('[data-tooltip]');
+          if (trigger && trigger !== current) show(trigger);
+        });
+        document.addEventListener('mouseout', function(ev) {
+          var t = ev.target;
+          if (!t || typeof t.closest !== 'function') return;
+          var trigger = t.closest('[data-tooltip]');
+          if (!trigger) return;
+          // mouseout fires when moving from trigger to a child —
+          // ignore those; only hide when relatedTarget is outside.
+          var to = ev.relatedTarget;
+          if (to && trigger.contains(to)) return;
+          hide();
+        });
+        document.addEventListener('focusin', function(ev) {
+          var t = ev.target;
+          if (!t || typeof t.closest !== 'function') return;
+          var trigger = t.closest('[data-tooltip]');
+          if (trigger) show(trigger);
+        });
+        document.addEventListener('focusout', function(ev) {
+          var t = ev.target;
+          if (!t || typeof t.closest !== 'function') return;
+          var trigger = t.closest('[data-tooltip]');
+          if (trigger) hide();
+        });
+        document.addEventListener('keydown', function(ev) {
+          if (ev.key === 'Escape' && current) hide();
+        });
+        // Touch: click toggles (no hover on touch). The mouseover
+        // handler already fires on touch devices that emulate it,
+        // so this is a fallback for pure-touch flows.
+        document.addEventListener('click', function(ev) {
+          var t = ev.target;
+          if (!t || typeof t.closest !== 'function') return;
+          var trigger = t.closest('[data-tooltip]');
+          if (!trigger) {
+            if (current) hide();
+            return;
+          }
+          if (current === trigger) {
+            hide();
+          } else {
+            show(trigger);
+          }
+        });
+        // Scroll / resize: hide active tooltip + let next hover
+        // recompute position. Cheap; avoids stale positions.
+        window.addEventListener('scroll', hide, true);
+        window.addEventListener('resize', hide);
+      })();
+
+      /*
+       * #94 — Service worker registration.
+       *
+       * Registers /sw.js at root scope so the PWA install heuristic
+       * triggers the browser's "Install" prompt. Wrapped in a
+       * feature-detect so older browsers (or browsers with SW
+       * turned off by site policy) silently skip registration
+       * instead of throwing. Failures are intentionally silent —
+       * registration is best-effort install plumbing, not a
+       * critical-path dependency.
+       */
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .catch(function () { /* silent: install prompt is opt-in */ });
+        });
+      }
+    </script>
+</body>
+</html>

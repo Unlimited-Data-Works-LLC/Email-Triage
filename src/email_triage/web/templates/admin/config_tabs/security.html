@@ -1,0 +1,240 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (security / compliance operator). Not end users.
+   TECH-SKILL:  high — reads HIPAA citations, BAA mechanics, session
+                policy, CSRF posture, audit-chain integrity. Plus
+                developer keypair management (SSH ed25519 pubkeys,
+                fingerprint hygiene, TTL).
+   COPY RULES:  protocol citations + LLM/backend terms are intentional
+                here (admin operators expect to read the spec citations
+                and the engine terms). See feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+
+{# ── Compliance & Security card grid (was /admin/compliance-security) ──
+   Six related controls grouped here. HIPAA mode + session policy +
+   brute-force protection + CSRF posture + classifier BAA gate +
+   audit-chain integrity all surface in one place so an auditor
+   walking the install doesn't have to context-switch across two or
+   three pages. #}
+<h3>Compliance &amp; Security</h3>
+<p>
+    Six related controls grouped here. HIPAA mode + session policy
+    + brute-force protection + CSRF posture + classifier BAA gate +
+    audit-chain integrity all surface in one place so an auditor
+    walking the install doesn't have to context-switch across two
+    or three pages.
+</p>
+
+<div class="grid">
+    <article style="padding:1rem;">
+        <header><strong>🏥 HIPAA mode</strong></header>
+        <p>
+            System-wide flag + per-account stacking. Per-account
+            HIPAA flag uses sticky inheritance from system flag at
+            account creation time. PHI scrubbing in logs +
+            notifications + escalation alerts is mode-aware.
+        </p>
+        <a href="/admin/security#hipaa" role="button" class="outline">HIPAA mode</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>⏱️ Session policy</strong></header>
+        <p>
+            <code>session_ttl_secs</code> for non-HIPAA installs
+            (default 24h), <code>hipaa_session_ttl_secs</code> as
+            the HIPAA-mode cap (default 15 min, hard ceiling 30
+            min). §164.312(a)(2)(iii) Automatic Logoff.
+        </p>
+        <a href="/admin/security#session" role="button" class="outline">Session TTL</a>
+    </article>
+</div>
+
+<div class="grid" style="margin-top:1rem;">
+    <article style="padding:1rem;">
+        <header><strong>🛡️ CSRF protection</strong></header>
+        <p>
+            Soft-launch counter + 24h/7d rejects rate + top-N
+            offending paths. Operator flips <code>csrf_enforce</code>
+            once 24h count is steady at zero. Operator-defined
+            exempt prefixes for custom integrations.
+        </p>
+        <a href="/admin/security#csrf" role="button" class="outline">CSRF + exempt prefixes</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>🔐 Login rate limits</strong></header>
+        <p>
+            Per-email + per-IP rolling-window failure counters
+            guarding OTP / WebAuthn / dev-keypair / passkey login
+            surfaces. Source of truth: <code>auth_events</code>
+            table. <code>max=0</code> per scope is the kill switch.
+            §164.312(a)(2)(i) Unique User Identification.
+        </p>
+        <a href="/admin/security#login-rate" role="button" class="outline">Login limits</a>
+    </article>
+</div>
+
+<div class="grid" style="margin-top:1rem;">
+    <article style="padding:1rem;">
+        <header><strong>📜 Classifier BAA gate</strong></header>
+        <p>
+            HIPAA-flagged accounts refuse to classify when the
+            configured LLM endpoint is non-local and no Business
+            Associate Agreement acknowledgment is on file.
+            Per-(backend, host) ack persisted via the privacy chip
+            on <code>/config</code>.
+        </p>
+        <a href="/compliance#baa" role="button" class="outline">BAA + boundary events</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>🔗 Audit chain integrity</strong></header>
+        <p>
+            Every <code>log_entries</code> row carries a hash of
+            its predecessor. Tampering breaks the chain. The
+            compliance page surfaces the current chain status and
+            recent boundary events; an external verifier CLI is
+            available via <code>verify_log_chain()</code>.
+        </p>
+        <a href="/compliance#audit-chain" role="button" class="outline">Audit chain</a>
+    </article>
+</div>
+
+{# ── Developer keypairs (was /admin/dev-keys) ──────────────────────── #}
+<h3 style="margin-top:2.5rem;">Developer keypairs</h3>
+<p>
+    Per-key TTL + per-email allowlist credential surface for
+    operator login. Operator generates a keypair locally
+    (<code>ssh-keygen -t ed25519</code>), pastes the <em>public</em>
+    key here. The matching private key never leaves the operator's
+    machine.
+</p>
+<p>
+    <strong>Hardware-key-wins rule:</strong> if a user has registered
+    any active hardware key, dev-keypair logins for that email are
+    denied with 403. OTP login remains available regardless. Users
+    register their own hardware keys at
+    <a href="/profile/hardware-keys">/profile/hardware-keys</a>
+    (each user manages their own; admins do NOT register on behalf
+    of users -- the private side never leaves the user's device).
+</p>
+
+{% if visible_owners %}
+<form method="get" action="/config" style="margin:0 0 1rem 0;">
+    {# Preserve the tab anchor on owner-filter submit so the page
+       comes back to the Security tab, not General. #}
+    <input type="hidden" name="tab" value="security">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Filter by owner:
+        <select name="owner_filter" onchange="this.form.submit()" style="margin:0;width:auto;">
+            <option value="all" {% if owner_filter == "all" %}selected{% endif %}>All users</option>
+            {% for o in visible_owners %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                {{ o.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+{% endif %}
+
+<aside style="border-left:3px solid var(--pico-primary);padding:0.5rem 1rem;margin:1rem 0;background:var(--pico-form-element-background-color);">
+    <strong>🔑 Personal hardware keys.</strong>
+    Want to register your own YubiKey / passkey for stronger login?
+    <a href="/profile/hardware-keys" role="button" class="outline secondary"
+       style="padding:0.15rem 0.6rem;font-size:0.85rem;margin-left:0.5rem;">
+        Open /profile/hardware-keys
+    </a>
+</aside>
+
+<details open>
+    <summary role="button" class="outline">Add a new key</summary>
+    <form method="post" action="/admin/dev-keys/add">
+        {{ csrf_input(request) }}
+        <label>
+            Name (display only)
+            <input type="text" name="name" placeholder="your laptop" required>
+        </label>
+        <label>
+            Public key (paste <code>~/.ssh/id_ed25519.pub</code>)
+            <textarea name="public_key" rows="4" required
+                      placeholder="ssh-ed25519 AAAAC3... user@host"></textarea>
+        </label>
+        <div class="grid">
+            <label>
+                TTL
+                <select name="ttl">
+                    <option value="1d">1 day</option>
+                    <option value="1w" selected>1 week</option>
+                    <option value="2w">2 weeks</option>
+                </select>
+            </label>
+            <label>
+                Email allowlist (comma-separated)
+                <input type="text" name="email_allowlist" placeholder="you@example.com,alt@example.com" required>
+            </label>
+        </div>
+        <button type="submit">Register key</button>
+    </form>
+</details>
+
+<section style="margin-top:1.5rem;">
+    <h4>Registered keys</h4>
+    {% if keys %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Fingerprint</th>
+                <th>Allowlist</th>
+                <th>Status</th>
+                <th>Expires</th>
+                <th>Last used</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for k in keys %}
+            <tr {% if not k.active %}style="opacity:0.55;"{% endif %}>
+                <td>{{ k.name }}</td>
+                <td><code style="font-size:0.78rem;">{{ k.fingerprint }}</code></td>
+                <td><small>{{ k.email_allowlist | join(", ") }}</small></td>
+                <td>
+                    {% if k.revoked_at %}
+                    <small style="color:var(--pico-del-color);">revoked {{ k.revoked_at[:10] }}</small>
+                    {% elif not k.active %}
+                    <small style="color:var(--pico-del-color);">expired</small>
+                    {% else %}
+                    <small style="color:var(--pico-ins-color);">active</small>
+                    {% endif %}
+                </td>
+                <td><small>{{ k.expires_at[:19] }}</small></td>
+                <td>
+                    <small>
+                        {% if k.last_used_at %}
+                        {{ k.last_used_at[:19] }}<br>
+                        as {{ k.last_used_email }}
+                        {% else %}
+                        &mdash;
+                        {% endif %}
+                    </small>
+                </td>
+                <td>
+                    {% if not k.revoked_at %}
+                    <form method="post" action="/admin/dev-keys/{{ k.id }}/revoke" style="margin:0;">
+                        {{ csrf_input(request) }}
+                        <button class="outline secondary"
+                                style="padding:0.1rem 0.5rem;font-size:0.85rem;color:var(--pico-del-color);">
+                            Revoke
+                        </button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>No dev keys registered yet.</em></p>
+    {% endif %}
+</section>

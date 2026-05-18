@@ -1,0 +1,178 @@
+{# ─── AUDIENCE ───
+   END-USER (mid-flow setup wizard). TECH-SKILL: low.
+   COPY RULES:
+     - "Sign in" is the verb, not "authenticate" / "OAuth flow".
+     - "OAuth" is OK once: the user is mid-flow and needs to know
+       what they're approving in the external browser. Frame it as
+       "Sign in to Google to grant email-triage permission to read
+       your inbox."
+     - For IMAP: keep "host", "port", "username", "password" (these
+       match the labels their mail provider's setup docs use).
+     - Tooltips with concrete example values on every field.
+     - No "ask your administrator" copy.
+     - Polling status uses plain language: "Waiting for sign-in..."
+       not "Polling auth-status endpoint."
+   #}
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Add Account — Step 2 of 5: Sign in{% endblock %}
+{% block content %}
+<h2>Add an email account: {{ acct.name }}</h2>
+
+{% set current_step = 2 %}
+{% include "account_wizard/_progress.html" %}
+
+<p>
+    Now sign in so email-triage can read your inbox. Each provider
+    has a different way of granting that permission — we've picked
+    the right one for the service you chose on the previous step.
+</p>
+
+{% if error %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin-bottom:1rem;">
+    <small style="color:var(--pico-del-color);">{{ error }}</small>
+</article>
+{% endif %}
+
+{% if acct.provider_type == "imap" %}
+<form method="post" action="/accounts/new/step2-imap">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="account_id" value="{{ acct.id }}">
+
+    <div class="grid">
+        <label>
+            Mail server (host){{ m.help("The hostname your mail provider gave you. Example: imap.gmail.com, outlook.office365.com, mail.fastmail.com. Look in your provider's 'IMAP settings' help page if you're not sure.") }}
+            <input type="text" name="host" required
+                   value="{{ acct.config.get('host', '') }}"
+                   placeholder="e.g. imap.example.com">
+        </label>
+        <label>
+            Port{{ m.help("The number your mail provider gave you. 993 is the standard secure port — leave it as-is unless your provider's docs say otherwise.") }}
+            <input type="number" name="port" min="1" max="65535"
+                   value="{{ acct.config.get('port', 993) }}">
+            <small>993 is the usual default.</small>
+        </label>
+    </div>
+    <div class="grid">
+        <label>
+            Username{{ m.help("Usually your full email address. Example: alex@example.com.") }}
+            <input type="text" name="username" required
+                   value="{{ acct.config.get('username', '') }}"
+                   placeholder="user@example.com">
+        </label>
+        <label>
+            Password{{ m.help("Your mailbox password. For Gmail or Outlook over IMAP this often needs to be an 'app password' — your provider's help page will say so.") }}
+            <input type="password" name="password" required
+                   placeholder="••••••••">
+            <small>Stored encrypted; never sent anywhere except your mail server.</small>
+        </label>
+    </div>
+
+    <label style="margin-top:0.5rem;">
+        <input type="checkbox" name="use_ssl" value="1"
+               {% if acct.config.get('use_ssl', True) %}checked{% endif %}>
+        Use a secure connection (recommended){{ m.help("Almost always 'yes' — keeps your password and mail traffic encrypted in transit. Only uncheck if your provider explicitly says they don't support it.") }}
+    </label>
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Next: Real-time mail watch →</button>
+        <a href="/accounts/new?step=1&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+
+{% elif acct.provider_type == "gmail_api" %}
+<form method="post" action="/accounts/{{ acct.id }}/gmail-api/auth/start">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="oauth_flow" value="web">
+    <input type="hidden" name="wizard_next_step" value="3">
+    <input type="hidden" name="csrf_token" value="">
+
+    <p>
+        Click the button below to send your browser to Google's
+        sign-in page. After you approve, Google sends you back here
+        and we'll move on to the next step automatically.
+    </p>
+
+    <label>
+        <input type="checkbox" name="calendar_opted_in" value="1">
+        Also let email-triage see my calendar (optional){{ m.help("Read-only access to your Google Calendar. Lets the meeting-intercept feature notice when an email is about a meeting on your calendar. Skip if unsure — you can turn it on later.") }}
+    </label>
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Sign in with Google →</button>
+        <a href="/accounts/new?step=1&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+
+{# Polling panel — once the operator clicks "Sign in with Google",
+   this strip checks /accounts/{id}/auth-status every 3 seconds and
+   auto-advances when the status flips to authenticated. The HTMX
+   trigger fires immediately so it picks up an already-completed
+   sign-in (e.g. operator returned to this tab after approving). #}
+<article id="auth-poll-panel"
+         hx-get="/accounts/{{ acct.id }}/auth-status?wizard=1"
+         hx-trigger="load, every 3s"
+         hx-swap="outerHTML"
+         style="margin-top:1.25rem;padding:0.75rem 1rem;border-left:3px solid var(--pico-muted-border-color);">
+    <small style="color:var(--pico-muted-color);">
+        Waiting for sign-in… After you approve in Google, this page
+        moves on to the next step on its own.
+    </small>
+</article>
+
+{% elif acct.provider_type == "office365" %}
+<form method="post" action="/accounts/new/step2-o365">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="account_id" value="{{ acct.id }}">
+
+    <p>
+        Sign in to Microsoft. We need your app's Client ID + Tenant
+        ID (your IT admin gives you these when they register the
+        app, or you can register one yourself in the Azure portal).
+        After this step we'll show the device-code prompt to finish
+        sign-in.
+    </p>
+
+    {# #126 — shared field block: same numbered "How do I find these
+       values?" recipe + tooltips + Probe button as the edit-page
+       Integrations tab. Wizard mode skips the outer fieldset chrome
+       (the wizard form already provides its own visual frame), the
+       intro paragraph above replaces the partial's intro, and the
+       Calendar checkbox + Probe button stay off (Calendar is handled
+       in step 4; Probe is meaningless before sign-in completes). #}
+    {% with show_legend=false, show_intro=false,
+            show_calendar=false, show_probe=false %}
+        {% include "accounts/_o365_fields.html" %}
+    {% endwith %}
+
+    <div style="display:flex;gap:0.5rem;margin-top:1rem;">
+        <button type="submit">Next: Real-time mail watch →</button>
+        <a href="/accounts/new?step=1&account_id={{ acct.id }}"
+           role="button" class="secondary outline"
+           style="text-decoration:none;line-height:2;">← Back</a>
+    </div>
+</form>
+
+{# Polling panel for O365 device-code completion — same shape as
+   the Gmail panel above. Once the operator finishes the device-code
+   handshake elsewhere, this auto-advances to step 3. #}
+<article id="auth-poll-panel"
+         hx-get="/accounts/{{ acct.id }}/auth-status?wizard=1"
+         hx-trigger="load, every 3s"
+         hx-swap="outerHTML"
+         style="margin-top:1.25rem;padding:0.75rem 1rem;border-left:3px solid var(--pico-muted-border-color);">
+    <small style="color:var(--pico-muted-color);">
+        Waiting for sign-in… After you finish the device-code prompt
+        in Microsoft, this page moves on to the next step on its own.
+    </small>
+</article>
+
+{% else %}
+<p>Unknown email service. <a href="/accounts/new?step=1">Restart wizard</a>.</p>
+{% endif %}
+
+{% endblock %}

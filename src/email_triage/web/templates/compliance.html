@@ -1,0 +1,364 @@
+{% extends "base.html" %}
+{% block title %}Compliance - Email Triage{% endblock %}
+{% block content %}
+<h2>Compliance</h2>
+<p>
+    Spot-check HIPAA state across the install. System-wide flag is at the
+    top; each account lists its individual flag, effective state, and lock
+    status. Every flag change is recorded as a boundary event so audit
+    history survives flips in either direction.
+</p>
+
+{# ── Summary ── #}
+<article style="padding:0.75rem 1rem;">
+    <div class="grid" style="grid-template-columns:auto 1fr;gap:0.75rem;align-items:center;">
+        <div>
+            {% if system_hipaa %}
+            <strong style="font-size:1.1rem;">🔒 System HIPAA: ON</strong>
+            {% else %}
+            <strong style="font-size:1.1rem;color:var(--pico-muted-color);">🔓 System HIPAA: off</strong>
+            {% endif %}
+        </div>
+        <div style="font-size:0.9rem;color:var(--pico-muted-color);">
+            {{ stats.total }} account{{ 's' if stats.total != 1 else '' }} configured &middot;
+            {{ stats.per_account_flagged }} individually flagged &middot;
+            <strong>{{ stats.effective_on }}</strong> effective HIPAA
+            {% if system_hipaa %}(system override){% endif %}
+        </div>
+    </div>
+    {% if system_last_event %}
+    <small style="color:var(--pico-muted-color);display:block;margin-top:0.5rem;">
+        Last system boundary event:
+        <code>{{ system_last_event.ts }}</code>
+        &middot; <strong>{{ system_last_event.direction }}</strong>
+        {% if system_last_event.actor_email %}
+            by {{ system_last_event.actor_email }}
+        {% else %}
+            ({{ system_last_event.reason or 'no reason' }})
+        {% endif %}
+    </small>
+    {% endif %}
+</article>
+
+{# ── Per-account breakdown ── #}
+<h3 style="margin-top:1.5rem;">Per-account breakdown</h3>
+{% if not accounts %}
+<p style="color:var(--pico-muted-color);">No accounts configured.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Owner</th>
+            <th>Provider</th>
+            <th>Per-account flag</th>
+            <th>Effective</th>
+            <th>Locked</th>
+            <th>Last event</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for acct in accounts %}
+        <tr>
+            <td><strong>{{ acct.name }}</strong></td>
+            <td title="{{ acct.owner_email }}">
+                {{ acct.owner_name if acct.owner_name else acct.owner_email }}
+            </td>
+            <td><code>{{ acct.provider_type }}</code></td>
+            <td style="text-align:center;">
+                {% if acct.hipaa %}
+                <span title="Per-account HIPAA flag is on">✓</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td style="text-align:center;">
+                {% if acct.effective_hipaa %}
+                <span title="Effective HIPAA">🔒</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td style="text-align:center;" title="{% if acct.locked %}Cannot be unflagged while system HIPAA is on{% endif %}">
+                {% if acct.locked %}
+                <span>🔐</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">—</span>
+                {% endif %}
+            </td>
+            <td style="font-size:0.85rem;color:var(--pico-muted-color);">
+                {% if acct.last_event %}
+                {{ acct.last_event.ts.split('T')[0] }} &middot; {{ acct.last_event.direction }}
+                {% else %}
+                —
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ── Recent boundary events ── #}
+<h3 id="baa" style="margin-top:1.5rem;">Recent boundary events</h3>
+{% if not recent_events %}
+<p style="color:var(--pico-muted-color);">No boundary events recorded yet.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Timestamp (UTC)</th>
+            <th>Scope</th>
+            <th>Direction</th>
+            <th>Actor</th>
+            <th>Reason</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for e in recent_events %}
+        <tr>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ e.ts }}</td>
+            <td><code>{{ e.scope }}</code></td>
+            <td>
+                {% if e.direction == 'on' %}🔒{% else %}🔓{% endif %}
+                {{ e.direction }}
+            </td>
+            <td>{{ e.actor_email or '—' }}</td>
+            <td style="color:var(--pico-muted-color);font-size:0.9rem;">{{ e.reason or '—' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ── HIPAA access events (§164.312(b)) ── #}
+<h3 style="margin-top:1.5rem;">Recent access events (HIPAA accounts)</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Every manual triage or category-discovery run against a HIPAA-flagged
+    account is recorded here — the compensating audit trail because the
+    normal triage_runs history doesn't store per-message results for those
+    accounts.
+</p>
+{% if not access_events %}
+<p style="color:var(--pico-muted-color);">No access events recorded yet.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Timestamp (UTC)</th>
+            <th>Actor</th>
+            <th>Account</th>
+            <th>Operation</th>
+            <th>Outcome</th>
+            <th>Detail</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for e in access_events %}
+        <tr>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ e.ts }}</td>
+            <td>{{ e.actor_email or '—' }}</td>
+            <td>{{ e.account_name or ('#' ~ e.account_id) }}</td>
+            <td><code>{{ e.operation }}</code></td>
+            <td>
+                {% if e.outcome == 'ok' %}
+                <span style="color:var(--pico-ins-color);">&#10003; ok</span>
+                {% elif e.outcome == 'error' %}
+                <span style="color:var(--pico-del-color);">&#10007; error</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);">{{ e.outcome }}</span>
+                {% endif %}
+            </td>
+            <td style="color:var(--pico-muted-color);font-size:0.9rem;">{{ e.detail or '—' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ── Generic access-audit log (#41 — every PHI-touch authenticated request) ── #}
+<h3 style="margin-top:1.5rem;">Recent PHI-route accesses (generic)</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Every authenticated request hitting a route that handles mail content
+    (classify, triage, digest, folder, message-fetch, OpenClaw API) is
+    recorded here. Sibling of the HIPAA-account access table above —
+    captures the broader §164.312(b) "access to PHI" audit, including
+    routes that touch non-HIPAA accounts. Route + method + status only;
+    no PHI is persisted.
+</p>
+{% if not generic_access_events %}
+<p style="color:var(--pico-muted-color);">No generic access events recorded yet.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Timestamp (UTC)</th>
+            <th>Actor</th>
+            <th>Method</th>
+            <th>Route</th>
+            <th>Account</th>
+            <th>Message id</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for e in generic_access_events %}
+        <tr>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.8rem;">{{ e.ts }}</td>
+            <td>{{ e.actor_email or '—' }}</td>
+            <td><code style="font-size:0.8rem;">{{ e.method }}</code></td>
+            <td><code style="font-size:0.8rem;">{{ e.route }}</code></td>
+            <td>{{ e.account_name or ('#' ~ e.account_id) if e.account_id else '—' }}</td>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.8rem;color:var(--pico-muted-color);">{{ e.message_id or '—' }}</td>
+            <td>
+                {% if e.outcome == 'ok' %}
+                <span style="color:var(--pico-ins-color);">{{ e.status_code }}</span>
+                {% elif e.outcome == 'denied' %}
+                <span style="color:var(--pico-color-amber-500);">{{ e.status_code }}</span>
+                {% else %}
+                <span style="color:var(--pico-del-color);">{{ e.status_code }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ── Log tamper-evidence — hash chain on log_entries ── #}
+<h3 id="audit-chain" style="margin-top:1.5rem;">Log integrity (hash chain)</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Every log_entries row carries a SHA-256 hash chained off its
+    predecessor. Any post-hoc modification to a row breaks every
+    subsequent row's recomputed hash, surfacing the first tamper
+    point. Verification is a read-only walk; runs on every load of
+    this page.
+</p>
+{% if log_chain.first_break_id %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ Chain break detected.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        <li>First break at log_entries.id = <code>{{ log_chain.first_break_id }}</code></li>
+        <li>Reason: {{ log_chain.first_break_reason }}</li>
+        <li>Verified rows before break: {{ log_chain.valid_through_id or '—' }}</li>
+        <li>Total chain-aware rows: {{ log_chain.chain_length }}</li>
+        <li>Pre-chain (legacy) rows: {{ log_chain.prechain_count }}</li>
+    </ul>
+</article>
+{% else %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>✓ Chain intact.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        <li>Chain-aware rows verified: {{ log_chain.rows_checked }}</li>
+        <li>Highest valid id: {{ log_chain.valid_through_id or '—' }}</li>
+        {% if log_chain.prechain_count %}
+        <li>Pre-chain (legacy) rows skipped: {{ log_chain.prechain_count }}</li>
+        {% endif %}
+    </ul>
+</article>
+{% endif %}
+
+{# ── API key lifecycle (audit trail for create/revoke) ── #}
+<h3 style="margin-top:1.5rem;">API key lifecycle</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Every API key created or revoked, across the web UI, JSON API, and
+    CLI. The raw token is never recorded — <code>key id</code> is the
+    correlation handle. Rows survive even after the underlying key is
+    deleted, so revocations remain auditable.
+</p>
+{% if not api_key_events %}
+<p style="color:var(--pico-muted-color);">No API key events recorded yet.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Timestamp (UTC)</th>
+            <th>Event</th>
+            <th>Key ID</th>
+            <th>Name</th>
+            <th>Target user</th>
+            <th>Actor</th>
+            <th>Source</th>
+            <th>Expires</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for e in api_key_events %}
+        <tr>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ e.ts }}</td>
+            <td>
+                {% if e.event == 'api_key_created' %}
+                <span style="color:var(--pico-ins-color);">&#10003; created</span>
+                {% elif e.event == 'api_key_revoked' %}
+                <span style="color:var(--pico-del-color);">&#10007; revoked</span>
+                {% else %}
+                <code>{{ e.event }}</code>
+                {% endif %}
+            </td>
+            <td><code>#{{ e.key_id }}</code></td>
+            <td>{{ e.name or '—' }}</td>
+            <td>{{ e.target_email or ('user#' ~ e.target_user_id if e.target_user_id else '—') }}</td>
+            <td>{{ e.actor_email or ('user#' ~ e.actor_user_id if e.actor_user_id else '—') }}</td>
+            <td><code>{{ e.source }}</code></td>
+            <td style="font-size:0.85rem;color:var(--pico-muted-color);">{{ e.expires_at or 'never' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{# ── Discover scans (universal audit, all accounts) ── #}
+<h3 style="margin-top:1.5rem;">Discover scans</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Every Discover Categories scan lands a row here — regardless of HIPAA
+    flag. Discover exposes sender + subject of every scanned message, so
+    "who scanned which mailbox + scope" is the audit question. Metadata
+    only; no message content is stored.
+</p>
+{% if not discover_runs %}
+<p style="color:var(--pico-muted-color);">No discover runs recorded yet.</p>
+{% else %}
+<table>
+    <thead>
+        <tr>
+            <th>Timestamp (UTC)</th>
+            <th>Actor</th>
+            <th>Account</th>
+            <th>Scope (folders)</th>
+            <th>Scanned</th>
+            <th>Errors</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for r in discover_runs %}
+        <tr>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ r.created_at }}</td>
+            <td>{{ r.actor_email or '—' }}</td>
+            <td>{{ r.account_name or ('#' ~ r.account_id) }}</td>
+            <td style="font-size:0.85rem;color:var(--pico-muted-color);">
+                {% if r.folders_list %}
+                    {{ r.folders_list | join(', ') }}
+                {% else %}
+                    —
+                {% endif %}
+            </td>
+            <td style="text-align:right;">{{ r.scanned_count }}</td>
+            <td style="text-align:right;">
+                {% if r.errors_count %}
+                <span style="color:var(--pico-del-color);">{{ r.errors_count }}</span>
+                {% else %}
+                0
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<p style="margin-top:1.5rem;font-size:0.85rem;color:var(--pico-muted-color);">
+    To flip a per-account flag, edit the account on the
+    <a href="/accounts">Accounts</a> page. To flip the system flag, use
+    <a href="/config">Config</a>. Every flip is automatically recorded here.
+</p>
+{% endblock %}

@@ -1,0 +1,24 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account integration setup)
+   TECH-SKILL:  medium — the operator already picked Office 365;
+                they know what an OAuth sign-in is at a high level,
+                but not the underlying token-exchange machinery.
+                Some operators will need their IT admin's help with
+                the Azure / Entra app-registration step (this is a
+                Microsoft-side requirement, not an email-triage
+                limitation).
+   COPY RULES:  no vendor-internal jargon; concrete examples over
+                abstract definitions. No admin-only paths
+                (/config, /admin/*). Disabled controls speak via
+                their disabled state — don't say "Ask your
+                administrator" for email-triage settings; we DO
+                point operators at their Microsoft 365 IT admin
+                because that's a separate Microsoft-side task.
+                "AI" not "language model" / "LLM".
+                Spell out "Out-of-Office" — never "OOO".
+   THIN WRAPPER:Used to inline a full copy of the field group; now
+                delegates to the shared accounts/_o365_fields.html
+                partial so the wizard step2-o365 form and the
+                edit-page Integrations tab can't drift apart. #126.
+   ─────────────────────────────────────────────────────────── #}
+{% include "accounts/_o365_fields.html" %}

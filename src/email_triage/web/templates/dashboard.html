@@ -1,0 +1,409 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate / admin doing
+                operator-side work for an owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model".
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Dashboard - Email Triage{% endblock %}
+{% block content %}
+
+{# ── LLM backend banner (#149): unreachable / scheduled maintenance ──
+     Alert banner, not a dashboard tile — keeps full-width <article>
+     with the warning border treatment rather than becoming an
+     .et-card. #}
+{% if llm_banner %}
+<section>
+    {% set bk = llm_banner.backend|capitalize %}
+    {% if llm_banner.maintenance_window %}
+    {# Calm copy — operator scheduled this. Yellow, not red. #}
+    <article style="background: var(--pico-card-sectionning-background-color, #fff8e1);
+                    border-left: 3px solid #d4a016; padding: 0.75rem 1rem;">
+        <strong>&#128338; {{ bk }} in scheduled maintenance{{ m.help("Your AI classifier is in a scheduled maintenance window — set up by your administrator. New mail keeps arriving and is held in a queue; once the window ends (for example at 01:30 UTC tonight) the queue drains automatically. Nothing to do here.") }}</strong>
+        <p style="margin:0.3rem 0 0 0;">
+            Back at <strong>{{ llm_banner.maintenance_window.ends_at_local_hm }}</strong>.
+            {% if llm_banner.queued %}
+            {{ llm_banner.queued }} message{% if llm_banner.queued != 1 %}s{% endif %} waiting in the retry queue.
+            {% endif %}
+        </p>
+    </article>
+    {% else %}
+    {# Alert copy — unscheduled outage. #}
+    <article style="background: var(--pico-card-sectionning-background-color, #fff4e5);
+                    border-left: 3px solid #d17b00; padding: 0.75rem 1rem;">
+        <strong>&#9888; {{ bk }} unreachable{{ m.help("The local AI used to classify your mail isn't responding right now. New mail is held in a retry queue and will get classified automatically once the AI is back online. For example: if 12 messages came in during the outage, they'll all process within a minute or two of recovery.") }}</strong>
+        <p style="margin:0.3rem 0 0 0;">
+            Retrying in about <strong>{{ llm_banner.remaining_minutes }} minute{% if llm_banner.remaining_minutes != 1 %}s{% endif %}</strong>.
+            {% if llm_banner.queued %}
+            {{ llm_banner.queued }} message{% if llm_banner.queued != 1 %}s{% endif %} queued for retry.
+            {% endif %}
+        </p>
+    </article>
+    {% endif %}
+</section>
+{% endif %}
+
+{# ── Watcher banner: any account's watcher stuck >15 min ─────────────
+     Alert banner — same reasoning as the LLM banner above. #}
+{% if watcher_banner %}
+<section>
+    <article style="background: var(--pico-card-sectionning-background-color, #fff4e5);
+                    border-left: 3px solid #d17b00; padding: 0.75rem 1rem;">
+        <strong>&#9888; Watcher attention needed</strong>
+        <ul style="margin:0.3rem 0 0 1rem;">
+            {% for w in watcher_banner.stuck %}
+            <li>
+                <a href="/accounts">{{ w.account_name or ('Account #' ~ w.account_id) }}</a>
+                {% if w.owner %}<small style="color:var(--pico-muted-color);">({{ w.owner }})</small>{% endif %}
+                is <code>{{ w.status }}</code>.
+            </li>
+            {% endfor %}
+        </ul>
+    </article>
+</section>
+{% endif %}
+
+{# ── Admin-only: health summary + admin quick-nav ────────────────────
+     Operator caught (2026-05-12): each of the 4 chips as its own
+     full-width 2-col card produced too much whitespace + the
+     left-column label bled out of the box on narrow widths.
+     Compressed shape:
+       * Health card — Gateway + Last triage run + Errors (24h)
+         folded into a single .et-card-stack with three one-line
+         rows (status glyph + label + value).
+       * Ingestion stays its own .et-card-stack (medium size,
+         title above body) because its body carries the per-
+         provider breakdown + per-folder ticks + alert detail.
+     Admin quick-nav trimmed to the three actually-used entries
+     (Accounts, Config, System Log); the rest were never clicked
+     according to operator. #}
+{% if is_admin and health_chips %}
+<section class="admin-health-strip">
+    <div class="et-cards">
+        <article class="et-card et-card-stack">
+            <header class="et-card-header">
+                <strong>Health</strong>
+                <small class="et-card-desc">
+                    Gateway uptime, recent triage activity, and the
+                    24-hour error count.
+                </small>
+            </header>
+            <div class="et-card-body" style="gap:0.35rem;">
+                <div>
+                    <strong>{% if health_chips.gateway.ok %}&#10003;{% else %}&#9888;{% endif %}
+                    Gateway:</strong>
+                    {{ health_chips.gateway.label }}{{ m.help("Process uptime + DB connectivity. Green when /health returns 200; warns when /health returns 503 (DB ping failed, supervised task quarantined, or watchers stale > 15 min). Reflects the same signal an external monitor sees.") }}
+                </div>
+                <div>
+                    <strong>{% if health_chips.last_run.ok %}&#10003;{% else %}&#8505;{% endif %}
+                    Last triage run:</strong>
+                    {{ health_chips.last_run.label }}{{ m.help("Timestamp of the most recent triage_runs row. Stale (> 24h) flips to info-icon when at least one account is actively ingesting -- could mean watchers are firing but the classifier is dropping events. Silent when no account ingests at all (expected behaviour, not degraded).") }}
+                </div>
+                <div>
+                    <strong>{% if health_chips.errors.ok %}&#10003;{% else %}&#9888;{% endif %}
+                    Errors (24h):</strong>
+                    {{ health_chips.errors.label }}{{ m.help("Count of ERROR-level rows in log_entries over the last 24h. Green at 0, warns when non-zero. Click 'System Log' below to filter to ERROR rows for the last 24h and see the actual exceptions.") }}
+                </div>
+                <div style="margin-top:0.35rem;font-size:0.85em;">
+                    <a href="/admin/stats">Detailed health &rarr;</a>
+                </div>
+            </div>
+        </article>
+
+        <article class="et-card et-card-stack">
+            <header class="et-card-header">
+                <strong>Ingestion{{ m.help("Per-account real-time-mail coverage. Counts accounts where push (IMAP IDLE / Gmail Pub/Sub / Office365 Graph) OR poll is healthy. 'uncovered' means that account's push-and-poll loop is broken; new mail won't classify until the operator fixes it. Per-provider breakdown below the count.") }}</strong>
+            </header>
+            <div class="et-card-body">
+                <strong>{% if health_chips.watchers.ok %}&#10003;{% else %}&#9888;{% endif %}
+                {% set provs = health_chips.watchers.providers or {} %}
+                {% set total_accts = (provs.values() | sum(attribute='total')) %}
+                {% set total_covered = (total_accts - (provs.values() | sum(attribute='uncovered'))) %}
+                {{ total_covered }}/{{ total_accts }} accounts covered</strong>
+
+                {# Per-provider breakdown — only shown when that provider has
+                   at least one account. Uses primary-mode counts (push +
+                   poll + uncovered = total). Mode mix detail (push+poll)
+                   surfaced as a parenthetical when present. #}
+                {% set provider_labels = {
+                    'imap':      'IMAP',
+                    'gmail_api': 'Gmail',
+                    'office365': 'Office 365',
+                } %}
+                {% for key, label in provider_labels.items() %}
+                    {% set b = provs.get(key) %}
+                    {% if b and b.total %}
+                    <small style="color:var(--pico-muted-color);">
+                        {{ label }}: {{ b.total }} acct{% if b.total != 1 %}s{% endif %} —
+                        {% if b.push %}{{ b.push }} push{% endif %}
+                        {% if b.push and b.poll %}, {% endif %}
+                        {% if b.poll %}{{ b.poll }} poll{% endif %}
+                        {% if b.push_plus_poll %} ({{ b.push_plus_poll }} both){% endif %}
+                        {% if b.uncovered %}<span style="color:var(--pico-del-color);">, {{ b.uncovered }} uncovered ⚠</span>{% endif %}
+                    </small>
+                    {% endif %}
+                {% endfor %}
+
+                {# Process-level: per-folder IDLE sockets, poll-loop ticks. #}
+                {% if health_chips.watchers.mailboxes and health_chips.watchers.mailboxes.total %}
+                <small style="color:var(--pico-muted-color);">
+                    IMAP folders: {{ health_chips.watchers.mailboxes.connected }}/{{ health_chips.watchers.mailboxes.total }} watching
+                </small>
+                {% endif %}
+                {% if health_chips.watchers.poll and health_chips.watchers.poll.registered %}
+                <small style="color:var(--pico-muted-color);">
+                    Poll loop: {{ health_chips.watchers.poll.fresh }}/{{ health_chips.watchers.poll.registered }} fresh
+                </small>
+                {% endif %}
+
+                {# Per-account alert detail — only when something actually
+                   needs operator attention. #}
+                {% if health_chips.watchers.alerts %}
+                <small style="color:var(--pico-del-color);">
+                    {% for a in health_chips.watchers.alerts %}
+                    {{ a.account_name or ('#' ~ a.account_id) }}{% if a.owner %} ({{ a.owner }}){% endif %}: {{ a.alert | replace('_', ' ') }}{% if not loop.last %}; {% endif %}
+                    {% endfor %}
+                </small>
+                {% endif %}
+            </div>
+        </article>
+    </div>
+
+    <nav class="admin-quicknav" aria-label="Admin navigation">
+        {# Trimmed 2026-05-13 to the three entries operator actually
+           uses. Stats / Users / TLS / Dev keys / Compliance &
+           Security are still reachable via the top-nav Admin
+           submenu — just not surfaced on the dashboard. #}
+        <a href="/accounts" role="button" class="outline">Accounts</a>
+        <a href="/config" role="button" class="outline">Config</a>
+        <a href="/logs" role="button" class="outline">System Log</a>
+    </nav>
+</section>
+{% endif %}
+
+{# ── Greeting ─────────────────────────────────────────────────────── #}
+<section>
+    <h2 style="margin-bottom:0.2rem;">Welcome back, {{ user.name }}</h2>
+    <p style="color: var(--pico-muted-color); margin-top:0;">
+        Email Triage classifies your inbox with a local AI, routes messages
+        into folders, and drafts replies you approve before they send.
+        {% if quiet_hours %}
+        <span class="quiet-chip" style="display:inline-block;padding:0.1rem 0.5rem;
+              border-radius:999px;background:var(--pico-code-background-color);
+              font-size:0.85rem;margin-left:0.5rem;">
+            &#128564; Quiet until {{ quiet_hours.until_local }}
+        </span>
+        {% endif %}
+    </p>
+</section>
+
+{# ── Quick actions (above the fold) ───────────────────────────────── #}
+<section>
+    <div class="grid">
+        <a href="/triage" role="button" class="contrast">Triage Now</a>
+        <a href="/accounts" role="button" class="outline">My Accounts</a>
+    </div>
+</section>
+
+{# ── Install-as-app surface (#124) ────────────────────────────────
+   Hidden by default. /static/pwa-install.js reveals the relevant
+   sub-block based on the platform:
+     * Chrome / Edge / Brave on desktop + Android: button enables
+       once the browser fires `beforeinstallprompt`.
+     * iOS Safari: instruction line for Share → Add to Home Screen.
+     * Already installed: a confirmation note instead of a duplicate
+       prompt.
+   Choice (accepted / dismissed) persists in localStorage so the
+   card stays hidden on subsequent visits.
+
+   Uses .et-card-stack — the body has a full-width banner + action
+   button + alternate-platform instruction that doesn't fit a
+   left-label/right-value shape. JS hook is on the OUTER <section>
+   (data-pwa-install); the existing data-pwa-install-trigger /
+   data-pwa-install-ios / data-pwa-install-installed children are
+   preserved verbatim. #}
+<section data-pwa-install hidden class="pwa-install-card">
+    <article class="et-card et-card-stack">
+        <header class="et-card-header">
+            <strong>Install as an app for desktop and mobile</strong>{{ m.help("Install Email Triage as an app on this device. Example: on Chrome desktop, the app gets a Start Menu icon and opens in its own window without browser tabs. Same as installing any other website-as-app from your browser. Your data and login stay on this device — installing only adds the icon and the standalone window.") }}
+            <small class="et-card-desc">
+                Open Email Triage in its own window with a desktop or home-screen icon, no browser tabs.
+            </small>
+        </header>
+        <div class="et-card-body">
+            <button type="button" data-pwa-install-trigger
+                    class="contrast" hidden disabled
+                    style="margin:0;">
+                Install Email Triage
+            </button>
+            <div data-pwa-install-ios hidden>
+                <p style="margin:0;">
+                    <strong>On iPhone or iPad?</strong>
+                    Tap the Share button at the bottom of Safari, then choose
+                    <em>Add to Home Screen</em>. Email Triage will appear with its own
+                    icon and open without browser controls.
+                </p>
+                <button type="button" data-pwa-install-ios-dismiss
+                        class="outline secondary"
+                        style="margin-top:0.4rem;">
+                    Got it — hide this
+                </button>
+            </div>
+            <div data-pwa-install-installed hidden>
+                <p style="margin:0; color: var(--pico-muted-color);">
+                    You're already using the installed app. Nothing more to do here.
+                </p>
+            </div>
+        </div>
+    </article>
+</section>
+
+{# ── Getting-started checklist ─────────────────────────────────────
+     Each step renders as an .et-card-stack (title on top, action
+     button below) so the cards size to their content rather than
+     getting stretched to a Pico grid track. Auto-flowing cards
+     wrap nicely on narrow viewports thanks to the .et-cards flex
+     column wrapper (one card per row by default; if a future
+     reorder wants side-by-side, switch the wrapper to a grid).
+     The .checklist-card / .done / .optional class tokens are
+     preserved so the existing CSS (.checklist-card.done opacity)
+     still applies; the dismiss-step HTMX endpoint also keeps
+     working unchanged. #}
+{% if not getting_started.all_done or getting_started.steps|selectattr('done', 'equalto', false)|list %}
+<section>
+    <h3>Getting started</h3>
+    <div class="et-cards getting-started">
+        {% for step in getting_started.steps %}
+            {% if not step.dismissed %}
+            <article data-step-id="{{ step.id }}" class="et-card et-card-stack checklist-card
+                     {% if step.done %}done{% endif %}
+                     {% if step.optional %}optional{% endif %}">
+                <header class="et-card-header"
+                        style="flex-direction:row;justify-content:space-between;align-items:start;">
+                    <strong>
+                        {% if step.done %}&#10003;{% else %}&#9675;{% endif %}
+                        {{ step.title }}
+                    </strong>
+                    {% if not step.done %}
+                    <button type="button"
+                            class="dismiss-step"
+                            aria-label="Dismiss step"
+                            hx-post="/dashboard/dismiss-step"
+                            hx-vals='{"step_id": "{{ step.id }}"}'
+                            hx-target="closest article"
+                            hx-swap="outerHTML"
+                            style="border:0;background:transparent;color:var(--pico-muted-color);
+                                   cursor:pointer;font-size:1.1rem;line-height:1;padding:0 0.2rem;">
+                        &times;
+                    </button>
+                    {% endif %}
+                </header>
+                <div class="et-card-body">
+                    {% if not step.done %}
+                    <a href="{{ step.href }}" role="button" class="outline"
+                       style="width:100%;margin:0;">{{ step.button }}</a>
+                    {% else %}
+                    <small style="color:var(--pico-muted-color);">Done</small>
+                    {% endif %}
+                </div>
+            </article>
+            {% endif %}
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
+{# ── Recent activity (user-scoped) ────────────────────────────────
+     Full-width content (table or empty-state copy) — .et-card-stack
+     so the body spans the whole width and the table doesn't get
+     squeezed into the right-hand grid column. #}
+<section>
+    <article class="et-card et-card-stack">
+        <header class="et-card-header">
+            <h3 style="margin:0;">Recent activity</h3>
+            <small class="et-card-desc">Triage runs you can see, newest first.</small>
+        </header>
+        <div class="et-card-body">
+            {% if recent_runs %}
+            <table style="font-size:0.9rem;margin:0;">
+                <thead>
+                    <tr>
+                        <th>When</th>
+                        <th>Account</th>
+                        <th style="text-align:right;">Messages</th>
+                        <th style="text-align:right;">Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for run in recent_runs %}
+                    <tr>
+                        <td>
+                            <span class="local-datetime" data-utc="{{ run.created_at }}">{{ run.created_at[:16] }}</span>
+                        </td>
+                        <td>{{ run.account_name }}</td>
+                        <td style="text-align:right;">{{ run.total_messages }}</td>
+                        <td style="text-align:right;">{{ "%.1f"|format(run.elapsed_secs) }}s</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p style="color: var(--pico-muted-color);margin:0;">
+                No triage runs yet. Go to <a href="/triage">Run Triage</a> to process some emails.
+            </p>
+            {% endif %}
+        </div>
+    </article>
+</section>
+
+<script>
+// Convert UTC datetimes to local display.
+document.querySelectorAll('.local-datetime').forEach(function(el) {
+    var utc = el.getAttribute('data-utc');
+    if (!utc) return;
+    try {
+        var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
+        var d = new Date(hastz ? utc : utc + 'Z');
+        el.textContent = d.toLocaleString(undefined, {
+            month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit'
+        });
+        el.title = utc;
+    } catch(e) {}
+});
+</script>
+
+<style>
+.admin-health-strip { margin-bottom: 1rem; }
+
+/* Operator caught (2026-05-13): the two admin cards (Health +
+   Ingestion) stack vertically because the shared .et-cards class
+   is flex-direction: column. On wide viewports they should sit
+   side-by-side. Scope a row-wrap override to this strip only so
+   other .et-cards consumers (getting-started checklist, future
+   pages) keep their vertical stack. Each card claims at least
+   18rem so the row wraps to one column on narrower viewports. */
+.admin-health-strip .et-cards {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: stretch;
+}
+.admin-health-strip .et-cards > .et-card {
+    flex: 1 1 22rem;
+    min-width: 0;
+}
+
+.admin-quicknav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.4rem;
+}
+.admin-quicknav a[role="button"] {
+    margin: 0;
+}
+.getting-started .checklist-card.done { opacity: 0.6; }
+</style>
+{% endblock %}

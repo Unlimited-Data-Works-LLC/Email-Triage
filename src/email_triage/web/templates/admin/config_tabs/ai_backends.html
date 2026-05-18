@@ -1,0 +1,272 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). Configures the LLM
+                backends email-triage talks to.
+   TECH-SKILL:  medium-to-high — admin-only page; technical
+                vocabulary (Ollama, embedding model, fallback
+                chain) is fine here.
+   COPY RULES:  no end-user-page-style obfuscation. Use accurate
+                terms (Ollama, sentence-transformers, embedding
+                model). Examples on every field.
+   ─────────────────────────────────────────────────────────── #}
+
+<section style="margin:1rem 0;">
+    {% if save_msg %}
+    <p style="padding:0.5rem 0.75rem;border-left:3px solid var(--pico-ins-color);
+              background:var(--pico-card-background-color);">
+        <strong>{{ save_msg }}</strong> Settings live in
+        <code>/app/config/email-triage.yaml</code>; the container
+        loads them at boot. Restart the container to pick up the
+        changes.
+    </p>
+    {% endif %}
+    {% if save_error %}
+    <p style="padding:0.5rem 0.75rem;border-left:3px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+        <strong>Could not save:</strong> {{ save_error }}
+    </p>
+    {% endif %}
+
+    <h3>AI Backends</h3>
+    <p style="color:var(--pico-muted-color);">
+        Which LLM endpoints email-triage uses for classification +
+        embedding. All backends are local-only by policy — the
+        privacy gate rejects public-internet endpoints at startup.
+        Settings persist to the install's YAML and take effect on
+        the next container restart.
+    </p>
+
+    {# ── Live state ─────────────────────────────────────────────
+       Surface what's actually loaded right now so the operator can
+       tell the YAML changes haven't been picked up yet (or the
+       fallback is the one doing the work). #}
+    <article class="et-card" style="margin:1rem 0;">
+        <header class="et-card-header">
+            <strong>Currently running</strong>
+            <small class="et-card-desc">Live state at this moment.
+                Restart the container to load YAML edits.</small>
+        </header>
+        <div class="et-card-body">
+            <p style="margin:0.25rem 0;">
+                <strong>Embedding backend:</strong>
+                {% if live_embedding_backend_type %}
+                <code>{{ live_embedding_backend_type }}</code>
+                {% if live_embedding_model %}
+                · model <code>{{ live_embedding_model }}</code>
+                {% endif %}
+                {% else %}
+                <span style="color:var(--pico-muted-color);">none loaded
+                — auto-scan + recent-reply-examples retrieval are off
+                until one is configured + the container restarts.</span>
+                {% endif %}
+            </p>
+            <p style="margin:0.25rem 0;">
+                <strong>Classifier backend:</strong>
+                <code>{{ classifier_backend or "(unset)" }}</code>
+                · model <code>{{ classifier_model or "(unset)" }}</code>
+                · URL <code>{{ classifier_ollama_url or "(unset)" }}</code>
+            </p>
+        </div>
+    </article>
+
+    {# ── Embedding-bits install card (#180) ─────────────────────
+       Slots between "Currently running" + the metrics card so the
+       operator sees the install gate before any per-backend telemetry.
+       Self-polls via HTMX while a download / verify / install is in
+       flight (hx-trigger every 2s) so the progress bar updates without
+       a full page reload. Static states (not_installed / installed /
+       failed) don't poll. #}
+    {% if install_state %}
+    <div
+        {% if install_state.status in ("downloading", "verifying", "installing") %}
+        hx-get="/config/ai-backends/embedding-install-status"
+        hx-trigger="every 2s"
+        hx-swap="outerHTML"
+        {% endif %}
+    >
+        {% include "admin/config_tabs/_embedding_install_card.html" %}
+    </div>
+    {% endif %}
+
+    {# ── Live metrics ───────────────────────────────────────────
+       Per-backend operational counters. Resets on container
+       restart (same model as the classification-cache + CSRF-
+       reject counters elsewhere). Fallback chain shows TWO
+       inner blocks (primary + backup) plus the fire count;
+       single backend shows just one. #}
+    {% if live_embedding_metrics %}
+    {% set _m = live_embedding_metrics %}
+    <article class="et-card" style="margin:1rem 0;">
+        <header class="et-card-header">
+            <strong>Embedding metrics</strong>
+            <small class="et-card-desc">Process-local counters since
+                last restart. ``Avg latency`` is per-call wall time
+                including I/O.</small>
+        </header>
+        <div class="et-card-body">
+            {% if _m.backend_type == "fallback" %}
+            {# Composite: primary + backup + fire count. #}
+            <p style="margin:0.25rem 0;">
+                <strong>Fallback activations:</strong>
+                {{ _m.fallback_fires }}
+                <small style="color:var(--pico-muted-color);">— count of
+                    times the primary raised and the backup absorbed
+                    the call.</small>
+            </p>
+            <table class="op-metrics" style="width:100%;font-size:0.9em;">
+                <thead>
+                    <tr>
+                        <th style="text-align:left;">Slot</th>
+                        <th style="text-align:left;">Backend</th>
+                        <th style="text-align:left;">Model</th>
+                        <th style="text-align:right;">Calls</th>
+                        <th style="text-align:right;">Errors</th>
+                        <th style="text-align:right;">Avg ms</th>
+                        <th style="text-align:left;">Last error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for slot, sub in [("primary", _m.primary), ("backup", _m.backup)] %}
+                    <tr>
+                        <td><strong>{{ slot }}</strong></td>
+                        <td><code>{{ sub.backend_type }}</code></td>
+                        <td><code>{{ sub.model or "—" }}</code></td>
+                        <td style="text-align:right;">{{ sub.calls or 0 }}</td>
+                        <td style="text-align:right;">
+                            {% if sub.errors %}<strong style="color:var(--pico-del-color);">{{ sub.errors }}</strong>{% else %}0{% endif %}
+                        </td>
+                        <td style="text-align:right;">{{ sub.avg_latency_ms or 0 }}</td>
+                        <td>
+                            {% if sub.last_error %}
+                            <code style="font-size:0.85em;">{{ sub.last_error }}</code>
+                            <small style="color:var(--pico-muted-color);">{{ sub.last_error_at[:19] }}</small>
+                            {% else %}
+                            <small style="color:var(--pico-muted-color);">—</small>
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% if _m.primary.dimension %}
+            <p style="margin:0.25rem 0;font-size:0.85em;color:var(--pico-muted-color);">
+                Primary embedding dimension: {{ _m.primary.dimension }}
+            </p>
+            {% endif %}
+            {% else %}
+            {# Single-backend (no fallback chain). #}
+            <p style="margin:0.25rem 0;">
+                <strong>Backend:</strong> <code>{{ _m.backend_type }}</code>
+                {% if _m.model %}· model <code>{{ _m.model }}</code>{% endif %}
+                {% if _m.dimension %}· dim {{ _m.dimension }}{% endif %}
+            </p>
+            <p style="margin:0.25rem 0;">
+                <strong>Calls:</strong> {{ _m.calls or 0 }}
+                · <strong>Errors:</strong>
+                {% if _m.errors %}<span style="color:var(--pico-del-color);">{{ _m.errors }}</span>{% else %}0{% endif %}
+                · <strong>Avg latency:</strong> {{ _m.avg_latency_ms or 0 }} ms
+            </p>
+            {% if _m.last_error %}
+            <p style="margin:0.25rem 0;font-size:0.9em;color:var(--pico-del-color);">
+                Last error: <code>{{ _m.last_error }}</code>
+                <small>at {{ _m.last_error_at[:19] }}</small>
+            </p>
+            {% endif %}
+            {% endif %}
+            <p style="margin:0.5rem 0 0 0;font-size:0.8em;color:var(--pico-muted-color);">
+                Counter started: <code>{{ (_m.primary.started_at if _m.backend_type == "fallback" else _m.started_at)[:19] }}</code>
+                — resets on container restart.
+            </p>
+        </div>
+    </article>
+    {% endif %}
+
+    {# ── Embedding form ─────────────────────────────────────────── #}
+    <form method="post" action="/config/ai-backends/save"
+          style="margin:1rem 0;">
+        {{ csrf_input(request) }}
+        <article class="et-card">
+            <header class="et-card-header">
+                <strong>Embedding backend (primary)</strong>
+                <small class="et-card-desc">
+                    The model email-triage uses to convert sent
+                    mail into similarity vectors. Needed for
+                    auto-scan, captured-edit-pairs, and recent-
+                    reply-examples retrieval in draft prompts.
+                </small>
+            </header>
+            <div class="et-card-body">
+                <label>
+                    Backend type{{ m.help("sentence_transformers = runs inside the email-triage container on CPU; ~150ms per embed; zero GPU contention; install-side, no extra service. ollama = HTTP call to a local Ollama instance; uses whatever the model size dictates; competes with classifier on the same GPU/CPU if pointed at the same Ollama. Empty = disabled.") }}
+                    <select name="embedding_backend">
+                        <option value="" {% if not embedding_backend %}selected{% endif %}>— disabled —</option>
+                        <option value="sentence_transformers" {% if embedding_backend == "sentence_transformers" %}selected{% endif %}>sentence_transformers (in-process CPU)</option>
+                        <option value="ollama" {% if embedding_backend == "ollama" %}selected{% endif %}>ollama (HTTP to local Ollama)</option>
+                    </select>
+                </label>
+                <label>
+                    Model name{{ m.help("For sentence_transformers: a HuggingFace model id like all-MiniLM-L6-v2 (80 MB, fast) or nomic-ai/nomic-embed-text-v1.5 (260 MB, higher quality). For ollama: the model tag as it appears in `ollama list`, e.g. nomic-embed-text:latest. Container ships with all-MiniLM-L6-v2 pre-cached so it works on first boot without a download.") }}
+                    <input type="text" name="embedding_model_name"
+                           value="{{ embedding_model_name }}"
+                           placeholder="all-MiniLM-L6-v2">
+                </label>
+                <label>
+                    Ollama URL (only used when backend = ollama){{ m.help("HTTP URL of the local Ollama instance. Example: http://ollama.home.example.local:11434. Must resolve to a LAN host — the privacy gate rejects public-internet URLs at startup. For sentence_transformers this field is ignored.") }}
+                    <input type="text" name="embedding_ollama_url"
+                           value="{{ embedding_ollama_url }}"
+                           placeholder="http://localhost:11434">
+                </label>
+            </div>
+        </article>
+
+        <article class="et-card" style="margin:1rem 0;">
+            <header class="et-card-header">
+                <strong>Embedding fallback (optional)</strong>
+                <small class="et-card-desc">
+                    Runs only when the primary backend raises an
+                    error (network blip, model still loading,
+                    container restart). Recommended pattern: fast
+                    in-process primary + a remote Ollama backup.
+                </small>
+            </header>
+            <div class="et-card-body">
+                <label>
+                    Fallback backend{{ m.help("Same options as primary. Leave at 'none' to skip the fallback chain — embedding errors will just degrade the recent-reply-examples retrieval on those messages without a retry.") }}
+                    <select name="fallback_backend">
+                        <option value="" {% if not fallback_backend %}selected{% endif %}>— none —</option>
+                        <option value="sentence_transformers" {% if fallback_backend == "sentence_transformers" %}selected{% endif %}>sentence_transformers</option>
+                        <option value="ollama" {% if fallback_backend == "ollama" %}selected{% endif %}>ollama</option>
+                    </select>
+                </label>
+                <label>
+                    Fallback model{{ m.help("Model name for the fallback backend. Example: [local-llm-model] on Ollama (reuses an already-loaded chat model — slow per-call but always available). For sentence_transformers: a different HuggingFace model id than the primary.") }}
+                    <input type="text" name="fallback_model_name"
+                           value="{{ fallback_model_name }}"
+                           placeholder="[local-llm-model]
+                </label>
+                <label>
+                    Fallback Ollama URL{{ m.help("HTTP URL for the fallback Ollama. Leave blank to inherit the primary's URL. Example: http://ollama.home.example.local:11434 — same LAN-only privacy gate.") }}
+                    <input type="text" name="fallback_ollama_url"
+                           value="{{ fallback_ollama_url }}"
+                           placeholder="(inherits primary URL)">
+                </label>
+            </div>
+        </article>
+
+        {# Classification cache tuning lives on the Integrations tab
+           (operator-policy 2026-05-13). Form fields, counters, and
+           the Redis URL all surface there. AI Backends scopes to the
+           LLM-side configuration only. #}
+
+        <button type="submit" class="contrast"
+                style="margin-top:0.5rem;">
+            Save AI backend settings
+        </button>
+        <p style="margin:0.5rem 0 0 0;color:var(--pico-muted-color);font-size:0.9em;">
+            Save writes to <code>/app/config/email-triage.yaml</code>.
+            Restart the container with
+            <code>sudo systemctl restart email-triage</code> (or
+            equivalent on this install) to pick up the change.
+        </p>
+    </form>
+</section>

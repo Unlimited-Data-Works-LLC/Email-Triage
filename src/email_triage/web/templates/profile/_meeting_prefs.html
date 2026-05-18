@@ -1,0 +1,248 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Spell out "Out of Office" — never "OOO".
+                Form input names (ooo_enabled, ooo_note, ooo_start,
+                ooo_end) stay — they are server contract, not text.
+   ─────────────────────────────────────────────────────────── #}
+<section style="margin-top:2rem;">
+    <h3>Meeting-Request Intercept</h3>
+    <p>
+        When the classifier categorises an incoming email as
+        <code>meeting-request</code>, the <code>suggest_meeting_times</code>
+        action drafts a reply listing the next free windows in your
+        calendar. These preferences control the suggestions.
+        Drafts are never sent automatically.
+    </p>
+
+    <form method="post" action="/profile/meeting-prefs">
+        {{ csrf_input(request) }}
+        {# Tab-state preservation: this form lives inside the meeting
+           tab-pane on /profile. Without active_tab the POST handlers
+           (profile_meeting_prefs_save + profile_meeting_prefs_group_apply)
+           fall through _resolve_profile_tab to "notifications" because
+           form.get("active_tab") returns "" and the request URL has no
+           ?tab= after a POST. Hidden field forces the redirect target. #}
+        <input type="hidden" name="active_tab" value="meeting">
+
+        <div class="grid">
+            <label>
+                Default meeting length
+                <select name="default_length_minutes">
+                    {% set lens = [15, 30, 45, 60, 90, 120] %}
+                    {% for n in lens %}
+                    <option value="{{ n }}"
+                            {% if meeting_prefs.default_length_minutes == n %}selected{% endif %}>
+                        {{ n }} minutes
+                    </option>
+                    {% endfor %}
+                </select>
+            </label>
+
+            <label>
+                Number of suggestions
+                <select name="suggestion_count">
+                    {% for n in [1, 2, 3, 4, 5] %}
+                    <option value="{{ n }}"
+                            {% if meeting_prefs.suggestion_count == n %}selected{% endif %}>
+                        {{ n }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </label>
+
+            {# 2026-05-14 — "over Number of Days" knob. Pairs with
+               Number of suggestions: "3 suggestions over 5 days"
+               means walk 5 working days and pick the earliest free
+               slot in 3 of them (or however many of those 5 days
+               have time). Replaces the legacy contiguous-fill that
+               yielded 3 back-to-back morning slots when the calendar
+               was empty. Working hours (per weekday) still govern
+               which days count as candidates. #}
+            <label>
+                Over number of days{{ m.help("How many working days to search for free slots. The first '{{ Number of suggestions }}' days with open time get one suggestion each. Working hours (per weekday, below) still govern which days are eligible — your weekend off-days are skipped. Example: '3 suggestions over 5 days' picks the earliest free slot in 3 of the next 5 working days.") }}
+                <select name="suggestion_days">
+                    {% for n in [1, 2, 3, 4, 5, 6, 7, 10, 14] %}
+                    <option value="{{ n }}"
+                            {% if meeting_prefs.suggestion_days == n %}selected{% endif %}>
+                        {{ n }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </label>
+        </div>
+
+        <div class="grid">
+            <label>
+                Business hours start (local)
+                <input type="time" name="business_hours_start"
+                       value="{{ meeting_prefs.business_hours_start }}"
+                       step="900">
+            </label>
+
+            <label>
+                Business hours end (local)
+                <input type="time" name="business_hours_end"
+                       value="{{ meeting_prefs.business_hours_end }}"
+                       step="900">
+            </label>
+        </div>
+
+        <div class="grid">
+            <label>
+                Timezone
+                <input type="text" name="timezone"
+                       value="{{ meeting_prefs.timezone }}"
+                       placeholder="UTC, America/Chicago, Europe/Berlin, …"
+                       list="tz-list">
+                <datalist id="tz-list">
+                    {% for z in ordered_zones %}
+                    <option value="{{ z }}">
+                    {% endfor %}
+                </datalist>
+            </label>
+
+            <label style="align-self:end;padding-bottom:0.5rem;">
+                <input type="checkbox" name="skip_weekends" value="1"
+                       {% if meeting_prefs.skip_weekends %}checked{% endif %}>
+                Skip weekends
+            </label>
+        </div>
+
+        <div class="grid">
+            <label title="Don't suggest slots starting sooner than this many hours from now.">
+                Minimum lead time (hours)
+                <input type="number" name="minimum_lead_time_hours"
+                       value="{{ meeting_prefs.minimum_lead_time_hours }}"
+                       min="0" max="168" step="1">
+            </label>
+
+            <label title="How far ahead to look for free windows.">
+                Search horizon (days)
+                <input type="number" name="search_horizon_days"
+                       value="{{ meeting_prefs.search_horizon_days }}"
+                       min="1" max="60" step="1">
+            </label>
+        </div>
+
+        {# ── Quick set (moved above the per-weekday grid) ────────────── #}
+        <h4 style="margin-top:1.5rem;">Quick set</h4>
+        <p>
+            Start here — set weekday hours in one click, then fine-tune
+            below. Quick set populates the grid below. You can then adjust
+            specific days if you need lunch breaks or shorter Fridays.
+        </p>
+        <div style="display:flex;gap:0.5rem;align-items:end;flex-wrap:wrap;">
+            <label>
+                Scope
+                <select name="scope">
+                    <option value="weekdays">Weekdays (Mon–Fri)</option>
+                    <option value="weekend">Weekend (Sat–Sun)</option>
+                    <option value="all">All days</option>
+                </select>
+            </label>
+            <label>
+                Start
+                <input type="time" name="start" value="09:00" step="900" style="width:6rem;">
+            </label>
+            <label>
+                End
+                <input type="time" name="end" value="17:00" step="900" style="width:6rem;">
+            </label>
+            <button type="submit" class="outline"
+                    formaction="/profile/meeting-prefs/group-apply"
+                    formmethod="post">Apply</button>
+        </div>
+
+        {# ── Per-weekday Working Hours (fine-tuning) ───────────────────── #}
+        <h4 style="margin-top:1.5rem;">Working hours (per weekday)</h4>
+        <p>
+            Fine-tune individual days after using Quick set above — for
+            lunch breaks (second interval) or shorter Fridays. Leave both
+            intervals blank to mark the day as off. Times are in the
+            timezone above. Per-day hours win over the legacy single
+            business-hours fields when set.
+        </p>
+        <table style="font-size:0.9rem;">
+            <thead>
+                <tr>
+                    <th style="width:5rem;">Day</th>
+                    <th>Interval 1 (start–end)</th>
+                    <th>Interval 2 (optional, start–end)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set day_labels = {"mon":"Mon","tue":"Tue","wed":"Wed","thu":"Thu","fri":"Fri","sat":"Sat","sun":"Sun"} %}
+                {% for day in ["mon","tue","wed","thu","fri","sat","sun"] %}
+                {% set intervals = meeting_prefs.working_hours.to_dict()[day] %}
+                <tr>
+                    <td><strong>{{ day_labels[day] }}</strong></td>
+                    <td>
+                        <input type="time" name="wh_{{ day }}_start_0"
+                               value="{{ intervals[0][0] if intervals|length > 0 else '' }}"
+                               step="900" style="width:6rem;display:inline-block;">
+                        –
+                        <input type="time" name="wh_{{ day }}_end_0"
+                               value="{{ intervals[0][1] if intervals|length > 0 else '' }}"
+                               step="900" style="width:6rem;display:inline-block;">
+                    </td>
+                    <td>
+                        <input type="time" name="wh_{{ day }}_start_1"
+                               value="{{ intervals[1][0] if intervals|length > 1 else '' }}"
+                               step="900" style="width:6rem;display:inline-block;">
+                        –
+                        <input type="time" name="wh_{{ day }}_end_1"
+                               value="{{ intervals[1][1] if intervals|length > 1 else '' }}"
+                               step="900" style="width:6rem;display:inline-block;">
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        {# ── Manual OOO Override ──────────────────────────────────────── #}
+        <h4 style="margin-top:1.5rem;">Out-of-office override</h4>
+        <p>
+            Use this when the calendar provider doesn't carry an
+            Out-of-Office event for the period — the slot finder will
+            treat the whole range as busy. Leave Active off to ignore.
+        </p>
+        <div class="grid">
+            <label>
+                <input type="checkbox" name="ooo_enabled" value="1"
+                       {% if meeting_prefs.ooo_override.enabled %}checked{% endif %}>
+                Active
+            </label>
+            <label>
+                Note (optional)
+                <input type="text" name="ooo_note"
+                       value="{{ meeting_prefs.ooo_override.note }}"
+                       placeholder="conference, vacation, …">
+            </label>
+        </div>
+        <div class="grid">
+            <label>
+                Start (UTC)
+                <input type="datetime-local" name="ooo_start"
+                       value="{{ meeting_prefs.ooo_override.start.strftime('%Y-%m-%dT%H:%M') if meeting_prefs.ooo_override.start else '' }}"
+                       step="900">
+            </label>
+            <label>
+                End (UTC)
+                <input type="datetime-local" name="ooo_end"
+                       value="{{ meeting_prefs.ooo_override.end.strftime('%Y-%m-%dT%H:%M') if meeting_prefs.ooo_override.end else '' }}"
+                       step="900">
+            </label>
+        </div>
+
+        <button type="submit">Save Meeting Preferences</button>
+    </form>
+
+    <small style="color:var(--pico-muted-color);display:block;margin-top:0.5rem;">
+        Add a route on each account: <code>meeting-request</code> →
+        <code>suggest_meeting_times</code> on the
+        <a href="/accounts">Accounts</a> page (Routes button).
+        Calendar must be enabled on the account first.
+    </small>
+</section>

@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / admin). NOT developers.
+   TECH-SKILL:  computer-literate professional.
+   COPY RULES:  no jargon — see feedback_audience_per_page.md.
+                Use "AI" not "LLM" / "language model"; use
+                "category name" not "slug" in user-rendered text.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Rules - Categories - Email Triage{% endblock %}
+{% block content %}
+<h2>Rules</h2>
+{% set active = "categories" %}
+{% include "_rules_tabs.html" %}
+
+<h3>Classification Categories{{ m.help("Categories the AI sorts incoming mail into. Each category has a short plain-English description the AI reads when deciding which category fits a message. Example: a message from your bank with subject 'Statement Available' lands in 'finance' if you've described that category as 'banking and financial statements'.") }}</h3>
+<p>Categories define what the AI classifies emails into. The AI prompt is built from this list when classifying. <em>System</em> categories are shared across every user; <em>personal</em> categories (scoped to one user) can be added on the Personal Categories tab and optionally promoted here.</p>
+
+{% if error %}
+<article aria-label="Error" style="border-left: 3px solid var(--pico-color-red-500); padding: 0.5rem 1rem;">
+    <p>{{ error }}</p>
+</article>
+{% endif %}
+
+{% if success %}
+<article aria-label="Success" style="border-left: 3px solid var(--pico-color-green-500); padding: 0.5rem 1rem;">
+    <p>{{ success }}</p>
+</article>
+{% endif %}
+
+<form method="get" action="/categories" style="margin:0.5rem 0;">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Scope
+        <select name="scope" onchange="this.form.submit()">
+            <option value="all" {% if scope == "all" %}selected{% endif %}>All</option>
+            <option value="system" {% if scope == "system" %}selected{% endif %}>System only</option>
+            <option value="personal" {% if scope == "personal" %}selected{% endif %}>Personal only</option>
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+
+<table>
+    <thead>
+        <tr>
+            <th>Category</th>
+            <th>Scope</th>
+            <th>Description</th>
+            <th style="width: 12rem;">Actions</th>
+        </tr>
+    </thead>
+    <tbody id="category-list">
+        {% for cat in categories %}
+        <tr id="cat-{{ cat.id }}">
+            <td><code>{{ cat.slug }}</code></td>
+            <td>
+                {% if cat.user_id is none %}
+                <span style="color:var(--pico-ins-color);">System</span>
+                {% else %}
+                {% set _owner = owners_by_id[cat.user_id] or {} %}
+                {% set _name = _owner.get("name") or "" %}
+                {% set _email = _owner.get("email") or ("user #%d" % cat.user_id) %}
+                {{ _name or _email }}
+                {% if _name and _email %}
+                <br><small style="color:var(--pico-muted-color);">{{ _email }}</small>
+                {% endif %}
+                {% endif %}
+            </td>
+            <td>{{ cat.description }}</td>
+            <td>
+                <div role="group">
+                    <button class="secondary outline"
+                            hx-get="/categories/{{ cat.id }}/edit"
+                            hx-target="#cat-{{ cat.id }}"
+                            hx-swap="outerHTML">Edit</button>
+                    {% if cat.user_id is not none %}
+                    <button class="secondary outline"
+                            hx-post="/categories/{{ cat.id }}/promote"
+                            hx-target="#cat-{{ cat.id }}"
+                            hx-swap="outerHTML"
+                            hx-confirm="Promote '{{ cat.slug }}' (category name) to a system category? It will become visible to every user.">Promote</button>
+                    {% else %}
+                    <button class="secondary outline"
+                            hx-get="/categories/{{ cat.id }}/demote-form"
+                            hx-target="#cat-{{ cat.id }}"
+                            hx-swap="outerHTML"
+                            title="Move this system category to one user's personal scope">Move</button>
+                    {% endif %}
+                    <button class="secondary outline"
+                            hx-delete="/categories/{{ cat.id }}"
+                            hx-target="#cat-{{ cat.id }}"
+                            hx-swap="outerHTML swap:0.2s"
+                            hx-confirm="Delete category '{{ cat.slug }}' (category name)? This cannot be undone.">Del</button>
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<p>Total: {{ categories|length }} categories {% if scope != "all" %}({{ scope }} scope){% endif %}</p>
+
+<details>
+    <summary>Add new category</summary>
+    <form method="post" action="/categories/create">
+        {{ csrf_input(request) }}
+        <div class="grid">
+            <label>
+                Category Name (e.g. <code>to-respond</code>)
+                <input type="text" name="slug" required
+                       pattern="[a-z0-9][a-z0-9\-]*"
+                       placeholder="lowercase-with-dashes">
+            </label>
+            <label>
+                Description
+                <input type="text" name="description" required
+                       placeholder="What this category catches">
+            </label>
+        </div>
+        <button type="submit">Add Category</button>
+    </form>
+</details>
+{% endblock %}

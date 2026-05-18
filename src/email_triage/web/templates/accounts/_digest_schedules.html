@@ -1,0 +1,134 @@
+{# Partial: digest schedule table (HTMX-swappable into #digest-schedules) #}
+{% if flash_msg %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.4rem 0.75rem;margin-bottom:0.75rem;font-size:0.9rem;">
+    {{ flash_msg }}
+</article>
+{% endif %}
+{% if digest_schedules %}
+<table style="font-size:0.9rem;">
+    <thead>
+        <tr>
+            <th style="width:3rem;">On</th>
+            <th>Time (local)</th>
+            <th>Cadence</th>
+            <th>Category</th>
+            <th>Format</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for sched in digest_schedules %}
+        <tr id="sched-row-{{ loop.index0 }}">
+            <td>
+                {% if sched.enabled %}
+                <span style="color:var(--pico-ins-color);" title="Active">&#x2713;</span>
+                {% else %}
+                <span style="color:var(--pico-muted-color);" title="Paused">&#x2014;</span>
+                {% endif %}
+            </td>
+            <td>
+                {# A visible Save button is the reliable saver — the
+                   earlier design used only `hx-trigger="change"` on
+                   the input, which fires a change event with no
+                   endpoint since hx-post lives on the form element.
+                   Keeping the change-trigger as a bonus auto-save
+                   (via form-level hx-trigger below). #}
+                <form hx-post="/accounts/{{ acct.id }}/digest/reschedule/{{ loop.index0 }}"
+                      hx-target="#digest-schedules"
+                      hx-swap="innerHTML"
+                      hx-trigger="submit, change from:input[type=time] delay:200ms"
+                      style="margin:0;display:flex;gap:0.25rem;align-items:center;">
+                    <input type="time"
+                           class="local-time-input"
+                           name="schedule_time"
+                           data-utc="{{ sched.time_utc }}"
+                           required
+                           style="margin:0;padding:0.15rem 0.3rem;font-size:0.85rem;width:auto;min-width:6.5rem;"
+                           title="Change time — stored as UTC">
+                    <input type="hidden" name="tz_offset" class="tz-offset-input" value="0">
+                    <button type="submit" class="outline"
+                            style="padding:0.15rem 0.5rem;margin:0;font-size:0.8rem;"
+                            title="Save new schedule time">Save</button>
+                </form>
+            </td>
+            <td>
+                {% set _cad = sched.get('cadence', 'daily') %}
+                {% if _cad == 'weekly' %}
+                {% set _days = sched.get('days_of_week') or [] %}
+                {% set _labels = {0:'Mon',1:'Tue',2:'Wed',3:'Thu',4:'Fri',5:'Sat',6:'Sun'} %}
+                <small>Weekly:<br>
+                    {% for d in _days %}{{ _labels[d] }}{% if not loop.last %} {% endif %}{% endfor %}
+                </small>
+                {% else %}
+                <small>Daily</small>
+                {% endif %}
+            </td>
+            <td><code>{{ sched.category }}</code></td>
+            <td>
+                {% if sched.get('format_prompt') %}
+                <details style="margin:0;">
+                    <summary style="font-size:0.8rem;cursor:pointer;">Custom</summary>
+                    <pre style="font-size:0.75rem;white-space:pre-wrap;max-width:20rem;margin:0.25rem 0 0 0;padding:0.25rem;background:var(--pico-card-background-color);border-radius:4px;">{{ sched.format_prompt }}</pre>
+                </details>
+                {% else %}
+                <small style="color:var(--pico-muted-color);">Default</small>
+                {% endif %}
+            </td>
+            <td style="display:flex;gap:0.25rem;flex-wrap:wrap;">
+                <button class="outline" style="padding:0.15rem 0.5rem;margin:0;font-size:0.8rem;"
+                        hx-post="/accounts/{{ acct.id }}/digest/run/{{ loop.index0 }}"
+                        hx-target="#digest-schedules"
+                        hx-swap="innerHTML"
+                        hx-confirm="Run this digest now? (Delivers to your inbox.)"
+                        title="Run this digest immediately">
+                    Run Now
+                </button>
+                <button class="outline secondary" style="padding:0.15rem 0.5rem;margin:0;font-size:0.8rem;"
+                        hx-get="/accounts/{{ acct.id }}/digest/edit/{{ loop.index0 }}"
+                        hx-target="#sched-row-{{ loop.index0 }}"
+                        hx-swap="outerHTML"
+                        title="Edit advanced settings">
+                    Edit
+                </button>
+                <button class="outline secondary" style="padding:0.15rem 0.5rem;margin:0;font-size:0.8rem;"
+                        hx-post="/accounts/{{ acct.id }}/digest/toggle/{{ loop.index0 }}"
+                        hx-target="#digest-schedules"
+                        hx-swap="innerHTML">
+                    {{ "Pause" if sched.enabled else "Resume" }}
+                </button>
+                <button class="outline secondary" style="padding:0.15rem 0.5rem;margin:0;font-size:0.8rem;color:var(--pico-del-color);"
+                        hx-delete="/accounts/{{ acct.id }}/digest/schedule/{{ loop.index0 }}"
+                        hx-target="#digest-schedules"
+                        hx-swap="innerHTML"
+                        hx-confirm="Remove this digest schedule?">
+                    Del
+                </button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+<script>
+// Convert UTC schedule times to local display + populate reschedule form.
+// Runs on initial load AND after HTMX swap (scripts in swapped content re-run).
+(function() {
+    var tzOffset = new Date().getTimezoneOffset();  // minutes behind UTC
+    document.querySelectorAll('#digest-schedules .local-time-input').forEach(function(el) {
+        var utc = el.getAttribute('data-utc');
+        if (!utc) return;
+        var parts = utc.split(':');
+        var d = new Date();
+        d.setUTCHours(parseInt(parts[0], 10), parseInt(parts[1], 10), 0, 0);
+        var localH = String(d.getHours()).padStart(2, '0');
+        var localM = String(d.getMinutes()).padStart(2, '0');
+        el.value = localH + ':' + localM;
+        el.title = 'Stored as ' + utc + ' UTC';
+    });
+    document.querySelectorAll('#digest-schedules .tz-offset-input').forEach(function(el) {
+        el.value = String(tzOffset);
+    });
+})();
+</script>
+{% else %}
+<p style="color:var(--pico-muted-color);font-size:0.9rem;">No digest schedules configured. Use the form below to add one.</p>
+{% endif %}

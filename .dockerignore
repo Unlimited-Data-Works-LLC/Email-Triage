@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Data (should be mounted, not baked in)
+data/
+config/
+
+# Development
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.ruff_cache
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info
+dist
+build
+
+# Plans and CI
+.claude
+.github

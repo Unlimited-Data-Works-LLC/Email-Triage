@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (security / compliance operator). Not end users.
+   TECH-SKILL:  high — six-card hub linking to detailed admin pages
+                covering HIPAA mode, session TTL, CSRF, login-rate,
+                BAA gate, audit-chain integrity. Spec citations and
+                engine/backend terms are intentional.
+   COPY RULES:  see feedback_audience_per_page.md.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Compliance &amp; Security - Email Triage{% endblock %}
+{% block content %}
+
+<h2>Compliance &amp; Security</h2>
+<p>
+    Six related controls grouped here. HIPAA mode + session policy
+    + brute-force protection + CSRF posture + classifier BAA gate +
+    audit-chain integrity all surface in one place so an auditor
+    walking the install doesn't have to context-switch across two
+    or three pages.
+</p>
+
+<div class="grid">
+    <article style="padding:1rem;">
+        <header><strong>🏥 HIPAA mode</strong></header>
+        <p>
+            System-wide flag + per-account stacking. Per-account
+            HIPAA flag uses sticky inheritance from system flag at
+            account creation time. PHI scrubbing in logs +
+            notifications + escalation alerts is mode-aware.
+        </p>
+        <a href="/admin/security#hipaa" role="button" class="outline">HIPAA mode</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>⏱️ Session policy</strong></header>
+        <p>
+            <code>session_ttl_secs</code> for non-HIPAA installs
+            (default 24h), <code>hipaa_session_ttl_secs</code> as
+            the HIPAA-mode cap (default 15 min, hard ceiling 30
+            min). §164.312(a)(2)(iii) Automatic Logoff.
+        </p>
+        <a href="/admin/security#session" role="button" class="outline">Session TTL</a>
+    </article>
+</div>
+
+<div class="grid" style="margin-top:1rem;">
+    <article style="padding:1rem;">
+        <header><strong>🛡️ CSRF protection</strong></header>
+        <p>
+            Soft-launch counter + 24h/7d rejects rate + top-N
+            offending paths. Operator flips <code>csrf_enforce</code>
+            once 24h count is steady at zero. Operator-defined
+            exempt prefixes for custom integrations.
+        </p>
+        <a href="/admin/security#csrf" role="button" class="outline">CSRF + exempt prefixes</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>🔐 Login rate limits</strong></header>
+        <p>
+            Per-email + per-IP rolling-window failure counters
+            guarding OTP / WebAuthn / dev-keypair / passkey login
+            surfaces. Source of truth: <code>auth_events</code>
+            table. <code>max=0</code> per scope is the kill switch.
+            §164.312(a)(2)(i) Unique User Identification.
+        </p>
+        <a href="/admin/security#login-rate" role="button" class="outline">Login limits</a>
+    </article>
+</div>
+
+<div class="grid" style="margin-top:1rem;">
+    <article style="padding:1rem;">
+        <header><strong>📜 Classifier BAA gate</strong></header>
+        <p>
+            HIPAA-flagged accounts refuse to classify when the
+            configured LLM endpoint is non-local and no Business
+            Associate Agreement acknowledgment is on file.
+            Per-(backend, host) ack persisted via the privacy chip
+            on <code>/config</code>.
+        </p>
+        <a href="/compliance#baa" role="button" class="outline">BAA + boundary events</a>
+    </article>
+
+    <article style="padding:1rem;">
+        <header><strong>🔗 Audit chain integrity</strong></header>
+        <p>
+            Every <code>log_entries</code> row carries a hash of
+            its predecessor. Tampering breaks the chain. The
+            compliance page surfaces the current chain status and
+            recent boundary events; an external verifier CLI is
+            available via <code>verify_log_chain()</code>.
+        </p>
+        <a href="/compliance#audit-chain" role="button" class="outline">Audit chain</a>
+    </article>
+</div>
+
+{% endblock %}

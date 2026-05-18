@@ -1,0 +1,98 @@
+name: Security
+
+# Supply-chain hardening: vulnerability scanning (CIP-010-R3) and SBOM
+# generation (supply-chain transparency). Runs on every push/PR to main.
+#
+# Jobs:
+#   vulnerability-scan  - pip-audit, BLOCKING (fails build on any real CVE)
+#   sbom                - cyclonedx-py CycloneDX SBOM, INFORMATIONAL (artifact only)
+#
+# Waivers (pip-audit --ignore-vuln <GHSA-id>) should only be added AFTER a
+# finding is reviewed and accepted as acceptable-risk. Do not add preemptive
+# waivers. As of initial rollout, no waivers are needed (clean scan).
+#
+# Actions pinned to Node 24-compatible majors (v5 of checkout/setup-python/
+# upload-artifact as of 2026-04) so the Node 20 deprecation warning goes
+# away. GitHub runners forced Node 24 by default 2026-06-02; this preempts
+# the forced migration and silences the deprecation noise on every push.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  vulnerability-scan:
+    name: pip-audit (CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install project
+        # Lockfile first so the audit / SBOM run against pinned
+        # transitive versions, not whatever pyproject's ranges
+        # resolve to today. Editable install of the project itself
+        # uses --no-deps so the lock isn't overridden.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install --no-deps -e .
+
+      - name: Vulnerability scan
+        # --skip-editable skips the project's own editable install from the
+        # vuln-lookup pass (the project is private, not on PyPI — pip-audit
+        # can't resolve it).
+        #
+        # --strict was removed: under --strict, pip-audit treats any
+        # dep-collection failure (including "couldn't resolve editable
+        # install") as a build failure even when --skip-editable handles
+        # the skip cleanly. Without --strict, pip-audit still exits
+        # non-zero on any REAL CVE finding — which is what we want the
+        # build to fail on.
+        #
+        # Net behavior: no CVE → exit 0. Real CVE → exit 1 → build fails.
+        # Editable-install note → exit 0 (noted in output as "Skip Reason").
+        run: |
+          pip install pip-audit
+          # Run via the canonical script so local pre-push hook + CI
+          # use the exact same invocation. Waivers live in that script
+          # so a single PR review approves them once for all surfaces.
+          ./scripts/run-pip-audit.sh
+
+  sbom:
+    name: CycloneDX SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install project
+        # Lockfile first so the audit / SBOM run against pinned
+        # transitive versions, not whatever pyproject's ranges
+        # resolve to today. Editable install of the project itself
+        # uses --no-deps so the lock isn't overridden.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install --no-deps -e .
+
+      - name: Generate SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment -o sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v5
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json

@@ -1,0 +1,66 @@
+{# ─── AUDIENCE ───
+   END-USER (account owner / operator). TECH-SKILL: low.
+   COPY RULES:
+     - Resume-setup banner uses plain language: "Pick up where you
+       left off" not "wizard state cookie expired".
+     - No admin-path / "ask your administrator" copy.
+   #}
+{# Full-page wrapper for /accounts/{id}/edit when hit directly
+   (not via HTMX). Brings in base.html (nav, Pico CSS, theme).
+
+   Embeds the same partial HTMX uses for the in-place row swap, but
+   with ``embed_in_table=False`` so the partial drops its <tr><td>
+   <article> chrome. Keeps page chrome consistent with the sibling
+   /accounts/{id}/routes page (clean h2 + tab strip + flat content,
+   no double-bordered nesting). #}
+{% extends "base.html" %}
+{% block title %}Edit {{ acct.name }} - Email Triage{% endblock %}
+{% block content %}
+<h2>Editing: {{ acct.name }}</h2>
+
+{# Resume-setup banner — fires when the operator abandoned the
+   add-account wizard mid-flow and came back here. The wizard's
+   POST handlers stamp account_state:<id>:wizard_step on each
+   step; the dispatcher above resolves it to a step name + URL
+   so the operator gets a one-click way back to where they were.
+
+   #120: when ``is_active`` is False (the new-account wizard creates
+   the row disabled and step 5 finish flips it to True), the banner
+   uses stronger "not running yet" copy. End-users can't tell from
+   the edit form alone that the account isn't being polled — the
+   banner is the only signal that the wizard's incomplete state
+   means "no triage on this mailbox until you finish." #}
+{% if wizard_resume_step %}
+{% set _disabled = not acct.is_active %}
+<article style="border-left:3px solid {% if _disabled %}var(--pico-del-color){% else %}var(--pico-color-amber-500){% endif %};
+                padding:0.75rem 1rem;margin-bottom:1rem;
+                background:var(--pico-card-background-color);">
+    {% if _disabled %}
+    <strong>Setup not finished — this account is paused.</strong>
+    <p style="margin:0.4rem 0 0 0;">
+        Mail won't be triaged until you finish setup. Pick up at:
+        {{ wizard_resume_step_label }}.
+    </p>
+    {% else %}
+    <strong>Pick up where you left off:</strong>
+    {{ wizard_resume_step_label }}
+    {% endif %}
+    <p style="margin:0.5rem 0 0 0;">
+        <a href="/accounts/new?step={{ wizard_resume_step }}&account_id={{ acct.id }}"
+           role="button" class="contrast">Resume setup</a>
+        <small style="margin-left:0.75rem;color:var(--pico-muted-color);">
+            {% if _disabled %}
+            The account turns on automatically when you finish the
+            last step of setup.
+            {% else %}
+            You can also continue editing on this page; the resume
+            link stays here until setup is finished.
+            {% endif %}
+        </small>
+    </p>
+</article>
+{% endif %}
+
+{% set embed_in_table = false %}
+{% include "accounts/_edit.html" %}
+{% endblock %}
