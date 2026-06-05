@@ -1,4 +1,4 @@
-"""HIPAA-safe per-contact style descriptor (#152 phase 4 / M-7 — Wave 3).
+"""HIPAA-safe per-contact style descriptor.
 
 Pipeline
 ========
@@ -258,6 +258,56 @@ def hash_recipient_for_install(
     return digest
 
 
+def hash_message_id_for_install(
+    rfc_message_id: str, *, secrets: Any,
+) -> str:
+    """Return the install-stable salted-SHA-256 hash of a Message-ID.
+
+    Used by :class:`HipaaSentCounterLoop` to dedup Sent-folder
+    scans without storing plaintext Message-IDs on disk for HIPAA-
+    flagged accounts. Message-IDs are not strictly PHI but they ARE
+    communication metadata under HIPAA's "minimum necessary"
+    interpretation — storing the salted hash satisfies both the dedup
+    requirement (deterministic per install) and the privacy posture
+    (one-way; opaque to anyone without the install salt).
+
+    Normalisation: strip whitespace + angle-bracket wrappers
+    (``<abc@example.com>`` → ``abc@example.com``) + lowercase. RFC
+    5322 says Message-ID is case-sensitive, but in practice some
+    relays uppercase the local-part; lowercasing makes the dedup
+    resilient to that.
+
+    Salt source: same install salt as
+    :func:`hash_recipient_for_install`. A salt rotation invalidates
+    both surfaces consistently — recipient counters reset to zero
+    AND dedup history resets to empty, so the rotated install starts
+    fresh on both planes.
+
+    Returns a 64-char lowercase hex string.
+
+    Raises
+    ------
+    ValueError
+        ``rfc_message_id`` is empty or not a string.
+    SaltUnavailableError
+        no install salt is available.
+    """
+    if not rfc_message_id or not isinstance(rfc_message_id, str):
+        raise ValueError("rfc_message_id must be a non-empty string")
+
+    # Normalise: strip angle brackets + whitespace + lowercase.
+    normalised = rfc_message_id.strip().lstrip("<").rstrip(">").strip().lower()
+    if not normalised:
+        raise ValueError("rfc_message_id was empty after normalisation")
+
+    salt = get_or_init_recipient_salt(secrets)
+    import hmac
+    digest = hmac.new(
+        salt, normalised.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+    return digest
+
+
 # ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
@@ -399,8 +449,13 @@ async def distill_hipaa_per_contact(
             recipient_hash="",
             error_class="SaltUnavailableError",
         )
+        #  — record_style_distill_event is @db_write; if this
+        # function is wired onto an event-loop task the write must hop
+        # to the threadpool. db_call is the canonical dispatch helper.
+        from email_triage.web.db_threadpool import db_call
         try:
-            record_style_distill_event(
+            await db_call(
+                record_style_distill_event,
                 db_conn,
                 account_id=account_id,
                 actor_user_id=actor_user_id,
@@ -442,53 +497,55 @@ async def distill_hipaa_per_contact(
         recipient_hash=recipient_hash,
     )
 
+    #  — per_contact distill is an async def touching the shared
+    # connection; every DB touch hops to the threadpool via db_call.
+    from email_triage.web.db_threadpool import db_call
+
     # ---- Gating ---------------------------------------------------------
 
-    row = db_conn.execute(
-        "SELECT id, hipaa, user_id FROM email_accounts WHERE id = ?",
-        (int(account_id),),
-    ).fetchone()
-    if row is None:
-        result.status = OUTCOME_NOT_HIPAA
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        return result
-
-    account_dict = {
-        "id": int(row["id"]),
-        "hipaa": int(row["hipaa"] or 0),
-        "user_id": row["user_id"],
-    }
-
-    if not is_hipaa_style_distill_enabled(db_conn):
-        result.status = OUTCOME_DISABLED
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        return result
-
-    if not is_account_hipaa(account_dict):
-        result.status = OUTCOME_NOT_HIPAA
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        return result
-
-    if not is_style_knobs_hipaa_allow(db_conn, account_id):
-        result.status = OUTCOME_NOT_OPTED_IN
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        return result
-
-    if not force:
-        if _is_within_per_contact_cadence(
+    # Account-row read + the install/HIPAA/opt-in/cadence gates run in
+    # one threadpool hop. Returns (account_dict_or_None, status); a
+    # non-None status is a short-circuit outcome.
+    def _per_contact_gating():
+        row = db_conn.execute(
+            "SELECT id, hipaa, user_id FROM email_accounts WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        if row is None:
+            return None, OUTCOME_NOT_HIPAA
+        acct = {
+            "id": int(row["id"]),
+            "hipaa": int(row["hipaa"] or 0),
+            "user_id": row["user_id"],
+        }
+        if not is_hipaa_style_distill_enabled(db_conn):
+            return acct, OUTCOME_DISABLED
+        if not is_account_hipaa(acct):
+            return acct, OUTCOME_NOT_HIPAA
+        if not is_style_knobs_hipaa_allow(db_conn, account_id):
+            return acct, OUTCOME_NOT_OPTED_IN
+        if not force and _is_within_per_contact_cadence(
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
         ):
-            result.status = OUTCOME_CADENCE_SKIP
-            _audit_per_contact(db_conn, account_id, actor_user_id, result)
-            return result
+            return acct, OUTCOME_CADENCE_SKIP
+        return acct, None
+
+    account_dict, _gate_status = await db_call(_per_contact_gating)
+    if _gate_status is not None:
+        result.status = _gate_status
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
+        return result
 
     # ---- Backend resolution --------------------------------------------
 
-    backend_id = _get_account_backend_id(db_conn, account_id)
+    backend_id = await db_call(_get_account_backend_id, db_conn, account_id)
     try:
-        adapter: BackendAdapter = load_backend(
+        adapter: BackendAdapter = await db_call(
+            load_backend,
             backend_id,
             db_conn=db_conn,
             secrets=secrets,
@@ -498,8 +555,11 @@ async def distill_hipaa_per_contact(
         result.status = OUTCOME_BACKEND_FAIL
         result.backend_id = backend_id
         result.error_class = type(exc).__name__
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_contact_retry(
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_contact_retry,
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
@@ -519,7 +579,9 @@ async def distill_hipaa_per_contact(
 
     if message_count <= 0:
         result.status = OUTCOME_NO_MESSAGES
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
         return result
 
     prompt = _format_distill_prompt(corpus)
@@ -542,8 +604,11 @@ async def distill_hipaa_per_contact(
         result.status = OUTCOME_BACKEND_FAIL
         result.error_class = type(exc).__name__
         result.latency_ms = int((time.monotonic() - t0) * 1000)
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_contact_retry(
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_contact_retry,
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
@@ -572,8 +637,11 @@ async def distill_hipaa_per_contact(
     if not parsed:
         result.status = OUTCOME_BACKEND_FAIL
         result.error_class = "JSONDecodeError"
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_contact_retry(
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_contact_retry,
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
@@ -587,7 +655,8 @@ async def distill_hipaa_per_contact(
     if not scrub.passed:
         # Drop any stale row from a prior cleaner run.
         try:
-            delete_per_contact_style_hipaa(
+            await db_call(
+                delete_per_contact_style_hipaa,
                 db_conn,
                 account_id=account_id,
                 recipient_hash=recipient_hash,
@@ -597,10 +666,13 @@ async def distill_hipaa_per_contact(
                 "per_contact distill: stale-descriptor delete failed",
             )
         result.status = OUTCOME_SCRUBBER_FAIL
-        _audit_per_contact(db_conn, account_id, actor_user_id, result)
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
         # Pause ONLY this contact — account-level + other contacts
         # stay active.
-        pause_style_distill_contact(
+        await db_call(
+            pause_style_distill_contact,
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
@@ -610,7 +682,8 @@ async def distill_hipaa_per_contact(
 
     # ---- Persist + audit -----------------------------------------------
 
-    set_per_contact_style_hipaa(
+    await db_call(
+        set_per_contact_style_hipaa,
         db_conn,
         account_id=account_id,
         recipient_hash=recipient_hash,
@@ -630,7 +703,8 @@ async def distill_hipaa_per_contact(
     result.descriptor = dict(scrub.scrubbed_descriptor)
 
     try:
-        clear_style_distill_contact_queue_entry(
+        await db_call(
+            clear_style_distill_contact_queue_entry,
             db_conn,
             account_id=account_id,
             recipient_hash=recipient_hash,
@@ -640,7 +714,9 @@ async def distill_hipaa_per_contact(
             "per_contact distill: queue-clear failed on success path",
         )
 
-    _audit_per_contact(db_conn, account_id, actor_user_id, result)
+    await db_call(
+        _audit_per_contact, db_conn, account_id, actor_user_id, result,
+    )
     return result
 
 
@@ -787,7 +863,7 @@ def per_contact_gc_daily_sweep(
 
 
 # ---------------------------------------------------------------------------
-# Draft-time merge helpers (#171-C)
+# Draft-time merge helpers
 # ---------------------------------------------------------------------------
 
 #: Descriptor fields treated as strings — overlay wins when its value
@@ -1051,6 +1127,7 @@ __all__ = [
     "distill_hipaa_per_contact",
     "get_contact_style_overlay",
     "get_or_init_recipient_salt",
+    "hash_message_id_for_install",
     "hash_recipient_for_install",
     "merge_overlays_for_recipients",
     "per_contact_gc_daily_sweep",

@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 
-# #145.1 — eviction window for idle buckets. A bucket whose key has
+# .1 — eviction window for idle buckets. A bucket whose key has
 # not been seen for this many seconds AND has refilled to capacity is
 # safe to drop; the next ``allow`` for that key reconstructs it at
 # full capacity, so eviction is observably equivalent to "never seen".
@@ -61,7 +61,7 @@ class TokenBucket:
             if tokens >= 1.0:
                 tokens -= 1.0
                 self._buckets[key] = (tokens, now)
-                # #145.1 — opportunistic GC of idle buckets. Each
+                # .1 — opportunistic GC of idle buckets. Each
                 # ``allow`` call makes one cheap pass over the dict
                 # to evict entries that are simultaneously (a) at
                 # full capacity (so the eviction is observably

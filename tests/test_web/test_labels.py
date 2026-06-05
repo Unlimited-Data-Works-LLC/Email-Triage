@@ -1,4 +1,4 @@
-"""Tests for the multi-label feature (#129).
+"""Tests for the multi-label feature.
 
 Covers:
   * Schema (v18 migration) — labels + message_labels tables, index,
@@ -352,3 +352,196 @@ class TestHIPAAGate:
         assert len(rows) == 1
         assert rows[0]["actor_user_id"] == admin_user["id"]
         assert rows[0]["account_id"] == account_id
+
+    # -- /labels/remove — same actor!=owner gate as /add ------
+    #
+    #  — the #245a hipaa_access_event write in message_label_remove
+    # ships with no coverage; these mirror the /add pair above so the
+    # remove path's actor!=owner gate is regression-proofed.
+
+    def test_remove_actor_eq_owner_no_audit_row(
+        self, client, user_cookies, db, regular_user,
+    ):
+        """Owner self-access on /labels/remove is NOT audited."""
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'clinic', 'gmail_api', '{}', 1, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/m-1/labels/remove",
+            data={"label_slug": "tag"},
+            cookies=user_cookies,
+        )
+        assert resp.status_code == 200
+        # Owner self-access is exempt — no label_remove audit row.
+        events = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'label_remove'"
+        ).fetchone()
+        assert (events["c"] if events else 0) == 0
+
+    def test_remove_actor_neq_owner_writes_audit_row(
+        self, client, admin_cookies, db, regular_user, admin_user,
+    ):
+        """Admin removing a label on a non-owner's HIPAA account =
+        audited with operation=label_remove."""
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'clinic', 'gmail_api', '{}', 1, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/m-1/labels/remove",
+            data={"label_slug": "tag"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        rows = db.execute(
+            "SELECT * FROM hipaa_access_events "
+            "WHERE operation = 'label_remove'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["actor_user_id"] == admin_user["id"]
+        assert rows[0]["account_id"] == account_id
+
+    def test_remove_non_hipaa_account_no_audit_row(
+        self, client, admin_cookies, db, regular_user,
+    ):
+        """A non-HIPAA account is never audited on /labels/remove,
+        even for a non-owner actor — the gate is hipaa AND actor!=owner.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'plain', 'gmail_api', '{}', 0, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/m-1/labels/remove",
+            data={"label_slug": "tag"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        events = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'label_remove'"
+        ).fetchone()
+        assert (events["c"] if events else 0) == 0
+
+    # -- /bulk-labels/add — same actor!=owner gate as the ------
+    # -- single-message paths; the bulk path previously lacked it.
+    #
+    #  — messages_bulk_label_add wrote labels on HIPAA accounts
+    # with NO hipaa_access_event row (a §164.312(b) hole). These pin
+    # the actor!=owner gate the fix added to _bulk_label_db_work.
+
+    def test_bulk_actor_eq_owner_no_audit_row(
+        self, client, user_cookies, db, regular_user,
+    ):
+        """Owner self-access on /bulk-labels/add is NOT audited."""
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'clinic', 'gmail_api', '{}', 1, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/bulk-labels/add",
+            data={"label_slug": "tag",
+                  "message_ids": ["m-1", "m-2", "m-3"]},
+            cookies=user_cookies,
+        )
+        assert resp.status_code == 200
+        # Owner self-access is exempt — no audit row for the bulk tag.
+        events = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'label_apply'"
+        ).fetchone()
+        assert (events["c"] if events else 0) == 0
+
+    def test_bulk_actor_neq_owner_writes_one_audit_row(
+        self, client, admin_cookies, db, regular_user, admin_user,
+    ):
+        """Admin bulk-tagging a non-owner's HIPAA account = audited.
+
+        One row per bulk operation (a bulk-tag is one operator
+        action), with ``bulk_n`` recording the message count.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'clinic', 'gmail_api', '{}', 1, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/bulk-labels/add",
+            data={"label_slug": "tag",
+                  "message_ids": ["m-1", "m-2", "m-3"]},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        rows = db.execute(
+            "SELECT * FROM hipaa_access_events "
+            "WHERE operation = 'label_apply'"
+        ).fetchall()
+        # Exactly ONE row for the whole bulk operation, not one per
+        # message.
+        assert len(rows) == 1
+        assert rows[0]["actor_user_id"] == admin_user["id"]
+        assert rows[0]["account_id"] == account_id
+        # The detail records the slug + the bulk message count.
+        detail = rows[0]["detail"]
+        assert "slug=tag" in detail
+        assert "bulk_n=3" in detail
+
+    def test_bulk_non_hipaa_account_no_audit_row(
+        self, client, admin_cookies, db, regular_user,
+    ):
+        """A non-HIPAA account is never audited on /bulk-labels/add,
+        even for a non-owner actor — the gate is hipaa AND actor!=owner.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            "INSERT INTO email_accounts (user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, 'plain', 'gmail_api', '{}', 0, ?, ?)",
+            (regular_user["id"], now, now),
+        )
+        account_id = cur.lastrowid
+        db.commit()
+        create_label(db, "tag", "Tag")
+        resp = client.post(
+            f"/messages/{account_id}/bulk-labels/add",
+            data={"label_slug": "tag",
+                  "message_ids": ["m-1", "m-2"]},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        events = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'label_apply'"
+        ).fetchone()
+        assert (events["c"] if events else 0) == 0

@@ -23,13 +23,20 @@ fetch path migrates here.
 
 Key design points:
 
-- **Connection per fetch** (not pooled). The blocking backend is
-  spun up + torn down inside ``asyncio.to_thread`` per call.
-  Connection establishment costs ~50-200ms (TLS handshake +
-  LOGIN), but bulk-list calls are serialised behind a
-  ``MailFilter`` search anyway, and the fetch fan-out is bounded
-  by ``push.bulk_max_batch_size`` (default 50). Pooling can be
-  added if real workloads show it's worth the complexity.
+- **Connection per fetch for single-UID calls** (not pooled). The
+  blocking backend is spun up + torn down inside
+  ``asyncio.to_thread`` per call. Connection establishment costs
+  ~50-200 ms (TLS handshake + LOGIN). For callers that already
+  hold a UID LIST, :func:`fetch_messages_batch_blocking` opens
+  ONE connection and FETCHes N UIDs serially on it — collapses
+  the per-fetch TLS+LOGIN cost from N × ~150 ms to 1 × ~150 ms
+  (~95 % latency reduction on bulk paths, ). Per-batch
+  teardown is deterministic (no pool state, no health-check, no
+  idle eviction); the parser-bug + credential-residency
+  guarantees both carry over unchanged. Persistent
+  connection-pool / per-watcher-connection variants tracked as
+  -followup-A for Cycle 9+ (requires hipaa-sme
+  §164.308(a)(4) cross-route).
 - **No state in this module.** Each call is a self-contained
   unit. The only persistent state is the credentials passed in
   by the caller.
@@ -210,6 +217,11 @@ async def fetch_message_blocking(
     each opens its own IMAP connection (no shared state to
     contend on). Bounded by the executor's max-workers default
     (min(32, cpu_count + 4) on Python 3.13).
+
+    For callers that already have a UID LIST in hand (poll cycle,
+    sent-mail-index batch, hipaa-sent-counter batch), prefer
+    :func:`fetch_messages_batch_blocking` instead — it amortizes
+    the ~150 ms TLS+LOGIN over N fetches by opening ONE connection.
     """
     return await asyncio.to_thread(
         _blocking_fetch,
@@ -220,6 +232,152 @@ async def fetch_message_blocking(
         password=password,
         mailbox=mailbox,
         uid=uid,
+        headers_only=headers_only,
+    )
+
+
+def _blocking_fetch_batch(
+    *,
+    host: str,
+    port: int,
+    use_ssl: bool,
+    username: str,
+    password: str,
+    mailbox: str,
+    uids: list[str],
+    headers_only: bool,
+) -> list[Tuple[bytes, list[str]]]:
+    """Fetch N UIDs from one mailbox on ONE stdlib IMAP connection.
+
+    Opens ONE ``IMAP4_SSL`` + LOGIN + SELECT, issues ``N`` ``UID
+    FETCH`` commands serially on that connection, returns
+    ``[(raw_bytes, flag_list), …]`` aligned 1:1 with the input
+    ``uids``. A UID the server can't return (deleted, not in this
+    mailbox per RFC 3501 § 2.3.1.1) yields ``(b"", [])`` in the
+    matching slot — matches single-fetch's "empty bytes pass through"
+    semantics.
+
+    Why this exists — :func:`_blocking_fetch` opens a fresh
+    connection per call. A 50-UID poll cycle pays 50 × (TLS handshake
+    + LOGIN + SELECT) = ~5-10 s of pure transport overhead. This
+    batch primitive collapses that to 1 × (TLS + LOGIN + SELECT) +
+    N × FETCH — ~95 % latency reduction on bulk paths. Per-batch
+    teardown is deterministic (no connection-pool state, no health-
+    check, no idle eviction), so the parser-bug guarantees from
+    ``bug_aioimaplib_recursion.md`` and the per-batch credential-
+    residency of :func:`_blocking_fetch` both carry over unchanged.
+
+    Mid-batch failure semantics: a per-UID ``FETCH`` failure (rare —
+    typically the UID vanished between SEARCH and FETCH) yields the
+    empty ``(b"", [])`` slot but does NOT abort the rest of the
+    batch. A protocol-level failure (LOGIN refused, SELECT refused,
+    connection drop) raises ``RuntimeError`` immediately and the
+    whole batch fails — callers that want per-UID error isolation
+    should fall back to :func:`_blocking_fetch` per-UID.
+    """
+    if not uids:
+        return []
+
+    if use_ssl:
+        client = imaplib.IMAP4_SSL(host, port)
+    else:
+        client = imaplib.IMAP4(host, port)
+
+    try:
+        typ, _ = client.login(username, password)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP LOGIN refused: {typ}")
+
+        typ, _ = client.select(_quote_mailbox(mailbox), readonly=True)
+        if typ != "OK":
+            raise RuntimeError(
+                f"IMAP SELECT {mailbox!r} failed: {typ}"
+            )
+
+        section = (
+            "(BODY.PEEK[HEADER] FLAGS)"
+            if headers_only
+            else "(BODY.PEEK[] FLAGS)"
+        )
+
+        results: list[Tuple[bytes, list[str]]] = []
+        for uid in uids:
+            try:
+                typ, data = client.uid("FETCH", uid, section)
+            except Exception:
+                # Per-UID FETCH failure — record an empty slot, keep
+                # the batch going. The whole-batch caller can decide
+                # whether to retry the vanished UID individually.
+                results.append((b"", []))
+                continue
+            if typ != "OK":
+                results.append((b"", []))
+                continue
+
+            # Same response-shape walk as :func:`_blocking_fetch`.
+            raw_bytes = b""
+            flag_blob = b""
+            for item in data:
+                if isinstance(item, tuple):
+                    if (
+                        len(item) >= 2
+                        and isinstance(item[1], (bytes, bytearray))
+                    ):
+                        raw_bytes = bytes(item[1])
+                    if isinstance(item[0], (bytes, bytearray)):
+                        flag_blob += bytes(item[0])
+                elif isinstance(item, (bytes, bytearray)):
+                    flag_blob += bytes(item)
+
+            flags: list[str] = []
+            match = _FLAGS_RE.search(flag_blob)
+            if match:
+                tokens = (
+                    match.group(1)
+                    .decode("ascii", errors="replace")
+                    .split()
+                )
+                flags = [t for t in tokens if t and t != r"\Recent"]
+
+            results.append((raw_bytes, flags))
+
+        return results
+
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            # Server may have already closed; not fatal.
+            pass
+
+
+async def fetch_messages_batch_blocking(
+    *,
+    host: str,
+    port: int,
+    use_ssl: bool,
+    username: str,
+    password: str,
+    mailbox: str,
+    uids: list[str],
+    headers_only: bool = False,
+) -> list[Tuple[bytes, list[str]]]:
+    """Async wrapper — runs :func:`_blocking_fetch_batch` in one
+    thread.
+
+    Returns ``[(raw_bytes, flags), …]`` aligned 1:1 with the input
+    ``uids``. Empty ``uids`` returns an empty list without opening a
+    connection.
+    """
+    return await asyncio.to_thread(
+        _blocking_fetch_batch,
+        host=host,
+        port=port,
+        use_ssl=use_ssl,
+        username=username,
+        password=password,
+        mailbox=mailbox,
+        uids=list(uids),
         headers_only=headers_only,
     )
 
@@ -247,7 +405,7 @@ def _blocking_search_all_folders(
     SEARCH responses across folder hierarchies. stdlib imaplib
     streams bytes directly to the consumer without trying to parse
     FETCH-shaped responses, so the parens-counting and recursion
-    bugs (upstream issue #118) don't apply. One TLS connection per
+    bugs (upstream issue ) don't apply. One TLS connection per
     cross-folder call; folder-loop happens in-process.
     """
     if use_ssl:

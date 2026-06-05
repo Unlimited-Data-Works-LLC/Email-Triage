@@ -1,9 +1,9 @@
-"""Privacy-invariant test pin — OAuth refresh paths never log plaintext tokens (#168).
+"""Privacy-invariant test pin — OAuth refresh paths never log plaintext tokens.
 
 Audit-driven response to the 2026-05-14 weekly HIPAA / NERC-CIP audit
 recommendation #4 ("OAuth token refresh logging — audit that no
 plaintext tokens land in logs during refresh flows (provider-level
-check)"). Code-side scrub (#86 + #111) lives in
+check)"). Code-side scrub lives in
 ``triage_logging.TriageLogger._TOKEN_KEYS`` + each provider's refresh
 implementation; this module fills the audit-gap by pinning the
 invariant at runtime across the paths the sibling
@@ -27,7 +27,7 @@ Existing coverage (do NOT duplicate):
     - Canonical-set monotonic-superset on _TOKEN_KEYS / _PHI_KEYS
     - Per-key drop behaviour in both modes
 
-Gaps this module fills (#168):
+Gaps this module fills:
 
 1. **O365 error path on token acquisition.** When
    ``acquire_token_for_client`` returns a dict WITHOUT

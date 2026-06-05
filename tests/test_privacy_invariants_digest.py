@@ -1,4 +1,4 @@
-"""Privacy invariants for digest body-preview HIPAA redaction (#167).
+"""Privacy invariants for digest body-preview HIPAA redaction.
 
 Filed against the 2026-05-14 weekly HIPAA / NERC-CIP audit
 recommendation #4: "Verify digest ``include_body_preview``
@@ -61,7 +61,7 @@ Companion modules:
     style-learning invariants. Same shape (sentinel-string +
     raising fixture pattern).
 
-See ``docs/privacy-audit-runbook.md`` for the full operator
+See ``internal documentation`` for the full operator
 contract.
 """
 

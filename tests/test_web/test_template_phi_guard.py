@@ -77,7 +77,7 @@ NON_PHI_CAT_DESCRIPTION_FILES = {
     "categories/_edit.html",
     "profile.html",
     "profile/_personal_categories.html",
-    # #95 sub-A — wizard step 5 renders the same per-user
+    #  sub-A — wizard step 5 renders the same per-user
     # escalation-categories table that profile.html does.
     # cat.description here is admin-config text describing the
     # category itself (e.g. "Bills/finance"), not PHI extracted
@@ -93,9 +93,9 @@ ALLOWLIST: set[str] = {
     # (server-internal code: "self_origin", "x_email_triage_header",
     # "in_flight"), NOT the LLM classification reason text. Server
     # codes are non-PHI; rendered into a tooltip so the operator can
-    # tell which loop-prevention gate fired. See punch-list #119 +
-    # #117 + #114.
-    # 2026-05-11: line shifted from 140 → 181 when #129 multi-label
+    # tell which loop-prevention gate fired. See the backlog  +
+    #  + .
+    # 2026-05-11: line shifted from 140 → 181 when  multi-label
     # added bulk-tag toolbar + per-row checkboxes above this block.
     # 2026-05-12: line shifted from 181 → 185 when the slug-jargon
     # cleanup commit added a 4-line Jinja comment inside the bulk-

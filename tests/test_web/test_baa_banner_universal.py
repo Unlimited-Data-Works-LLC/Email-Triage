@@ -1,7 +1,7 @@
-"""Universal admin BAA-expiry banner coverage (#171-D).
+"""Universal admin BAA-expiry banner coverage.
 
-W2-α (#169 I7) shipped the BAA-expiry tracking + banner partial, wired
-into ``/config`` and ``/config/ai-backends`` only. #171-D extends that
+W2-α shipped the BAA-expiry tracking + banner partial, wired
+into ``/config`` and ``/config/ai-backends`` only. -D extends that
 to every admin page via ctx auto-injection in ``_shared._render``
 plus an include in ``base.html``.
 
@@ -293,7 +293,7 @@ class TestStaleCachedSummary:
     cache and renders whatever buckets are in there; the bucket math
     is day-resolution so 1-25 hours of staleness is invisible.
 
-    /health/detail surfaces a Nagios-pollable freshness signal
+    /health/detail surfaces a the monitoring system-pollable freshness signal
     separately — the banner doesn't try to second-guess.
     """
 

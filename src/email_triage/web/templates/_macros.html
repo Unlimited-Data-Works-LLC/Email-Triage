@@ -4,8 +4,7 @@
 {#
     Renders an in-UI help tooltip trigger.
 
-    Originally shipped on Pico's CSS-pseudo-element data-tooltip
-    (#64). That mechanism kept failing in production: ancestor
+    Originally shipped on Pico's CSS-pseudo-element data-tooltip. That mechanism kept failing in production: ancestor
     overflow:hidden / transform / contain contexts clip the
     pseudo-element regardless of viewport math, and a JS-stamped
     data-tip-anchor patch only solved the viewport-edge subset.

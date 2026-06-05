@@ -1,4 +1,4 @@
-"""Tests for the M-7 per-contact HIPAA overlay draft-time consumer (#171-C).
+"""Tests for the M-7 per-contact HIPAA overlay draft-time consumer.
 
 Scope: when ``build_prompt_messages`` runs for a HIPAA-flagged account,
 it looks up per-contact style descriptors (via W3's

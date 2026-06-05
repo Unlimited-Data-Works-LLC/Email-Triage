@@ -35,7 +35,7 @@ provider:
 
 classifier:
   backend: ollama
-  model: [local-llm-model]                     # Or any model on your Ollama instance
+  model: qwen3.5:35b                     # Or any model on your Ollama instance
   ollama_url: http://gpu-server.local:11434
 
   categories:
@@ -70,6 +70,7 @@ secrets:
 
 persistence:
   db_path: /app/data/triage.db           # Container volume mount
+  encryption_enabled: true               # SQLCipher AES-256 at rest (on by default for new installs)
 
 push:
   listen_port: 8080
@@ -96,7 +97,7 @@ push:
   gmail_subscription_sa_email: ""
   gmail_audience: ""
 
-  # OpenClaw / agent-instance bearer-token API.
+  # OpenClaw / the agent bearer-token API.
   # `openclaw_webhook_enabled` is the global kill switch for the
   # outbound `triage.completed` event — flip it off to silence the
   # emitter without removing the webhooks: block below. Each account

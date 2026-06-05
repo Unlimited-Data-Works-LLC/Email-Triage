@@ -1,6 +1,6 @@
 """Routes for the wizard concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,7 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
+    RequireUser,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,15 +50,29 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.wizard")
 
 router = APIRouter()
 
 
+def _wizard_fetch_and_auth(db, user, account_id):
+    """/ — account fetch + can-manage check in one threadpool
+    hop. Returns ``(acct, can_manage)``; ``acct`` is ``None`` when the
+    row does not exist. Shared by every wizard step so the read +
+    permission check are a single thread crossing.
+    """
+    from email_triage.web.db import get_email_account
+    acct = get_email_account(db, account_id)
+    if acct is None:
+        return None, False
+    return acct, can_manage_account(db, user, acct)
+
+
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -101,14 +115,12 @@ def __getattr__(name):
 @router.get("/accounts/new", response_class=HTMLResponse)
 async def wizard_step_dispatcher(
     request: Request,
+    user: RequireUser,
     step: int = 1,
     account_id: int | None = None,
 ):
     """Single GET dispatcher for the wizard. Reads ?step=N and
     renders the matching template with the right context."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     db = get_db(request)
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
@@ -116,7 +128,7 @@ async def wizard_step_dispatcher(
     # Step 1 doesn't need an account_id — it's the entry point.
     if step == 1:
         def _wizard_step1_assignable(db) -> list[dict] | None:
-            """#135 phase 2 — admin-only assignable-users roster off
+            """ phase 2 — admin-only assignable-users roster off
             the loop."""
             rows = db.execute(
                 "SELECT id, email, name FROM users "
@@ -128,7 +140,7 @@ async def wizard_step_dispatcher(
         assignable_users = None
         if is_admin:
             assignable_users = await db_call(_wizard_step1_assignable, db)
-        return _render(templates, request, "account_wizard/step1.html", {
+        return await _render(templates, request, "account_wizard/step1.html", {
             "user": user, "is_admin": is_admin,
             "assignable_users": assignable_users,
             "default_owner_id": user["id"],
@@ -140,7 +152,7 @@ async def wizard_step_dispatcher(
     from email_triage.web.db import get_email_account
 
     def _wizard_acct_check(db, account_id, user) -> dict | None:
-        """#135 phase 2 — fetch + can-manage-check in one threadpool hop."""
+        """ phase 2 — fetch + can-manage-check in one threadpool hop."""
         acct = get_email_account(db, account_id)
         if acct is None or not can_manage_account(db, user, acct):
             return None
@@ -185,7 +197,7 @@ async def wizard_step_dispatcher(
         )
 
     if step == 2:
-        return _render(templates, request, "account_wizard/step2.html", {
+        return await _render(templates, request, "account_wizard/step2.html", {
             "user": user, "acct": acct,
             "skipped_steps": skipped_steps,
         })
@@ -224,7 +236,7 @@ async def wizard_step_dispatcher(
         auth_success = bool(
             request.query_params.get("auth") == "ok"
         )
-        return _render(templates, request, "account_wizard/step3.html", {
+        return await _render(templates, request, "account_wizard/step3.html", {
             "user": user, "acct": acct,
             "push_blocked_reason": push_blocked_reason,
             "push_enabled_default": push_enabled_default,
@@ -233,7 +245,7 @@ async def wizard_step_dispatcher(
         })
     if step == 4:
         def _wizard_step4_snapshot(db, account_id, user) -> list[dict]:
-            """#135 phase 2 — copy-from candidate accounts in one
+            """ phase 2 — copy-from candidate accounts in one
             threadpool hop."""
             from email_triage.web.db import list_email_accounts
             all_accts = list_email_accounts(db)
@@ -262,14 +274,14 @@ async def wizard_step_dispatcher(
         other_accounts = await db_call(
             _wizard_step4_snapshot, db, account_id, user,
         )
-        return _render(templates, request, "account_wizard/step4.html", {
+        return await _render(templates, request, "account_wizard/step4.html", {
             "user": user, "acct": acct,
             "other_accounts": other_accounts,
             "skipped_steps": skipped_steps,
         })
     if step == 5:
         def _wizard_step5_snapshot(db, user_id) -> dict:
-            """#135 phase 2 — categories + escalation prefs in one hop."""
+            """ phase 2 — categories + escalation prefs in one hop."""
             from email_triage.web.db import (
                 list_categories, get_user_escalation_categories,
             )
@@ -283,7 +295,7 @@ async def wizard_step_dispatcher(
             }
 
         snap = await db_call(_wizard_step5_snapshot, db, user["id"])
-        return _render(templates, request, "account_wizard/step5.html", {
+        return await _render(templates, request, "account_wizard/step5.html", {
             "user": user, "acct": acct,
             "categories": snap["categories"],
             "escalation_categories": snap["escalation_categories"],
@@ -295,12 +307,8 @@ async def wizard_step_dispatcher(
 
 
 @router.post("/accounts/new/step1", response_class=HTMLResponse)
-async def wizard_step1_submit(request: Request):
+async def wizard_step1_submit(request: Request, user: RequireUser):
     """Create the account row + redirect to step 2."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     form = await request.form()
     db = get_db(request)
     is_admin = user["role"] == "admin"
@@ -310,14 +318,14 @@ async def wizard_step1_submit(request: Request):
     ptype = form.get("provider_type", "imap")
 
     if not name:
-        return _render(templates, request, "account_wizard/step1.html", {
+        return await _render(templates, request, "account_wizard/step1.html", {
             "user": user, "is_admin": is_admin,
             "name": name, "provider_type": ptype,
             "error": "Account name is required.",
             "default_owner_id": user["id"],
         })
     if ptype not in _PROVIDER_TYPES:
-        return _render(templates, request, "account_wizard/step1.html", {
+        return await _render(templates, request, "account_wizard/step1.html", {
             "user": user, "is_admin": is_admin,
             "name": name,
             "error": f"Unknown provider type: {ptype}",
@@ -325,18 +333,18 @@ async def wizard_step1_submit(request: Request):
         })
 
     if is_admin and form.get("user_id"):
-        owner_id = int(form["user_id"])
+        owner_id = _safe_int(form["user_id"], user["id"])
     else:
         owner_id = user["id"]
 
     # Minimal config — provider-specific fields land in step 2.
     # is_active=False so the half-configured stub does not get polled
     # by watchers / pollers / triage workers between step 1 and step 5
-    # finish (item #120). Step-5 submit flips it to True via
+    # finish (item ). Step-5 submit flips it to True via
     # ``set_account_active``. Background pollers already gate on
     # ``is_active`` (six call sites in app.py + ui.py), so the flag
     # suppresses "missing credentials" / "not authenticated" error
-    # spam that fired between steps and triggered Nagios alerts on
+    # spam that fired between steps and triggered the monitoring system alerts on
     # the homelab monitoring path.
     from email_triage.triage_logging import is_hipaa_mode
     from email_triage.web.db import create_email_account
@@ -345,7 +353,7 @@ async def wizard_step1_submit(request: Request):
         hipaa_flag = False  # operator can flip on edit page later
 
     def _wizard_step1_create_snapshot(db, owner_id, name, ptype, hipaa_flag):
-        """#135 phase 2 — account create + wizard-progress marker in
+        """ phase 2 — account create + wizard-progress marker in
         one threadpool hop."""
         aid = create_email_account(
             db, owner_id, name, ptype, {},
@@ -365,24 +373,19 @@ async def wizard_step1_submit(request: Request):
 
 
 @router.post("/accounts/new/step2-imap", response_class=HTMLResponse)
-async def wizard_step2_imap(request: Request):
+async def wizard_step2_imap(request: Request, user: RequireUser):
     """IMAP creds save + watch start prep. Redirect to step 3."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     form = await request.form()
     db = get_db(request)
     secrets = get_secrets(request)
     templates = get_templates(request)
 
-    account_id = int(form.get("account_id") or 0)
-    from email_triage.web.db import get_email_account
-    # #135 phase 3 — DB-before-network: wrap in db_call so the SQLite
-    # read happens off the event loop. Subsequent provider work is
-    # network-dominated; the threadpool hop here is the win.
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None or not can_manage_account(db, user, acct):
+    account_id = _safe_int(form.get("account_id"), 0)
+    # / — DB-before-network: fetch + can-manage in one hop.
+    acct, can_manage = await db_call(
+        _wizard_fetch_and_auth, db, user, account_id,
+    )
+    if acct is None or not can_manage:
         return RedirectResponse("/accounts/new?step=1", status_code=303)
     if acct["provider_type"] != "imap":
         return RedirectResponse(
@@ -395,7 +398,7 @@ async def wizard_step2_imap(request: Request):
     host = (form.get("host") or "").strip()
     username = (form.get("username") or "").strip()
     try:
-        port = int(form.get("port") or 993)
+        port = _safe_int(form.get("port"), 993)
     except (TypeError, ValueError):
         port = 993
     use_ssl = "use_ssl" in form
@@ -407,24 +410,30 @@ async def wizard_step2_imap(request: Request):
         preview = dict(acct.get("config") or {})
         preview.update({"host": host, "port": port,
                         "username": username, "use_ssl": use_ssl})
-        return _render(templates, request, "account_wizard/step2.html", {
+        return await _render(templates, request, "account_wizard/step2.html", {
             "user": user, "acct": {**acct, "config": preview},
             "error": "Host and username are required.",
         })
 
-    # Adjacent helper #137 — atomic read-modify-write that
-    # preserves any unrelated config keys + emits a structured-log
-    # entry of which keys changed. Replaces 7-line dict-patch idiom.
-    from email_triage.web.db import update_account_config_keys
-    update_account_config_keys(
-        db, account_id,
-        host=host, port=port, username=username, use_ssl=use_ssl,
-    )
     pw = form.get("password", "")
-    if pw:
-        secrets.set(_secret_key_for_account(account_id, "imap"), pw)
 
-    _record_wizard_step(db, account_id, 2)
+    def _step2_imap_db_work() -> None:
+        """/ — config-key write + secret store + wizard-step
+        marker in one threadpool hop.
+        """
+        # Adjacent helper  — atomic read-modify-write that
+        # preserves any unrelated config keys + emits a structured-log
+        # entry of which keys changed. Replaces 7-line dict-patch idiom.
+        from email_triage.web.db import update_account_config_keys
+        update_account_config_keys(
+            db, account_id,
+            host=host, port=port, username=username, use_ssl=use_ssl,
+        )
+        if pw:
+            secrets.set(_secret_key_for_account(account_id, "imap"), pw)
+        _record_wizard_step(db, account_id, 2)
+
+    await db_call(_step2_imap_db_work)
     return RedirectResponse(
         f"/accounts/new?step=3&account_id={account_id}",
         status_code=303,
@@ -432,7 +441,7 @@ async def wizard_step2_imap(request: Request):
 
 
 @router.post("/accounts/new/step2-o365", response_class=HTMLResponse)
-async def wizard_step2_o365(request: Request):
+async def wizard_step2_o365(request: Request, user: RequireUser):
     """O365 client creds save. Redirect to step 3.
 
     Note: full Microsoft device-code flow lands separately;
@@ -441,20 +450,18 @@ async def wizard_step2_o365(request: Request):
     needs. Production flow would interleave a device-code prompt
     here; deferred to follow-up.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
 
     form = await request.form()
     db = get_db(request)
     secrets = get_secrets(request)
     templates = get_templates(request)
 
-    account_id = int(form.get("account_id") or 0)
-    from email_triage.web.db import get_email_account
-    # #135 phase 3 — DB-before-network.
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None or not can_manage_account(db, user, acct):
+    account_id = _safe_int(form.get("account_id"), 0)
+    # / — DB-before-network: fetch + can-manage in one hop.
+    acct, can_manage = await db_call(
+        _wizard_fetch_and_auth, db, user, account_id,
+    )
+    if acct is None or not can_manage:
         return RedirectResponse("/accounts/new?step=1", status_code=303)
     if acct["provider_type"] != "office365":
         return RedirectResponse(
@@ -467,13 +474,18 @@ async def wizard_step2_o365(request: Request):
     # choice on this step is personal-MSA vs org tenant.
     is_personal_msa = "is_personal_msa" in form
 
-    # Adjacent helper #137 — atomic read-modify-write per key.
-    from email_triage.web.db import update_account_config_keys
-    update_account_config_keys(
-        db, account_id, is_personal_msa=is_personal_msa,
-    )
+    def _step2_o365_db_work() -> None:
+        """/ — config-key write + wizard-step marker in one
+        threadpool hop.
+        """
+        # Adjacent helper  — atomic read-modify-write per key.
+        from email_triage.web.db import update_account_config_keys
+        update_account_config_keys(
+            db, account_id, is_personal_msa=is_personal_msa,
+        )
+        _record_wizard_step(db, account_id, 2)
 
-    _record_wizard_step(db, account_id, 2)
+    await db_call(_step2_o365_db_work)
     return RedirectResponse(
         f"/accounts/new?step=3&account_id={account_id}",
         status_code=303,
@@ -481,7 +493,7 @@ async def wizard_step2_o365(request: Request):
 
 
 @router.post("/accounts/new/step3", response_class=HTMLResponse)
-async def wizard_step3_submit(request: Request):
+async def wizard_step3_submit(request: Request, user: RequireUser):
     """Save push/poll, register the watcher, redirect to step 4.
 
     For IMAP: registers the IDLE watcher via WatcherManager.start().
@@ -489,17 +501,14 @@ async def wizard_step3_submit(request: Request):
     (sub-B). For O365: push not yet implemented; poll registration
     only.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     form = await request.form()
     db = get_db(request)
-    from email_triage.web.db import get_email_account
-    account_id = int(form.get("account_id") or 0)
-    # #135 phase 3 — DB-before-network (watcher start below).
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None or not can_manage_account(db, user, acct):
+    account_id = _safe_int(form.get("account_id"), 0)
+    # / — DB-before-network (watcher start below).
+    acct, can_manage = await db_call(
+        _wizard_fetch_and_auth, db, user, account_id,
+    )
+    if acct is None or not can_manage:
         return RedirectResponse("/accounts/new?step=1", status_code=303)
 
     push_enabled = "push_enabled" in form
@@ -513,9 +522,11 @@ async def wizard_step3_submit(request: Request):
     except (TypeError, ValueError):
         poll_interval_minutes = 60
 
-    # Adjacent helper #137 — atomic read-modify-write per key.
+    # Adjacent helper  — atomic read-modify-write per key.
+    # / — config write off the loop, before the watcher start.
     from email_triage.web.db import update_account_config_keys
-    update_account_config_keys(
+    await db_call(
+        update_account_config_keys,
         db, account_id,
         push_enabled=push_enabled,
         poll_enabled=poll_enabled,
@@ -535,7 +546,7 @@ async def wizard_step3_submit(request: Request):
                 account_id=account_id, error=fmt_exc(e),
             )
 
-    _record_wizard_step(db, account_id, 3)
+    await db_call(_record_wizard_step, db, account_id, 3)
     return RedirectResponse(
         f"/accounts/new?step=4&account_id={account_id}",
         status_code=303,
@@ -543,68 +554,76 @@ async def wizard_step3_submit(request: Request):
 
 
 @router.post("/accounts/new/step4", response_class=HTMLResponse)
-async def wizard_step4_submit(request: Request):
+async def wizard_step4_submit(request: Request, user: RequireUser):
     """Optionally copy routes from another account. Redirect to step 5."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     form = await request.form()
     db = get_db(request)
-    from email_triage.web.db import get_email_account
-    account_id = int(form.get("account_id") or 0)
-    # #135 phase 3 — both fetches wrapped (route copy below is a separate hop).
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None or not can_manage_account(db, user, acct):
+    account_id = _safe_int(form.get("account_id"), 0)
+    # / — fetch + can-manage in one hop.
+    acct, can_manage = await db_call(
+        _wizard_fetch_and_auth, db, user, account_id,
+    )
+    if acct is None or not can_manage:
         return RedirectResponse("/accounts/new?step=1", status_code=303)
 
     route_source = (form.get("route_source") or "fresh").strip()
-    if route_source.startswith("copy:"):
-        try:
-            source_id = int(route_source.split(":", 1)[1])
-        except (TypeError, ValueError):
-            source_id = 0
-        if source_id and source_id != account_id:
-            source_acct = await db_call(get_email_account, db, source_id)
-            if (
-                source_acct is not None
-                and can_manage_account(db, user, source_acct)
-            ):
-                # Copy account_routes rows from source → target.
-                # Best-effort; per-row failure is logged + skipped.
-                try:
-                    src_rows = db.execute(
-                        "SELECT category_slug, action_name, "
-                        "       config_json, sort_order "
-                        "FROM account_routes WHERE account_id = ? "
-                        "ORDER BY sort_order",
-                        (source_id,),
-                    ).fetchall()
-                    for r in src_rows:
-                        try:
-                            db.execute(
-                                "INSERT INTO account_routes "
-                                "(account_id, category_slug, action_name, "
-                                " config_json, sort_order) "
-                                "VALUES (?, ?, ?, ?, ?)",
-                                (account_id, r["category_slug"],
-                                 r["action_name"], r["config_json"],
-                                 r["sort_order"]),
-                            )
-                        except Exception as e:
-                            _log.warning(
-                                "Wizard step 4: route copy row failed",
-                                src=source_id, dst=account_id,
-                                error=fmt_exc(e),
-                            )
-                    db.commit()
-                except Exception as e:
-                    _log.warning(
-                        "Wizard step 4: route copy failed",
-                        src=source_id, dst=account_id, error=fmt_exc(e),
-                    )
 
-    _record_wizard_step(db, account_id, 4)
+    def _step4_db_work() -> None:
+        """/ — optional route-copy (source fetch + permission
+        check + per-row INSERT loop) + wizard-step marker, ALL in one
+        threadpool hop. The N-row copy loop is one thread crossing.
+        """
+        from email_triage.web.db import get_email_account
+        if route_source.startswith("copy:"):
+            try:
+                source_id = int(route_source.split(":", 1)[1])
+            except (TypeError, ValueError):
+                source_id = 0
+            if source_id and source_id != account_id:
+                source_acct = get_email_account(db, source_id)
+                if (
+                    source_acct is not None
+                    and can_manage_account(db, user, source_acct)
+                ):
+                    # Copy account_routes rows from source → target.
+                    # Best-effort; per-row failure is logged + skipped.
+                    try:
+                        src_rows = db.execute(
+                            "SELECT category_slug, action_name, "
+                            "       config_json, sort_order "
+                            "FROM account_routes WHERE account_id = ? "
+                            "ORDER BY sort_order",
+                            (source_id,),
+                        ).fetchall()
+                        for r in src_rows:
+                            try:
+                                db.execute(
+                                    "INSERT INTO account_routes "
+                                    "(account_id, category_slug, "
+                                    " action_name, config_json, "
+                                    " sort_order) "
+                                    "VALUES (?, ?, ?, ?, ?)",
+                                    (account_id, r["category_slug"],
+                                     r["action_name"], r["config_json"],
+                                     r["sort_order"]),
+                                )
+                            except Exception as e:
+                                _log.warning(
+                                    "Wizard step 4: route copy row failed",
+                                    src=source_id, dst=account_id,
+                                    error=fmt_exc(e),
+                                )
+                        db.commit()
+                    except Exception as e:
+                        _log.warning(
+                            "Wizard step 4: route copy failed",
+                            src=source_id, dst=account_id,
+                            error=fmt_exc(e),
+                        )
+
+        _record_wizard_step(db, account_id, 4)
+
+    await db_call(_step4_db_work)
     return RedirectResponse(
         f"/accounts/new?step=5&account_id={account_id}",
         status_code=303,
@@ -612,22 +631,16 @@ async def wizard_step4_submit(request: Request):
 
 
 @router.post("/accounts/new/step5", response_class=HTMLResponse)
-async def wizard_step5_submit(request: Request):
+async def wizard_step5_submit(request: Request, user: RequireUser):
     """Save digest + escalation prefs. Redirect to /dashboard with success."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     form = await request.form()
     db = get_db(request)
-    from email_triage.web.db import (
-        get_email_account,
-        set_user_escalation_categories, list_categories,
+    account_id = _safe_int(form.get("account_id"), 0)
+    # / — fetch + can-manage in one hop.
+    acct, can_manage = await db_call(
+        _wizard_fetch_and_auth, db, user, account_id,
     )
-    account_id = int(form.get("account_id") or 0)
-    # #135 phase 3 — DB-before-(potential)-network in this handler.
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None or not can_manage_account(db, user, acct):
+    if acct is None or not can_manage:
         return RedirectResponse("/accounts/new?step=1", status_code=303)
 
     # Recipient digest — persists to account config_json.
@@ -644,38 +657,56 @@ async def wizard_step5_submit(request: Request):
     else:
         recipient_digest_send_at = "08:10"
 
-    # Adjacent helper #137 — atomic read-modify-write per key.
-    from email_triage.web.db import update_account_config_keys
-    update_account_config_keys(
-        db, account_id,
-        recipient_digest_enabled=recipient_digest_enabled,
-        recipient_digest_send_at=recipient_digest_send_at,
-    )
+    # The set of escalate-checkbox keys present in the posted form.
+    # Snapshotted on the loop so the threadpool helper only does DB
+    # work (form membership is needed to compute ``selected``).
+    escalate_keys = {
+        k for k in form.keys() if str(k).startswith("escalate_")
+    }
 
-    # Escalation prefs — per-user, applies across all their accounts.
-    cats = list_categories(db, user_id=user["id"], scope="all")
-    selected = [
-        c["slug"] for c in cats if f"escalate_{c['slug']}" in form
-    ]
-    try:
-        set_user_escalation_categories(db, user["id"], selected)
-    except Exception as e:
-        _log.warning(
-            "Wizard step 5: escalation prefs save failed",
-            user_id=user["id"], error=fmt_exc(e),
+    def _step5_db_work() -> None:
+        """/ — config write + escalation-prefs read+write +
+        wizard-step clear + activate, ALL in one threadpool hop. No
+        network sits between these calls.
+        """
+        # Adjacent helper  — atomic read-modify-write per key.
+        from email_triage.web.db import (
+            update_account_config_keys,
+            set_user_escalation_categories, list_categories,
+            set_account_active,
+        )
+        update_account_config_keys(
+            db, account_id,
+            recipient_digest_enabled=recipient_digest_enabled,
+            recipient_digest_send_at=recipient_digest_send_at,
         )
 
-    # Wizard complete — clear the resume marker so the Resume banner
-    # stops showing on the edit page.
-    _clear_wizard_step(db, account_id)
+        # Escalation prefs — per-user, applies across all accounts.
+        cats = list_categories(db, user_id=user["id"], scope="all")
+        selected = [
+            c["slug"] for c in cats
+            if f"escalate_{c['slug']}" in escalate_keys
+        ]
+        try:
+            set_user_escalation_categories(db, user["id"], selected)
+        except Exception as e:
+            _log.warning(
+                "Wizard step 5: escalation prefs save failed",
+                user_id=user["id"], error=fmt_exc(e),
+            )
 
-    # #120: flip the account to is_active=True now that every step
-    # has been touched. Step 1 created the row with is_active=False
-    # so background pollers / watchers would not fire on the half-
-    # configured stub between steps. With provider auth + watch +
-    # categories all complete, the account is ready to triage.
-    from email_triage.web.db import set_account_active
-    set_account_active(db, account_id, True)
+        # Wizard complete — clear the resume marker so the Resume
+        # banner stops showing on the edit page.
+        _clear_wizard_step(db, account_id)
+
+        # : flip the account to is_active=True now that every step
+        # has been touched. Step 1 created the row with is_active=False
+        # so background pollers / watchers would not fire on the half-
+        # configured stub between steps. With provider auth + watch +
+        # categories all complete, the account is ready to triage.
+        set_account_active(db, account_id, True)
+
+    await db_call(_step5_db_work)
 
     # Build the success banner. HIPAA-mode installs get a reminder
     # that the per-account HIPAA flag can be flipped on the edit

@@ -78,37 +78,29 @@ async def _o365_subscription_renewer_loop(app) -> None:
     the previous tick took (a slow tick due to many subscriptions
     doesn't push the next tick into HH:30 territory).
     """
-    await asyncio.sleep(_START_DELAY_SECONDS)
-    log.info("Office 365 subscription renewer started")
+    from email_triage.web.task_supervisor import supervised_interval_loop
 
-    while True:
-        try:
-            cfg = app.state.config
-            window_hours = int(
-                getattr(
-                    cfg.push,
-                    "office365_subscription_renewal_window_hours",
-                    24,
-                )
-            )
-            await _run_o365_renewal_sweep(app, window_hours=window_hours)
-        except asyncio.CancelledError:
-            log.info("Office 365 subscription renewer cancelled")
-            return
-        except Exception as e:
-            log.error(
-                "Office 365 subscription renewer sweep failed",
-                error=fmt_exc(e),
-            )
+    async def _tick() -> None:
+        cfg = app.state.config
+        window_hours = int(getattr(
+            cfg.push,
+            "office365_subscription_renewal_window_hours",
+            24,
+        ))
+        await _run_o365_renewal_sweep(app, window_hours=window_hours)
 
-        # Sleep to the next HH:00 + jitter boundary. Recompute every
-        # tick so wall-clock skew (NTP correction, suspend/resume)
-        # snaps us back to the schedule.
-        try:
-            await asyncio.sleep(_seconds_until_next_tick())
-        except asyncio.CancelledError:
-            log.info("Office 365 subscription renewer cancelled")
-            return
+    # Cron-anchored cadence — sleep to the next HH:00 + jitter boundary,
+    # recomputed each tick so wall-clock skew snaps back to schedule —
+    # via supervised_interval_loop's callable-interval form.  —
+    # lease-gated: renewing a Graph subscription is idempotent, one
+    # instance per tick.
+    await supervised_interval_loop(
+        "o365-subscription-renewer", _seconds_until_next_tick, _tick,
+        warmup_secs=_START_DELAY_SECONDS,
+        startup_jitter_secs=30.0,
+        lease_name="o365-subscription-renewer",
+        lease_conn=app.state.db,
+    )
 
 
 def _seconds_until_next_tick(*, now: datetime | None = None) -> float:
@@ -157,13 +149,20 @@ async def _run_o365_renewal_sweep(
     )
     from email_triage.providers.office365 import Office365Provider
     from email_triage.web.routers.ui import _create_provider_from_account
+    #  — this sweep fans out ``_renew_one`` coroutines concurrently
+    # via ``asyncio.gather``; each one MUST route its DB work through
+    # ``db_call`` so the process-wide DB lock serialises it against
+    # other db_call workers / @db_write helpers on the shared
+    # ``sqlite3.Connection``. A bare sync DB call on the event-loop
+    # thread bypasses the lock.
+    from email_triage.web.db_threadpool import db_call
 
     db = app.state.db
     secrets = app.state.secrets
 
     now = datetime.now(timezone.utc)
     horizon = (now + timedelta(hours=window_hours)).isoformat()
-    expiring = list_o365_subscriptions_expiring(db, horizon)
+    expiring = await db_call(list_o365_subscriptions_expiring, db, horizon)
 
     counters = {"considered": len(expiring), "renewed": 0, "failed": 0}
     if not expiring:
@@ -177,7 +176,7 @@ async def _run_o365_renewal_sweep(
         account_id = row["account_id"]
         subscription_id = row["subscription_id"]
         async with semaphore:
-            acct = get_email_account(db, account_id)
+            acct = await db_call(get_email_account, db, account_id)
             if acct is None:
                 # Orphaned subscription row — account was deleted but
                 # the subscription survived. Log and skip; the
@@ -219,14 +218,16 @@ async def _run_o365_renewal_sweep(
                 new_sub_id = (
                     (data or {}).get("id") or subscription_id
                 )
-                record_o365_subscription_renewal(
+                await db_call(
+                    record_o365_subscription_renewal,
                     db,
                     account_id=account_id,
                     subscription_id=new_sub_id,
                     new_expiration_at=new_exp,
                 )
                 try:
-                    record_auth_event(
+                    await db_call(
+                        record_auth_event,
                         db,
                         event_type="o365_subscription_renewed",
                         email=account_email,
@@ -249,7 +250,8 @@ async def _run_o365_renewal_sweep(
             except Exception as e:
                 err_text = fmt_exc(e)
                 try:
-                    record_o365_subscription_error(
+                    await db_call(
+                        record_o365_subscription_error,
                         db,
                         account_id=account_id,
                         error_text=err_text,
@@ -257,7 +259,8 @@ async def _run_o365_renewal_sweep(
                 except Exception:
                     pass
                 try:
-                    record_auth_event(
+                    await db_call(
+                        record_auth_event,
                         db,
                         event_type="o365_subscription_renewed",
                         email=account_email,

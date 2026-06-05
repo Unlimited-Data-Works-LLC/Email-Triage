@@ -1,7 +1,7 @@
 """Tests for ``email_triage.web.calendars``.
 
 Covers the merge / parse / role-query helpers that back the
-per-account calendar selection feature (#105 phase 1A). Lower-
+per-account calendar selection feature. Lower-
 level unit tests; HTTP-route tests for the discover/save
 endpoints live in tests/test_web/test_calendars_route.py.
 """
@@ -173,13 +173,13 @@ def test_get_self_schedule_calendar_id_single_pick():
 
 def test_roles_constant_lock():
     """Lock the role keys + order. Editor table column order
-    relies on this; downstream readers (#107) assume the keys
+    relies on this; downstream readers assume the keys
     are stable."""
     assert ROLES == ("meetings", "listings", "api", "self_schedule")
 
 
 # ---------------------------------------------------------------------------
-# Surrogate helpers (#105 phase 1A++)
+# Surrogate helpers
 # ---------------------------------------------------------------------------
 
 

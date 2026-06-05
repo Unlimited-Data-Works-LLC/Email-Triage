@@ -1,4 +1,4 @@
-"""Unit tests for the email-to-SMS gateway helper module (#73)."""
+"""Unit tests for the email-to-SMS gateway helper module."""
 
 from __future__ import annotations
 

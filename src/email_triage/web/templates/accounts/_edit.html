@@ -203,7 +203,7 @@
                                 </div>
                             </div>
 
-                            {# ── Sub-block: Additional addresses (#106) ──
+                            {# ── Sub-block: Additional addresses ──
                                Lets the owner declare extra addresses that deliver
                                to the same inbox so triage routes + digest delivery
                                work for each. The partial owns its own HTMX-driven
@@ -219,16 +219,16 @@
                             {# ── Sub-block: Local timezone ─────────────────
                                Used to render calendar event times back to you in
                                your local clock. Pick the zone you live in. New
-                               accounts default to Eastern (Detroit); change as
+                               accounts default to Eastern (New York); change as
                                needed. Drives the day-of-week + AM/PM strings
                                shown by the assistant.
                                Common North American + a few global zones; the
                                list intentionally short — operators in zones
                                not on it can ask to have theirs added. #}
                             <div class="et-card-section">
-                                {% set _account_tz = acct.config.get('tz') or 'America/Detroit' %}
+                                {% set _account_tz = acct.config.get('tz') or 'America/New_York' %}
                                 {% set _common_tzs = [
-                                    'America/Detroit',
+                                    'America/New_York',
                                     'America/New_York',
                                     'America/Chicago',
                                     'America/Denver',

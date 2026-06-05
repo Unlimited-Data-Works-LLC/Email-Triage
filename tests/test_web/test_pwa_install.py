@@ -1,4 +1,4 @@
-"""Tests for PWA install-prompt surface (#124).
+"""Tests for PWA install-prompt surface.
 
 Covers the second layer of PWA support shipped on top of the existing
 manifest + service worker plumbing:

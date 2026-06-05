@@ -1,4 +1,4 @@
-"""Tests for the M-3 (account-level) HIPAA-distill trigger watcher (#171-B).
+"""Tests for the M-3 (account-level) HIPAA-distill trigger watcher.
 
 Validates the trigger-plane logic that decides when an account warrants
 an M-3 distill enqueue. The watcher itself is pure-DB; no provider /

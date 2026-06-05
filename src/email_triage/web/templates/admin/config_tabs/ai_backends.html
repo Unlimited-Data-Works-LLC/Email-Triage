@@ -69,7 +69,7 @@
         </div>
     </article>
 
-    {# ── Embedding-bits install card (#180) ─────────────────────
+    {# ── Embedding-bits install card ─────────────────────
        Slots between "Currently running" + the metrics card so the
        operator sees the install gate before any per-backend telemetry.
        Self-polls via HTMX while a download / verify / install is in
@@ -239,10 +239,10 @@
                     </select>
                 </label>
                 <label>
-                    Fallback model{{ m.help("Model name for the fallback backend. Example: [local-llm-model] on Ollama (reuses an already-loaded chat model — slow per-call but always available). For sentence_transformers: a different HuggingFace model id than the primary.") }}
+                    Fallback model{{ m.help("Model name for the fallback backend. Example: qwen3.6:35b on Ollama (reuses an already-loaded chat model — slow per-call but always available). For sentence_transformers: a different HuggingFace model id than the primary.") }}
                     <input type="text" name="fallback_model_name"
                            value="{{ fallback_model_name }}"
-                           placeholder="[local-llm-model]
+                           placeholder="qwen3.6:35b">
                 </label>
                 <label>
                     Fallback Ollama URL{{ m.help("HTTP URL for the fallback Ollama. Leave blank to inherit the primary's URL. Example: http://ollama.home.example.local:11434 — same LAN-only privacy gate.") }}

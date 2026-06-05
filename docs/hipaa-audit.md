@@ -1,6 +1,6 @@
 # HIPAA Compliance Audit — Findings Summary
 
-**Date of most recent audit:** 2026-05-17
+**Date of most recent audit:** 2026-05-31 (v0.1.2 — encryption-at-rest + MFA-enforcement review)
 **Audit scope:** Source code at `src/email_triage/` + container build pipeline + admin surfaces
 **Audit type:** Internal review (single-maintainer project)
 
@@ -14,6 +14,9 @@
 - 3-layer PHI scrubber (`tests/test_privacy_invariants_phi_scrubber.py`).
 - M-7 per-contact descriptor recipient-hash salting (`tests/test_privacy_invariants_m7_hipaa.py`).
 - M-series cross-cutting invariants (`tests/test_privacy_invariants_m_series.py`).
+- **v0.1.2 — Database encryption at rest** (SQLCipher AES-256, key HKDF-derived from the master key; fail-closed in HIPAA mode) — `tests/test_db_encryption_boot.py` + the `db encrypt`/`db decrypt` migration round-trip.
+- **v0.1.2 — HIPAA-mode MFA enforcement** (WebAuthn passkey required; OTP-only rejected) — `tests/test_web/test_mfa.py`.
+- **v0.1.2 — Deprecated `env` master-key backend** rejected at boot in HIPAA mode; audit-chain HMAC preserved across master-key rotation.
 
 Tests run in CI on every push; production deploys verify integrity post-restart.
 
@@ -50,8 +53,11 @@ Findings closed prior to this audit cycle, with mitigation status. Each closed f
 | Exception messages leaking provider response bodies | **Closed** | `GmailApiError.__init__` applies `_TOKEN_KEYS` defensive scrub before stringifying any dict body. Sibling pattern in `AzureOpenAIError`, `GeminiError`, `OpenAIError`. Test pins the invariant. |
 | HIPAA-flagged actor != owner audit gate (operator can read HIPAA account they don't own without auditing) | **Closed** | The audit-emit gate is `actor_user_id is not None AND account.hipaa AND actor_user_id != account.user_id`. Owner-self-access remains first-party under §164.502(a). Documented in policy. |
 | Style-learning indexing of HIPAA-flagged content | **Closed** | Two-track design: non-HIPAA accounts use the standard RAG store; HIPAA accounts use describe-and-discard (structured-output LLM call → 3-layer PHI scrubber → store only the scrubbed descriptor; the body is discarded after the call). M-7 per-contact descriptors use a salted hash of the recipient address; recipient plaintext never appears in storage or logs. |
-| Per-message watcher errors silently lost | **Closed** | New retry queue with exponential backoff (30s / 2m / 10m / 1h / 6h / 24h, 6 attempts). UIDVALIDITY-aware re-fetch. Operator-visible at `/admin/retry-queue`. Daily-health email surfaces patterns when deads accumulate. |
+| Per-message watcher errors silently lost | **Closed** | New retry queue with exponential backoff (30s / 2m / 10m / 1h / 6h / 24h, 6 attempts). UIDVALIDITY-aware re-fetch. Operator-visible at `/admin/retry-queue`. Daily-health email surfaces patterns when dead letters accumulate. |
 | Master-key rotation cadence undocumented | **Closed** | Annual rotation policy + runbook in [SECURITY.md](../SECURITY.md). `email-triage secrets rotate-master-key` performs the transactional re-encryption. Calendar reminder is operator-side. |
+| PHI database not encrypted at rest (relied on operator filesystem encryption) | **Closed (v0.1.2)** | Optional SQLCipher (AES-256) whole-file encryption, key HKDF-derived from the master key; fail-closed in HIPAA mode (no silent plaintext fallback). New installs encrypt at first boot; existing installs migrate once via `email-triage db encrypt`. |
+| Single-factor (OTP-only) authentication accepted in HIPAA mode | **Closed (v0.1.2)** | HIPAA mode enforces MFA — WebAuthn passkey required, OTP-only rejected for any user with a registered credential. Printable single-use recovery codes + operator-key fallback. |
+| Master key readable from the process environment (`env` backend) | **Closed (v0.1.2)** | `env` backend deprecated to dev/CI only and rejected at boot in HIPAA mode; the default `auto` backend reads a container secret. Master-key rotation preserves the audit-chain HMAC so legacy rows stay verifiable. |
 
 ## Audit methodology
 

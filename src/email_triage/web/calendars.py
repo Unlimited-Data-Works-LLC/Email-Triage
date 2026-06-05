@@ -13,7 +13,7 @@ that downstream consumers honour:
                                 that lets external assistants query
                                 the user's schedule
 * ``self_schedule`` (single)  — destination for the self-sent-event
-                                triage path (#107). At most one
+                                triage path. At most one
                                 calendar across the account.
 
 Storage shape: ``email_accounts.config_json["calendars"]`` is a
@@ -269,7 +269,7 @@ def get_self_schedule_calendar_id(
     """Single-pick helper for the ``self_schedule`` role.
 
     Returns the calendar ID the operator picked for self-sent
-    events (#107), or ``None`` if no calendar carries the role.
+    events, or ``None`` if no calendar carries the role.
     Mirrors ``calendars_with_role(acct, "self_schedule")[:1]`` but
     returns a string (or None) for ergonomic single-pick callers.
     """

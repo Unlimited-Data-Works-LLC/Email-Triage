@@ -1,4 +1,4 @@
-"""Tests for the DB-backed ACME job-state path (#103 + #104).
+"""Tests for the DB-backed ACME job-state path.
 
 Covers:
 * Migration #6 creates the ``acme_jobs`` table with the expected
@@ -176,7 +176,7 @@ def test_cancelled_is_terminal_phase():
 
 
 # ---------------------------------------------------------------------------
-# Cancel request flow (#103)
+# Cancel request flow
 # ---------------------------------------------------------------------------
 
 def test_request_cancel_flips_flag(db):
@@ -225,7 +225,7 @@ def test_cancel_double_call_is_noop(db):
 
 
 # ---------------------------------------------------------------------------
-# Resume on startup (#104)
+# Resume on startup
 # ---------------------------------------------------------------------------
 
 def test_resume_on_empty_db_is_noop(db):
@@ -345,7 +345,7 @@ def test_adopt_persisted_loads_into_ram(db):
 
 def test_list_recent_returns_history(db):
     """list_recent returns rows newest-first for the recent-jobs
-    surface (#104 spec: last 10 on /admin/tls)."""
+    surface."""
     j1 = acme_job_state.start(
         domains=["a.test"], directory_url="d", max_attempts=1,
     )

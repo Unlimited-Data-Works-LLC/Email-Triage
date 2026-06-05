@@ -1,4 +1,4 @@
-"""Tests for #166 push-delivery counter table.
+"""Tests for  push-delivery counter table.
 
 Pins:
 

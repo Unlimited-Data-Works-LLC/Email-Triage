@@ -1,0 +1,624 @@
+"""SQLAlchemy Core engine factory for v0.1.2 single-file encryption.
+
+This module is the engine/connection-pool seam between the application
+helpers and the underlying SQLite + SQLCipher backend. It exposes a
+``create_engine_for_app(db_path, *, encrypted=...)`` factory that:
+
+  * derives the single SQLCipher storage key from the existing
+    ``DbSecrets`` master via HKDF-SHA256 (RFC 5869), reusing the
+    EQM-05 audit-chain HMAC-key derivation precedent so no new
+    §164.308(a)(4)(ii)(C) Access Management key-management surface
+    is introduced;
+  * uses SA Core's ``create_engine("sqlite://", creator=...)`` pattern
+    so the encrypted DBAPI driver is :mod:`sqlcipher3` (sync; coleifer
+    fork; the only actively-maintained Python SQLCipher binding) —
+    NOT the deprecated ``sqlite+pysqlcipher://`` URL dialect (which
+    points at the abandoned ``pysqlcipher3`` driver) and NOT the
+    incompatible ``sqlite+aiosqlite://`` URL (``aiosqlite`` wraps
+    stdlib ``sqlite3``, not ``sqlcipher3``; per builder-2 + DA-2
+    SHOWSTOPPER verdict 2026-05-28);
+  * runs every post-connect PRAGMA (``key`` BEFORE any other SQL, then
+    journal_mode=WAL, busy_timeout=30000, foreign_keys=ON,
+    cached_statements=0 per CPython #118172 mitigation from Phase 0
+    ) under a single ``creator`` callable so the engine is fully
+    populated by the time the writer thread accepts work.
+
+Why SA Core (not ORM)
+---------------------
+Per ``internal documentation`` §0 + §2: hand-tuned SQL
+with qmark ``?`` placeholders is retained at every callsite. SA Core
+exists here ONLY to (a) give Alembic a stable ``Engine`` to introspect
+for migrations, (b) provide the ``creator=`` pattern that wires
+``sqlcipher3`` cleanly, and (c) be the v0.2.0  forward-compat seam
+where the URL swaps from ``sqlite://`` to ``postgresql+asyncpg://``.
+No declarative models. No identity map. No sessions.
+
+§-anchors (§164.316(b)(1) policies-and-procedures inline coverage per
+EQM-08 row):
+    §164.312(a)(2)(iv) Encryption — single-file SQLCipher AES-256-CBC
+        + HMAC-SHA512 page integrity via the ``sqlcipher3-binary``
+        coleifer fork; ``PRAGMA key`` raw-hex form bypasses PBKDF2
+        because HKDF already produces a uniform 256-bit key.
+    §164.308(a)(4)(ii)(C) Access Management — key derivation is a
+        thin HKDF wrapper around the master key already enforced
+        per ``secrets.enforce_master_key_at_rest_for_hipaa``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("email_triage.db._engine")
+
+# v0.1.2 single-file encryption — one-shot env override for the
+# ``persistence.encryption_enabled`` YAML field. Mirrors the
+# ``EMAIL_TRIAGE_CSRF_ENFORCE`` / ``tls.csrf_enforce`` idiom: the YAML
+# field is the durable setting; the env var lets an operator flip it for
+# a single boot without editing config. Recognized truthy / falsy values
+# are deliberately narrow so a typo doesn't silently disable encryption.
+_DB_ENCRYPTION_ENV_VAR = "EMAIL_TRIAGE_DB_ENCRYPTION"
+
+# Single source of truth for the HIPAA-mode-plaintext advisory text so the
+# boot-time emit (console/file, immediate) and the §164.312(b) audit-chain
+# re-emit (after add_sqlite_handler attaches) are byte-identical.
+HIPAA_PLAINTEXT_ADVISORY = (
+    "HIPAA mode is ON but persistence.encryption_enabled is OFF. The DB "
+    "will open in PLAINTEXT. §164.312(a)(2)(iv) expects encryption-at-rest; "
+    "if you rely on disk-level encryption (LUKS/dm-crypt) as the equivalent "
+    "measure, record that as an EQM rationale. To enable SQLCipher "
+    "single-file encryption set persistence.encryption_enabled=true "
+    "(requires the 'encryption' extra + a master key)."
+)
+
+# Versioned per-purpose HKDF info label. Future schema-evolution that
+# changes the derivation contract bumps the ``v1`` suffix — keeping the
+# audit-trail per ``feedback_hipaa_sme_standards_2026-05-23.md`` §2.7
+# durable-disposition discipline.
+_DB_STORAGE_KEY_HKDF_INFO_TMPL = b"email_triage/db/storage_key/%s/v1"
+
+
+def derive_storage_key(purpose: str, master_key: str | bytes) -> bytes:
+    """Derive the single SQLCipher storage key via HKDF-SHA256.
+
+    Mirrors :func:`email_triage.secrets.derive_audit_chain_hmac_key`
+    (same algorithm, same length, same salt convention) but with a
+    namespaced ``info`` label so the storage-key derivation cannot
+    collide with the audit-chain HMAC derivation. Under single-file encryption,
+    ``purpose`` is fixed to ``"triage"``; under v0.2.0  pg_tde
+    retrofit, ``purpose`` may be per-tablespace.
+
+    Args:
+        purpose: per-key namespace tag. ``"triage"`` for the single
+            v0.1.2 file; reserved for v0.2.0 expansion.
+        master_key: Fernet master key (str or bytes) — same value
+            ``DbSecrets`` returns from :meth:`master_key_str`.
+
+    Returns:
+        32 raw bytes suitable as the SQLCipher AES-256 key. Pass
+        through :func:`format_raw_hex_key` before handing to
+        ``PRAGMA key``.
+
+    References:
+        - RFC 5869 (HKDF) §3.1.
+        - NIST SP 800-66 Rev. 2 §4.4 (HIPAA integrity controls).
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if isinstance(master_key, str):
+        master_key_bytes = master_key.encode("utf-8")
+    else:
+        master_key_bytes = master_key
+
+    info_label = _DB_STORAGE_KEY_HKDF_INFO_TMPL % purpose.encode("utf-8")
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info_label,
+    )
+    return hkdf.derive(master_key_bytes)
+
+
+def format_raw_hex_key(key: bytes) -> str:
+    """Render a 32-byte key as SQLCipher's raw-hex ``PRAGMA key`` form.
+
+    SQLCipher's ``PRAGMA key`` accepts either a passphrase (which it
+    runs through PBKDF2-SHA512, 256 000 rounds by default) or a raw
+    256-bit key in the ``"x'<64-hex>'"`` syntax that uses the bytes
+    directly as the AES-256 key. We use the raw-hex form because the
+    HKDF output is already cryptographically uniform — running PBKDF2
+    on top adds ~250-500 ms boot cost per connection with zero entropy
+    gain. The HKDF derivation IS the §164.308(a)(4)(ii)(C) key-
+    derivation control; PBKDF2 would be a redundant second derivation
+    surface, not an additional control.
+
+    Raises:
+        ValueError: if ``key`` is not exactly 32 bytes (SQLCipher
+            rejects any other length under the raw-hex form).
+    """
+    if len(key) != 32:
+        raise ValueError(
+            f"SQLCipher raw-hex key must be exactly 32 bytes; got {len(key)}"
+        )
+    return f"x'{key.hex()}'"
+
+
+# ---------------------------------------------------------------------------
+# N-17 — process-level encrypted-conn context for  dedicated connections
+# ---------------------------------------------------------------------------
+#
+# The  dedicated-connection pattern (audit-chain log handler, acme_jobs
+# writer,  write-lock conn) and the CLI / banner read paths open their
+# OWN connections on the same DB file as the main boot conn. Before N-17
+# those openers did a raw ``sqlite3.connect(db_path)`` with no PRAGMA key —
+# on an encrypted install they could not open the file at all (hard crash at
+# the first PRAGMA for the audit-chain + acme conns; silent commit-scope /
+# isolation loss for the  lock conn via its except-fallback).
+#
+# Root cause: the SQLCipher key (and the encrypted-vs-plaintext decision)
+# lived ONLY inside the boot lifespan + ``_make_encrypted_conn``; the
+# dedicated openers had neither the key nor the decision.
+#
+# Fix: the boot lifespan owns the encryption decision + master key already
+# (it calls ``enforce_db_encryption_boot_contract`` + ``read_bootstrap_
+# master_key`` before ``init_db_encrypted``). It stamps that resolved
+# context HERE, ONCE, via :func:`set_dedicated_conn_encryption`. Every
+# dedicated-conn opener then routes through :func:`open_dedicated_conn`,
+# which self-selects encrypted-vs-plaintext exactly like the main conn —
+# no per-call-site threading of the key through app.py, and the openers
+# stay decoupled from config.
+#
+# Threading the key through a process-level holder (vs. every app.py call
+# site) matches how the boot already owns key ordering: the key is read
+# once, before any dedicated conn exists, and is process-global by nature
+# (one DB file, one key, one process).
+#
+# §-anchor: §164.312(b) Audit controls — the audit-chain log handler conn
+# MUST open against the encrypted file or the tamper-evident log cannot be
+# written; a swallowed failure here would silently disable the audit trail
+# (the wrong fail-mode), so :func:`open_dedicated_conn` does NOT try/except
+# the encrypted open.
+
+_DEDICATED_CONN_ENCRYPTED: bool = False
+_DEDICATED_CONN_MASTER_KEY: str | bytes | None = None
+_DEDICATED_CONN_PURPOSE: str = "triage"
+
+
+def set_dedicated_conn_encryption(
+    *,
+    encrypted: bool,
+    master_key: str | bytes | None,
+    purpose: str = "triage",
+) -> None:
+    """Stamp the process-level context the  dedicated-conn openers use.
+
+    Called ONCE by the boot lifespan (and by the CLI entrypoints) AFTER the
+    encrypted-vs-plaintext decision is resolved
+    (:func:`enforce_db_encryption_boot_contract`) and the master key is
+    read (:func:`email_triage.secrets.read_bootstrap_master_key`).
+
+    When ``encrypted`` is True, ``master_key`` MUST be non-None — every
+    subsequent :func:`open_dedicated_conn` will HKDF-derive the SQLCipher
+    storage key from it. Passing ``encrypted=True`` with no key is a
+    programmer error (the boot contract guarantees a key in that mode).
+    """
+    global _DEDICATED_CONN_ENCRYPTED
+    global _DEDICATED_CONN_MASTER_KEY
+    global _DEDICATED_CONN_PURPOSE
+    if encrypted and master_key is None:
+        raise RuntimeError(
+            "set_dedicated_conn_encryption(encrypted=True) requires a "
+            "master_key — the SQLCipher storage key for  dedicated "
+            "connections is HKDF-derived from it. The boot contract "
+            "guarantees a key in encrypted mode (§164.312(a)(2)(iv))."
+        )
+    _DEDICATED_CONN_ENCRYPTED = bool(encrypted)
+    _DEDICATED_CONN_MASTER_KEY = master_key
+    _DEDICATED_CONN_PURPOSE = purpose
+
+
+def reset_dedicated_conn_encryption() -> None:
+    """Clear the dedicated-conn context. Test-fixture teardown only.
+
+    Tests open per-test plaintext DBs; the encrypted context must not leak
+    across tests. Production sets the context once at boot and never resets.
+    """
+    global _DEDICATED_CONN_ENCRYPTED
+    global _DEDICATED_CONN_MASTER_KEY
+    global _DEDICATED_CONN_PURPOSE
+    _DEDICATED_CONN_ENCRYPTED = False
+    _DEDICATED_CONN_MASTER_KEY = None
+    _DEDICATED_CONN_PURPOSE = "triage"
+
+
+def dedicated_conn_is_encrypted() -> bool:
+    """True iff dedicated-conn openers should open the encrypted SQLCipher
+    path this process. Pure read of the stamped boot context."""
+    return _DEDICATED_CONN_ENCRYPTED
+
+
+def open_dedicated_encrypted_conn_readish(db_path: str) -> sqlite3.Connection:
+    """Open a SQLCipher conn for a read-ONLY-intent caller (the version
+    banner). sqlcipher3 has no ``mode=ro`` URI equivalent, so this opens a
+    read-write handle; the caller only issues a SELECT. Uses the boot-
+    stamped master key + purpose. Caller must guard with
+    :func:`dedicated_conn_is_encrypted` first."""
+    return _make_encrypted_conn(
+        db_path,
+        _DEDICATED_CONN_MASTER_KEY,  # type: ignore[arg-type]
+        purpose=_DEDICATED_CONN_PURPOSE,
+    )
+
+
+def open_dedicated_conn(
+    db_path: str,
+    *,
+    check_same_thread: bool = False,
+) -> sqlite3.Connection:
+    """Open a -style dedicated connection that SELF-SELECTS encryption.
+
+    The single encrypted-aware replacement for the raw
+    ``sqlite3.connect(db_path)`` calls that the dedicated-conn openers
+    (audit-chain log handler, acme_jobs writer,  write-lock conn) +
+    the standalone-CLI FlowStore / embedding-bits paths used before N-17.
+
+    When the process boot (or the CLI entrypoint) stamped
+    :func:`set_dedicated_conn_encryption` with ``encrypted=True``, this
+    opens a ``sqlcipher3`` connection via :func:`_make_encrypted_conn`
+    (PRAGMA key first, then WAL/busy/FK) — byte-identical PRAGMA sequence
+    to the main boot conn. Otherwise it opens the plaintext stdlib
+    ``sqlite3`` path with the same PRAGMAs the pre-N-17 openers set (WAL,
+    busy_timeout=30000, foreign_keys=ON, cached_statements=0).
+
+    This opener is for READ-WRITE dedicated conns. The two read-ONLY-intent
+    callers (CLI ``audit verify`` / ``audit reconcile --read-only`` and the
+    version banner) keep their own ``file:...?mode=ro`` open on the
+    plaintext path (a read-only handle rejects ``PRAGMA journal_mode``, so
+    it must not route here) and use :func:`open_dedicated_encrypted_conn_
+    readish` on the encrypted path.
+
+    The returned conn's ``row_factory`` is NOT set here — callers apply
+    :func:`email_triage.db._helpers.apply_compatible_row_factory` (N-16),
+    which already selects the right Row class for whichever dbapi this
+    returns. Keeping row_factory at the call site preserves each opener's
+    existing post-open sequence (e.g. ``set_cached_db_path``).
+
+    Does NOT try/except the encrypted open — a swallowed failure would
+    silently disable the §164.312(b) audit chain (the wrong fail-mode).
+    A genuinely broken encrypted open MUST surface as a boot crash, the
+    same fail-closed posture as the main conn.
+
+    Args:
+        db_path: filesystem path to the single DB file.
+        check_same_thread: passed to the plaintext ``sqlite3.connect`` (the
+            dedicated conns are held across threadpool workers, so the
+            openers pass ``False``); the encrypted path always uses
+            ``check_same_thread=False`` (see :func:`_make_encrypted_conn`).
+    """
+    if _DEDICATED_CONN_ENCRYPTED:
+        return _make_encrypted_conn(
+            db_path,
+            _DEDICATED_CONN_MASTER_KEY,  # type: ignore[arg-type]
+            purpose=_DEDICATED_CONN_PURPOSE,
+        )
+    conn = sqlite3.connect(
+        db_path,
+        timeout=30.0,
+        check_same_thread=check_same_thread,
+        cached_statements=0,
+    )
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _make_encrypted_conn(
+    db_path: str,
+    master_key: str | bytes,
+    *,
+    purpose: str = "triage",
+) -> sqlite3.Connection:
+    """Open a single SQLCipher-encrypted connection.
+
+    Order matters: ``PRAGMA key`` MUST be the FIRST SQL the connection
+    sees (per SQLCipher documentation at zetetic.net/sqlcipher/sqlcipher-api/),
+    BEFORE any read or query. Subsequent PRAGMAs (journal_mode,
+    busy_timeout, foreign_keys, cached_statements) configure the
+    connection for v0.1.2's workload pattern; ``cached_statements=0``
+    is the Phase 0  mitigation for CPython issue #118172 (multi-
+    thread cursor-cache silent corruption on Python 3.12+).
+    """
+    import sqlcipher3  # lazy: heavy binary; not needed at import time
+
+    key = derive_storage_key(purpose, master_key)
+    pragma_key_arg = format_raw_hex_key(key)
+
+    conn = sqlcipher3.dbapi2.connect(
+        db_path,
+        check_same_thread=False,
+        cached_statements=0,
+        timeout=30.0,
+    )
+    # ORDER-CRITICAL: PRAGMA key must be the first SQL the conn sees.
+    conn.execute(f"PRAGMA key = \"{pragma_key_arg}\"")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def create_engine_for_app(
+    db_path: str | Path,
+    *,
+    encrypted: bool = True,
+    master_key: str | bytes | None = None,
+) -> Any:
+    """Build a SQLAlchemy Core ``Engine`` for the email-triage single file.
+
+    ``encrypted=True`` (the production default) wires the SQLCipher
+    ``creator=`` callable; ``master_key`` is required in that mode.
+    ``encrypted=False`` opens a plain ``sqlite3`` connection — for
+    tests, fixtures, and migrations against an unencrypted scratch
+    DB. Per :mod:`internal documentation` §4 Phase 4,
+    HIPAA-mode boot raises ``RuntimeError`` if ``encrypted=False`` is
+    reached.
+
+    Returns a SQLAlchemy Core ``Engine``. Uses ``NullPool`` — the
+    ``WriterBackend`` Protocol owns its own long-lived connection
+    via the writer thread; SA's pool would compete with it.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    db_path_str = str(db_path)
+
+    if encrypted:
+        if master_key is None:
+            raise RuntimeError(
+                "create_engine_for_app(encrypted=True) requires master_key. "
+                "HIPAA-mode boot must NEVER fall back to a plaintext engine "
+                "(EQM-08 fail-closed contract)."
+            )
+
+        def _creator() -> sqlite3.Connection:
+            return _make_encrypted_conn(db_path_str, master_key)
+
+        # Embed the real path in the URL even though ``creator`` owns the
+        # actual connection: SA leaves ``engine.url.database`` populated so
+        # Alembic env.py + the baseline migration can discover the path via
+        # ``bind.engine.url.database``. The creator still overrides HOW the
+        # connection is opened (sqlcipher3 + PRAGMA key).
+        engine = create_engine(
+            f"sqlite:///{db_path_str}",
+            creator=_creator,
+            poolclass=NullPool,
+            future=True,
+        )
+        logger.info(
+            "v0.1.2 SA Core engine created (encrypted via sqlcipher3)",
+            extra={"_extra": {"db_path": db_path_str}},
+        )
+        return engine
+
+    # Plain stdlib sqlite3 path — TESTS / FIXTURES / DEV ONLY.
+    def _plain_creator() -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            db_path_str,
+            check_same_thread=False,
+            cached_statements=0,
+            timeout=30.0,
+        )
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    engine = create_engine(
+        f"sqlite:///{db_path_str}",
+        creator=_plain_creator,
+        poolclass=NullPool,
+        future=True,
+    )
+    logger.info(
+        "v0.1.2 SA Core engine created (plain sqlite3 — non-HIPAA path)",
+        extra={"_extra": {"db_path": db_path_str}},
+    )
+    return engine
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — encrypted-boot resolution + fail-closed contract
+# ---------------------------------------------------------------------------
+#
+# These helpers are the single decision point for "does this boot open an
+# encrypted DB or a plaintext one, and is that choice safe?" They are
+# deliberately separated from the FastAPI lifespan so the contract is
+# unit-testable WITHOUT standing up the whole app (and without the
+# ``sqlcipher3`` binary, which is the ``encryption`` extra — Linux/
+# container only, NOT installed on the Windows dev box).
+#
+# §-anchors (inline §164.316(b)(1) per EQM-08):
+#     §164.312(a)(2)(iv) Encryption — the fail-closed gate guarantees an
+#         encryption-required deploy can NEVER come up serving PHI from a
+#         plaintext file because a dependency or key was missing.
+#     §164.306(d)(3)(i) Required-spec implementation — once the operator
+#         declares HIPAA mode + encryption, the addressable→required
+#         escalation is enforced in code, not left to deploy discipline.
+
+
+def _env_override() -> bool | None:
+    """Resolve the ``EMAIL_TRIAGE_DB_ENCRYPTION`` env override.
+
+    Returns ``True`` / ``False`` when the env var is set to a recognized
+    value, or ``None`` when the var is unset/empty/unrecognized (meaning
+    "defer to the YAML field"). Narrow recognized set so a typo can't
+    silently DISABLE encryption on a HIPAA deploy — an unrecognized value
+    falls through to the YAML field rather than being treated as falsy.
+    """
+    raw = os.environ.get(_DB_ENCRYPTION_ENV_VAR)
+    if raw is None:
+        return None
+    val = raw.strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "Ignoring unrecognized %s=%r; deferring to "
+        "persistence.encryption_enabled YAML field",
+        _DB_ENCRYPTION_ENV_VAR,
+        raw,
+    )
+    return None
+
+
+def sqlcipher3_available() -> bool:
+    """True iff the ``sqlcipher3`` binding can be imported in this process.
+
+    Probes WITHOUT opening any connection. ``sqlcipher3-binary`` is the
+    ``encryption`` extra (Linux/container only); on a dev box without it
+    this returns ``False``, which is exactly what the fail-closed gate
+    needs to distinguish "encryption requested but impossible" from
+    "encryption working."
+    """
+    try:
+        import sqlcipher3  # noqa: F401
+    except Exception:  # ImportError, or a partial/native-load failure
+        return False
+    return True
+
+
+def resolve_db_encryption(config: Any) -> bool:
+    """Resolve whether THIS boot wants the DB opened encrypted.
+
+    Resolution order (first decisive wins):
+      1. ``EMAIL_TRIAGE_DB_ENCRYPTION`` env var (recognized true/false).
+      2. ``config.persistence.encryption_enabled`` YAML field.
+
+    This is the *intent* layer only — it does NOT enforce the fail-closed
+    contract (that's :func:`enforce_db_encryption_boot_contract`, which
+    also factors in HIPAA mode + ``sqlcipher3`` availability + master-key
+    presence). A non-HIPAA install can legitimately resolve ``True`` here
+    and the contract will still require the binary + key to be present.
+    """
+    override = _env_override()
+    if override is not None:
+        return override
+    persistence = getattr(config, "persistence", None)
+    return bool(getattr(persistence, "encryption_enabled", False))
+
+
+def enforce_db_encryption_boot_contract(
+    config: Any,
+    *,
+    master_key_available: bool,
+) -> bool:
+    """Decide the effective boot DB mode + enforce the fail-closed contract.
+
+    Returns ``True`` when the app MUST open the encrypted (SQLCipher)
+    connection, ``False`` when it opens the plaintext ``sqlite3`` path.
+
+    The fail-closed rules (per ``internal documentation``
+    §4.3) — evaluated only when encryption was requested
+    (:func:`resolve_db_encryption` is ``True``) OR HIPAA mode is on:
+
+      * **HIPAA mode + encryption requested** is the encryption-REQUIRED
+        posture. If ``sqlcipher3`` is not importable → ``RuntimeError``.
+        If the master key is unavailable → ``RuntimeError``. NEVER a
+        silent plaintext fallback (§164.312(a)(2)(iv)).
+      * **HIPAA mode WITHOUT encryption requested** is NOT auto-escalated
+        here — operator may run HIPAA mode with disk-level encryption
+        (LUKS) instead of SQLCipher, a documented EQM-03-style equivalent
+        measure. We log a loud advisory but do not force-enable, because
+        forcing it would break every existing plaintext HIPAA install on
+        upgrade. Escalating HIPAA→required-SQLCipher is a separate,
+        operator-ratified migration (Phase 6 cutover), not an upgrade
+        surprise.
+      * **Non-HIPAA + encryption requested**: still fail-closed on a
+        missing binary or key — the operator explicitly asked for
+        encryption; coming up plaintext would silently violate that
+        request. (Same RuntimeError, framed as a misconfiguration.)
+      * **Non-HIPAA + encryption NOT requested**: plaintext path,
+        unchanged. The overwhelmingly common existing-install case.
+
+    Args:
+        config: a ``TriageConfig``-shaped object exposing
+            ``.persistence.encryption_enabled``.
+        master_key_available: whether the boot sequence successfully read
+            a master key from the bootstrap secrets backend. Passed in
+            (not read here) because the caller owns the secrets-bootstrap
+            ordering; this keeps the contract a pure function of its
+            inputs and trivially testable.
+
+    Raises:
+        RuntimeError: when encryption is required (or explicitly
+            requested) but ``sqlcipher3`` is unavailable or no master key
+            could be read.
+    """
+    from email_triage.triage_logging import is_hipaa_mode
+
+    requested = resolve_db_encryption(config)
+    hipaa = is_hipaa_mode()
+
+    if not requested:
+        if hipaa:
+            # Loud advisory, NOT a hard fail — see the HIPAA-without-
+            # encryption branch in the docstring above. This early emit
+            # gives the operator an IMMEDIATE boot signal (console/file).
+            # It is RE-EMITTED through the §164.312(b) audit chain by the
+            # lifespan AFTER add_sqlite_handler attaches (the chain handler
+            # is not yet wired at boot-contract time) — see
+            # :func:`hipaa_plaintext_advisory_applies` + its lifespan
+            # caller. hipaa-sme condition 2: "operator was warned they're
+            # running plaintext in HIPAA mode" must be a tamper-evident
+            # audit event, not stderr-only.
+            logger.warning(HIPAA_PLAINTEXT_ADVISORY)
+        return False
+
+    # Encryption requested from here down — fail-closed on any gap.
+    if not sqlcipher3_available():
+        raise RuntimeError(
+            "DB encryption requested "
+            f"({'HIPAA mode + ' if hipaa else ''}"
+            "persistence.encryption_enabled / "
+            f"{_DB_ENCRYPTION_ENV_VAR}) but the 'sqlcipher3' binding could "
+            "not be imported. Install the 'encryption' extra "
+            "(sqlcipher3-binary) — Linux/container only. Per EQM-08 "
+            "fail-closed contract, the app will NOT fall back to a "
+            "plaintext database (§164.312(a)(2)(iv))."
+        )
+    if not master_key_available:
+        raise RuntimeError(
+            "DB encryption requested but no master key is available from "
+            "the secrets backend. The SQLCipher storage key is HKDF-"
+            "derived from the master key; without it the encrypted file "
+            "cannot be opened. Provision the master key "
+            "('email-triage secrets init-master-key') before enabling "
+            "encryption. Per EQM-08 fail-closed contract, the app will "
+            "NOT fall back to a plaintext database "
+            "(§164.312(a)(2)(iv))."
+        )
+    return True
+
+
+def hipaa_plaintext_advisory_applies(config: Any) -> bool:
+    """True iff this boot is HIPAA-mode AND opening the DB in plaintext.
+
+    The lifespan calls this AFTER ``add_sqlite_handler`` attaches the
+    §164.312(b) audit-chain log handler, then re-emits
+    :data:`HIPAA_PLAINTEXT_ADVISORY` through the app logger so the
+    "operator ran plaintext under HIPAA mode" advisory is a tamper-
+    evident ``log_entries`` row, not stderr-only (hipaa-sme condition 2).
+    Mirrors the no-encryption branch of
+    :func:`enforce_db_encryption_boot_contract` exactly so the two never
+    drift.
+    """
+    from email_triage.triage_logging import is_hipaa_mode
+
+    return is_hipaa_mode() and not resolve_db_encryption(config)

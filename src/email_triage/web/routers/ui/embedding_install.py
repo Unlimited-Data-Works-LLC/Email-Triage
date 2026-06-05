@@ -1,4 +1,4 @@
-"""Admin routes for the lazy embedding-stack install (#180).
+"""Admin routes for the lazy embedding-stack install.
 
 Lives at ``/config/ai-backends/embedding-*`` — siblings of the
 existing ``/config/ai-backends/save`` POST. Each handler is admin-
@@ -71,8 +71,10 @@ from email_triage.embedding_bits import (
 )
 from email_triage.web.app import get_db, get_templates
 from email_triage.web.db import record_auth_event
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 
+# async-db: handlers route SQLite through db_call
 _log = logging.getLogger("email_triage.web.ui.embedding_install")
 router = APIRouter()
 
@@ -143,17 +145,19 @@ def _is_htmx(request: Request) -> bool:
     return request.headers.get("HX-Request", "").lower() == "true"
 
 
-def _render_install_card(request: Request) -> HTMLResponse:
+async def _render_install_card(request: Request) -> HTMLResponse:
     """Return the install-card partial against the current DB state.
 
     Routes call this on the HTMX branch instead of ``_redirect_to_tab``
     so the user's click result swaps the card in-place. The polling
     attributes the template attaches when the state is in-flight
     keep the card live until a terminal state lands.
+
+    / — ``get_install_status`` runs off the event loop.
     """
     db = get_db(request)
     templates = get_templates(request)
-    install_state = get_install_status(db)
+    install_state = await db_call(get_install_status, db)
     manifest_sha = install_state.get("manifest_sha256") or ""
     return templates.TemplateResponse(
         request,
@@ -169,14 +173,14 @@ def _render_install_card(request: Request) -> HTMLResponse:
     )
 
 
-def _post_response(request: Request) -> HTMLResponse | RedirectResponse:
+async def _post_response(request: Request) -> HTMLResponse | RedirectResponse:
     """Branch on HTMX vs plain POST.
 
     HTMX: return the install-card partial (current DB state).
     Plain: 303 to /config?tab=ai_backends (back-compat).
     """
     if _is_htmx(request):
-        return _render_install_card(request)
+        return await _render_install_card(request)
     return _redirect_to_tab()
 
 
@@ -225,54 +229,64 @@ def _progress_writer(
 @router.post("/config/ai-backends/embedding-install", response_class=HTMLResponse)
 async def embedding_install(request: Request):
     """Kick off the auto-download install. Admin-only."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
 
-    # Refuse to spawn if an install is already in flight. The
-    # install_state row's status is the truth; we read it under the
-    # request connection so the UI sees consistent state.
-    state = get_install_status(db)
-    if state["status"] in ("downloading", "verifying", "installing"):
+    def _install_db_work() -> bool:
+        """/ — in-flight check + audit + status flip in one
+        threadpool hop. Returns ``True`` when an install is already
+        in flight (handler should bail without spawning a worker).
+        """
+        # Refuse to spawn if an install is already in flight. The
+        # install_state row's status is the truth; we read it under the
+        # request connection so the UI sees consistent state.
+        state = get_install_status(db)
+        if state["status"] in ("downloading", "verifying", "installing"):
+            _audit(
+                db, user,
+                event_type="embedding_install_start",
+                detail="rejected — install already in flight",
+                outcome="failure",
+            )
+            return True
+
         _audit(
             db, user,
             event_type="embedding_install_start",
-            detail="rejected — install already in flight",
-            outcome="failure",
+            detail="method=auto",
         )
-        return _post_response(request)
 
-    _audit(
-        db, user,
-        event_type="embedding_install_start",
-        detail="method=auto",
-    )
+        # 2026-05-18 — flip status to "downloading" synchronously BEFORE
+        # spawning the worker. Otherwise the HTMX response (or the 303-
+        # followed page render) wins the race and shows the prior state
+        # (installed / failed / not_installed), forcing the operator to
+        # manually reload to see progress. With the synchronous flip, the
+        # immediate card render carries status="downloading" + the polling
+        # attributes the template attaches in that branch keep the card
+        # live until the terminal state lands.
+        from email_triage.embedding_bits import _update_state
+        _update_state(
+            db,
+            status="downloading",
+            install_method="auto",
+            current_file=None,
+            progress_files_done=0,
+            progress_bytes_done=0,
+            bump_attempt=True,
+            set_last_attempt_now=True,
+            clear_error=True,
+        )
+        db.commit()
+        return False
+
+    already_in_flight = await db_call(_install_db_work)
+    if already_in_flight:
+        return await _post_response(request)
 
     target_dir = get_runtime_deps_path()
     manifest_path = _manifest_path()
-
-    # 2026-05-18 — flip status to "downloading" synchronously BEFORE
-    # spawning the worker. Otherwise the HTMX response (or the 303-
-    # followed page render) wins the race and shows the prior state
-    # (installed / failed / not_installed), forcing the operator to
-    # manually reload to see progress. With the synchronous flip, the
-    # immediate card render carries status="downloading" + the polling
-    # attributes the template attaches in that branch keep the card
-    # live until the terminal state lands.
-    from email_triage.embedding_bits import _update_state
-    _update_state(
-        db,
-        status="downloading",
-        install_method="auto",
-        current_file=None,
-        progress_files_done=0,
-        progress_bytes_done=0,
-        bump_attempt=True,
-        set_last_attempt_now=True,
-        clear_error=True,
-    )
-    db.commit()
 
     # Fire-and-forget: install runs in the background, writes its own
     # state, returns. We use the app-state DB connection for the
@@ -291,14 +305,27 @@ async def embedding_install(request: Request):
         except Exception:  # noqa: BLE001
             _log.exception("embedding install_auto task raised")
 
-    asyncio.create_task(_run())
-    return _post_response(request)
+    #  — track the fire-and-forget task on app.state so it has a
+    # strong reference until completion (asyncio only weak-refs tasks,
+    # so a bare create_task can be gc-collected mid-run) and tests can
+    # drain at teardown. Same canonical pattern as
+    # ``access_audit.py:239-258``. ``set.discard`` is idempotent so the
+    # done-callback is safe if the task completes between add and
+    # discard.
+    task = asyncio.create_task(_run())
+    pending = getattr(request.app.state, "_fire_and_forget_pending", None)
+    if pending is None:
+        pending = set()
+        request.app.state._fire_and_forget_pending = pending
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+    return await _post_response(request)
 
 
 @router.post("/config/ai-backends/embedding-sideload", response_class=HTMLResponse)
 async def embedding_sideload(request: Request):
     """Kick off the sideload install. Admin-only."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
@@ -310,59 +337,75 @@ async def embedding_sideload(request: Request):
     source_dir = Path(source_dir_raw)
 
     if not source_dir.exists() or not source_dir.is_dir():
+        def _sideload_notfound_db_work() -> None:
+            """/ — failure-path audit + state write in one hop."""
+            _audit(
+                db, user,
+                event_type="embedding_install_start",
+                detail=(
+                    f"method=sideload; source_dir not found: {source_dir_raw}"
+                ),
+                outcome="failure",
+            )
+            # Write the user-visible error to the install_state row so
+            # the admin tab surfaces it on the next render.
+            from email_triage.embedding_bits import _update_state
+            _update_state(
+                db,
+                status="failed",
+                install_method="sideload",
+                last_error_class="FileNotFoundError",
+                last_error_msg=f"Source dir does not exist: {source_dir_raw}",
+                bump_attempt=True,
+                set_last_attempt_now=True,
+            )
+            db.commit()
+
+        await db_call(_sideload_notfound_db_work)
+        return await _post_response(request)
+
+    def _sideload_db_work() -> bool:
+        """/ — in-flight check + audit + status flip in one
+        threadpool hop. Returns ``True`` when an install is already
+        in flight (handler should bail without spawning a worker).
+        """
+        state = get_install_status(db)
+        if state["status"] in ("downloading", "verifying", "installing"):
+            _audit(
+                db, user,
+                event_type="embedding_install_start",
+                detail="rejected — install already in flight",
+                outcome="failure",
+            )
+            return True
+
         _audit(
             db, user,
             event_type="embedding_install_start",
-            detail=f"method=sideload; source_dir not found: {source_dir_raw}",
-            outcome="failure",
+            detail=f"method=sideload; source_dir={source_dir_raw}",
         )
-        # Write the user-visible error to the install_state row so the
-        # admin tab surfaces it on the next render.
-        from email_triage.embedding_bits import _update_state, _scrub_error
+
+        # Same synchronous status flip as the auto path — the HTMX swap
+        # needs to see "downloading" immediately, not whatever the prior
+        # state was.
+        from email_triage.embedding_bits import _update_state
         _update_state(
             db,
-            status="failed",
+            status="downloading",
             install_method="sideload",
-            last_error_class="FileNotFoundError",
-            last_error_msg=f"Source dir does not exist: {source_dir_raw}",
+            current_file=None,
+            progress_files_done=0,
+            progress_bytes_done=0,
             bump_attempt=True,
             set_last_attempt_now=True,
+            clear_error=True,
         )
         db.commit()
-        return _post_response(request)
+        return False
 
-    state = get_install_status(db)
-    if state["status"] in ("downloading", "verifying", "installing"):
-        _audit(
-            db, user,
-            event_type="embedding_install_start",
-            detail="rejected — install already in flight",
-            outcome="failure",
-        )
-        return _post_response(request)
-
-    _audit(
-        db, user,
-        event_type="embedding_install_start",
-        detail=f"method=sideload; source_dir={source_dir_raw}",
-    )
-
-    # Same synchronous status flip as the auto path — the HTMX swap
-    # needs to see "downloading" immediately, not whatever the prior
-    # state was.
-    from email_triage.embedding_bits import _update_state
-    _update_state(
-        db,
-        status="downloading",
-        install_method="sideload",
-        current_file=None,
-        progress_files_done=0,
-        progress_bytes_done=0,
-        bump_attempt=True,
-        set_last_attempt_now=True,
-        clear_error=True,
-    )
-    db.commit()
+    already_in_flight = await db_call(_sideload_db_work)
+    if already_in_flight:
+        return await _post_response(request)
 
     target_dir = get_runtime_deps_path()
     manifest_path = _manifest_path()
@@ -380,8 +423,16 @@ async def embedding_sideload(request: Request):
         except Exception:  # noqa: BLE001
             _log.exception("embedding install_sideload task raised")
 
-    asyncio.create_task(_run())
-    return _post_response(request)
+    #  — track on app.state (same canonical pattern as the auto-
+    # install path above + ``access_audit.py:239``).
+    task = asyncio.create_task(_run())
+    pending = getattr(request.app.state, "_fire_and_forget_pending", None)
+    if pending is None:
+        pending = set()
+        request.app.state._fire_and_forget_pending = pending
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+    return await _post_response(request)
 
 
 @router.post(
@@ -390,18 +441,18 @@ async def embedding_sideload(request: Request):
 )
 async def embedding_install_cancel(request: Request):
     """Flip the cancel flag. Admin-only."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
 
     request_cancel()
-    _audit(
-        db, user,
+    await db_call(
+        _audit, db, user,
         event_type="embedding_install_cancelled",
         detail="operator requested cancel",
     )
-    return _post_response(request)
+    return await _post_response(request)
 
 
 @router.post(
@@ -410,13 +461,13 @@ async def embedding_install_cancel(request: Request):
 )
 async def embedding_reverify(request: Request):
     """Re-hash staged files against the manifest. No re-download."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
 
-    _audit(
-        db, user,
+    await db_call(
+        _audit, db, user,
         event_type="embedding_install_reverify",
         detail="operator triggered re-verify",
     )
@@ -427,6 +478,13 @@ async def embedding_reverify(request: Request):
     # Reverify is fast (just rehash; no download) — run inline so the
     # admin UI surfaces the result immediately. await-via-to_thread
     # so it doesn't block the event loop while hashing.
+    #
+    #  — reverify is intentionally NOT routed through db_call: it
+    # spends the bulk of its time hashing files (CPU), and holding the
+    # process-wide DB lock for that whole span would stall every other
+    # DB caller. Its only DB touch is the inner ``_update_state``, which
+    # is ``@db_write``-decorated and so acquires the lock for just the
+    # UPDATE+commit.
     try:
         result = await asyncio.to_thread(
             reverify,
@@ -435,8 +493,8 @@ async def embedding_reverify(request: Request):
             target_dir=target_dir,
         )
         if result.status == "failed":
-            _audit(
-                db, user,
+            await db_call(
+                _audit, db, user,
                 event_type="embedding_install_reverify",
                 detail=f"reverify failed: {result.error_class}",
                 outcome="failure",
@@ -444,7 +502,7 @@ async def embedding_reverify(request: Request):
     except Exception:  # noqa: BLE001
         _log.exception("embedding reverify raised")
 
-    return _post_response(request)
+    return await _post_response(request)
 
 
 @router.post(
@@ -453,14 +511,14 @@ async def embedding_reverify(request: Request):
 )
 async def embedding_reindex(request: Request, account_id: int):
     """Enqueue a reindex job for one account. Admin-only."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
 
     if not is_runtime_ready():
-        _audit(
-            db, user,
+        await db_call(
+            _audit, db, user,
             event_type="embedding_reindex_enqueue",
             detail=f"account_id={account_id} rejected — runtime not ready",
             outcome="failure",
@@ -471,17 +529,22 @@ async def embedding_reindex(request: Request, account_id: int):
             status_code=303,
         )
 
-    from email_triage.jobs.embedding_reindex import (
-        enqueue_embedding_reindex,
-    )
-    job_id = enqueue_embedding_reindex(
-        db, account_id=account_id, actor_user_id=user.get("id"),
-    )
-    _audit(
-        db, user,
-        event_type="embedding_reindex_enqueue",
-        detail=f"account_id={account_id} job_id={job_id}",
-    )
+    def _reindex_db_work() -> str:
+        """/ — enqueue the reindex job + audit in one hop."""
+        from email_triage.jobs.embedding_reindex import (
+            enqueue_embedding_reindex,
+        )
+        job_id = enqueue_embedding_reindex(
+            db, account_id=account_id, actor_user_id=user.get("id"),
+        )
+        _audit(
+            db, user,
+            event_type="embedding_reindex_enqueue",
+            detail=f"account_id={account_id} job_id={job_id}",
+        )
+        return job_id
+
+    await db_call(_reindex_db_work)
     return RedirectResponse(
         f"/triage/run?account_id={account_id}", status_code=303,
     )
@@ -498,13 +561,13 @@ async def embedding_install_status(request: Request):
     replaces just this card. Same admin gate as the mutating routes
     (a non-admin GET would expose install-state surface that's
     sensitive in the failure-message column)."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err is not None:
         return err
     db = get_db(request)
     templates = get_templates(request)
 
-    install_state = get_install_status(db)
+    install_state = await db_call(get_install_status, db)
     manifest_sha = install_state.get("manifest_sha256") or ""
 
     return templates.TemplateResponse(

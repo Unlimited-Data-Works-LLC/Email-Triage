@@ -6,21 +6,13 @@ OpenAI chat completions API (e.g. vLLM, LM Studio, text-generation-webui).
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
-import httpx
-
-from email_triage.classify.base import Classifier
-from email_triage.classify.ollama import _parse_llm_json
-from email_triage.classify.prompts import build_system_prompt, build_user_prompt
-from email_triage.engine.models import Classification, EmailMessage, ListHint
-
-logger = logging.getLogger("email_triage.classify.openai_compat")
+from email_triage._http_client import LazyHttpClient
+from email_triage.classify.base import JsonChatClassifier
 
 
-class OpenAICompatClassifier(Classifier):
+class OpenAICompatClassifier(JsonChatClassifier):
     """Classify emails via any OpenAI-compatible chat completions endpoint.
 
     Parameters
@@ -51,6 +43,11 @@ class OpenAICompatClassifier(Classifier):
         self._model = model
         self._api_key = api_key
         self._timeout = timeout
+        #  — one long-lived pooled client per classifier instance.
+        # The classifier is rebuilt per triage batch and reused for
+        # every message in that batch, so pooling collapses N
+        # per-message TLS handshakes into one. Mirrors OllamaClassifier.
+        self._http = LazyHttpClient(timeout=timeout)
         self._extra_headers = extra_headers or {}
         # OpenAI-compatible endpoint can be local (LiteLLM proxy on
         # the homelab) or external (api.openai.com). Classify the
@@ -63,6 +60,11 @@ class OpenAICompatClassifier(Classifier):
             self._base_url, extra_suffixes=tuple(local_url_suffixes or ()),
         )
 
+    async def close(self) -> None:
+        """Drain the pooled HTTP client. Idempotent — safe from a
+        shutdown hook even if no request was ever issued."""
+        await self._http.aclose()
+
     def _build_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
@@ -70,39 +72,33 @@ class OpenAICompatClassifier(Classifier):
         headers.update(self._extra_headers)
         return headers
 
-    async def classify(
-        self,
-        message: EmailMessage,
-        categories: dict[str, str],
-        list_hints: list[ListHint] | None = None,
-    ) -> Classification:
-        system_prompt = build_system_prompt(categories, list_hints)
-        user_prompt = build_user_prompt(message)
+    async def _resolve_model(self) -> str:
+        # The classification-cache key. Some self-hosted endpoints
+        # ignore the model field, so an empty configured model still
+        # needs a stable, non-empty cache key — fall back to a literal
+        # (mirrors the pre-refactor behaviour). The request payload
+        # itself uses ``self._model`` directly (see :meth:`_chat`) and
+        # omits the field entirely when it is empty.
+        return self._model or "openai-compat"
 
-        # 2026-05-13 two-level cache lookup.
-        outer_key: str | None = None
-        inner_field: str | None = None
-        hint_text: str | None = None
-        try:
-            from email_triage.cache.classification import (
-                cache_lookup_for_message,
-            )
-            outer_key, inner_field, cache_entry, hint_text = (
-                cache_lookup_for_message(
-                    message, self._model or "openai-compat", categories,
-                )
-            )
-            if cache_entry is not None:
-                logger.info("Classification cache hit (cache_hit=True)")
-                return cache_entry
-        except Exception as e:
-            logger.debug("Classification cache lookup error: %s", e)
+    async def _chat(
+        self, system_prompt: str, user_prompt: str, model: str,
+    ) -> str:
+        """Issue an OpenAI-compatible ``/chat/completions`` request.
 
-        if hint_text:
-            system_prompt = (
-                f"[SENDER HISTORY HINT] {hint_text}\n\n{system_prompt}"
-            )
+        ``model`` is the cache key from :meth:`_resolve_model`; the
+        payload uses ``self._model`` directly so an empty configured
+        model omits the field rather than sending the cache-key
+        placeholder to the endpoint.
 
+         — the POST is wrapped in the shared circuit-breaker helper
+        :func:`llm_health.translate_unreachable`. A dead OpenAI-
+        compatible endpoint (connection refused / network blip) now
+        trips the ``"openai"`` breaker and re-raises a typed
+        ``LLMBackendUnreachableError`` — same posture Ollama has had
+        since . Keyed ``"openai"`` to match the configured
+        ``classifier.backend`` the ``is_healthy`` gate resolves.
+        """
         payload: dict[str, Any] = {
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -110,14 +106,17 @@ class OpenAICompatClassifier(Classifier):
             ],
             "temperature": 0.3,
             "max_tokens": 256,
+            # Some providers support response_format for guaranteed JSON.
+            "response_format": {"type": "json_object"},
         }
         if self._model:
             payload["model"] = self._model
 
-        # Some providers support response_format for guaranteed JSON.
-        payload["response_format"] = {"type": "json_object"}
-
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "openai", self._base_url, default_port=443,
+        ):
+            client = await self._http.get()
             resp = await client.post(
                 f"{self._base_url}/chat/completions",
                 headers=self._build_headers(),
@@ -126,52 +125,17 @@ class OpenAICompatClassifier(Classifier):
             resp.raise_for_status()
 
         body = resp.json()
-        raw_text = (
+        return (
             body.get("choices", [{}])[0]
             .get("message", {})
             .get("content", "")
         )
-        logger.debug("OpenAI-compat raw response", extra={"raw": raw_text[:500]})
-
-        parsed = _parse_llm_json(raw_text)
-
-        category = parsed.get("category", "")
-        if category not in categories:
-            logger.warning(
-                "LLM returned unknown category '%s', treating as low confidence",
-                category,
-            )
-
-        confidence = float(parsed.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-
-        reason = parsed.get("reason", "")
-
-        result = Classification(
-            category=category,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
-        )
-
-        # 2026-05-13 — best-effort two-level store; HIPAA strip handled
-        # inside the helper.
-        try:
-            from email_triage.cache.classification import (
-                cache_store_for_message,
-            )
-            cache_store_for_message(
-                outer_key, inner_field,
-                self._model or "openai-compat", result, categories,
-                is_hipaa=bool(getattr(message, "hipaa", False)),
-            )
-        except Exception as e:
-            logger.debug("Classification cache store error: %s", e)
-
-        return result
 
     async def complete(self, prompt: str) -> str:
-        """Raw text completion via OpenAI-compatible chat endpoint."""
+        """Raw text completion via OpenAI-compatible chat endpoint.
+
+         — same shared circuit-breaker wrap as :meth:`_chat`.
+        """
         payload: dict[str, Any] = {
             "messages": [
                 {"role": "user", "content": prompt},
@@ -182,7 +146,11 @@ class OpenAICompatClassifier(Classifier):
         if self._model:
             payload["model"] = self._model
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "openai", self._base_url, default_port=443,
+        ):
+            client = await self._http.get()
             resp = await client.post(
                 f"{self._base_url}/chat/completions",
                 headers=self._build_headers(),

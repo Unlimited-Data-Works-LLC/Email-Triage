@@ -1,4 +1,4 @@
-"""Tests for /admin/backup web surface (#65)."""
+"""Tests for /admin/backup web surface."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Provider-level unit tests for the bulk-triage ``search_iter`` API (#101).
+"""Provider-level unit tests for the bulk-triage ``search_iter`` API.
 
 The runner in ``triage_runner_bulk.py`` consumes ``provider.search_iter``
 to walk a mailbox in operator-controllable batches with cursor-based
@@ -168,7 +168,7 @@ def _o365_provider():
         token_cache_path="/tmp/cache.json",
     )
     p._http = AsyncMock()
-    # Phase-2 (#138 phase 2): _request now calls acquire_token per
+    # Phase-2: _request now calls acquire_token per
     # request and uses ``client.request(method, ...)``. Stub both so
     # verb-keyed mocks (provider._http.get = ...) keep working.
     p.acquire_token = AsyncMock(return_value="test-token")

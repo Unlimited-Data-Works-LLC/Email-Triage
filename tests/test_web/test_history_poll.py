@@ -49,7 +49,7 @@ class TestCadenceSaveHandler:
 
     def _post(self, client, admin_cookies, **extra):
         data = {"log_level": "INFO", "classifier_backend": "ollama",
-                "classifier_model": "[local-llm-model]
+                "classifier_model": "qwen3.5:35b",
                 "classifier_ollama_url": "http://localhost:11434",
                 "smtp_port": "587", "logging_format": "text"}
         data.update(extra)

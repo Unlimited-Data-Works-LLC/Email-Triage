@@ -1,4 +1,4 @@
-"""Self-sent event triage path (#107).
+"""Self-sent event triage path.
 
 When the operator emails THEMSELVES (``From == To`` on the same
 account, or any of the account's aliases) and the message looks like
@@ -364,7 +364,7 @@ class SelfSentEventAction(Action):
         # Idempotency short-circuit (PR 6 / C2). On a re-run of the
         # same flow + message the state_bag already carries the
         # previous calendar event id; bail before re-writing.
-        prior = check_idempotent_already_done(flow, message, self.name)
+        prior = await check_idempotent_already_done(flow, message, self.name)
         if prior is not None:
             return prior
 
@@ -482,7 +482,7 @@ class SelfSentEventAction(Action):
             )
         except NotImplementedError:
             # Provider doesn't support write (IMAP-stub / CalDAV-parked
-            # per #108). Degrade cleanly.
+            # per ). Degrade cleanly.
             return ActionOutput(
                 result=ActionResult.SKIPPED,
                 data={
@@ -496,7 +496,7 @@ class SelfSentEventAction(Action):
                 error=f"create_event_error: {e}",
             )
 
-        # Per-message dedup stamp (#107 audit + dedup). Best-effort —
+        # Per-message dedup stamp. Best-effort —
         # a DB blip here must not cause an action failure.
         db = state_bag.get("db")
         rfc_id = (message.headers or {}).get("Message-Id") or (
@@ -505,11 +505,14 @@ class SelfSentEventAction(Action):
         if db is not None and account_id and rfc_id:
             try:
                 from email_triage.web.db import mark_triaged
-                mark_triaged(db, int(account_id), str(rfc_id))
+                from email_triage.web.db_threadpool import db_call
+                #  — mark_triaged is @db_write; action.execute runs
+                # on the event-loop thread, so dispatch via db_call.
+                await db_call(mark_triaged, db, int(account_id), str(rfc_id))
             except Exception:
                 pass
 
-        record_idempotent_done(
+        await record_idempotent_done(
             flow, message, self.name, external_id=str(new_event_id),
         )
 

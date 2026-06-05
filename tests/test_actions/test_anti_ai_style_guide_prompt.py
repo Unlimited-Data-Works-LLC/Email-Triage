@@ -162,7 +162,7 @@ class TestPrefixHipaaGate:
 
 
 class TestPrefixStackBehaviour:
-    """Build matrix from the punch-list spec."""
+    """Build matrix from the backlog spec."""
 
     def test_both_empty_no_section_injected(self):
         pre = build_style_prompt_prefix(

@@ -24,10 +24,10 @@ Concrete adapters shipped today
     for the loader migration.
   * :class:`OpenAIAdapter` — OpenAI direct + OpenAI-compatible
     endpoints (LiteLLM proxy, vLLM, LM Studio, etc.). Ships with the
-    :class:`OpenAIClassifier` shim (#171-A).
+    :class:`OpenAIClassifier` shim.
   * :class:`GeminiAdapter` — Google Gemini via the AI Studio REST
     surface (Vertex AI works with a custom endpoint). Ships with the
-    :class:`GeminiClassifierShim` shim (#171-A).
+    :class:`GeminiClassifierShim` shim.
 
 Classifier-path migration
 -------------------------

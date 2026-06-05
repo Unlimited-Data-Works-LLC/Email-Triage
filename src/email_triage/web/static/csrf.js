@@ -9,12 +9,12 @@
 //    carries the header without each call site having to plumb it.
 // 3. Listens for `htmx:configRequest` so HTMX-driven calls (which
 //    use XHR, not window.fetch, and would otherwise bypass the shim
-//    entirely) also carry the header. (#83.1)
+//    entirely) also carry the header.
 // 4. Exposes ``window.ETCsrfToken`` (always-current cached value)
 //    and ``window.ETCsrfReady`` (a Promise that resolves to the
 //    token) so legacy inline JS that already mints its own
 //    request can synchronise on the shim instead of building a
-//    parallel cookie-reading fallback. (#83.4)
+//    parallel cookie-reading fallback.
 //
 // Form-body POSTs (plain HTML form, no JS) are covered by the
 // server-side receive-buffering enhancement landed alongside this
@@ -127,7 +127,7 @@
   // it. We listen for `submit` at document level (capture phase) and
   // inject a hidden csrf_token field with the cached token before the
   // browser serializes the form. The server-side middleware reads the
-  // field from the body. (#83.2)
+  // field from the body.
   //
   // Skips:
   //   * non-POST forms (GET / dialog) -- safe methods don't need it.

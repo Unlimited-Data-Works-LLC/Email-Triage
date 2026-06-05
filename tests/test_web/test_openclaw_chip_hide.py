@@ -1,4 +1,4 @@
-"""Tests for #96 — the OpenClaw chip + Pause / quiet-hours controls
+"""Tests for  — the OpenClaw chip + Pause / quiet-hours controls
 hide on the account edit page when no webhook destinations are
 configured at the install level.
 

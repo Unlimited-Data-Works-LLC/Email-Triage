@@ -1,4 +1,4 @@
-"""Tests for #147 — IMAP NONAUTH digest race + state diagnostics.
+"""Tests for  — IMAP NONAUTH digest race + state diagnostics.
 
 The failure: scheduled digest fired at 06:00, hit a cached IMAP
 client whose protocol state had drifted to ``NONAUTH``, and aioimaplib

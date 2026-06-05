@@ -186,7 +186,7 @@ class TestLogOutput:
 
 class TestLocalTzFormatting:
     """Timestamps honour the local timezone (container TZ env var),
-    not a hard-coded UTC. Deployments in America/Detroit should
+    not a hard-coded UTC. Deployments in America/New_York should
     render EDT/EST times, not +00:00."""
 
     def test_text_formatter_honors_local_tz(self, monkeypatch):
@@ -200,7 +200,7 @@ class TestLocalTzFormatting:
 
         # Force the process TZ. time.tzset() is POSIX-only; on Windows
         # we fall back to a manual offset check via astimezone().
-        monkeypatch.setenv("TZ", "America/Detroit")
+        monkeypatch.setenv("TZ", "America/New_York")
         if hasattr(_time, "tzset"):
             _time.tzset()
 
@@ -238,7 +238,7 @@ class TestLocalTzFormatting:
         import time as _time
         from email_triage.triage_logging import _JsonFormatter
 
-        monkeypatch.setenv("TZ", "America/Detroit")
+        monkeypatch.setenv("TZ", "America/New_York")
         if hasattr(_time, "tzset"):
             _time.tzset()
 
@@ -250,7 +250,7 @@ class TestLocalTzFormatting:
         data = _json.loads(formatter.format(record))
 
         if hasattr(_time, "tzset"):
-            # America/Detroit is either -05:00 (EST) or -04:00 (EDT).
+            # America/New_York is either -05:00 (EST) or -04:00 (EDT).
             # Never +00:00.
             assert "-04:00" in data["ts"] or "-05:00" in data["ts"], (
                 f"expected -04:00/-05:00 in ts, got: {data['ts']!r}"

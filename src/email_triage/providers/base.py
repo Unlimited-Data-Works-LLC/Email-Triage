@@ -88,7 +88,7 @@ class EmailProvider(ABC):
         once with ``cursor=None`` — covers providers that haven't
         grown a paged variant. Sweeps against those providers cap
         at ``batch_size`` and have no resume support; the dedup
-        table (#101 step 8) still prevents double-processing on
+        table still prevents double-processing on
         resume, just less efficiently.
 
         Args:

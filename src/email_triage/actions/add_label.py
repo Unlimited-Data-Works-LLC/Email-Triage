@@ -89,6 +89,19 @@ class AddLabelAction(Action):
     editor's "Also adds labels" / "Also apply provider labels".
     """
 
+    #  — provider+storage-level idempotency contract. The internal
+    # labels go through ``apply_labels_to_message`` which is a forward-
+    # only INSERT-OR-IGNORE (per the module docstring); the provider
+    # labels go through ``provider.apply_label`` which is a no-op when
+    # the label is already attached. A crash-recovery rerun re-issues
+    # the same upserts with no duplicate side effect.
+    _naturally_idempotent: bool = True
+    _idempotency_rationale: str = (
+        "internal labels via apply_labels_to_message are INSERT-OR-IGNORE; "
+        "provider labels via provider.apply_label are no-ops on already-"
+        "attached; a crash-recovery rerun produces no duplicate effect"
+    )
+
     @property
     def name(self) -> str:
         return "add-label"
@@ -157,7 +170,12 @@ class AddLabelAction(Action):
             if db is not None and account_id is not None:
                 try:
                     from email_triage.web.db import apply_labels_to_message
-                    inserted = apply_labels_to_message(
+                    from email_triage.web.db_threadpool import db_call
+                    #  — apply_labels_to_message is @db_write;
+                    # action.execute runs on the event-loop thread, so
+                    # dispatch the write through db_call.
+                    inserted = await db_call(
+                        apply_labels_to_message,
                         db, message.message_id, account_id,
                         internal_slugs,
                         applied_by_actor=actor_user_id,

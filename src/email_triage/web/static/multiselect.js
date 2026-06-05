@@ -1,5 +1,5 @@
 /*
- * Multi-select dropdown enhancement (#163 follow-up).
+ * Multi-select dropdown enhancement.
  *
  * Operator screenshot 2026-05-12 asked for a real multi-select widget
  * style — chips inline in a closed control, click to open a popup

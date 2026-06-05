@@ -16,9 +16,9 @@ HTTP call sites that today open a fresh client per request:
   (cold path on Gmail push deliveries; one fetch per kid rotation)
 * :class:`email_triage.providers.gmail_calendar.GoogleCalendarProvider`
   (already had ``_get_client``; this class adds the lock that the
-  Gmail provider got via Bundle G #142)
+  Gmail provider got via Bundle G )
 
-Per-request handshake on TLS endpoints costs 50-200 ms; #139 collapses
+Per-request handshake on TLS endpoints costs 50-200 ms;  collapses
 that into a single long-lived pool per call site.
 
 Why a class rather than scattering ``self._http`` + ``self._lock`` on
@@ -85,7 +85,7 @@ class LazyHttpClient:
         Wrapped in a per-instance lock so two concurrent coroutines
         observing ``self._client is None`` don't both build clients
         and orphan one of the connection pools (the same race the
-        Gmail / O365 providers already guarded via Bundle G #142).
+        Gmail / O365 providers already guarded via Bundle G ).
         """
         if self._client is not None:
             return self._client

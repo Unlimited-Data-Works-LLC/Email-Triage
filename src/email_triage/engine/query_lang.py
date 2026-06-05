@@ -1,4 +1,4 @@
-"""Provider-agnostic mail-query language (#138.3).
+"""Provider-agnostic mail-query language.
 
 Three providers (IMAP, Gmail API, Office 365) each carried their own
 ``_translate_filter`` + ``_translate_query`` pair, with subtle drift

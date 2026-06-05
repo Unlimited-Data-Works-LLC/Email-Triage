@@ -1,18 +1,17 @@
-"""Tests for Bundle D #140.1 + #140.2 + #145.7 — settings-layer hardening.
+"""Tests for Bundle D .1 + .2 + .7 — settings-layer hardening.
 
 Covers:
     * ``get_setting`` defensive on a corrupt ``settings.value_json`` row
       (returns None + emits a structured WARNING with the key only —
       not the value, which is suspect / potentially sensitive).
-    * In-process TTL cache around ``get_setting`` (#140.2): repeated
+    * In-process TTL cache around ``get_setting``: repeated
       reads under TTL hit the cache; expiry triggers a fresh SELECT;
       ``set_setting`` invalidates the cached entry.
     * Cache is process-local (in-memory dict; tests verify the
       isolation by mutating the DB directly under a held cache entry
       and confirming the read still returns the cached value until
       the cache is invalidated).
-    * ``set_bool_setting`` / ``get_bool_setting`` round-trip
-      (#145.7); default applied when the row is absent; legacy
+    * ``set_bool_setting`` / ``get_bool_setting`` round-trip; default applied when the row is absent; legacy
       ``{"enabled": True}`` blobs remain readable.
 """
 
@@ -47,7 +46,7 @@ def conn():
 
 
 # ---------------------------------------------------------------------------
-# #140.1 — corrupt-row defensive
+# .1 — corrupt-row defensive
 # ---------------------------------------------------------------------------
 
 class TestCorruptRowDefensive:
@@ -130,7 +129,7 @@ class TestCorruptRowDefensive:
 
 
 # ---------------------------------------------------------------------------
-# #140.2 — TTL cache
+# .2 — TTL cache
 # ---------------------------------------------------------------------------
 
 class TestTTLCache:
@@ -262,7 +261,7 @@ class TestTTLCache:
 
 
 # ---------------------------------------------------------------------------
-# #145.7 — bool-setting helpers
+# .7 — bool-setting helpers
 # ---------------------------------------------------------------------------
 
 class TestBoolSettingHelpers:

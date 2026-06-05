@@ -1,4 +1,4 @@
-"""Optional Redis-backed cache for LLM classification results (#151).
+"""Optional Redis-backed cache for LLM classification results.
 
 The same inbound email — same sender, same subject, same body — passes
 the classifier on every retry / poll / push wake. For installs that see
@@ -56,13 +56,14 @@ Circuit-breaker
 On Redis-unreachable errors the lookup logs WARN once per breaker
 window and returns ``None`` (cache miss). The next call retries.
 Reuses :class:`LLMBackendUnreachableError` shape for symmetry with
-the #149 Bundle B classifier-side breaker, but cache failures are
+the  Bundle B classifier-side breaker, but cache failures are
 strictly best-effort — they NEVER raise into the caller. Live LLM
 call always wins as the fallback.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -71,6 +72,14 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+
+#  — hoisted from inside ``_Counters._mirror`` (was re-imported on
+# every cache-counter bump). ``persistent_counters`` imports only
+# ``triage_logging`` (and lazily ``redis``), so there is no circular
+# import and no optional-dependency cost at module load.
+from email_triage.engine.persistent_counters import (
+    get_install_counter_backend,
+)
 
 logger = logging.getLogger("email_triage.cache.classification")
 
@@ -102,6 +111,98 @@ MAX_TTL_SECS = 90 * 24 * 3600
 #: and still scope a ``KEYS et:cls:*`` debug command. Used by the
 #: manual-flush admin path to know which keys belong to us.
 KEY_PREFIX = "et:cls:"
+
+#:  — Lua script behind :meth:`ClassificationCache.store_inner`.
+#: Redis runs a script atomically (no other command interleaves), so
+#: the whole read-scan-evict-write is one indivisible step: the
+#: per-sender ``cap`` holds under concurrent stores, the O(N) field
+#: scan stays server-side, and the companion ``{category: count}``
+#: distribution hash (KEYS[2]) is kept exactly in lockstep with the
+#: inner hash — incremented on insert, decremented on evict /
+#: category-changed overwrite. Branch 2 then reads that tiny hash
+#: directly instead of HGETALL-ing every payload to recount.
+#: ``EVAL`` + ``cjson`` are Redis 2.6+ (and valkey) — within the
+#: module's documented Redis-5+ support.
+#: KEYS[1]=inner hash, KEYS[2]=distribution hash;
+#: ARGV=(inner_field, payload, cap, ttl_secs).
+_STORE_INNER_LUA = """
+local key = KEYS[1]
+local distkey = KEYS[2]
+local field = ARGV[1]
+local payload = ARGV[2]
+local cap = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local function cat_of(raw)
+    if not raw then return nil end
+    local ok, decoded = pcall(cjson.decode, raw)
+    if ok and type(decoded) == 'table'
+            and decoded.category ~= nil
+            and decoded.category ~= cjson.null then
+        return tostring(decoded.category)
+    end
+    return nil
+end
+
+-- Decrement a category's count; drop the field at <=0 so the dist
+-- hash never carries a zero/negative row (also self-heals drift).
+local function dist_dec(cat)
+    if cat == nil or cat == '' then return end
+    if redis.call('HINCRBY', distkey, cat, -1) <= 0 then
+        redis.call('HDEL', distkey, cat)
+    end
+end
+
+local function dist_inc(cat)
+    if cat == nil or cat == '' then return end
+    redis.call('HINCRBY', distkey, cat, 1)
+end
+
+local new_cat = cat_of(payload)
+local existing = redis.call('HGET', key, field)
+
+if existing then
+    -- Overwrite — hash size is unchanged (no eviction). Adjust the
+    -- distribution only when the category actually changed.
+    local old_cat = cat_of(existing)
+    if old_cat ~= new_cat then
+        dist_dec(old_cat)
+        dist_inc(new_cat)
+    end
+else
+    -- New field — evict the oldest (by classified_at) first if the
+    -- hash is already at/over cap. cap <= 0 disables eviction.
+    if cap and cap > 0 and redis.call('HLEN', key) >= cap then
+        local flat = redis.call('HGETALL', key)
+        local oldest_field = nil
+        local oldest_ts = nil
+        local oldest_raw = nil
+        for i = 1, #flat, 2 do
+            local ts = ''
+            local ok, decoded = pcall(cjson.decode, flat[i + 1])
+            if ok and type(decoded) == 'table'
+                    and decoded.classified_at ~= nil then
+                ts = tostring(decoded.classified_at)
+            end
+            if oldest_field == nil or ts < oldest_ts then
+                oldest_field = flat[i]
+                oldest_ts = ts
+                oldest_raw = flat[i + 1]
+            end
+        end
+        if oldest_field ~= nil then
+            redis.call('HDEL', key, oldest_field)
+            dist_dec(cat_of(oldest_raw))
+        end
+    end
+    dist_inc(new_cat)
+end
+
+redis.call('HSET', key, field, payload)
+redis.call('EXPIRE', key, ttl)
+redis.call('EXPIRE', distkey, ttl)
+return 1
+"""
 
 
 def clamp_ttl_secs(value: int | None, default: int = DEFAULT_TTL_SECS) -> int:
@@ -167,14 +268,16 @@ class _Counters:
     def _mirror(self, field: str) -> None:
         """Best-effort HINCRBY to the install-level Redis backend.
 
-        Lazy-imported so a cache write in a test without Redis wired
-        doesn't pay the import. The backend itself silently no-ops
-        when the URL is empty / Redis unreachable.
+         — the ``persistent_counters`` import is hoisted to module
+        scope (see top of file). It was previously imported inside this
+        method on the theory of "don't pay the import in a no-Redis
+        test", but every counter bump on the cache hot path re-ran the
+        ``import`` statement (a ``sys.modules`` dict lookup — cheap, but
+        needless per-call work). The module has no heavy / optional-dep
+        import cost of its own, so hoisting is free. The backend itself
+        still silently no-ops when the URL is empty / Redis unreachable.
         """
         try:
-            from email_triage.engine.persistent_counters import (
-                get_install_counter_backend,
-            )
             be = get_install_counter_backend()
             if be is not None:
                 be.incr(self._PERSIST_NAMESPACE, field)
@@ -314,14 +417,39 @@ def compute_body_hash(body_text: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _categories_digest(categories: dict[str, str] | None) -> str:
+    """Stable short digest of the category taxonomy.
+
+    Folded into the outer cache key so that editing the taxonomy —
+    adding, removing, renaming or re-describing a category — changes
+    the key and naturally orphans classifications produced under the
+    old prompt. ``PROMPT_VERSION`` is a hand-bumped constant; before
+    this digest it was the *only* invalidation lever, so a taxonomy
+    edit (which silently rewrites the LLM system prompt) served stale
+    classifications until someone remembered to bump the constant.
+
+    Canonicalised with ``sort_keys`` so dict ordering never perturbs
+    the digest; truncated to 16 hex chars (64 bits) — ample against
+    accidental collision for a per-install taxonomy.
+    """
+    if not categories:
+        return ""
+    canonical = json.dumps(
+        categories, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def make_outer_cache_key(
     *,
     account_id: int,
     sender: str,
     classifier_model: str,
+    categories: dict[str, str],
     prompt_version: str = PROMPT_VERSION,
 ) -> str:
-    """Outer Redis HASH key — one per (account, sender, model, prompt) triple.
+    """Outer Redis HASH key — one per (account, sender, model, prompt,
+    taxonomy) tuple.
 
     Drops subject + body from the key so all classifications from the
     same sender land in the SAME HASH. The inner field (per-message
@@ -331,6 +459,11 @@ def make_outer_cache_key(
       * Branch 2 — outer match, inner miss → summarise sibling fields
         into a category-distribution hint that biases the LLM call.
 
+    The taxonomy digest is part of the key: a category-set edit
+    changes the LLM system prompt, so its cached results must not be
+    served. ``prompt_version`` remains the manual lever for changes to
+    the prompt *template* wording that ``categories`` cannot capture.
+
     SHA-256 of the tuple (defence-in-depth — sender is PHI-shape; a
     Redis ``KEYS *`` dump shouldn't surface it cleartext).
     """
@@ -339,6 +472,7 @@ def make_outer_cache_key(
         _norm(sender),
         classifier_model.strip(),
         prompt_version.strip(),
+        _categories_digest(categories),
     ])
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"{KEY_PREFIX}{digest}"
@@ -439,7 +573,7 @@ class ClassificationCache:
         default_ttl_secs: int = DEFAULT_TTL_SECS,
         breaker_ttl_secs: int = 60,
         *,
-        inner_cap_per_sender: int = 250,
+        inner_cap_per_sender: int = 128,
         hint_strategy: str = "top_k_with_freq",
         dominant_threshold_pct: int = 70,
     ) -> None:
@@ -471,10 +605,18 @@ class ClassificationCache:
     def _get_client(self) -> Any:
         """Build / return the synchronous Redis client.
 
-        Sync (not async) because the classifier is already an async
-        function whose LLM POST is the slow path. A round-trip to a
-        LAN Redis is sub-millisecond — running it on the event loop
-        directly is fine, no thread pool needed.
+        Sync (not async) because the library underneath is sync — the
+        async-reachable callers (``JsonChatClassifier.classify``,
+        ``admin_integrations_cache_flush``) dispatch each Redis call
+        off the event loop via the ``a*`` mirror methods on this class,
+        which wrap the sync surface in ``asyncio.to_thread``. The
+        original "no thread pool needed" assumption was wrong
+        when measured: a Redis hiccup pinned by the 2.0 s
+        ``socket_timeout`` would block the whole event loop for the
+        full timeout, stalling watchers + web + every other in-flight
+        classify. The fix preserves the sync surface (admin
+        tooling, CLI, tests) and adds an ``a*`` mirror per Redis-
+        touching method that async callers MUST use.
 
         Lazily imports ``redis`` so installs without the optional
         ``cache`` extra installed don't error at import time.
@@ -655,40 +797,40 @@ class ClassificationCache:
             )
             return None
 
-    def fetch_field_set(self, outer_key: str) -> list[dict[str, Any]]:
-        """Branch 2 — pull every inner field's payload for an outer key.
+    def fetch_category_distribution(self, outer_key: str) -> dict[str, int]:
+        """Branch 2 — return the ``{category: count}`` distribution for
+        a sender.
 
-        Returns a list of value-dicts (NOT the field names; caller only
-        needs the category distribution for hint derivation). Empty
-        list on outer-miss / error.
-
-        ``HGETALL`` is O(N) where N is the HASH size — capped at
-        ``inner_cap_per_sender`` (default 250) so the per-call cost
-        stays bounded.
+        Reads the companion ``<outer_key>:dist`` hash that
+        ``store_inner``'s Lua script maintains in lockstep with the
+        inner hash. One ``HGETALL`` of a tiny hash — one field per
+        distinct category, a few hundred bytes — instead of the prior
+        ``HGETALL`` of every full payload only to recount categories.
+        Empty dict on outer-miss / error.
         """
         if not self.enabled or self._breaker_open():
-            return []
+            return {}
         client = self._get_client()
         if client is None:
-            return []
+            return {}
         try:
-            raw_map = client.hgetall(outer_key)
+            raw = client.hgetall(outer_key + ":dist")
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: HGETALL failed (%s); breaker open",
+                "Classification cache: dist HGETALL failed (%s); breaker open",
                 type(exc).__name__,
             )
-            self._open_breaker(f"HGETALL: {exc}")
+            self._open_breaker(f"dist HGETALL: {exc}")
             _counters.incr_error()
-            return []
-        out: list[dict[str, Any]] = []
-        for _field, raw in (raw_map or {}).items():
+            return {}
+        out: dict[str, int] = {}
+        for cat, cnt in (raw or {}).items():
             try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    out.append(parsed)
-            except Exception:  # noqa: BLE001
+                n = int(cnt)
+            except (TypeError, ValueError):
                 continue
+            if n > 0:
+                out[str(cat)] = n
         return out
 
     def store_inner(
@@ -698,18 +840,24 @@ class ClassificationCache:
         value: dict[str, Any],
         *,
         ttl_secs: int | None = None,
-        cap: int = 250,
+        cap: int = 128,
     ) -> None:
         """Write a per-message inner entry. LRU-evicts at ``cap``.
 
-        When the outer HASH reaches ``cap`` fields, the oldest entry
+        When the inner HASH reaches ``cap`` fields, the oldest entry
         (by ``classified_at`` ISO timestamp in the payload) is HDEL'd
-        before the new field is added. Bounds growth on heavy-traffic
-        senders + keeps Branch 2's full-set summarise cost bounded.
+        before the new field is added — bounds growth on heavy-traffic
+        senders.
 
-        Resets the outer key's TTL on every write so a sender that
-        keeps sending stays cached. Sender that goes silent for the
-        full window TTL-expires the whole HASH at once.
+        A companion ``<outer_key>:dist`` hash holds the
+        ``{category: count}`` distribution; the same Lua script keeps
+        it in lockstep with the inner hash (incremented on insert,
+        decremented on evict / category-changed overwrite) so Branch 2
+        reads the aggregate directly rather than scanning payloads.
+
+        Resets the TTL of both keys on every write so a sender that
+        keeps sending stays cached; a sender that goes silent
+        TTL-expires the whole pair at once.
         """
         if not self.enabled or self._breaker_open():
             return
@@ -725,39 +873,24 @@ class ClassificationCache:
             )
             return
         try:
-            # LRU eviction — pull the field set + drop the oldest if
-            # we'd exceed the cap. Skip the check when cap<=0 (defensive
-            # bound) or when the current field already exists (overwrite,
-            # not insert).
-            if cap > 0:
-                size = int(client.hlen(outer_key) or 0)
-                already_present = bool(client.hexists(outer_key, inner_field))
-                if size >= cap and not already_present:
-                    # Find oldest by classified_at; HDEL it.
-                    raw_map = client.hgetall(outer_key) or {}
-                    oldest_field: str | None = None
-                    oldest_ts: str = ""
-                    for fld, raw in raw_map.items():
-                        try:
-                            ts = str(json.loads(raw).get("classified_at", ""))
-                        except Exception:
-                            ts = ""
-                        if oldest_field is None or ts < oldest_ts:
-                            oldest_field = fld
-                            oldest_ts = ts
-                    if oldest_field is not None:
-                        try:
-                            client.hdel(outer_key, oldest_field)
-                        except Exception:  # noqa: BLE001
-                            pass
-            client.hset(outer_key, inner_field, payload)
-            client.expire(outer_key, ttl)
+            #  — atomic eviction + write + distribution update in
+            # one server-side Lua EVAL. The whole read-scan-evict-write
+            # runs without command interleaving, so the cap holds
+            # under concurrent stores, the O(N) field scan never
+            # crosses the wire, and the {category:count} dist hash
+            # stays exactly consistent with the inner hash. See
+            # _STORE_INNER_LUA.
+            client.eval(
+                _STORE_INNER_LUA, 2,
+                outer_key, outer_key + ":dist",
+                inner_field, payload, cap, ttl,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: HSET failed (%s); breaker open",
+                "Classification cache: store EVAL failed (%s); breaker open",
                 type(exc).__name__,
             )
-            self._open_breaker(f"HSET: {exc}")
+            self._open_breaker(f"store_inner EVAL: {exc}")
             _counters.incr_error()
 
     def flush_all(self) -> int:
@@ -830,6 +963,69 @@ class ClassificationCache:
         except Exception:  # noqa: BLE001
             pass
 
+    # -- Async mirrors ---------------------------------------------
+    # Every Redis-touching public method has an ``a*`` mirror that
+    # dispatches the sync call through ``asyncio.to_thread`` so the
+    # 2.0 s ``socket_timeout`` worst case never blocks the event loop.
+    # The async-reachable callers (`JsonChatClassifier.classify`,
+    # `admin_integrations_cache_flush`) MUST use these mirrors; the
+    # sync surface is kept for non-async callers (admin CLI, tests).
+    #
+    # The mirrors are intentionally one-liners — each one delegates
+    # everything (breaker check, client lookup, counter bookkeeping,
+    # error handling) to the sync method, so the two surfaces can
+    # never disagree on semantics. A future refactor to a real async
+    # Redis client (`redis.asyncio`) would replace these wrappers and
+    # leave every caller untouched.
+
+    async def alookup(self, key: str) -> dict[str, Any] | None:
+        """Async mirror of :meth:`lookup` (legacy flat-key)."""
+        return await asyncio.to_thread(self.lookup, key)
+
+    async def astore(
+        self,
+        key: str,
+        value: dict[str, Any],
+        ttl_secs: int | None = None,
+    ) -> None:
+        """Async mirror of :meth:`store` (legacy flat-key)."""
+        await asyncio.to_thread(self.store, key, value, ttl_secs)
+
+    async def alookup_inner(
+        self, outer_key: str, inner_field: str,
+    ) -> dict[str, Any] | None:
+        """Async mirror of :meth:`lookup_inner` — Branch 1 exact hit."""
+        return await asyncio.to_thread(
+            self.lookup_inner, outer_key, inner_field,
+        )
+
+    async def afetch_category_distribution(
+        self, outer_key: str,
+    ) -> dict[str, int]:
+        """Async mirror of :meth:`fetch_category_distribution` — Branch 2."""
+        return await asyncio.to_thread(
+            self.fetch_category_distribution, outer_key,
+        )
+
+    async def astore_inner(
+        self,
+        outer_key: str,
+        inner_field: str,
+        value: dict[str, Any],
+        *,
+        ttl_secs: int | None = None,
+        cap: int = 128,
+    ) -> None:
+        """Async mirror of :meth:`store_inner` — post-LLM write-back."""
+        await asyncio.to_thread(
+            self.store_inner, outer_key, inner_field, value,
+            ttl_secs=ttl_secs, cap=cap,
+        )
+
+    async def aflush_all(self) -> int:
+        """Async mirror of :meth:`flush_all` — admin SCAN+DELETE sweep."""
+        return await asyncio.to_thread(self.flush_all)
+
 
 # ---------------------------------------------------------------------------
 # Install-level singleton (mirrors providers/factory.py pattern)
@@ -890,7 +1086,7 @@ def cache_key_for_message(
 
 
 def cache_keys_for_message(
-    message: Any, classifier_model: str,
+    message: Any, classifier_model: str, categories: dict[str, str],
 ) -> tuple[str | None, str | None]:
     """Return (outer_key, inner_field) — both None when cache is skipped.
 
@@ -898,6 +1094,9 @@ def cache_keys_for_message(
     classifications for HIPAA accounts with the ``reason`` field
     stripped (cache_store_for_message handles the redaction).
     Force-reclassify still short-circuits.
+
+    ``categories`` is the LLM's category taxonomy; its digest is part
+    of the outer key so a taxonomy edit invalidates the cache.
     """
     if message is None:
         return None, None
@@ -911,12 +1110,91 @@ def cache_keys_for_message(
         account_id=int(raw_md.get("account_id", 0) or 0),
         sender=getattr(message, "sender", "") or "",
         classifier_model=classifier_model,
+        categories=categories,
     )
     inner = make_inner_cache_field(
         subject=getattr(message, "subject", "") or "",
         body_hash=compute_body_hash(getattr(message, "body_text", "") or ""),
     )
     return outer, inner
+
+
+def _classification_from_inner_payload(
+    raw: dict[str, Any], categories: dict,
+) -> Any | None:
+    """Build a :class:`Classification` from an inner-cache payload, or
+    return ``None`` when the cached category fell outside the current
+    taxonomy or the payload is malformed.
+
+    Extracted from :func:`cache_lookup_for_message` so the sync and
+    async lookup paths share one canonical shape — a future change to
+    the Classification construction (extra field, defensive clamp)
+    lands once and applies to both.
+    """
+    try:
+        cat = str(raw.get("category", ""))
+        if cat not in categories:
+            return None
+        conf = max(0.0, min(1.0, float(raw.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        return None
+    from email_triage.engine.models import Classification
+    return Classification(
+        category=cat,
+        confidence=conf,
+        reason=str(raw.get("reason", "")),
+        source="llm_cached",
+    )
+
+
+def _hint_from_distribution(
+    raw_dist: dict[str, int], categories: dict, cache: Any,
+) -> tuple[str | None, str]:
+    """Process a Branch-2 distribution into (hint_text, counter_field).
+
+    Returns ``(hint_text_or_none, name_of_counter_to_bump)``. The
+    counter side-effect lives at the caller so the (sync, async)
+    lookup helpers each fire it on their own thread/loop. Strategy +
+    threshold come from the cache singleton (set at boot).
+
+    Pure Python — no I/O. Extracted from
+    :func:`cache_lookup_for_message` so both lookup paths produce
+    bit-identical hint strings + counter bumps from the same
+    distribution.
+    """
+    distribution = {
+        cat: n for cat, n in raw_dist.items()
+        if cat and cat in categories
+    }
+    if not distribution:
+        return None, "incr_miss_cold"
+
+    strategy = getattr(cache, "hint_strategy", "top_k_with_freq")
+    dominant_pct = int(getattr(cache, "dominant_threshold_pct", 70))
+
+    total = sum(distribution.values())
+    sorted_dist = sorted(
+        distribution.items(), key=lambda kv: (-kv[1], kv[0]),
+    )
+
+    if strategy == "top_1_dominant":
+        top_cat, top_n = sorted_dist[0]
+        pct = (top_n * 100) // max(1, total)
+        if pct < dominant_pct:
+            return None, "incr_hit_hint_skipped"
+        hint_text = (
+            f"Sender history: {top_n}/{total} prior emails from this "
+            f"sender were classified as `{top_cat}`."
+        )
+        return hint_text, "incr_hit_hint_dominant"
+
+    # Default — C mode: full distribution.
+    pieces = [f"{n} {cat}" for cat, n in sorted_dist]
+    hint_text = (
+        f"Sender history ({total} prior emails from this sender, "
+        f"by category): " + ", ".join(pieces) + "."
+    )
+    return hint_text, "incr_hit_hint_topk"
 
 
 # Hint shape: (cached_classification | None, hint_text | None)
@@ -948,7 +1226,9 @@ def cache_lookup_for_message(
       * Branch 2 in B mode (ambiguous) → ``hits_hint_skipped``
       * Cold miss → ``misses_cold``
     """
-    outer, inner = cache_keys_for_message(message, classifier_model)
+    outer, inner = cache_keys_for_message(
+        message, classifier_model, categories,
+    )
     if outer is None or inner is None:
         return None, None, None, None
     cache = get_install_classification_cache()
@@ -958,69 +1238,67 @@ def cache_lookup_for_message(
     # Branch 1 — exact inner match.
     raw = cache.lookup_inner(outer, inner)
     if raw is not None:
-        try:
-            cat = str(raw.get("category", ""))
-            if cat in categories:
-                conf = max(0.0, min(1.0, float(raw.get("confidence", 0.5))))
-                from email_triage.engine.models import Classification
-                _counters.incr_hit_exact()
-                return outer, inner, Classification(
-                    category=cat,
-                    confidence=conf,
-                    reason=str(raw.get("reason", "")),
-                    source="llm_cached",
-                ), None
-        except (TypeError, ValueError):
-            pass  # Fall through to Branch 2.
+        cached = _classification_from_inner_payload(raw, categories)
+        if cached is not None:
+            _counters.incr_hit_exact()
+            return outer, inner, cached, None
+        # Fell through (taxonomy moved, malformed payload) → Branch 2.
 
-    # Branch 2 — outer-set summarise to hint.
-    field_set = cache.fetch_field_set(outer)
-    if not field_set:
+    # Branch 2 — read the maintained {category:count} distribution.
+    raw_dist = cache.fetch_category_distribution(outer)
+    if not raw_dist:
         _counters.incr_miss_cold()
         return outer, inner, None, None
 
-    # Derive distribution + emit hint per strategy.
-    distribution: dict[str, int] = {}
-    for entry in field_set:
-        cat = str(entry.get("category") or "")
-        if cat and cat in categories:
-            distribution[cat] = distribution.get(cat, 0) + 1
-    if not distribution:
-        # No usable history (every entry's category fell outside the
-        # current taxonomy — taxonomy was edited). LLM cold.
+    hint_text, counter = _hint_from_distribution(
+        raw_dist, categories, cache,
+    )
+    getattr(_counters, counter)()
+    return outer, inner, None, hint_text
+
+
+async def acache_lookup_for_message(
+    message: Any, classifier_model: str, categories: dict,
+) -> tuple[str | None, str | None, Any | None, str | None]:
+    """ — async mirror of :func:`cache_lookup_for_message`.
+
+    Same return shape, same counter side-effects, same HIPAA gate
+    semantics — but every Redis round-trip is dispatched off the event
+    loop via the ``ClassificationCache.a*`` methods, so a 2.0 s
+    ``socket_timeout`` on a stuck Redis no longer pins the loop.
+
+    Pure-Python key derivation + distribution-to-hint processing is
+    shared with the sync helper via :func:`_classification_from_inner_payload`
+    and :func:`_hint_from_distribution`, so the two paths emit
+    bit-identical results from the same Redis state.
+    """
+    outer, inner = cache_keys_for_message(
+        message, classifier_model, categories,
+    )
+    if outer is None or inner is None:
+        return None, None, None, None
+    cache = get_install_classification_cache()
+    if cache is None:
+        return outer, inner, None, None
+
+    # Branch 1 — exact inner match.
+    raw = await cache.alookup_inner(outer, inner)
+    if raw is not None:
+        cached = _classification_from_inner_payload(raw, categories)
+        if cached is not None:
+            _counters.incr_hit_exact()
+            return outer, inner, cached, None
+
+    # Branch 2 — read the maintained {category:count} distribution.
+    raw_dist = await cache.afetch_category_distribution(outer)
+    if not raw_dist:
         _counters.incr_miss_cold()
         return outer, inner, None, None
 
-    # Strategy + threshold come from the cache singleton (set at
-    # boot from RedisCacheConfig). Defaults survive misconfiguration.
-    strategy = getattr(cache, "hint_strategy", "top_k_with_freq")
-    dominant_pct = int(getattr(cache, "dominant_threshold_pct", 70))
-
-    total = sum(distribution.values())
-    sorted_dist = sorted(
-        distribution.items(), key=lambda kv: (-kv[1], kv[0]),
+    hint_text, counter = _hint_from_distribution(
+        raw_dist, categories, cache,
     )
-
-    if strategy == "top_1_dominant":
-        top_cat, top_n = sorted_dist[0]
-        pct = (top_n * 100) // max(1, total)
-        if pct < dominant_pct:
-            _counters.incr_hit_hint_skipped()
-            return outer, inner, None, None
-        hint_text = (
-            f"Sender history: {top_n}/{total} prior emails from this "
-            f"sender were classified as `{top_cat}`."
-        )
-        _counters.incr_hit_hint_dominant()
-        return outer, inner, None, hint_text
-
-    # Default — C mode: full distribution.
-    pieces = [f"{n} {cat}" for cat, n in sorted_dist]
-    hint_text = (
-        f"Sender history ({total} prior emails from this sender, "
-        f"by category): " + ", ".join(pieces) + "."
-    )
-    _counters.incr_hit_hint_topk()
+    getattr(_counters, counter)()
     return outer, inner, None, hint_text
 
 
@@ -1041,7 +1319,7 @@ def cache_store_for_message(
     LLM free-text that could echo body fragments.
 
     Cap from install config (``redis_cache.inner_cap_per_sender``,
-    default 250); ``ClassificationCache.store_inner`` LRU-evicts the
+    default 128); ``ClassificationCache.store_inner`` LRU-evicts the
     oldest field on overflow before adding the new one.
     """
     if not outer_key or not inner_field:
@@ -1049,11 +1327,36 @@ def cache_store_for_message(
     cache = get_install_classification_cache()
     if cache is None or not cache.enabled:
         return
+    value = _build_inner_payload(
+        classifier_model, classification, categories, is_hipaa=is_hipaa,
+    )
+    if value is None:
+        return
+    cap = int(getattr(cache, "inner_cap_per_sender", 128))
+    try:
+        cache.store_inner(outer_key, inner_field, value, cap=cap)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Classification cache store error: %s", exc)
+
+
+def _build_inner_payload(
+    classifier_model: str,
+    classification: Any,
+    categories: dict,
+    *,
+    is_hipaa: bool,
+) -> dict[str, Any] | None:
+    """Build the payload :func:`(a)cache_store_for_message` writes, or
+    return ``None`` when the classification's category fell outside the
+    current taxonomy and writing would poison the cache.
+
+    Extracted from :func:`cache_store_for_message` so the sync and
+    async store paths produce bit-identical payloads + HIPAA redaction
+    from the same Classification.
+    """
     cat = getattr(classification, "category", "")
     if cat not in categories:
-        return
-    cap = int(getattr(cache, "inner_cap_per_sender", 250))
-
+        return None
     from datetime import datetime, timezone
     value: dict[str, Any] = {
         "category": cat,
@@ -1061,16 +1364,41 @@ def cache_store_for_message(
         "classified_at": datetime.now(timezone.utc).isoformat(),
         "model": classifier_model,
     }
-    # HIPAA: omit reason (the PHI-shape free-text leak surface).
-    # Non-HIPAA: include reason for debug + audit visibility.
     if not is_hipaa:
         value["reason"] = str(
             getattr(classification, "reason", "") or "",
         )
+    return value
+
+
+async def acache_store_for_message(
+    outer_key: str | None,
+    inner_field: str | None,
+    classifier_model: str,
+    classification: Any,
+    categories: dict,
+    *,
+    is_hipaa: bool = False,
+) -> None:
+    """ — async mirror of :func:`cache_store_for_message`. Best-
+    effort; never raises. Dispatches the Redis write off the event
+    loop via :meth:`ClassificationCache.astore_inner`.
+    """
+    if not outer_key or not inner_field:
+        return
+    cache = get_install_classification_cache()
+    if cache is None or not cache.enabled:
+        return
+    value = _build_inner_payload(
+        classifier_model, classification, categories, is_hipaa=is_hipaa,
+    )
+    if value is None:
+        return
+    cap = int(getattr(cache, "inner_cap_per_sender", 128))
     try:
-        cache.store_inner(outer_key, inner_field, value, cap=cap)
+        await cache.astore_inner(outer_key, inner_field, value, cap=cap)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Classification cache store error: %s", exc)
+        logger.debug("Classification cache async store error: %s", exc)
 
 
 def build_cache_from_config(redis_cache_cfg: Any) -> ClassificationCache | None:
@@ -1085,7 +1413,7 @@ def build_cache_from_config(redis_cache_cfg: Any) -> ClassificationCache | None:
         return None
     raw_ttl = getattr(redis_cache_cfg, "ttl_secs", DEFAULT_TTL_SECS)
     ttl = clamp_ttl_secs(raw_ttl)
-    cap = int(getattr(redis_cache_cfg, "inner_cap_per_sender", 250) or 250)
+    cap = int(getattr(redis_cache_cfg, "inner_cap_per_sender", 128) or 128)
     strategy = str(
         getattr(redis_cache_cfg, "hint_strategy", "top_k_with_freq")
         or "top_k_with_freq",

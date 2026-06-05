@@ -1,4 +1,4 @@
-"""Tests for the provider-agnostic mail-query language (#138.3).
+"""Tests for the provider-agnostic mail-query language.
 
 The IMAP / Gmail / O365 providers each used to carry their own
 ``_translate_filter`` + ``_translate_query`` pair. They now delegate

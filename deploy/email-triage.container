@@ -5,44 +5,39 @@ Wants=network-online.target
 After=network-online.target podman.socket
 
 [Container]
-# Image by name; built via `sudo podman build` on host before restart.
-# The systemd unit does NOT build — it only runs the already-tagged
-# :latest image. Deploy loop: `podman build -t email-triage:latest ...`
-# then `systemctl restart email-triage.service`.
-Image=localhost/email-triage:latest
+# Pinned release image from GHCR. Pull the tag you want to run; the unit
+# does not build. To upgrade: change the tag and `systemctl restart
+# email-triage.service`.
+Image=ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
 ContainerName=email-triage
 
-# Per-user CLAUDE.md guidance: SearXNG owns 8080 on DeployHost, email-triage
-# owns 8081. Hard-code the mapping so a future operator can't
-# accidentally publish on the wrong port.
-PublishPort=8081:8080
+# Host:container port mapping. The app listens on 8080 inside the
+# container; publish it on whatever host port is free for you.
+PublishPort=8080:8080
 
-# Timezone — log formatter at src/email_triage/triage_logging.py reads
-# container TZ; without these two lines it silently falls back to UTC.
-# Matches the original `-e TZ=America/Detroit` + `-v /etc/localtime`
-# bind from the podman-run recipe.
-Environment=TZ=America/Detroit
+# Timezone — the log formatter reads the container TZ; without it logs
+# fall back to UTC. Set this to your local zone if you prefer local-time
+# logs (e.g. TZ=America/New_York).
+Environment=TZ=UTC
 Volume=/etc/localtime:/etc/localtime:ro
 
-# Persistent data + config volumes. Layout matches the pre-quadlet
-# deploy so triage.db + email-triage.yaml survive the cutover without
-# touching host paths.
+# Persistent data + config volumes. Point these at host paths you control;
+# triage.db (SQLCipher-encrypted) and the config file live under /app/data
+# and /app/config respectively.
 Volume=/srv/email-triage/data:/app/data
 Volume=/srv/email-triage/config:/app/config
 
-# Master key — same Podman secret used before. Missing secret causes
-# the app lifespan to raise SecretNotFound and the container exits.
+# Master key — a Podman secret named ET_MASTER_KEY. A missing secret makes
+# the app raise SecretNotFound at startup and the container exits.
 Secret=ET_MASTER_KEY
 
-# Graceful shutdown cap. WatcherManager.stop_all caps per-watcher
-# shutdown at ~3s and the IMAP logout caps at 2s, so a clean drain
-# finishes well inside 30s even with multiple slow watchers + Pub/Sub
-# flush. systemd will SIGKILL after this elapses.
+# Graceful shutdown cap. A clean drain (watcher stop + IMAP logout + any
+# push flush) finishes well inside 30s; systemd SIGKILLs after this.
 StopTimeout=30
 
 [Service]
-# Restart semantics — survive transient crashes, but back off so a
-# broken config doesn't crash-loop at maximum rate.
+# Restart on transient crashes, but back off so a broken config does not
+# crash-loop at maximum rate.
 Restart=on-failure
 RestartSec=10
 

@@ -7,6 +7,7 @@ mail server or return the HTML for preview.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 from dataclasses import dataclass, field
@@ -16,6 +17,18 @@ from typing import Any
 from email_triage.engine.models import EmailMessage
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+
+#  — bounded concurrency for the LLM-extraction hot path in
+# generate_digest. Conservative default: 5 parallel calls is well-
+# matched to a single-GPU Ollama backend (typical 4-7K context per
+# prompt × 5 = fits in 24GB VRAM with the chat model resident); also
+# under any reasonable rate-limit for OpenAI / Gemini backends. The
+# style-profile companion site at ``actions/style_profile.py``
+# (audit-pattern-before-fix catch) shares this cap.
+# TODO: per-backend tunable in Cycle 8 (see the backlog
+# -followup-config-knob) — Ollama VRAM cap vs OpenAI rate-limit
+# cap have different ceilings.
+_DIGEST_EXTRACT_CONCURRENCY = 5
 
 log = get_logger("actions.digest")
 
@@ -69,7 +82,7 @@ If the article has a URL/link \u2014 include the actual link in the \
 
 
 # ---------------------------------------------------------------------------
-# Signature rendering (#33 — scope: newsletter digest)
+# Signature rendering
 # ---------------------------------------------------------------------------
 
 def render_signature(
@@ -258,7 +271,7 @@ async def extract_articles(
         # the fallback path renders subject-only for HIPAA-flagged
         # messages so a parser exception can't surface body content
         # the gate at the top of this function was supposed to
-        # protect (audit punch-list #110, 2026-05-08).
+        # protect (audit the backlog , 2026-05-08).
         if getattr(message, "hipaa", False):
             return [Article(
                 headline=message.subject or "Newsletter",
@@ -440,6 +453,8 @@ async def generate_digest(
     account: str = "",
     html_template: str = "",
     digest_name: str = "",
+    account_id: int | None = None,
+    db_conn: Any = None,
 ) -> tuple[str, int, int]:
     """Generate an HTML digest from newsletter messages.
 
@@ -453,10 +468,56 @@ async def generate_digest(
     ``digest_name`` threads through to ``build_digest_html`` so the
     template can surface which digest sent the email (matches the
     operator-typed name on ``DigestConfig``).
+
+    ``account_id`` + ``db_conn`` are the H-06 divergence-visibility
+    plumbing (§164.308(a)(7) Contingency Plan, 2026-05-23). When
+    ``delete_originals=True`` AND any HIPAA-flagged message's archive
+    call fails, we emit a ``hipaa_access_events`` row with
+    ``operation='digest_archive_failed'`` so the state divergence
+    (PHI now in BOTH the digest recipient mailbox AND the source
+    mailbox) is operator-visible in daily-health beyond the
+    buried-in-logs warning. Both parameters must be provided
+    together for the audit row to land; either being None skips the
+    emission silently and only the legacy ``log.warning`` fires.
+
+    **Dormant production caller path (per hipaa-sme-3 R-1
+    verify-don't-accept review 2026-05-24)**: NO in-tree caller
+    currently invokes ``generate_digest(delete_originals=True)`` —
+    the only production caller path (``digest_render.
+    render_newsletter_async``) hardcodes ``delete_originals=False``.
+    The signature plumbing is defense-in-depth for the public API
+    surface that FUTURE callers (incl. N-01-forward LLM-draft work)
+    inherit. Caller wiring at ``app._fire_one_digest`` is NOT
+    updated this cycle since no in-tree caller is changing
+    ``delete_originals=True``; integration-test coverage at the
+    ``_fire_one_digest`` → ``generate_digest`` boundary deferred to
+    whichever future cycle activates ``delete_originals=True``
+    (whoever flips that switch owns the integration test). Unit
+    tests cover the H-06 emission contract via AsyncMock providers
+    + in-memory DB.
     """
     groups: dict[str, SenderGroup] = {}
 
-    for msg in messages:
+    #  — pre-fix, this loop called ``await extract_articles`` per
+    # message sequentially. For a 20-50-article digest at 1-3s per LLM
+    # round-trip that's 20-150s of wall-clock per digest. Parallelize
+    # under a bounded Semaphore so the worker thread pool / GPU isn't
+    # swamped; the cap lives at module scope so the style_profile
+    # companion site can share the same constant when the same fix
+    # lands there. ``return_exceptions=False`` propagates the first
+    # failure exactly like the sequential await did — a per-article
+    # failure was always fatal to the digest in the pre-fix shape.
+    sem = asyncio.Semaphore(_DIGEST_EXTRACT_CONCURRENCY)
+
+    async def _extract_bounded(msg: EmailMessage) -> list[Any]:
+        async with sem:
+            return await extract_articles(classifier, msg)
+
+    extracted = await asyncio.gather(
+        *(_extract_bounded(msg) for msg in messages),
+    )
+
+    for msg, articles in zip(messages, extracted):
         sender_name = _extract_sender_name(msg.sender)
         sender_key = msg.sender.strip().lower()
 
@@ -466,11 +527,10 @@ async def generate_digest(
                 sender_email=msg.sender,
             )
 
-        articles = await extract_articles(classifier, msg)
         groups[sender_key].articles.extend(articles)
 
     # Local tz — matches "Thursday, April 23, 2026" style user expects
-    # + matches the /health last_triage render + log formatter (#3).
+    # + matches the /health last_triage render + log formatter.
     date_str = datetime.now().astimezone().strftime("%A, %B %d, %Y")
     signature = ""
     if signature_template:
@@ -490,6 +550,20 @@ async def generate_digest(
     source_count = sum(1 for g in groups.values() if g.articles)
 
     # Optionally archive/delete originals.
+    #
+    # H-06 (Cycle 6, 2026-05-23, §164.308(a)(7) Contingency Plan):
+    # When delete_originals=True and an archive call fails AFTER the
+    # digest HTML has been built (and, in the multi-digest sender
+    # path, AFTER the SMTP send has succeeded), the install ends up
+    # with PHI in BOTH the digest recipient's inbox AND the source
+    # mailbox — a state divergence the operator cannot detect from
+    # the warning log alone. Mirror precedent 4e1e138 (
+    # bulk-label HIPAA actor!=owner audit) and emit a
+    # hipaa_access_events row with operation='digest_archive_failed'
+    # for every HIPAA-flagged message whose archive call failed, so
+    # daily-health surfaces the divergence count. Owner self-access
+    # is a non-concept here (system-initiated digest send, no actor),
+    # so actor_user_id is None.
     if delete_originals:
         for msg in messages:
             try:
@@ -498,5 +572,74 @@ async def generate_digest(
             except Exception as e:
                 log.warning("Failed to archive source",
                             uid=msg.message_id, error=fmt_exc(e))
+                # H-06 divergence-visibility audit row. Gated on
+                # HIPAA flag (this is a HIPAA contingency-plan
+                # control — non-HIPAA archive failures stay in the
+                # log only) AND on the caller having threaded both
+                # ``account_id`` AND ``db_conn`` (callers without DB
+                # context get log-only behavior). Failures inside
+                # the audit emission itself must NOT propagate — the
+                # primary archive failure is already logged, and a
+                # secondary audit-DB hiccup would otherwise mask the
+                # per-uid archive-failure visibility for subsequent
+                # messages in the same loop. The audit row's
+                # ``detail`` field carries the truncated error
+                # class for forensic correlation (never PHI —
+                # ``fmt_exc`` returns the exception type + message,
+                # which for archive failures is provider-API surface,
+                # not message content).
+                if (
+                    getattr(msg, "hipaa", False)
+                    and account_id is not None
+                    and db_conn is not None
+                ):
+                    try:
+                        # Late import to avoid the web.db cycle —
+                        # generate_digest is imported by actions
+                        # which are imported by web.app at startup;
+                        # importing db.audit at module top would
+                        # invert the load order.
+                        from email_triage.db.audit import (
+                            record_hipaa_access_event,
+                        )
+                        # asyncio.to_thread keeps the sync DB write
+                        # off the event loop. The @db_write decorator
+                        # on record_hipaa_access_event holds the
+                        # process-wide single-writer lock for the
+                        # duration of the INSERT + COMMIT, matching
+                        # the precedent path's threading contract
+                        # (see web/db_threadpool.py module docstring
+                        # for the shared-connection RLock invariant).
+                        # asyncio is imported at module scope
+                        # — no local re-import needed (and a local
+                        # re-import would shadow the module-level
+                        # binding for the entire function body via
+                        # Python's LEGB scoping rule).
+
+                        def _emit() -> None:
+                            record_hipaa_access_event(
+                                db_conn,
+                                actor_user_id=None,
+                                account_id=account_id,
+                                operation="digest_archive_failed",
+                                outcome="error",
+                                detail=(
+                                    f"uid={msg.message_id} "
+                                    f"err={fmt_exc(e)[:180]}"
+                                ),
+                            )
+                        await asyncio.to_thread(_emit)
+                    except Exception as audit_e:
+                        # Don't let an audit-emit failure mask the
+                        # per-message archive-failure loop. The log
+                        # warning above carries the operational signal
+                        # for this uid; the audit-emit failure gets
+                        # its own (separate) log line for ops
+                        # diagnosis.
+                        log.warning(
+                            "Failed to emit H-06 divergence audit",
+                            uid=msg.message_id,
+                            error=fmt_exc(audit_e),
+                        )
 
     return digest_html, total_articles, source_count

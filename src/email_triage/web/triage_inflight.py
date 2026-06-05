@@ -1,4 +1,4 @@
-"""Per-(account, UID) in-flight dedup gate (#114).
+"""Per-(account, UID) in-flight dedup gate.
 
 When a push delivery and a watcher / poll cycle fire on the same UID
 within seconds, both can run the full triage pipeline before either

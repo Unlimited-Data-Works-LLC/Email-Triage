@@ -1,4 +1,4 @@
-"""Privacy invariants for HIPAA-safe per-contact style descriptors (#152 W3).
+"""Privacy invariants for HIPAA-safe per-contact style descriptors.
 
 CI guard for the M-7 HIPAA path at
 :mod:`email_triage.style_learning.per_contact_hipaa`. Each test pins a

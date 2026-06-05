@@ -43,10 +43,10 @@ def _msg(body: str, *, uid: str = "u1") -> EmailMessage:
 
 _GOOD_LLM_JSON = {
     "greeting": "Hi {name},",
-    "signoff": "Thanks,\nCraig",
+    "signoff": "Thanks,\nAlex",
     "formality": 2,
     "avg_sentence_length": 9,
-    "signature": "— Alex\nCraig L.",
+    "signature": "— Alex\nAlex L.",
     "phrases_used": ["let me know", "happy to", "quick note"],
     "phrases_avoided": ["I hope this email finds you well"],
     "persona_summary": "Direct and friendly; short sentences; no boilerplate.",
@@ -63,7 +63,7 @@ class TestStyleProfileDataclass:
         d = p.to_dict()
         # Sample_count / model_used carry across.
         assert d["greeting"] == "Hi {name},"
-        assert d["signoff"] == "Thanks,\nCraig"
+        assert d["signoff"] == "Thanks,\nAlex"
         assert d["formality"] == 2
         assert d["phrases_used"] == ["let me know", "happy to", "quick note"]
 
@@ -176,7 +176,7 @@ class TestExtractStyleProfile:
 
         # Structured shape, every M-3 key present.
         assert profile.greeting == "Hi {name},"
-        assert profile.signoff == "Thanks,\nCraig"
+        assert profile.signoff == "Thanks,\nAlex"
         assert profile.formality == 2
         assert profile.avg_sentence_length == 9
         assert profile.signature.startswith("— Alex")

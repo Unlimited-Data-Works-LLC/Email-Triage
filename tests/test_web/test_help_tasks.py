@@ -1,4 +1,4 @@
-"""Tests for /help/tasks (#128).
+"""Tests for /help/tasks.
 
 The help page is anonymous-accessible (non-PHI). These tests pin
 the contract end-users + medical-researchers depend on:
@@ -43,7 +43,7 @@ class TestAnonymousAccess:
 
 class TestSixTasks:
     def test_all_six_task_titles_render(self, client):
-        """The exact title strings from the punch-list appear once each.
+        """The exact title strings from the backlog appear once each.
 
         We assert on the title strings (not anchor ids) because copy
         changes are easier to audit when the test reads like a TOC.

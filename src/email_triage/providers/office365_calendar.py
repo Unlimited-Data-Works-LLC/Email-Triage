@@ -9,17 +9,17 @@ Calendar" device-code flow takes care of.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import date, datetime, time as dt_time, timezone
 from typing import Any
 
 import httpx
 
+from email_triage._isotime import parse_iso
 from email_triage.engine.models import CalendarEvent
 from email_triage.providers.calendar_base import (
     CalendarProvider,
-    CalendarScopeError,
+    _CalendarHttpMixin,
 )
 from email_triage.providers.office365 import (
     GRAPH_BASE,
@@ -30,13 +30,22 @@ from email_triage.providers.office365 import (
 logger = logging.getLogger("email_triage.providers.office365_calendar")
 
 
-class Office365CalendarProvider(CalendarProvider):
+class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
     """Graph calendar client.
 
     Wraps an ``Office365Provider`` for token acquisition — we don't
     re-implement MSAL device flow, we lean on the same MSAL app the
     mail provider uses.
+
+    HTTP plumbing (``_get_client`` / ``_request``) comes from
+    :class:`_CalendarHttpMixin`; this class supplies the Graph-specific
+    hooks below.
     """
+
+    _scope_error_keywords = (
+        "scope", "permission", "privilege", "consent", "accessdenied",
+    )
+    _provider_label = "office365_calendar"
 
     def __init__(
         self,
@@ -44,6 +53,7 @@ class Office365CalendarProvider(CalendarProvider):
         tenant_id: str = "common",
         client_secret: str = "",
         token_cache_path: str = "./data/msal_cache.json",
+        username: str = "",
         scopes: list[str] | None = None,
         timeout: float = 30.0,
     ):
@@ -57,6 +67,7 @@ class Office365CalendarProvider(CalendarProvider):
             tenant_id=tenant_id,
             client_secret=client_secret,
             token_cache_path=token_cache_path,
+            username=username,
             scopes=scopes,
         )
         self._timeout = timeout
@@ -70,62 +81,24 @@ class Office365CalendarProvider(CalendarProvider):
     # Auth + HTTP plumbing — mirrors the mail provider's _get_client
     # ------------------------------------------------------------------
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._http is not None:
-            return self._http
+    # -- _CalendarHttpMixin hooks --------------------------------------
+
+    async def _build_client(self) -> httpx.AsyncClient:
+        # Graph's bearer token is stable for the client's lifetime, so
+        # bake it onto the client; _on_unauthorized rotates it in place.
         token = await self._mail.acquire_token()
-        self._http = httpx.AsyncClient(
+        return httpx.AsyncClient(
             base_url=GRAPH_BASE,
             headers={"Authorization": f"Bearer {token}"},
             timeout=self._timeout,
         )
-        return self._http
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        json_data: Any = None,
-    ) -> Any:
-        client = await self._get_client()
-        for attempt in range(2):
-            resp = await client.request(
-                method, path, params=params, json=json_data,
-            )
-            if resp.status_code == 401 and attempt == 0:
-                # Refresh the token and rebuild the client.
-                token = await self._mail.acquire_token()
-                client.headers["Authorization"] = f"Bearer {token}"
-                continue
+    async def _on_unauthorized(self, client: httpx.AsyncClient) -> None:
+        token = await self._mail.acquire_token()
+        client.headers["Authorization"] = f"Bearer {token}"
 
-            if resp.status_code >= 400:
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = resp.text
-                body_str = (
-                    json.dumps(body) if isinstance(body, dict) else str(body)
-                ).lower()
-                if resp.status_code in (401, 403) and (
-                    "scope" in body_str
-                    or "permission" in body_str
-                    or "privilege" in body_str
-                    or "consent" in body_str
-                    or "accessdenied" in body_str
-                ):
-                    raise CalendarScopeError("office365_calendar", str(body))
-                raise GraphError(resp.status_code, body, path)
-
-            if resp.status_code == 204 or not resp.content:
-                return None
-            try:
-                return resp.json()
-            except Exception:
-                return resp.text
-
-        raise GraphError(401, "Failed after token refresh", path)
+    def _http_error(self, status: int, body: Any, path: str) -> Exception:
+        return GraphError(status, body, path)
 
     # ------------------------------------------------------------------
     # Normalisation
@@ -137,16 +110,15 @@ class Office365CalendarProvider(CalendarProvider):
         dt_str = raw.get("dateTime")
         is_all_day = False
         if dt_str:
-            try:
-                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    # Graph returns all-day-event endpoints without
-                    # a timezone offset; treat as UTC midnight.
-                    dt = dt.replace(tzinfo=timezone.utc)
-                    is_all_day = True
-                return dt.astimezone(timezone.utc), is_all_day
-            except Exception:
+            dt = parse_iso(dt_str)
+            if dt is None:
                 return None, False
+            if dt.tzinfo is None:
+                # Graph returns all-day-event endpoints without
+                # a timezone offset; treat as UTC midnight.
+                dt = dt.replace(tzinfo=timezone.utc)
+                is_all_day = True
+            return dt.astimezone(timezone.utc), is_all_day
         return None, False
 
     def _normalise(self, raw: dict[str, Any]) -> CalendarEvent:
@@ -309,7 +281,7 @@ class Office365CalendarProvider(CalendarProvider):
         *, calendar_id: str | None = None,
     ) -> str:
         # Per-call override for the self-sent event triage path
-        # (#107). Graph addresses non-default calendars at
+        #. Graph addresses non-default calendars at
         # ``/me/calendars/{id}/events``; default (no calendar_id)
         # posts to ``/me/events`` which targets the operator's
         # default calendar.
@@ -336,7 +308,13 @@ class Office365CalendarProvider(CalendarProvider):
     ) -> None:
         await self._request("DELETE", f"/me/events/{event_id}")
 
-    async def respond_to_invite(self, event_id: str, response: str) -> None:
+    async def respond_to_invite(
+        self, event_id: str, response: str,
+        *, calendar_id: str | None = None,
+    ) -> None:
+        # Graph routes by global event id; calendar_id is accepted for
+        # API symmetry with the other mutation methods but not needed
+        # in the path.
         verb_map = {
             "accepted": "accept",
             "declined": "decline",
@@ -352,10 +330,9 @@ class Office365CalendarProvider(CalendarProvider):
         )
 
     async def close(self) -> None:
-        if self._http is not None:
-            await self._http.aclose()
-            self._http = None
-        # Mail-side close handles the cache flush.
+        # _CalendarHttpMixin.close() drops the httpx client; the
+        # mail-side close additionally flushes the MSAL token cache.
+        await super().close()
         try:
             await self._mail.close()
         except Exception:

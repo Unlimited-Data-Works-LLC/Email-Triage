@@ -1,4 +1,4 @@
-"""Privacy invariants for the HIPAA describe-and-discard distill (#152 S1).
+"""Privacy invariants for the HIPAA describe-and-discard distill.
 
 CI guard for the orchestrator at
 :mod:`email_triage.style_learning.distill_hipaa`. Each test asserts a

@@ -1,6 +1,6 @@
 """Routes for the categories concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -46,7 +46,8 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
+    RequireUser,
+    RequireUserFragment,
     get_session_secret,
     require_auth,
     require_role,
@@ -54,6 +55,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.categories")
 
 router = APIRouter()
@@ -62,7 +64,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -103,7 +105,7 @@ def __getattr__(name):
 
 
 def _parse_provider_labels_form(raw_values: list[str]) -> list[dict]:
-    """#163 — parse the ``provider_labels`` form field into the DB
+    """ — parse the ``provider_labels`` form field into the DB
     shape.
 
     Each form value is ``<account_id>:<label_slug>`` (the picker
@@ -132,16 +134,12 @@ def _parse_provider_labels_form(raw_values: list[str]) -> list[dict]:
 
 
 @router.get("/rules", response_class=HTMLResponse)
-async def rules_page(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
+async def rules_page(request: Request, user: RequireUser):
     db = get_db(request)
     templates = get_templates(request)
     snap = await db_call(_build_rules_page_snapshot, db, user)
 
-    return _render(templates, request, "rules/lists.html", {
+    return await _render(templates, request, "rules/lists.html", {
         "user": user,
         "personal_lists": snap["personal_lists"],
         "global_lists": snap["global_lists"],
@@ -152,10 +150,7 @@ async def rules_page(request: Request):
 
 
 @router.get("/rules/global", response_class=HTMLResponse)
-async def global_rules_page(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
+async def global_rules_page(request: Request, user: RequireUser):
     if user["role"] not in ("admin", "power_user"):
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -163,7 +158,7 @@ async def global_rules_page(request: Request):
     templates = get_templates(request)
     snap = await db_call(_build_rules_page_snapshot, db, user)
 
-    return _render(templates, request, "rules/global.html", {
+    return await _render(templates, request, "rules/global.html", {
         "user": user,
         "global_lists": snap["global_lists"],
         "categories": snap["categories"],
@@ -175,6 +170,7 @@ async def global_rules_page(request: Request):
 @router.post("/rules/create", response_class=HTMLResponse)
 async def create_list(
     request: Request,
+    user: RequireUserFragment,
     name: str = Form(...),
     category: str = Form(...),
     is_global: str = Form("0"),
@@ -182,17 +178,13 @@ async def create_list(
     pattern: str = Form(""),
     skip_ai: str = Form("0"),
 ):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     global_flag = is_global == "1"
     if global_flag and user["role"] not in ("admin", "power_user"):
         return HTMLResponse("Forbidden", status_code=403)
 
     db = get_db(request)
 
-    # #129 — "Also adds labels" multi-select on the rule form. Form
+    #  — "Also adds labels" multi-select on the rule form. Form
     # field is repeated (one entry per checkbox), so read via getlist
     # on the form-data dict rather than the per-arg Form binding.
     form = await request.form()
@@ -201,7 +193,7 @@ async def create_list(
         for slug in form.getlist("adds_labels")
         if slug and slug.strip()
     ]
-    # #163 — "Also apply provider labels" multi-select. Each value is
+    #  — "Also apply provider labels" multi-select. Each value is
     # ``<account_id>:<label_slug>``; parse + drop malformed entries.
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
@@ -219,11 +211,9 @@ async def create_list(
 
 
 @router.post("/rules/{list_id}/delete", response_class=HTMLResponse)
-async def delete_list(request: Request, list_id: int):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
+async def delete_list(
+    request: Request, list_id: int, user: RequireUserFragment,
+):
     db = get_db(request)
     status, is_global = await db_call(
         _delete_list_snapshot, db, list_id, user["id"], user["role"],
@@ -242,24 +232,21 @@ async def delete_list(request: Request, list_id: int):
 async def add_rule(
     request: Request,
     list_id: int,
+    user: RequireUserFragment,
     rule_type: str = Form(...),
     pattern: str = Form(...),
     skip_ai: str = Form("0"),
 ):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
 
-    # #129 — "Also adds labels" on the per-list add-rule form.
+    #  — "Also adds labels" on the per-list add-rule form.
     form = await request.form()
     adds_labels = [
         slug.strip().lower()
         for slug in form.getlist("adds_labels")
         if slug and slug.strip()
     ]
-    # #163 — "Also apply provider labels" multi-select.
+    #  — "Also apply provider labels" multi-select.
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
     )
@@ -272,6 +259,13 @@ async def add_rule(
         return HTMLResponse("Not found", status_code=404)
     if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
+    #  — empty / whitespace-only pattern rejected at the snapshot
+    # layer. Surface as 400 so the operator sees an actionable error
+    # rather than a silently-dropped or match-everything rule.
+    if status == "invalid_pattern":
+        return HTMLResponse(
+            "Pattern must not be empty", status_code=400,
+        )
 
     if is_global:
         return RedirectResponse("/rules/global", status_code=303)
@@ -279,11 +273,10 @@ async def add_rule(
 
 
 @router.post("/rules/{list_id}/rules/{rule_id}/delete", response_class=HTMLResponse)
-async def delete_rule(request: Request, list_id: int, rule_id: int):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
+async def delete_rule(
+    request: Request, list_id: int, rule_id: int,
+    user: RequireUserFragment,
+):
     db = get_db(request)
     status, is_global = await db_call(
         _delete_rule_snapshot, db, list_id, rule_id, user["id"], user["role"],
@@ -299,7 +292,7 @@ async def delete_rule(request: Request, list_id: int, rule_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Per-row rule edit affordance (#160). Three endpoints feed the
+# Per-row rule edit affordance. Three endpoints feed the
 # inline-edit pattern from categories: GET .../edit renders the
 # edit-mode partial; GET .../row renders the view-mode partial
 # (used by Cancel to revert without persisting); POST .../save
@@ -311,24 +304,23 @@ async def delete_rule(request: Request, list_id: int, rule_id: int):
     "/rules/{list_id}/rules/{rule_id}/edit",
     response_class=HTMLResponse,
 )
-async def edit_rule_form(request: Request, list_id: int, rule_id: int):
+async def edit_rule_form(
+    request: Request, list_id: int, rule_id: int,
+    user: RequireUserFragment,
+):
     """Inline edit form for one rule (HTMX swap target = the row tr).
 
     Sibling-pattern of /categories/{cat_id}/edit. Read-only auth
     check: owner of the list OR admin/power_user (matches the
     update-paths' role gate).
 
-    #163 — also builds ``provider_label_groups``: one entry per
+     — also builds ``provider_label_groups``: one entry per
     non-HIPAA managed account, each carrying the labels / folders /
     categories that already exist on the provider. The template
     renders the picker so the operator can pick from labels they
     ALREADY HAVE rather than re-defining everything in the install-
     internal catalog.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     templates = get_templates(request)
     # Pull the rule + the list catalog of labels (same shape the
@@ -343,28 +335,38 @@ async def edit_rule_form(request: Request, list_id: int, rule_id: int):
         return HTMLResponse("Forbidden", status_code=403)
     all_labels = await db_call(list_labels, db)
 
-    # #163 — provider-native labels per account. HIPAA accounts
+    #  — provider-native labels per account. HIPAA accounts
     # NEVER expose the picker (per actor != owner gate); skip them
     # both at the picker route AND inside the helper as defense-in-
     # depth.
     accounts = await db_call(
         list_email_accounts, db, user_id=user.get("id"),
     )
-    provider_label_groups = []
     secrets = request.app.state.secrets
-    for a in accounts:
-        if is_account_hipaa(a):
-            continue
-        labels = await list_provider_labels_for_account(
+    #  — the per-account provider-label lookups are independent
+    # provider round-trips (Gmail/O365 list_labels, IMAP
+    # list_folders); run them concurrently rather than awaiting each
+    # in turn. HIPAA accounts are excluded (the helper also returns
+    # [] for them as a second layer). list_provider_labels_for_account
+    # is fail-soft — returns [] and never raises — so a plain gather
+    # can't be tripped by one bad provider.
+    _visible = [a for a in accounts if not is_account_hipaa(a)]
+    _label_lists = await asyncio.gather(*(
+        list_provider_labels_for_account(
             db=db, secrets=secrets, account_id=int(a["id"]),
         )
-        provider_label_groups.append({
+        for a in _visible
+    ))
+    provider_label_groups = [
+        {
             "account_id": int(a["id"]),
             "account_name": a.get("name", "") or "",
             "provider_type": a.get("provider_type", "") or "",
             "labels": labels,
-        })
-    return _render(templates, request, "rules/_rule_edit.html", {
+        }
+        for a, labels in zip(_visible, _label_lists)
+    ]
+    return await _render(templates, request, "rules/_rule_edit.html", {
         "user": user,
         "lst": lst,
         "rule": rule,
@@ -378,12 +380,11 @@ async def edit_rule_form(request: Request, list_id: int, rule_id: int):
     "/rules/{list_id}/rules/{rule_id}/row",
     response_class=HTMLResponse,
 )
-async def rule_row(request: Request, list_id: int, rule_id: int):
+async def rule_row(
+    request: Request, list_id: int, rule_id: int,
+    user: RequireUserFragment,
+):
     """Return the view-mode row partial (Cancel target from edit mode)."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     templates = get_templates(request)
     status, rule, lst = await db_call(
@@ -393,7 +394,7 @@ async def rule_row(request: Request, list_id: int, rule_id: int):
         return HTMLResponse("Not found", status_code=404)
     if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
-    return _render(templates, request, "rules/_rule_row.html", {
+    return await _render(templates, request, "rules/_rule_row.html", {
         "user": user,
         "lst": lst,
         "rule": rule,
@@ -408,6 +409,7 @@ async def save_rule(
     request: Request,
     list_id: int,
     rule_id: int,
+    user: RequireUserFragment,
     rule_type: str = Form(...),
     pattern: str = Form(...),
     skip_ai: str = Form("0"),
@@ -417,10 +419,6 @@ async def save_rule(
     POSTs (no HTMX) fall through to a 303 back to /rules — the form
     in `_rule_edit.html` carries both `action=` and `hx-post=` so it
     degrades gracefully if HTMX is off."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -431,7 +429,7 @@ async def save_rule(
         for slug in form.getlist("adds_labels")
         if slug and slug.strip()
     ]
-    # #163 — "Also apply provider labels" multi-select.
+    #  — "Also apply provider labels" multi-select.
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
     )
@@ -444,11 +442,17 @@ async def save_rule(
         return HTMLResponse("Not found", status_code=404)
     if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
+    #  — empty / whitespace-only pattern rejected at the snapshot
+    # layer; same surface as the add-rule path.
+    if status == "invalid_pattern":
+        return HTMLResponse(
+            "Pattern must not be empty", status_code=400,
+        )
 
     # HTMX request → return the row partial. Plain form POST →
     # 303 back to the page (let the browser refresh).
     if request.headers.get("HX-Request") == "true":
-        return _render(templates, request, "rules/_rule_row.html", {
+        return await _render(templates, request, "rules/_rule_row.html", {
             "user": user,
             "lst": lst,
             "rule": rule,
@@ -464,7 +468,7 @@ async def save_rule(
 
 @router.get("/categories", response_class=HTMLResponse)
 async def categories_page(request: Request):
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -474,7 +478,7 @@ async def categories_page(request: Request):
     scope = (request.query_params.get("scope") or "all").strip()
     snap = await db_call(_build_categories_page_snapshot, db, scope)
 
-    return _render(templates, request, "categories/manage.html", {
+    return await _render(templates, request, "categories/manage.html", {
         "user": user,
         **snap,
     })
@@ -482,7 +486,7 @@ async def categories_page(request: Request):
 
 @router.post("/categories/create", response_class=HTMLResponse)
 async def categories_create(request: Request, slug: str = Form(...), description: str = Form(...)):
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -496,12 +500,12 @@ async def categories_create(request: Request, slug: str = Form(...), description
         _categories_create_snapshot, db, slug, description,
     )
     if not success:
-        return _render(templates, request, "categories/manage.html", {
+        return await _render(templates, request, "categories/manage.html", {
             "user": user, "categories": cats,
             "error": f"Category '{slug}' already exists.",
         })
 
-    return _render(templates, request, "categories/manage.html", {
+    return await _render(templates, request, "categories/manage.html", {
         "user": user, "categories": cats,
         "success": f"Category '{slug}' created.",
     })
@@ -509,7 +513,7 @@ async def categories_create(request: Request, slug: str = Form(...), description
 
 @router.get("/categories/{cat_id}/edit", response_class=HTMLResponse)
 async def categories_edit_form(request: Request, cat_id: int):
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -521,13 +525,13 @@ async def categories_edit_form(request: Request, cat_id: int):
     if cat is None:
         return HTMLResponse("Not found", status_code=404)
 
-    return _render(templates, request, "categories/_edit.html", {"cat": cat})
+    return await _render(templates, request, "categories/_edit.html", {"cat": cat})
 
 
 @router.get("/categories/{cat_id}/row", response_class=HTMLResponse)
 async def categories_row(request: Request, cat_id: int):
     """Return a single row fragment (for cancel from edit mode)."""
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -539,12 +543,12 @@ async def categories_row(request: Request, cat_id: int):
     if cat is None:
         return HTMLResponse("Not found", status_code=404)
 
-    return _render(templates, request, "categories/_row.html", {"cat": cat})
+    return await _render(templates, request, "categories/_row.html", {"cat": cat})
 
 
 @router.put("/categories/{cat_id}", response_class=HTMLResponse)
 async def categories_update(request: Request, cat_id: int, slug: str = Form(...), description: str = Form(...)):
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -558,12 +562,12 @@ async def categories_update(request: Request, cat_id: int, slug: str = Form(...)
         _categories_update_snapshot, db, cat_id, slug, description,
     )
 
-    return _render(templates, request, "categories/_row.html", {"cat": cat})
+    return await _render(templates, request, "categories/_row.html", {"cat": cat})
 
 
 @router.delete("/categories/{cat_id}", response_class=HTMLResponse)
 async def categories_delete(request: Request, cat_id: int):
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -578,16 +582,12 @@ async def categories_delete(request: Request, cat_id: int):
 # --- Personal categories (any authenticated user; owned by request user) ---
 
 @router.get("/rules/personal-categories", response_class=HTMLResponse)
-async def personal_categories_page(request: Request):
+async def personal_categories_page(request: Request, user: RequireUser):
     """Standalone page for personal categories, sitting under the
     Rules cluster (alongside Categories + Discover Categories). The
     embedded form posts to the existing
     ``/profile/personal-categories/create`` + DELETE handlers — only
     the discovery surface moved, not the data path."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     from email_triage.web.db import (
         list_categories, MAX_PERSONAL_CATEGORIES_PER_USER,
     )
@@ -597,7 +597,7 @@ async def personal_categories_page(request: Request):
     personal_categories = await db_call(
         list_categories, db, user_id=user["id"], scope="personal",
     )
-    return _render(templates, request, "categories/personal.html", {
+    return await _render(templates, request, "categories/personal.html", {
         "user": user,
         "personal_categories": personal_categories,
         "personal_cap": MAX_PERSONAL_CATEGORIES_PER_USER,
@@ -607,13 +607,10 @@ async def personal_categories_page(request: Request):
 @router.post("/profile/personal-categories/create", response_class=HTMLResponse)
 async def personal_category_create(
     request: Request,
+    user: RequireUser,
     slug: str = Form(...),
     description: str = Form(...),
 ):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     from email_triage.web.db import MAX_PERSONAL_CATEGORIES_PER_USER
     db = get_db(request)
     templates = get_templates(request)
@@ -624,7 +621,7 @@ async def personal_category_create(
     error, personal_categories = await db_call(
         _personal_category_create_snapshot, db, slug, description, user["id"],
     )
-    return _render(templates, request,
+    return await _render(templates, request,
                    "profile/_personal_categories.html", {
         "personal_categories": personal_categories,
         "personal_cap": MAX_PERSONAL_CATEGORIES_PER_USER,
@@ -636,11 +633,9 @@ async def personal_category_create(
     "/profile/personal-categories/{cat_id}",
     response_class=HTMLResponse,
 )
-async def personal_category_delete(request: Request, cat_id: int):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
+async def personal_category_delete(
+    request: Request, cat_id: int, user: RequireUser,
+):
     from email_triage.web.db import MAX_PERSONAL_CATEGORIES_PER_USER
     db = get_db(request)
     templates = get_templates(request)
@@ -651,7 +646,7 @@ async def personal_category_delete(request: Request, cat_id: int):
     if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
 
-    return _render(templates, request,
+    return await _render(templates, request,
                    "profile/_personal_categories.html", {
         "personal_categories": personal_categories,
         "personal_cap": MAX_PERSONAL_CATEGORIES_PER_USER,
@@ -661,7 +656,7 @@ async def personal_category_delete(request: Request, cat_id: int):
 @router.post("/categories/{cat_id}/promote", response_class=HTMLResponse)
 async def categories_promote(request: Request, cat_id: int):
     """Promote a personal category to system scope. Admin-only."""
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -671,64 +666,92 @@ async def categories_promote(request: Request, cat_id: int):
     db = get_db(request)
     templates = get_templates(request)
 
-    # Capture the pre-state for the audit detail (slug + originating
-    # owner) -- after the UPDATE the user_id column is NULL, so we'd
-    # lose the "from" leg if we read it post-mutation.
-    pre = get_category(db, cat_id)
-    pre_owner = pre.get("user_id") if pre else None
-    pre_slug = pre.get("slug") if pre else "?"
-
     client_host = (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
 
-    try:
-        ok = promote_category_to_system(db, cat_id)
-    except ValueError as e:
-        try:
-            record_auth_event(
-                db, event_type="category_promote", email=user.get("email", ""),
-                user_id=user["id"], ip=client_host, user_agent=user_agent,
-                outcome="failure",
-                detail=f"cat_id={cat_id} slug={pre_slug} reason={e}",
-            )
-        except Exception:
-            pass
-        cat = get_category(db, cat_id) or {"id": cat_id, "slug": "?",
-                                            "description": str(e)}
-        return _render(templates, request, "categories/_row.html", {
-            "cat": cat,
-            "owners_by_id": {},
-            "error": fmt_exc(e),
-        })
+    def _promote_db_work() -> tuple[str, dict]:
+        """/ — pre-read + promote + audit + post-read in ONE
+        threadpool hop. Returns ``(kind, payload)``:
+          - ("value_error", {cat, error})    → render _row.html w/ error
+          - ("not_found", {})                → 404
+          - ("ok", {cat, owners_by_id})      → render _row.html
+        """
+        # Capture the pre-state for the audit detail (slug + originating
+        # owner) -- after the UPDATE the user_id column is NULL, so we'd
+        # lose the "from" leg if we read it post-mutation.
+        pre = get_category(db, cat_id)
+        pre_owner = pre.get("user_id") if pre else None
+        pre_slug = pre.get("slug") if pre else "?"
 
-    if not ok:
+        try:
+            ok = promote_category_to_system(db, cat_id)
+        except ValueError as e:
+            try:
+                record_auth_event(
+                    db, event_type="category_promote",
+                    email=user.get("email", ""),
+                    user_id=user["id"], ip=client_host,
+                    user_agent=user_agent,
+                    outcome="failure",
+                    detail=f"cat_id={cat_id} slug={pre_slug} reason={e}",
+                )
+            except Exception:
+                pass
+            cat = get_category(db, cat_id) or {
+                "id": cat_id, "slug": "?", "description": str(e),
+            }
+            return "value_error", {"cat": cat, "error": fmt_exc(e)}
+
+        if not ok:
+            try:
+                record_auth_event(
+                    db, event_type="category_promote",
+                    email=user.get("email", ""),
+                    user_id=user["id"], ip=client_host,
+                    user_agent=user_agent,
+                    outcome="failure",
+                    detail=(
+                        f"cat_id={cat_id} "
+                        "reason=not_found_or_already_system"
+                    ),
+                )
+            except Exception:
+                pass
+            return "not_found", {}
+
         try:
             record_auth_event(
-                db, event_type="category_promote", email=user.get("email", ""),
+                db, event_type="category_promote",
+                email=user.get("email", ""),
                 user_id=user["id"], ip=client_host, user_agent=user_agent,
-                outcome="failure",
-                detail=f"cat_id={cat_id} reason=not_found_or_already_system",
+                outcome="success",
+                detail=(
+                    f"cat_id={cat_id} slug={pre_slug} "
+                    f"from_user_id={pre_owner}"
+                ),
             )
         except Exception:
             pass
+
+        cat = get_category(db, cat_id)
+        user_rows = db.execute(
+            "SELECT id, email, name FROM users"
+        ).fetchall()
+        owners_by_id = {u["id"]: dict(u) for u in user_rows}
+        return "ok", {"cat": cat, "owners_by_id": owners_by_id}
+
+    kind, payload = await db_call(_promote_db_work)
+    if kind == "not_found":
         return HTMLResponse("Not found or already system", status_code=404)
-
-    try:
-        record_auth_event(
-            db, event_type="category_promote", email=user.get("email", ""),
-            user_id=user["id"], ip=client_host, user_agent=user_agent,
-            outcome="success",
-            detail=f"cat_id={cat_id} slug={pre_slug} from_user_id={pre_owner}",
-        )
-    except Exception:
-        pass
-
-    cat = get_category(db, cat_id)
-    user_rows = db.execute("SELECT id, email, name FROM users").fetchall()
-    owners_by_id = {u["id"]: dict(u) for u in user_rows}
-    return _render(templates, request, "categories/_row.html", {
-        "cat": cat,
-        "owners_by_id": owners_by_id,
+    if kind == "value_error":
+        return await _render(templates, request, "categories/_row.html", {
+            "cat": payload["cat"],
+            "owners_by_id": {},
+            "error": payload["error"],
+        })
+    return await _render(templates, request, "categories/_row.html", {
+        "cat": payload["cat"],
+        "owners_by_id": payload["owners_by_id"],
     })
 
 
@@ -737,7 +760,7 @@ async def categories_demote_form(request: Request, cat_id: int):
     """Inline form for selecting which user to demote a system category
     to. Returns a row partial with a user-picker dropdown. Admin-only.
     HTMX swap target is the cat-row tr."""
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -752,7 +775,7 @@ async def categories_demote_form(request: Request, cat_id: int):
     if status == "not_system":
         return HTMLResponse("Not a system category", status_code=400)
 
-    return _render(templates, request, "categories/_row_demote_form.html", {
+    return await _render(templates, request, "categories/_row_demote_form.html", {
         "cat": cat,
         "users": users,
     })
@@ -764,7 +787,7 @@ async def categories_demote(
     target_user_id: int = Form(...),
 ):
     """Demote a system category to personal scope for one user. Admin-only."""
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -774,65 +797,91 @@ async def categories_demote(
     db = get_db(request)
     templates = get_templates(request)
 
-    pre = get_category(db, cat_id)
-    pre_slug = pre.get("slug") if pre else "?"
-
     client_host = (request.client.host if request.client else None)
     user_agent = request.headers.get("user-agent")
 
-    try:
-        ok = demote_category_to_user(db, cat_id, target_user_id)
-    except ValueError as e:
-        try:
-            record_auth_event(
-                db, event_type="category_demote", email=user.get("email", ""),
-                user_id=user["id"], ip=client_host, user_agent=user_agent,
-                outcome="failure",
-                detail=(f"cat_id={cat_id} slug={pre_slug} "
-                        f"to_user_id={target_user_id} reason={e}"),
-            )
-        except Exception:
-            pass
-        cat = get_category(db, cat_id) or {"id": cat_id, "slug": "?",
-                                            "description": str(e)}
-        return _render(templates, request, "categories/_row.html", {
-            "cat": cat,
-            "owners_by_id": {},
-            "error": fmt_exc(e),
-        })
+    def _demote_db_work() -> tuple[str, dict]:
+        """/ — pre-read + demote + audit + post-read in ONE
+        threadpool hop. Returns ``(kind, payload)`` — see the
+        ``categories_promote`` twin for the kind vocabulary.
+        """
+        pre = get_category(db, cat_id)
+        pre_slug = pre.get("slug") if pre else "?"
 
-    if not ok:
+        try:
+            ok = demote_category_to_user(db, cat_id, target_user_id)
+        except ValueError as e:
+            try:
+                record_auth_event(
+                    db, event_type="category_demote",
+                    email=user.get("email", ""),
+                    user_id=user["id"], ip=client_host,
+                    user_agent=user_agent,
+                    outcome="failure",
+                    detail=(
+                        f"cat_id={cat_id} slug={pre_slug} "
+                        f"to_user_id={target_user_id} reason={e}"
+                    ),
+                )
+            except Exception:
+                pass
+            cat = get_category(db, cat_id) or {
+                "id": cat_id, "slug": "?", "description": str(e),
+            }
+            return "value_error", {"cat": cat, "error": fmt_exc(e)}
+
+        if not ok:
+            try:
+                record_auth_event(
+                    db, event_type="category_demote",
+                    email=user.get("email", ""),
+                    user_id=user["id"], ip=client_host,
+                    user_agent=user_agent,
+                    outcome="failure",
+                    detail=(
+                        f"cat_id={cat_id} to_user_id={target_user_id} "
+                        "reason=not_found_or_already_personal"
+                    ),
+                )
+            except Exception:
+                pass
+            return "not_found", {}
+
         try:
             record_auth_event(
-                db, event_type="category_demote", email=user.get("email", ""),
+                db, event_type="category_demote",
+                email=user.get("email", ""),
                 user_id=user["id"], ip=client_host, user_agent=user_agent,
-                outcome="failure",
-                detail=(f"cat_id={cat_id} to_user_id={target_user_id} "
-                        f"reason=not_found_or_already_personal"),
+                outcome="success",
+                detail=(
+                    f"cat_id={cat_id} slug={pre_slug} "
+                    f"to_user_id={target_user_id}"
+                ),
             )
         except Exception:
             pass
+
+        cat = get_category(db, cat_id)
+        user_rows = db.execute(
+            "SELECT id, email, name FROM users"
+        ).fetchall()
+        owners_by_id = {u["id"]: dict(u) for u in user_rows}
+        return "ok", {"cat": cat, "owners_by_id": owners_by_id}
+
+    kind, payload = await db_call(_demote_db_work)
+    if kind == "not_found":
         return HTMLResponse(
             "Not found or already personal", status_code=404,
         )
-
-    try:
-        record_auth_event(
-            db, event_type="category_demote", email=user.get("email", ""),
-            user_id=user["id"], ip=client_host, user_agent=user_agent,
-            outcome="success",
-            detail=(f"cat_id={cat_id} slug={pre_slug} "
-                    f"to_user_id={target_user_id}"),
-        )
-    except Exception:
-        pass
-
-    cat = get_category(db, cat_id)
-    user_rows = db.execute("SELECT id, email, name FROM users").fetchall()
-    owners_by_id = {u["id"]: dict(u) for u in user_rows}
-    return _render(templates, request, "categories/_row.html", {
-        "cat": cat,
-        "owners_by_id": owners_by_id,
+    if kind == "value_error":
+        return await _render(templates, request, "categories/_row.html", {
+            "cat": payload["cat"],
+            "owners_by_id": {},
+            "error": payload["error"],
+        })
+    return await _render(templates, request, "categories/_row.html", {
+        "cat": payload["cat"],
+        "owners_by_id": payload["owners_by_id"],
     })
 
 
@@ -841,11 +890,8 @@ async def categories_demote(
 # ---------------------------------------------------------------------------
 
 @router.post("/categories/add-discovered", response_class=HTMLResponse)
-async def add_discovered_category(request: Request):
+async def add_discovered_category(request: Request, user: RequireUserFragment):
     """HTMX endpoint to add a single discovered category (admin only)."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -861,7 +907,7 @@ async def add_discovered_category(request: Request):
 
     try:
         from email_triage.web.db import create_category
-        create_category(db, slug, description)
+        await db_call(create_category, db, slug, description)
         return HTMLResponse(
             '<span style="color:var(--pico-ins-color);">Added &#10003;</span>'
         )

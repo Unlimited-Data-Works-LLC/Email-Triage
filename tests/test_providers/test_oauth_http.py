@@ -1,4 +1,4 @@
-"""Tests for the shared OAuth HTTP requester (#138 phase 2).
+"""Tests for the shared OAuth HTTP requester.
 
 The Gmail + O365 ``_request`` bodies were lifted onto ``oauth_request``
 in phase 2. These tests pin the contract:

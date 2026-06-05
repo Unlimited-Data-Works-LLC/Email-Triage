@@ -1,4 +1,4 @@
-"""Tests for ``log_entries`` rotation (item #26).
+"""Tests for ``log_entries`` rotation (item ).
 
 Covers the combined age-plus-count prune helper and its wiring into
 app startup and the background 30-minute sweep.
@@ -196,7 +196,10 @@ def test_startup_prunes_log_entries(tmp_path):
     with patch.object(
         _secrets_mod,
         "bootstrap_secrets_from_config",
-        lambda conn, cfg: _StubSecrets(),
+        #  Phase 4: the lifespan now passes master_key= (already read
+        # from the bootstrap backend before opening the DB); the stub
+        # accepts + ignores it.
+        lambda conn, cfg, *, master_key=None: _StubSecrets(),
     ):
         app = create_app(config)
         with TestClient(app):
@@ -235,26 +238,23 @@ def test_background_task_prunes_periodically():
     _App.state.config.logging = LoggingConfig(retention_days=30, max_rows=50000)
 
     async def _drive():
-        # Patch the two sleep points so the loop runs one sweep then
-        # cancels cleanly on the second sleep.
-        real_sleep = asyncio.sleep
-        calls = {"n": 0}
+        # The prune loop was refactored to run via the shared
+        # ``supervised_interval_loop`` and to route the
+        # DELETE off the event loop through ``db_call``. Drive
+        # exactly one sweep: stub the supervisor to invoke the tick once,
+        # and run db_call synchronously against the in-memory conn.
+        import email_triage.web.task_supervisor as _ts
+        import email_triage.web.db_threadpool as _tp
 
-        async def fast_sleep(_secs):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # The initial startup delay — skip instantly.
-                return
-            # The post-sweep 30-min wait — cancel here to unwind the loop.
-            raise asyncio.CancelledError()
+        async def _one_tick(_name, _interval, tick, **_kw):
+            await tick()
 
-        with patch("email_triage.web.app.asyncio.sleep", fast_sleep):
-            try:
-                await _log_entries_prune_loop(_App)
-            except asyncio.CancelledError:
-                pass
-        # Ensure we restored the real sleep for any later awaits.
-        _ = real_sleep  # noqa: F841
+        async def _sync_db_call(fn, *a, **k):
+            return fn(*a, **k)
+
+        with patch.object(_ts, "supervised_interval_loop", _one_tick), \
+                patch.object(_tp, "db_call", _sync_db_call):
+            await _log_entries_prune_loop(_App)
 
     asyncio.run(_drive())
 

@@ -1,6 +1,6 @@
 """Routes for the push concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,6 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +49,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.push")
 
 router = APIRouter()
@@ -58,7 +58,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -103,7 +103,7 @@ async def gmail_api_watch_start(
     request: Request, account_id: int, owned: OwnedGmailApiAccount,
 ):
     """Register a Gmail Pub/Sub watch for the account."""
-    # #137 phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
+    #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
     config = get_config(request)
     is_admin = user["role"] == "admin"
@@ -129,7 +129,7 @@ async def gmail_api_watch_start(
         )
 
     from email_triage.providers.gmail_api import GmailApiProvider, GmailApiError
-    provider = _create_provider_from_account(acct, secrets)
+    provider = await db_call(_create_provider_from_account, acct, secrets)
     if not isinstance(provider, GmailApiProvider):
         return HTMLResponse("Not a Gmail-native account", status_code=400)
 
@@ -163,17 +163,22 @@ async def gmail_api_watch_start(
             'Account is missing the Gmail address — save the account first.</small>'
         )
 
-    upsert_gmail_watch(
-        db,
-        account_id=account_id,
-        email_address=email_address,
-        topic_name=topic,
-        history_id=str(data.get("historyId") or "0"),
-        expires_at=exp_iso,
-    )
+    history_id = str(data.get("historyId") or "0")
 
-    from email_triage.web.db import get_gmail_watch
-    return HTMLResponse(_render_gmail_watch_chip(get_gmail_watch(db, account_id)))
+    def _watch_start_db_work() -> str:
+        """/ — watch upsert + chip re-render read in one hop."""
+        from email_triage.web.db import get_gmail_watch
+        upsert_gmail_watch(
+            db,
+            account_id=account_id,
+            email_address=email_address,
+            topic_name=topic,
+            history_id=history_id,
+            expires_at=exp_iso,
+        )
+        return _render_gmail_watch_chip(get_gmail_watch(db, account_id))
+
+    return HTMLResponse(await db_call(_watch_start_db_work))
 
 
 @router.post("/accounts/{account_id}/gmail-api/watch/stop", response_class=HTMLResponse)
@@ -181,14 +186,14 @@ async def gmail_api_watch_stop(
     request: Request, account_id: int, owned: OwnedGmailApiAccount,
 ):
     """Unregister the Gmail watch and drop the local row."""
-    # #137 phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
+    #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
     is_admin = user["role"] == "admin"
 
     from email_triage.web.db import delete_gmail_watch
 
     from email_triage.providers.gmail_api import GmailApiProvider
-    provider = _create_provider_from_account(acct, secrets)
+    provider = await db_call(_create_provider_from_account, acct, secrets)
     if isinstance(provider, GmailApiProvider):
         try:
             await provider.stop_watch()
@@ -200,7 +205,7 @@ async def gmail_api_watch_stop(
             except Exception:
                 pass
 
-    delete_gmail_watch(db, account_id)
+    await db_call(delete_gmail_watch, db, account_id)
     return HTMLResponse(_render_gmail_watch_start_button(account_id))
 
 
@@ -228,7 +233,7 @@ async def office365_push_start(
     so a failed start (Graph 5xx, missing public_url, etc.) is visible
     in the audit trail. Redirects back to the integrations tab.
     """
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
@@ -244,18 +249,24 @@ async def office365_push_start(
     webhook_url, client_state = _o365_subscription_create_args(
         request, account_id,
     )
-    if not webhook_url:
+    def _audit_o365_start(outcome: str, detail: str) -> None:
+        """/ — single best-effort o365_push_start audit row,
+        off the event loop. Wrapped at each call site via db_call.
+        """
         try:
             record_auth_event(
                 db,
                 event_type="o365_push_start",
                 email=user.get("email", ""),
                 user_id=user.get("id"),
-                outcome="failure",
-                detail="public_url_unset",
+                outcome=outcome,
+                detail=detail,
             )
         except Exception:
             pass
+
+    if not webhook_url:
+        await db_call(_audit_o365_start, "failure", "public_url_unset")
         # Redirect with a short error string so the operator sees
         # something rather than a blank page. Admin path NOT mentioned
         # per the no-admin-path rule for end-user copy.
@@ -265,21 +276,13 @@ async def office365_push_start(
             status_code=303,
         )
     if not client_state:
-        # #132 — secret-store write failed during auto-generate.
+        #  — secret-store write failed during auto-generate.
         # Refuse to register a subscription whose deliveries we
         # can't verify; Graph would happily push us notifications
         # we'd then 401 on every time.
-        try:
-            record_auth_event(
-                db,
-                event_type="o365_push_start",
-                email=user.get("email", ""),
-                user_id=user.get("id"),
-                outcome="failure",
-                detail="clientstate_persist_failed",
-            )
-        except Exception:
-            pass
+        await db_call(
+            _audit_o365_start, "failure", "clientstate_persist_failed",
+        )
         return RedirectResponse(
             f"/accounts/{account_id}/edit?tab=integrations"
             f"&o365_err=clientstate_persist_failed",
@@ -288,7 +291,7 @@ async def office365_push_start(
 
     from email_triage.providers.office365 import Office365Provider
 
-    provider = _create_provider_from_account(acct, secrets)
+    provider = await db_call(_create_provider_from_account, acct, secrets)
     if not isinstance(provider, Office365Provider):
         return HTMLResponse("Not an Office 365 account", status_code=400)
 
@@ -309,17 +312,7 @@ async def office365_push_start(
             account_id=account_id,
             error=fmt_exc(e),
         )
-        try:
-            record_auth_event(
-                db,
-                event_type="o365_push_start",
-                email=user.get("email", ""),
-                user_id=user.get("id"),
-                outcome="failure",
-                detail=str(e)[:200],
-            )
-        except Exception:
-            pass
+        await db_call(_audit_o365_start, "failure", str(e)[:200])
         return RedirectResponse(
             f"/accounts/{account_id}/edit?tab=integrations"
             f"&o365_err=create_failed",
@@ -331,40 +324,24 @@ async def office365_push_start(
     if expiration_iso and expiration_iso.endswith("Z"):
         expiration_iso = expiration_iso[:-1] + "+00:00"
     if not sub_id or not expiration_iso:
-        try:
-            record_auth_event(
-                db,
-                event_type="o365_push_start",
-                email=user.get("email", ""),
-                user_id=user.get("id"),
-                outcome="failure",
-                detail="malformed_response",
-            )
-        except Exception:
-            pass
+        await db_call(_audit_o365_start, "failure", "malformed_response")
         return RedirectResponse(
             f"/accounts/{account_id}/edit?tab=integrations"
             f"&o365_err=malformed_response",
             status_code=303,
         )
 
-    upsert_o365_subscription(
-        db,
-        account_id=account_id,
-        subscription_id=sub_id,
-        expiration_at=expiration_iso,
-    )
-    try:
-        record_auth_event(
+    def _o365_start_success_db_work() -> None:
+        """/ — subscription upsert + success audit in one hop."""
+        upsert_o365_subscription(
             db,
-            event_type="o365_push_start",
-            email=user.get("email", ""),
-            user_id=user.get("id"),
-            outcome="success",
-            detail=f"account_id={account_id}",
+            account_id=account_id,
+            subscription_id=sub_id,
+            expiration_at=expiration_iso,
         )
-    except Exception:
-        pass
+        _audit_o365_start("success", f"account_id={account_id}")
+
+    await db_call(_o365_start_success_db_work)
     _log.info(
         "Office 365 push started",
         actor=user.get("email"),
@@ -388,7 +365,7 @@ async def office365_push_stop(
     operator can recreate later if needed; we never leave a stale
     DB row blocking a Start retry.
     """
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
@@ -402,12 +379,14 @@ async def office365_push_stop(
     if acct["provider_type"] != "office365":
         return HTMLResponse("Wrong provider type", status_code=400)
 
-    sub_row = get_o365_subscription(db, account_id)
+    sub_row = await db_call(get_o365_subscription, db, account_id)
     sub_id = (sub_row or {}).get("subscription_id") or ""
 
     if sub_id:
         from email_triage.providers.office365 import Office365Provider
-        provider = _create_provider_from_account(acct, secrets)
+        provider = await db_call(
+            _create_provider_from_account, acct, secrets,
+        )
         if isinstance(provider, Office365Provider):
             try:
                 try:
@@ -426,18 +405,22 @@ async def office365_push_stop(
                 except Exception:
                     pass
 
-    delete_o365_subscription(db, account_id)
-    try:
-        record_auth_event(
-            db,
-            event_type="o365_push_stop",
-            email=user.get("email", ""),
-            user_id=user.get("id"),
-            outcome="success",
-            detail=f"account_id={account_id}",
-        )
-    except Exception:
-        pass
+    def _o365_stop_db_work() -> None:
+        """/ — local-row delete + success audit in one hop."""
+        delete_o365_subscription(db, account_id)
+        try:
+            record_auth_event(
+                db,
+                event_type="o365_push_stop",
+                email=user.get("email", ""),
+                user_id=user.get("id"),
+                outcome="success",
+                detail=f"account_id={account_id}",
+            )
+        except Exception:
+            pass
+
+    await db_call(_o365_stop_db_work)
     _log.info(
         "Office 365 push stopped",
         actor=user.get("email"),
@@ -451,7 +434,7 @@ async def office365_push_stop(
 
 
 # ---------------------------------------------------------------------------
-# Office 365 / Microsoft Graph credential PROBE (#126)
+# Office 365 / Microsoft Graph credential PROBE
 #
 # Pre-flight verifier exposed on the account-edit Integrations tab.
 # Operator clicks "Probe my config", we call Graph's /me with the
@@ -499,7 +482,9 @@ async def office365_probe(
     # so the probe goes through OAuthHttpRequester / GraphError just
     # like every other Graph call (per the code-reuse mandate).
     try:
-        provider = _create_provider_from_account(acct, secrets)
+        provider = await db_call(
+            _create_provider_from_account, acct, secrets,
+        )
     except ImportError:
         return HTMLResponse(
             _render_o365_probe_chip_failure(
@@ -563,7 +548,7 @@ async def office365_probe(
         else:
             err_text = str(ge.error)
         code, msg = _aadsts_translate(err_text)
-        # #121-A — pass account_id so the Explain-this-error
+        # -A — pass account_id so the Explain-this-error
         # button's HIPAA actor!=owner gate fires for this account
         # and the AI prompt includes the operator-readable
         # account name.
@@ -607,7 +592,7 @@ async def office365_probe(
 # Calendar enable / disable + provider factory
 # ---------------------------------------------------------------------------
 
-# #154 retired the per-account /accounts/{id}/watches/{...} UI routes.
+#  retired the per-account /accounts/{id}/watches/{...} UI routes.
 # The match-and-fire watch editor now lives at /profile/watches with a
 # multi-account picker; the OpenClaw API (/api/openclaw/accounts/.../watches)
 # still owns the JSON CRUD surface for programmatic clients.
@@ -656,7 +641,7 @@ async def watch_start(
     * ``office365`` — Graph webhooks (subscription-based); also not
       a generator. Same treatment as gmail_api.
     """
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
 
@@ -669,7 +654,7 @@ async def watch_start(
     # and the server-wide B3 poller handles missed-push catch-up.
     if ptype == "gmail_api":
         msg, status = _gmail_api_watch_start_status(request, db, account_id)
-        return _render(templates, request, "accounts/_watch_status.html", {
+        return await _render(templates, request, "accounts/_watch_status.html", {
             "acct": acct,
             "watch_status": status,
             "watch_msg": msg,
@@ -690,7 +675,7 @@ async def watch_start(
             "last_error": None,
             "started_at": None,
         }
-        return _render(templates, request, "accounts/_watch_status.html", {
+        return await _render(templates, request, "accounts/_watch_status.html", {
             "acct": acct,
             "watch_status": status,
             "watch_msg": msg,
@@ -702,7 +687,7 @@ async def watch_start(
     msg = await mgr.start(account_id)
     status = mgr.status(account_id)
 
-    return _render(templates, request, "accounts/_watch_status.html", {
+    return await _render(templates, request, "accounts/_watch_status.html", {
         "acct": acct,
         "watch_status": status,
         "watch_msg": msg,
@@ -715,7 +700,7 @@ async def watch_stop(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Stop IMAP IDLE watching for an account."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
 
@@ -726,7 +711,7 @@ async def watch_stop(
 
     hwm_ctx = await db_call(_get_hwm_context, db, account_id)
 
-    return _render(templates, request, "accounts/_watch_status.html", {
+    return await _render(templates, request, "accounts/_watch_status.html", {
         "acct": acct,
         "watch_status": status,
         "watch_msg": msg,
@@ -739,7 +724,7 @@ async def watch_status(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Get current watch status for an account (HTMX poll)."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
 
@@ -747,12 +732,12 @@ async def watch_status(
     mgr = get_watcher_manager(request)
     status = mgr.status(account_id)
 
-    # #135 phase 2 — HWM context off the loop. /watch/status is HTMX-
+    #  phase 2 — HWM context off the loop. /watch/status is HTMX-
     # polled every few seconds — keeping its DB reads on the threadpool
     # is critical so a slow disk doesn't serialise other handlers.
     hwm_ctx = await db_call(_get_hwm_context, db, account_id)
 
-    return _render(templates, request, "accounts/_watch_status.html", {
+    return await _render(templates, request, "accounts/_watch_status.html", {
         "acct": acct,
         "watch_status": status,
         **hwm_ctx,
@@ -764,12 +749,12 @@ async def watch_reset_hwm(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Reset the high-water mark so the watcher reprocesses from scratch."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
 
     def _watch_reset_hwm_snapshot(db, account_id: int, acct_cfg: dict) -> dict:
-        """#135 phase 2 — delete every HWM key + read fresh hwm context
+        """ phase 2 — delete every HWM key + read fresh hwm context
         in one threadpool hop."""
         from email_triage.web.db import delete_setting, _account_mailboxes
         delete_setting(db, _S.watch_hwm(account_id))
@@ -785,7 +770,7 @@ async def watch_reset_hwm(
     mgr = get_watcher_manager(request)
     status = mgr.status(account_id)
 
-    return _render(templates, request, "accounts/_watch_status.html", {
+    return await _render(templates, request, "accounts/_watch_status.html", {
         "acct": acct,
         "watch_status": status,
         "watch_msg": "High-water mark reset. Next watch start will process all unseen messages.",
@@ -798,7 +783,7 @@ async def watch_set_hwm_current(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Connect to the mailbox, grab the latest UID, and set it as the HWM."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
     from email_triage.web.db import set_setting
@@ -814,7 +799,10 @@ async def watch_set_hwm_current(
     failures: list[tuple[str, str]] = []
     for mb in mailboxes:
         try:
-            provider = _create_provider_from_account(
+            # / — provider build does a SQLite/secret read;
+            # off the loop before the network get_latest_uid below.
+            provider = await db_call(
+                _create_provider_from_account,
                 acct, secrets, mailbox_override=mb,
             )
             latest_uid = await provider.get_latest_uid()
@@ -829,7 +817,7 @@ async def watch_set_hwm_current(
         mgr = get_watcher_manager(request)
         status = mgr.status(account_id)
         hwm_ctx = await db_call(_get_hwm_context, db, account_id)
-        return _render(templates, request, "accounts/_watch_status.html", {
+        return await _render(templates, request, "accounts/_watch_status.html", {
             "acct": acct,
             "watch_status": status,
             "watch_msg": f"Failed to connect to {mb}: {err}",
@@ -839,7 +827,7 @@ async def watch_set_hwm_current(
     def _watch_set_hwm_current_snapshot(
         db, account_id: int, results: list[tuple[str, int]],
     ) -> tuple[int, dict]:
-        """#135 phase 2 — bundle every settings write + the hwm-context
+        """ phase 2 — bundle every settings write + the hwm-context
         re-read into one threadpool hop."""
         from datetime import datetime, timezone as _tz
         set_count = 0
@@ -877,7 +865,7 @@ async def watch_set_hwm_current(
     mgr = get_watcher_manager(request)
     status = mgr.status(account_id)
 
-    return _render(templates, request, "accounts/_watch_status.html", {
+    return await _render(templates, request, "accounts/_watch_status.html", {
         "acct": acct,
         "watch_status": status,
         "watch_msg": msg,

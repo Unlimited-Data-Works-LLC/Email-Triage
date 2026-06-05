@@ -4,7 +4,7 @@ sent-folder override.
 Covers:
 
   * GET /profile/style-data — checkbox state reflects the resolved
-    default (#157 HIPAA-aware: non-HIPAA → checked, HIPAA without
+    default ( HIPAA-aware: non-HIPAA → checked, HIPAA without
     opt-in → disabled with reason chip).
   * POST /profile/style-data/toggle-rag — non-HIPAA save persists;
     HIPAA-without-opt-in save refused silently (no state change).
@@ -49,7 +49,7 @@ class TestToggleRender:
     def test_non_hipaa_account_checkbox_checked_by_default(
         self, client, user_cookies, db, regular_user,
     ):
-        """Per #157 — non-HIPAA accounts default ON. The relocated
+        """Per  — non-HIPAA accounts default ON. The relocated
         checkbox renders with the ``checked`` attribute even when no
         explicit setting row exists."""
         _make_acct(db, regular_user["id"], "Personal")

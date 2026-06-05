@@ -302,6 +302,7 @@ class TestGenerateDigest:
 
     @pytest.mark.asyncio
     async def test_generate_empty_messages(self):
+
         from unittest.mock import AsyncMock
 
         classifier = AsyncMock()
@@ -323,7 +324,7 @@ class TestDefaultFormatPrompt:
 
 
 # ---------------------------------------------------------------------------
-# Signature (#33 scope correction — signature lives on newsletter digest,
+# Signature ( scope correction — signature lives on newsletter digest,
 # not on the daily admin health email).
 # ---------------------------------------------------------------------------
 
@@ -462,3 +463,279 @@ class TestDigestSignature:
             provider, classifier, [msg], delete_originals=False,
         )
         assert "Sent by your email-triage" not in html_out
+
+
+# ---------------------------------------------------------------------------
+# H-06 (Cycle 6, 2026-05-23) — digest archive-failure state-divergence
+# visibility per §164.308(a)(7) Contingency Plan. When delete_originals=True
+# and an archive call fails on a HIPAA-flagged message, the install ends up
+# with PHI in BOTH the digest recipient mailbox AND the source mailbox — a
+# divergence that the existing log.warning alone leaves operator-invisible.
+# Mirror precedent 4e1e138 and
+# emit a hipaa_access_events row with operation='digest_archive_failed' so
+# the divergence count surfaces in daily-health beyond the buried log.
+# ---------------------------------------------------------------------------
+
+
+def _make_hipaa_message(uid: str = "h100") -> EmailMessage:
+    """Variant of _make_message with hipaa=True for the H-06 tests."""
+    m = _make_message(uid=uid)
+    m.hipaa = True
+    return m
+
+
+class TestH06DigestArchiveFailureAudit:
+    """H-06 — divergence-visibility audit row on HIPAA archive failure."""
+
+    @pytest.fixture
+    def db_and_account(self):
+        """Fresh in-memory DB with v26+ schema + one HIPAA account.
+
+        Returns (conn, account_id) — sqlite3.Connection cannot carry
+        ad-hoc attributes, so the tuple is the simplest way to thread
+        the seeded account id into each test.
+        """
+        from email_triage.web.db import init_db, create_email_account
+        from datetime import datetime, timezone
+        conn = init_db(":memory:")
+        # Seed a user (FK target; account_id needs a real owner).
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "INSERT INTO users (email, name, role, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("admin@example.com", "Admin", "admin", now),
+        )
+        conn.commit()
+        user_id = int(cur.lastrowid)
+        account_id = create_email_account(
+            conn, user_id, "Clinic", "imap", {}, hipaa=True,
+        )
+        return conn, account_id
+
+    @pytest.mark.asyncio
+    async def test_happy_path_no_audit_row(self, db_and_account):
+        """Archive succeeds → no divergence row emitted (consistency =
+        absence of evidence is the operator-facing signal).
+        """
+        from unittest.mock import AsyncMock
+
+        db, account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()  # archive() succeeds by default
+
+        await generate_digest(
+            provider, classifier,
+            [_make_hipaa_message()],
+            delete_originals=True,
+            account_id=account_id,
+            db_conn=db,
+        )
+
+        rows = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchone()
+        assert rows["c"] == 0
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_on_hipaa_emits_audit_row(
+        self, db_and_account,
+    ):
+        """Archive fails on a HIPAA-flagged source → exactly one
+        ``hipaa_access_events`` row with operation='digest_archive_failed'
+        and the uid embedded in the detail field for operator
+        correlation. This is the H-06 §164.308(a)(7) divergence-
+        visibility surface.
+        """
+        from unittest.mock import AsyncMock
+
+        db, account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()
+        provider.archive.side_effect = RuntimeError("IMAP move refused")
+
+        await generate_digest(
+            provider, classifier,
+            [_make_hipaa_message(uid="phi-uid-42")],
+            delete_originals=True,
+            account_id=account_id,
+            db_conn=db,
+        )
+
+        rows = db.execute(
+            "SELECT account_id, operation, outcome, detail, "
+            "       actor_user_id "
+            "FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["account_id"] == account_id
+        assert row["outcome"] == "error"
+        assert "phi-uid-42" in (row["detail"] or "")
+        assert "IMAP move refused" in (row["detail"] or "")
+        # System-initiated digest send — no human actor.
+        assert row["actor_user_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_on_non_hipaa_emits_no_row(
+        self, db_and_account,
+    ):
+        """Gate must be ON HIPAA — non-HIPAA archive failures are
+        operational concerns (logged) but NOT §164.308(a)(7)
+        Contingency-Plan-scope. No audit row.
+        """
+        from unittest.mock import AsyncMock
+
+        db, account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()
+        provider.archive.side_effect = RuntimeError("IMAP move refused")
+
+        # Non-HIPAA message (hipaa=False default).
+        await generate_digest(
+            provider, classifier,
+            [_make_message(uid="ordinary")],
+            delete_originals=True,
+            account_id=account_id,
+            db_conn=db,
+        )
+
+        rows = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchone()
+        assert rows["c"] == 0
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_without_db_context_is_log_only(
+        self, db_and_account,
+    ):
+        """Caller didn't thread account_id / db_conn (e.g. direct
+        unit-test call, or a future caller outside the sender path):
+        the audit row is silently skipped, the log.warning still
+        fires. Production caller (``app._fire_one_digest``) always
+        threads both; this gate keeps the public API safe for
+        legacy callers.
+        """
+        from unittest.mock import AsyncMock
+
+        db, _account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()
+        provider.archive.side_effect = RuntimeError("IMAP move refused")
+
+        # Neither account_id nor db_conn passed — legacy signature.
+        await generate_digest(
+            provider, classifier,
+            [_make_hipaa_message()],
+            delete_originals=True,
+        )
+
+        rows = db.execute(
+            "SELECT COUNT(*) AS c FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchone()
+        assert rows["c"] == 0
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_audits_only_failed_uids(
+        self, db_and_account,
+    ):
+        """Mixed loop: one archive succeeds, one fails. Exactly one
+        audit row, on the failing uid only. Per-uid divergence
+        granularity matters for operator forensics — "which messages
+        are diverged?" must be answerable from the audit trail.
+        """
+        from unittest.mock import AsyncMock
+
+        db, account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()
+
+        # First succeeds, second raises.
+        async def _archive(message_id):
+            if message_id == "ok-uid":
+                return None
+            raise RuntimeError("provider error")
+
+        provider.archive.side_effect = _archive
+
+        await generate_digest(
+            provider, classifier,
+            [
+                _make_hipaa_message(uid="ok-uid"),
+                _make_hipaa_message(uid="bad-uid"),
+            ],
+            delete_originals=True,
+            account_id=account_id,
+            db_conn=db,
+        )
+
+        rows = db.execute(
+            "SELECT detail FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert "bad-uid" in (rows[0]["detail"] or "")
+        assert "ok-uid" not in (rows[0]["detail"] or "")
+
+    @pytest.mark.asyncio
+    async def test_detail_field_carries_no_phi(self, db_and_account):
+        """The ``detail`` field carries provider error + uid — never
+        message body, sender, or subject. Belt-and-braces verification
+        that even when the source message has PHI in subject/body, the
+        audit row's detail field stays PHI-free.
+        """
+        from unittest.mock import AsyncMock
+
+        db, account_id = db_and_account
+        classifier = AsyncMock()
+        classifier.complete.return_value = json.dumps([
+            {"headline": "X", "summary": "Y", "url": None},
+        ])
+        provider = AsyncMock()
+        provider.archive.side_effect = RuntimeError("provider err")
+
+        msg = _make_hipaa_message(uid="m-99")
+        msg.subject = "Patient SSN 123-45-6789 results"
+        msg.body_text = "PHI-bearing body content"
+        msg.sender = "Dr. Smith <smith@clinic.example>"
+
+        await generate_digest(
+            provider, classifier, [msg],
+            delete_originals=True,
+            account_id=account_id,
+            db_conn=db,
+        )
+
+        rows = db.execute(
+            "SELECT detail FROM hipaa_access_events "
+            "WHERE operation = 'digest_archive_failed'"
+        ).fetchall()
+        assert len(rows) == 1
+        detail = rows[0]["detail"] or ""
+        # The uid + the error class are expected — nothing else.
+        assert "m-99" in detail
+        assert "provider err" in detail
+        # PHI MUST NOT leak into the audit-row detail field.
+        assert "SSN" not in detail
+        assert "123-45-6789" not in detail
+        assert "PHI-bearing" not in detail
+        assert "Dr. Smith" not in detail
+        assert "smith@clinic" not in detail

@@ -78,6 +78,7 @@ from email_triage.mail_headers import (
     get_triage_header,
 )
 from email_triage.triage_logging import get_logger, is_account_hipaa
+from email_triage.web.db_writelock import get_write_lock
 
 log = get_logger("actions.sent_mail_capture")
 
@@ -130,12 +131,18 @@ class SentMailCaptureLoop:
     # -- account-state helpers ---------------------------------------------
 
     def _account_row(self) -> dict | None:
-        cur = self._db.execute(
-            "SELECT id, hipaa, created_under_system_hipaa "
-            "FROM email_accounts WHERE id = ?",
-            (self._account_id,),
-        )
-        row = cur.fetchone()
+        #  — hold the process-wide DB write lock for the shared-
+        # connection read. Callers reach this via db_call (which already
+        # holds the lock); the RLock is reentrant, so the in-method
+        # acquire is correct regardless of caller and clears the 
+        # connection-holding-class ratchet.
+        with get_write_lock():
+            cur = self._db.execute(
+                "SELECT id, hipaa, created_under_system_hipaa "
+                "FROM email_accounts WHERE id = ?",
+                (self._account_id,),
+            )
+            row = cur.fetchone()
         if row is None:
             return None
         if hasattr(row, "keys"):
@@ -194,7 +201,12 @@ class SentMailCaptureLoop:
         it doesn't, the scanner simply finds zero matching headers
         and writes zero rows -- no privacy impact, just a no-op.
         """
-        if self._hipaa_short_circuit("scan_recent"):
+        #  — scan_recent is awaited from the sent-mail-capture loop
+        # on the event-loop thread. _hipaa_short_circuit + the
+        # _captured_row_count reads touch the shared connection, so
+        # dispatch them off-loop via db_call.
+        from email_triage.web.db_threadpool import db_call
+        if await db_call(self._hipaa_short_circuit, "scan_recent"):
             return 0
         if self._provider is None:
             log.warning(
@@ -251,7 +263,7 @@ class SentMailCaptureLoop:
             )
             return 0
 
-        before = self._captured_row_count()
+        before = await db_call(self._captured_row_count)
         for folder, mid in merged_pairs:
             try:
                 if folder:
@@ -270,15 +282,24 @@ class SentMailCaptureLoop:
                 continue
             await self.index_captured_pair(msg)
 
-        return max(0, self._captured_row_count() - before)
+        #  —  wrapped the `before` read above in db_call but
+        # left this closing count as a raw on-loop touch. Route it off
+        # the loop too, same as `before`.
+        after = await db_call(self._captured_row_count)
+        return max(0, after - before)
 
     def _captured_row_count(self) -> int:
-        cur = self._db.execute(
-            "SELECT COUNT(*) AS n FROM sent_mail_index "
-            "WHERE account_id = ? AND is_captured_pair = 1",
-            (self._account_id,),
-        )
-        row = cur.fetchone()
+        #  — hold the process-wide DB write lock for the shared-
+        # connection read. db_call (the dispatching caller) already
+        # holds the reentrant lock; the in-method acquire makes the
+        # method correct regardless of caller and clears the  ratchet.
+        with get_write_lock():
+            cur = self._db.execute(
+                "SELECT COUNT(*) AS n FROM sent_mail_index "
+                "WHERE account_id = ? AND is_captured_pair = 1",
+                (self._account_id,),
+            )
+            row = cur.fetchone()
         if row is None:
             return 0
         return int(row["n"] if hasattr(row, "keys") else row[0])
@@ -295,7 +316,12 @@ class SentMailCaptureLoop:
         Idempotent: a second call on a message whose
         ``rfc_message_id`` is already in the index is a no-op.
         """
-        if self._hipaa_short_circuit("index_captured_pair"):
+        #  —  wrapped the scan_recent call of
+        # _hipaa_short_circuit in db_call but left this one a raw
+        # on-loop touch. _hipaa_short_circuit reads the shared
+        # connection (via _account_row), so dispatch it off-loop.
+        from email_triage.web.db_threadpool import db_call
+        if await db_call(self._hipaa_short_circuit, "index_captured_pair"):
             return False
 
         # Defence in depth: even if a HIPAA flag was missed, the

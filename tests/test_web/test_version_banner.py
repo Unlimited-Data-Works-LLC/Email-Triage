@@ -1,4 +1,4 @@
-"""/config — version + schema-compat banner (#125 partial).
+"""/config — version + schema-compat banner.
 
 Smoke-tests:
 
@@ -22,8 +22,9 @@ class TestVersionBannerAdmin:
         assert "data-status=" in body
         # App version is named on the banner (test fixture sets
         # app.state.version = "testsha1" but the banner reads the
-        # python package __version__ which is "0.1.0").
-        assert "0.1.0" in body
+        # python package __version__, resolved from package metadata).
+        from email_triage import __version__ as appv
+        assert appv in body
         # Update-flow hint copy is present.
         assert "scripts/deploy.sh" in body
 

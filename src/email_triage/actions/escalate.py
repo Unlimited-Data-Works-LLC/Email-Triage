@@ -11,6 +11,7 @@ its priority.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -60,9 +61,12 @@ class EscalateAction(Action):
     """Send an urgent notification to a secondary email address.
 
     This action is typically triggered for urgent categories like
-    ``to-respond`` and ``action-required``.  The actual email sending
-    is stubbed for now — it logs the notification payload and stores it
-    in the action output.  Full SMTP delivery is added in Phase 6.
+    ``to-respond`` and ``action-required``.  Delivery goes out over
+    SMTP via :func:`send_simple_smtp_email` (run off the event loop);
+    the alert text is HIPAA-scrubbed by :meth:`_build_notification`
+    before it leaves the process. When no ``notify_email`` or no SMTP
+    relay is configured the action returns ``SKIPPED`` rather than
+    failing the flow.
     """
 
     @property
@@ -83,7 +87,7 @@ class EscalateAction(Action):
         from email_triage.actions.base import (
             check_idempotent_already_done, record_idempotent_done,
         )
-        prior = check_idempotent_already_done(
+        prior = await check_idempotent_already_done(
             flow, message, self.name,
         )
         if prior is not None:
@@ -148,7 +152,11 @@ class EscalateAction(Action):
                     smtp_password = secrets.get("SMTP_PASSWORD") or ""
                 except Exception:
                     smtp_password = ""
-            send_simple_smtp_email(
+            # smtplib is blocking — run it off the event loop so an
+            # escalation SMTP handshake doesn't stall the watcher /
+            # push consumers sharing this loop.
+            await asyncio.to_thread(
+                send_simple_smtp_email,
                 smtp_host=smtp_cfg.host,
                 smtp_port=smtp_cfg.port,
                 smtp_user=smtp_cfg.username,
@@ -180,7 +188,7 @@ class EscalateAction(Action):
                 },
             )
 
-        record_idempotent_done(
+        await record_idempotent_done(
             flow, message, self.name, external_id=notify_email,
         )
         return ActionOutput(

@@ -12,7 +12,7 @@ stays on disk -- internal-use only, plain copy, no master key,
 not a substitute for an encrypted ``email-triage backup export``.
 
 This module is the cleanup half of the lifecycle. When the
-operator explicitly runs the full ``backup export`` (#65 encrypted
+operator explicitly runs the full ``backup export`` ( encrypted
 bundle), the rollback safety net is no longer required for the
 pre-export state: the operator's real backup now captures
 everything the snapshot would protect. We delete the older

@@ -23,7 +23,7 @@ authorise a request on session B. Lifetime matches the session
 older than ``CSRF_MAX_AGE``.
 
 Enforcement: ``CsrfMiddleware`` honours ``app.state.csrf_enforce``
-(default True as of #82, 2026-05-10). When True, violations return
+(default True as of , 2026-05-10). When True, violations return
 HTTP 403. When False (operator opt-out via ``tls.csrf_enforce`` in
 YAML or ``EMAIL_TRIAGE_CSRF_ENFORCE=0``), violations log + bump
 ``app.state.csrf_rejects`` but the request proceeds. Operator may
@@ -103,9 +103,28 @@ def _hash_session(session_token: str) -> str:
     return hashlib.sha256(session_token.encode("utf-8")).hexdigest()[:16]
 
 
+#  — serializer cache. URLSafeTimedSerializer is a pure function
+# of (secret_key, salt): the salt is the _CSRF_SALT constant and the
+# secret_key is app.state.session_secret, stable for the process.
+# Rebuilding it on every mint (per form render) and every verify (per
+# guarded request) was pure overhead — memoise by secret_key. The
+# cache is effectively one entry; secret_key only changes on a
+# master-key rotation.
+_serializer_cache: dict[str, URLSafeTimedSerializer] = {}
+
+
+def _get_serializer(secret_key: str) -> URLSafeTimedSerializer:
+    """Return a cached CSRF serializer for ``secret_key``."""
+    s = _serializer_cache.get(secret_key)
+    if s is None:
+        s = URLSafeTimedSerializer(secret_key, salt=_CSRF_SALT)
+        _serializer_cache[secret_key] = s
+    return s
+
+
 def mint_csrf_token(secret_key: str, session_token: str) -> str:
     """Create a signed CSRF token bound to ``session_token``."""
-    s = URLSafeTimedSerializer(secret_key, salt=_CSRF_SALT)
+    s = _get_serializer(secret_key)
     return s.dumps({"sid": _hash_session(session_token)})
 
 
@@ -156,7 +175,7 @@ def verify_csrf_token(
     """
     if not token:
         return False
-    s = URLSafeTimedSerializer(secret_key, salt=_CSRF_SALT)
+    s = _get_serializer(secret_key)
     try:
         payload = s.loads(token, max_age=max_age)
     except (BadSignature, SignatureExpired):
@@ -249,7 +268,7 @@ class CsrfMiddleware:
         method = scope["method"].upper()
         path = scope.get("path", "") or ""
 
-        # Operator-defined extra exemptions (#82 item 4). Reads from
+        # Operator-defined extra exemptions. Reads from
         # app.state at request time so a /admin/security save can
         # take effect without a restart, mirroring csrf_enforce.
         extra_exempt = tuple(
@@ -326,7 +345,7 @@ class CsrfMiddleware:
                         # below or proceed under soft-launch.
                         pass
 
-                # #133 — oversize-body short-circuit. If the body
+                #  — oversize-body short-circuit. If the body
                 # blew past _BODY_BUFFER_CAP and we still have no
                 # token (no X-CSRF-Token header, no parseable form
                 # field), the only fallthrough was passing the
@@ -362,7 +381,7 @@ class CsrfMiddleware:
         if not valid:
             state = scope["app"].state
             state.csrf_rejects = int(getattr(state, "csrf_rejects", 0)) + 1
-            # Default True: #82 flipped the install-wide default to
+            # Default True:  flipped the install-wide default to
             # enforce. The runtime fallback mirrors so a missing
             # attribute (e.g. test fixture skipping lifespan) reflects
             # the production posture, not the legacy soft-launch one.
@@ -379,16 +398,26 @@ class CsrfMiddleware:
                     "body_too_large": body_too_large,
                 }},
             )
-            # #82 item 3 — append a structured access_log row so the
+            #  item 3 — append a structured access_log row so the
             # admin UI can answer "which paths are tripping the
             # counter?" without grepping log_entries. Outcome name
             # distinguishes soft-launch (would-have-rejected; the
             # request still proceeded) from enforce (actually 403'd).
-            try:
-                from email_triage.web.db import record_access_event
-                db = getattr(state, "db", None)
-                if db is not None:
-                    record_access_event(
+            from email_triage.web.db import record_access_event
+            from email_triage.web.db_threadpool import db_call
+            #  — record_access_event is @db_write; calling it
+            # synchronously here ran the insert (and lock acquisition)
+            # on the event-loop thread inside the ASGI middleware.
+            # Route it through db_call so the write happens off-loop.
+            # Audit-write failure must not block the request flow — the
+            # structured log line above already records the rejection;
+            # we log the audit miss so /health can see drift, then
+            # swallow it (same policy as safe_audit_write).
+            db = getattr(state, "db", None)
+            if db is not None:
+                try:
+                    await db_call(
+                        record_access_event,
                         db,
                         actor_user_id=None,
                         method=method,
@@ -406,12 +435,14 @@ class CsrfMiddleware:
                             f"body_too_large={body_too_large}"
                         ),
                     )
-            except Exception:
-                # Audit-write failure must not block the request flow.
-                # The structured log line above still records the
-                # rejection; audit_failures counter on /health
-                # surfaces drift if this becomes systematic.
-                pass
+                except Exception as exc:
+                    _log.warning(
+                        "audit_write_failed",
+                        extra={"_extra": {
+                            "audit": "csrf_rejection",
+                            "error": str(exc),
+                        }},
+                    )
             if enforce:
                 response = JSONResponse(
                     {"error": "csrf_token_invalid"},
@@ -483,6 +514,16 @@ def csrf_input(request) -> object:
     """
     from markupsafe import Markup
 
+    #  — reuse a token already minted for THIS request. A page
+    # with several forms calls csrf_input() once per form, but one
+    # session-bound token is valid for all of them (the token is a
+    # session-scoped double-submit value, not a per-form nonce).
+    cached = getattr(getattr(request, "state", None), "_csrf_token", None)
+    if cached is not None:
+        return Markup(
+            f'<input type="hidden" name="csrf_token" value="{cached}">'
+        )
+
     try:
         from email_triage.web.auth import SESSION_COOKIE_NAME
         session_token = request.cookies.get(SESSION_COOKIE_NAME, "") or ""
@@ -496,6 +537,13 @@ def csrf_input(request) -> object:
         token = mint_csrf_token(secret_key, session_token)
     else:
         token = ""
+
+    # Cache on request.state so sibling forms in the same render
+    # reuse it. Best-effort — some render contexts pass a non-Request.
+    try:
+        request.state._csrf_token = token
+    except Exception:
+        pass
 
     return Markup(
         f'<input type="hidden" name="csrf_token" value="{token}">'

@@ -1,4 +1,4 @@
-"""Web-layer tests for the #152 phase 2 M-1+M-2 HIPAA opt-in.
+"""Web-layer tests for the  phase 2 M-1+M-2 HIPAA opt-in.
 
 The lift (operator-typed style knobs render under HIPAA when the per-
 account ``style_knobs_hipaa_allow:<id>`` opt-in is on) is end-to-end
@@ -413,10 +413,10 @@ class TestNoOperatorIdentifiers:
         # (The signature exposes account_id + actor_user_id only;
         # detail is caller-supplied.)
         for forbidden in (
-            "@therealms",
-            "claforest",
+            "@examplerealm",
+            "exampleuser",
             "openclaw",
-            "agents-host",
+            "the gateway host",
         ):
             assert forbidden not in src, (
                 f"record_hipaa_access_event source mentions "

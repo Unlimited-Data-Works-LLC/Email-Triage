@@ -178,7 +178,7 @@ class TestCountByStatus:
 
 
 # ---------------------------------------------------------------------------
-# #145.4 — canonical connection injection
+# .4 — canonical connection injection
 # ---------------------------------------------------------------------------
 
 class TestConnectionInjection:
@@ -267,7 +267,7 @@ class TestConnectionInjection:
         canonical.close()
 
     def test_shared_connection_no_expected_revision_regress(self, tmp_path):
-        """Concurrent-writes regression. The 2026-05-09 architecture
+        """Concurrent-writes regression. The @skip=tests/* architecture
         sweep flagged that TWO connections per process let an updater
         observe a stale revision. With both ``FlowStore`` and the
         ad-hoc web.db caller sharing ONE connection, revisions stay
@@ -304,3 +304,165 @@ class TestConnectionInjection:
 
         store.close()
         canonical.close()
+
+
+# ---------------------------------------------------------------------------
+#  / H-01 — HIPAA redact-at-write for ``Classification.reason``
+# ---------------------------------------------------------------------------
+
+class TestClassificationReasonHipaaRedaction:
+    """``_cls_to_json`` must strip ``Classification.reason`` when
+    ``is_hipaa_mode()`` is True (45 CFR §164.306(d)(3)(ii)(B) equivalent
+    alternative measure to §164.312(a)(2)(iv)). See ``engine/store.py``
+    ``_cls_to_json`` for the documented rationale + reg cite.
+    """
+
+    def _set_hipaa(self, value: bool) -> bool:
+        """Set the process-wide HIPAA flag, return the prior value so
+        the test can restore on teardown — mirrors the disciplined
+        save-and-restore pattern at tests/test_log_no_token_leak.py:
+        410-426 (avoids the test-contamination class that hipaa-sme
+        flagged for Cycle 6)."""
+        from email_triage import triage_logging
+        prior = triage_logging._hipaa_mode
+        triage_logging._hipaa_mode = value
+        return prior
+
+    def test_reason_stripped_in_hipaa_mode(self):
+        """Unit (hipaa-sme C2): in HIPAA mode, the serialised JSON must
+        carry an empty ``reason`` field — no PHI lands at rest."""
+        import json as _json
+        from email_triage.engine.store import _cls_to_json
+
+        prior = self._set_hipaa(True)
+        try:
+            cls = Classification(
+                category="medical",
+                confidence=0.92,
+                reason="Email cites chemotherapy dosage for patient John Doe",
+                source="llm",
+            )
+            blob = _cls_to_json(cls)
+            assert blob is not None
+            parsed = _json.loads(blob)
+            assert parsed["category"] == "medical"
+            assert parsed["confidence"] == 0.92
+            assert parsed["source"] == "llm"
+            assert parsed["reason"] == "", (
+                f"In HIPAA mode the LLM reason MUST be redacted; "
+                f"got reason={parsed['reason']!r}"
+            )
+        finally:
+            self._set_hipaa(prior)
+
+    def test_reason_preserved_outside_hipaa_mode(self):
+        """Negative control: with HIPAA off, ``reason`` round-trips
+        verbatim. Without this we couldn't tell whether the strip is
+        actually predicate-driven or accidentally always-on."""
+        import json as _json
+        from email_triage.engine.store import _cls_to_json
+
+        prior = self._set_hipaa(False)
+        try:
+            cls = Classification(
+                category="action-required",
+                confidence=0.85,
+                reason="Email requests review by EOD; non-PHI install context.",
+                source="llm",
+            )
+            blob = _cls_to_json(cls)
+            assert blob is not None
+            parsed = _json.loads(blob)
+            assert parsed["reason"] == cls.reason, (
+                f"Outside HIPAA mode reason must round-trip verbatim; "
+                f"got reason={parsed['reason']!r}"
+            )
+        finally:
+            self._set_hipaa(prior)
+
+    def test_none_classification_returns_none(self):
+        """Boundary: a None Classification serialises to None
+        regardless of HIPAA mode."""
+        from email_triage.engine.store import _cls_to_json
+
+        prior = self._set_hipaa(True)
+        try:
+            assert _cls_to_json(None) is None
+        finally:
+            self._set_hipaa(prior)
+
+    def test_integration_persisted_column_has_no_reason_in_hipaa_mode(
+        self, memory_store: FlowStore,
+    ):
+        """Integration (DA Gate 3): round-trip a HIPAA-mode flow through
+        ``FlowStore.update_flow`` and read the raw
+        ``classification_json`` column back via SQL. The column MUST
+        carry an empty ``reason`` — the at-rest content carries no PHI.
+
+        Belt-and-suspenders against the unit test: catches any future
+        refactor that bypasses ``_cls_to_json`` (e.g. a sibling
+        serializer) by exercising the actual write path."""
+        import json as _json
+
+        # Create a flow + advance it to CLASSIFIED with a PHI-bearing
+        # reason; this mimics what FlowEngine.classify() does.
+        flow = memory_store.create_flow("msg-hipaa-1", "gmail_api")
+        flow.status = FlowStatus.CLASSIFIED
+        flow.classification = Classification(
+            category="medical",
+            confidence=0.99,
+            reason="patient X reports symptom Y after dose Z",
+            source="llm",
+        )
+
+        prior = self._set_hipaa(True)
+        try:
+            memory_store.update_flow(flow, expected_revision=0)
+        finally:
+            self._set_hipaa(prior)
+
+        # Read the raw column via SQL — bypass _cls_from_json so we see
+        # exactly what landed on disk.
+        row = memory_store._conn.execute(
+            "SELECT classification_json FROM flows WHERE flow_id = ?",
+            (flow.flow_id,),
+        ).fetchone()
+        assert row is not None, "flow row missing after update"
+        persisted = _json.loads(row["classification_json"])
+        assert persisted["category"] == "medical"
+        assert persisted["confidence"] == 0.99
+        assert persisted["source"] == "llm"
+        assert persisted["reason"] == "", (
+            f"flows.classification_json must carry empty reason in "
+            f"HIPAA mode; got reason={persisted['reason']!r}"
+        )
+
+    def test_integration_persisted_column_keeps_reason_outside_hipaa(
+        self, memory_store: FlowStore,
+    ):
+        """Negative-control integration: outside HIPAA mode the
+        persisted column retains ``reason`` verbatim. Pins the
+        predicate-driven behaviour of the persistence path."""
+        import json as _json
+
+        flow = memory_store.create_flow("msg-nonhipaa-1", "gmail_api")
+        flow.status = FlowStatus.CLASSIFIED
+        flow.classification = Classification(
+            category="action-required",
+            confidence=0.7,
+            reason="Email asks for a meeting next Tuesday; non-PHI.",
+            source="llm",
+        )
+
+        prior = self._set_hipaa(False)
+        try:
+            memory_store.update_flow(flow, expected_revision=0)
+        finally:
+            self._set_hipaa(prior)
+
+        row = memory_store._conn.execute(
+            "SELECT classification_json FROM flows WHERE flow_id = ?",
+            (flow.flow_id,),
+        ).fetchone()
+        persisted = _json.loads(row["classification_json"])
+        assert persisted["reason"] == flow.classification.reason

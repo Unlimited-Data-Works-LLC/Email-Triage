@@ -1,4 +1,4 @@
-"""Optional caching surfaces for email-triage (#151).
+"""Optional caching surfaces for email-triage.
 
 Currently a single submodule (``classification``) — the optional
 Redis-backed cache for LLM classification results. Future caches

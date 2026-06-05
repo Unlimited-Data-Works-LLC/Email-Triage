@@ -44,7 +44,6 @@ globals().update({
 from .accounts import router as _accounts_router
 from .wizard import router as _wizard_router
 from .routes import router as _routes_router
-from .digests import router as _digests_router
 from .categories import router as _categories_router
 from .calendars import router as _calendars_router
 from .oauth import router as _oauth_router
@@ -75,7 +74,6 @@ for _r in (
     _accounts_router,
     _wizard_router,
     _routes_router,
-    _digests_router,
     _categories_router,
     _calendars_router,
     _oauth_router,
@@ -100,7 +98,6 @@ _CONCERN_MODULES = (
     ".accounts",
     ".wizard",
     ".routes",
-    ".digests",
     ".categories",
     ".calendars",
     ".oauth",
@@ -125,7 +122,7 @@ class _UiPackage(_types.ModuleType):
     Why the broad mirror: dozens of tests patch
     `email_triage.web.routers.ui.X` (via `unittest.mock.patch` or
     `monkeypatch.setattr`) for helpers that originally lived module-
-    level in `web/routers/ui.py`. After the #144 split, those helpers
+    level in `web/routers/ui.py`. After the  split, those helpers
     moved to `_shared.py`; each concern file does
     `globals().update(vars(_shared))` at import to keep handler
     bare-name references working. The original-module patch path used
@@ -153,7 +150,7 @@ class _UiPackage(_types.ModuleType):
 
     def __getattr__(self, name):
         # PEP 562 fallback. Order:
-        #   1. legacy install-singleton names (factory.py, #138.1)
+        #   1. legacy install-singleton names (factory.py, .1)
         #   2. anything in `_shared`
         #   3. concern submodules
         if name == "_install_google_oauth":

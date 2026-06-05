@@ -1,5 +1,4 @@
-"""Shared EmailMessage assembly helper for provider ``_normalise`` paths
-(#145.8).
+"""Shared EmailMessage assembly helper for provider ``_normalise`` paths.
 
 All three providers (Gmail, O365, IMAP) ended their ``_normalise``
 methods with the same final-assembly shape: extract dialect-specific

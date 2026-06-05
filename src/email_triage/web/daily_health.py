@@ -1,4 +1,4 @@
-"""Daily health / summary email (#27) + admin-notification channel (CR-2c/2d).
+"""Daily health / summary email + admin-notification channel (CR-2c/2d).
 
 Admin-facing "did the gateway die overnight?" push signal. Renders an
 HTML + text email from current app state and ships it over the existing
@@ -48,6 +48,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any
 
+from email_triage._isotime import parse_iso
 from email_triage.config import TriageConfig
 from email_triage.triage_logging import get_logger, is_hipaa_mode
 from email_triage.web.auth import format_from_header
@@ -294,7 +295,7 @@ def gather_update_available_section(
 
 
 # ---------------------------------------------------------------------------
-# Retry-queue threshold section (#175 R-B)
+# Retry-queue threshold section
 # ---------------------------------------------------------------------------
 
 # Per-account threshold: an account with this many or more deads in
@@ -345,7 +346,7 @@ def gather_retry_deads_section(
         # Install-wide total.
         row = db.execute(
             "SELECT COUNT(*) AS c FROM watcher_retry_queue "
-            "WHERE state = 'dead' AND updated_at >= ?",
+            "WHERE state = 'dead' AND resolved_at >= ?",
             (since,),
         ).fetchone()
         if row is None:
@@ -360,7 +361,7 @@ def gather_retry_deads_section(
             "FROM watcher_retry_queue q "
             "LEFT JOIN email_accounts ea ON ea.id = q.account_id "
             "LEFT JOIN users u ON u.id = ea.user_id "
-            "WHERE q.state = 'dead' AND q.updated_at >= ? "
+            "WHERE q.state = 'dead' AND q.resolved_at >= ? "
             "GROUP BY q.account_id "
             "HAVING c >= ?",
             (since, RETRY_DEADS_PER_ACCOUNT_THRESHOLD),
@@ -376,7 +377,7 @@ def gather_retry_deads_section(
             bd_rows = db.execute(
                 "SELECT dead_reason, COUNT(*) AS c "
                 "FROM watcher_retry_queue "
-                "WHERE state = 'dead' AND updated_at >= ? "
+                "WHERE state = 'dead' AND resolved_at >= ? "
                 "  AND account_id = ? "
                 "GROUP BY dead_reason",
                 (since, acct_id),
@@ -435,7 +436,7 @@ def gather_health_state(
     ``app`` is the FastAPI instance (optional). When supplied, the
     listener-restart-pending check runs and may add an entry to
     ``attention_reasons`` so the daily digest signals the operator
-    even on a day when nothing else is wrong. (#81)
+    even on a day when nothing else is wrong.
     """
     now = now or datetime.now(timezone.utc)
     since_24h = (now - timedelta(hours=24)).isoformat()
@@ -637,7 +638,7 @@ def gather_health_state(
     state["hipaa_events_count"] = hipaa_events_count
     state["hipaa_recent_actors"] = hipaa_recent_actors
 
-    # --- BAA expirations (#169 Wave 2-α — I7) ------------------------------
+    # --- BAA expirations ------------------------------
     # Pull the bucket data here so the renderer can decide whether to
     # surface a section. Returns ``None`` when nothing is in scope so
     # the email isn't bloated by a "BAA: nothing to report" line on a
@@ -677,7 +678,7 @@ def gather_health_state(
                 + state["update_available"].get("explanation", _u_status)
             )
 
-    # --- Retry-queue dead-pattern section (#175 R-B) ---------------------
+    # --- Retry-queue dead-pattern section ---------------------
     # Surface accounts piling up abandoned retries, or an install-wide
     # spike. Returns ``None`` on a clean day so the email body doesn't
     # grow a redundant "retry queue: nothing to report" line.
@@ -734,7 +735,7 @@ def gather_health_state(
     # "not configured" so the section exists but isn't misleading.
     state["pubsub_configured"] = bool(config.push.gmail_topic_name)
 
-    # --- O365 Graph subscriptions (#66) ---------------------------------
+    # --- O365 Graph subscriptions ---------------------------------
     # Same shape as gmail_push: total / active / expiring_in_24h /
     # errored. Errored or fully-expired-without-poll-fallback entries
     # bump attention_reasons.
@@ -785,14 +786,9 @@ def gather_health_state(
         for r in rows:
             status = (r.get("status") or "").strip()
             exp_raw = r.get("expiration_at") or ""
-            try:
-                exp = datetime.fromisoformat(
-                    str(exp_raw).replace("Z", "+00:00"),
-                )
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                exp = None
+            exp = parse_iso(exp_raw)
+            if exp is not None and exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
             row_dict = {
                 "account_id": r.get("account_id"),
                 "account_label": _label(r.get("account_id")),
@@ -829,10 +825,10 @@ def gather_health_state(
 
     # --- Gateway / container health placeholder ---------------------------
     # Minimal: if we can query the DB we're up. Detailed gateway probing
-    # is out of scope for #27.
+    # is out of scope for .
     state["gateway_ok"] = True
 
-    # --- TLS cert expiry warning (#74) -----------------------------------
+    # --- TLS cert expiry warning -----------------------------------
     # Manually-managed certs (institutional CA + self-signed) have no
     # auto-renewal hook. Daily-health surfaces a warning at 30 / 14 / 7
     # days before not_after so the operator has lead time. ACME-managed
@@ -854,7 +850,7 @@ def gather_health_state(
         # Cert read failures shouldn't fail the health email build.
         pass
 
-    # --- Listener-mode restart pending (#81) ------------------------------
+    # --- Listener-mode restart pending ------------------------------
     # When ``app`` is supplied (live process), compare the boot-time
     # listener mode to the saved value. Operator forgot to restart =>
     # the new toggle is silently ignored until the process bounces.
@@ -1029,7 +1025,7 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
                 )
             parts.append("</ul>")
 
-    # 4c. BAA expirations (#169 Wave 2-α — I7). Renders ONLY when at
+    # 4c. BAA expirations. Renders ONLY when at
     # least one ai_backends row is in the expiring-soon / expired
     # bucket. On a clean day the section is suppressed entirely so
     # the email doesn't grow a redundant "BAA: nothing to report"
@@ -1072,7 +1068,7 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
                 )
             parts.append("</ul>")
 
-    # 4c-bis. Retry queue dead-pattern section (#175 R-B). Renders ONLY
+    # 4c-bis. Retry queue dead-pattern section. Renders ONLY
     # when ``state["retry_deads"]`` is non-None (≥3 deads on any one
     # account OR ≥5 deads install-wide in last 24h). Silent on a clean
     # day so the email body doesn't grow a redundant "retry queue:
@@ -1175,7 +1171,7 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             f'<li>Pub/Sub topic: '
             f'{"configured" if state["pubsub_configured"] else "not configured"}</li>'
         )
-        # #66 — O365 Graph subscriptions sibling line. Conditional on
+        #  — O365 Graph subscriptions sibling line. Conditional on
         # the same include_pubsub toggle since both are "external push
         # transport health" surfaces.
         o365 = state.get("office365_push") or {}
@@ -1335,7 +1331,7 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
             )
         lines.append("")
 
-    # Retry queue dead-pattern section (#175 R-B). Sibling to the
+    # Retry queue dead-pattern section. Sibling to the
     # HTML block above; silent on a clean day.
     rd = state.get("retry_deads")
     if rd:
@@ -1405,7 +1401,7 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
             "Pub/Sub topic: "
             + ("configured" if state["pubsub_configured"] else "not configured")
         )
-        # #66 — O365 sibling line in the text-mode digest.
+        #  — O365 sibling line in the text-mode digest.
         o365 = state.get("office365_push") or {}
         if o365.get("total", 0) > 0:
             lines.append(
@@ -1515,7 +1511,7 @@ def send_daily_health_email(
     ``force=True`` bypasses ``quiet_mode`` — used by the "Send now"
     admin button so ops can verify wiring even on a boringly healthy day.
     ``app`` (FastAPI instance) enables the listener-restart-pending
-    check (#81) — passed through from the supervisor; tests can omit.
+    check — passed through from the supervisor; tests can omit.
     """
     cfg = config.health_email
     if not cfg.enabled and not force:
@@ -1527,7 +1523,19 @@ def send_daily_health_email(
     if not smtp.host:
         return False, "SMTP not configured"
 
-    state = gather_health_state(db, config, watcher_manager, app=app)
+    #  — gather_health_state issues many raw reads on the shared
+    # sqlite3 connection. send_daily_health_email runs from the
+    # daily-health background loop (and the admin "Send now" button);
+    # the background path is NOT routed through db_call, so the read
+    # batch is taken under the process-wide DB lock to serialise
+    # against any request-surface db_call worker. The lock spans the
+    # whole snapshot so it is also internally consistent; it is
+    # released before the SMTP send so a slow network send never
+    # holds the DB lock. (RLock — re-entrant if the admin-button
+    # caller is already inside db_call.)
+    from email_triage.web.db_writelock import get_write_lock
+    with get_write_lock():
+        state = gather_health_state(db, config, watcher_manager, app=app)
     if cfg.quiet_mode and not force and not is_interesting(state):
         return False, "quiet_mode: nothing interesting"
 

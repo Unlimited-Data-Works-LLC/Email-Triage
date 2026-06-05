@@ -60,7 +60,7 @@ def render_block() -> str:
     if notes:
         lines.append(f"> Notes: {notes}")
     lines.append("")
-    lines.append("Verify with cosign — see `docs/release-process.md`.")
+    lines.append("Verify with cosign — see `internal documentation`.")
     lines.append(MARKER_END)
     return "\n".join(lines)
 

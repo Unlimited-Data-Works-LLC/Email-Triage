@@ -1,4 +1,4 @@
-"""Tests for the /config/ai-backends admin CRUD page (#169 Wave 2-α — I3).
+"""Tests for the /config/ai-backends admin CRUD page.
 
 Covers:
 
@@ -96,7 +96,7 @@ class TestIndexRender:
         create_ai_backend(
             db, name="Local Ollama", type_="ollama",
             endpoint="http://localhost:11434",
-            api_key_secret_ref=None, model="[local-llm-model]
+            api_key_secret_ref=None, model="qwen3.6:8b",
             baa_certified=False, baa_expires_at=None,
             enabled=True, created_by=admin_user["id"],
         )
@@ -109,7 +109,7 @@ class TestIndexRender:
         body = resp.text
         assert "Local Ollama" in body
         assert "ollama" in body
-        assert "[local-llm-model] in body
+        assert "qwen3.6:8b" in body
 
 
 # ---------------------------------------------------------------------------
@@ -430,13 +430,19 @@ class TestHealthDetailBaaStatus:
     def test_health_detail_carries_baa_status(
         self, client, db, admin_user, admin_cookies,
     ):
-        # Seed one expiring + one expired backend.
+        # Seed one backend whose BAA is expiring soon (urgent bucket).
+        # The date is computed relative to "now" so the backend stays
+        # in the expiring window regardless of when the suite runs — a
+        # hardcoded date drifts into the "expired" bucket over time,
+        # and  made an expired BAA degrade /health (-> 503), which
+        # is not the path this test exercises.
+        from datetime import date, timedelta
+        soon = (date.today() + timedelta(days=5)).isoformat()
         create_ai_backend(
             db, name="A", type_="azure_openai",
             endpoint="https://x.com",
             api_key_secret_ref=None, model=None,
-            baa_certified=True, baa_expires_at="2026-05-20",
-            # ~5 days from 2026-05-15 — urgent bucket
+            baa_certified=True, baa_expires_at=soon,
             enabled=True, created_by=admin_user["id"],
         )
         client.cookies.set(
@@ -444,6 +450,7 @@ class TestHealthDetailBaaStatus:
             admin_cookies[SESSION_COOKIE_NAME],
         )
         resp = client.get("/health/detail")
+        # An expiring-soon (not expired) BAA does not degrade /health.
         assert resp.status_code == 200
         body = resp.json()
         assert "baa_status" in body
@@ -451,3 +458,6 @@ class TestHealthDetailBaaStatus:
         assert "expiring_soon" in baa
         assert "expired" in baa
         assert "expired_hipaa_accounts_disabled" in baa
+        # The seeded backend is reflected in the expiring-soon count.
+        assert baa["expiring_soon"] >= 1
+        assert baa["expired"] == 0

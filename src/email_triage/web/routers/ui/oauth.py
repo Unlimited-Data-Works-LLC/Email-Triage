@@ -1,6 +1,6 @@
 """Routes for the oauth concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -23,6 +23,7 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage._isotime import parse_iso
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
 from email_triage.web import settings_keys as _S
@@ -50,6 +51,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.oauth")
 
 router = APIRouter()
@@ -58,7 +60,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -108,7 +110,7 @@ async def gmail_api_auth_start(
     redirects to ``/oauth/google/callback`` on success; no further UI
     interaction is needed in this panel.
     """
-    # #137 phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
+    #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
 
     config = get_config(request)
@@ -163,7 +165,7 @@ async def gmail_api_auth_start_manual(
     URL (or just the code) into. No public URL needed; works with a
     Desktop OAuth client.
     """
-    # #137 phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
+    #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
 
     config = get_config(request)
@@ -220,7 +222,7 @@ async def gmail_api_auth_complete_manual(
     request: Request, account_id: int, owned: OwnedGmailApiAccount,
 ):
     """Take the pasted redirect URL/code from the manual flow and finish auth."""
-    # #137 phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
+    #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
 
     form = await request.form()
@@ -264,27 +266,38 @@ async def gmail_api_auth_complete_manual(
             '<a href="https://myaccount.google.com/permissions" target="_blank">account permissions</a> '
             'and re-authenticate.</small>'
         )
-    sk = _secret_key_for_account(account_id, "gmail_api")
-    if sk:
-        secrets.set(sk, refresh_token)
+    def _complete_manual_db_work() -> None:
+        """/ — token store + setting writes + auth-stale clear
+        in one threadpool hop, after the network token exchange above.
+        """
+        sk = _secret_key_for_account(account_id, "gmail_api")
+        if sk:
+            secrets.set(sk, refresh_token)
 
-    # Sync calendar_enabled with the account's current opt-in, since
-    # the scopes we just asked Google for were derived from it.
-    from email_triage.web.db import set_bool_setting, set_setting
-    wants_calendar = bool((acct["config"] or {}).get("calendar_opted_in"))
-    set_bool_setting(db, _S.calendar_enabled(account_id), wants_calendar)
+        # Sync calendar_enabled with the account's current opt-in,
+        # since the scopes we just asked Google for were derived from
+        # it.
+        from email_triage.web.db import set_bool_setting, set_setting
+        wants_calendar = bool(
+            (acct["config"] or {}).get("calendar_opted_in")
+        )
+        set_bool_setting(
+            db, _S.calendar_enabled(account_id), wants_calendar,
+        )
 
-    # Stamp the OAuth flow type. This handler is the Desktop /
-    # manual-paste finish; tokens are usable for read+classify but
-    # don't unlock Start Push (operator-named separation: Primary --
-    # push-enabled is the path that enables push).
-    set_setting(db, _S.gmail_oauth_flow(account_id), "manual")
+        # Stamp the OAuth flow type. This handler is the Desktop /
+        # manual-paste finish; tokens are usable for read+classify but
+        # don't unlock Start Push (operator-named separation: Primary
+        # -- push-enabled is the path that enables push).
+        set_setting(db, _S.gmail_oauth_flow(account_id), "manual")
 
-    # Clear auth-stale flag immediately on successful re-auth so the
-    # banner / chip disappears without waiting for the next poll
-    # cycle to confirm.
-    from email_triage.web.app import _clear_auth_stale
-    _clear_auth_stale(db, account_id)
+        # Clear auth-stale flag immediately on successful re-auth so
+        # the banner / chip disappears without waiting for the next
+        # poll cycle to confirm.
+        from email_triage.web.app import _clear_auth_stale
+        _clear_auth_stale(db, account_id)
+
+    await db_call(_complete_manual_db_work)
 
     _gmail_auth_state(request).pop(account_id, None)
     # OOB-swap the stale-auth banner area on the edit page with a
@@ -318,7 +331,7 @@ async def oauth_google_callback(request: Request):
     the code for tokens, stores the refresh token. For calendar
     enablement, also flips the ``calendar_enabled`` setting.
     """
-    user = get_current_user(request)
+    user = await db_call(get_current_user, request)  # 
     if user is None:
         # The OAuth round-trip can take a couple of minutes — the
         # session may have expired. Surface an actionable error rather
@@ -371,10 +384,18 @@ async def oauth_google_callback(request: Request):
     from email_triage.web.db import (
         get_email_account, set_bool_setting, set_setting,
     )
-    acct = get_email_account(db, account_id)
+
+    def _callback_account_snapshot() -> tuple[dict | None, bool]:
+        """/ — account fetch + can-manage check in one hop."""
+        acct_ = get_email_account(db, account_id)
+        if acct_ is None:
+            return None, False
+        return acct_, can_manage_account(db, user, acct_)
+
+    acct, can_manage = await db_call(_callback_account_snapshot)
     if acct is None:
         return HTMLResponse("Account not found", status_code=404)
-    if not can_manage_account(db, user, acct):
+    if not can_manage:
         return HTMLResponse("Forbidden", status_code=403)
 
     config = get_config(request)
@@ -419,26 +440,37 @@ async def oauth_google_callback(request: Request):
             status_code=400,
         )
 
-    sk = _secret_key_for_account(account_id, "gmail_api")
-    if sk:
-        secrets.set(sk, refresh_token)
+    def _callback_token_db_work() -> None:
+        """/ — token store + flow stamp + calendar flag +
+        auth-stale clear in one threadpool hop, after the network
+        token exchange above.
+        """
+        sk = _secret_key_for_account(account_id, "gmail_api")
+        if sk:
+            secrets.set(sk, refresh_token)
 
-    # Stamp the OAuth flow type. This handler is the Web-app /
-    # Primary -- push-enabled callback; tokens unlock Start Push.
-    # Render layer reads gmail_oauth_flow:<id> on the chip path.
-    set_setting(db, _S.gmail_oauth_flow(account_id), "web")
+        # Stamp the OAuth flow type. This handler is the Web-app /
+        # Primary -- push-enabled callback; tokens unlock Start Push.
+        # Render layer reads gmail_oauth_flow:<id> on the chip path.
+        set_setting(db, _S.gmail_oauth_flow(account_id), "web")
 
-    # Calendar enablement tracks the scope set the new token carries.
-    # Unchecking the opt-in and re-authenticating strips calendar
-    # scope, so we flip the flag either way to stay in sync.
-    set_bool_setting(db, _S.calendar_enabled(account_id), wants_calendar)
+        # Calendar enablement tracks the scope set the new token
+        # carries. Unchecking the opt-in and re-authenticating strips
+        # calendar scope, so we flip the flag either way to stay
+        # in sync.
+        set_bool_setting(
+            db, _S.calendar_enabled(account_id), wants_calendar,
+        )
 
-    # Clear auth-stale flag immediately on successful re-auth so the
-    # banner / chip disappears without waiting for the next poll.
-    from email_triage.web.app import _clear_auth_stale
-    _clear_auth_stale(db, account_id)
+        # Clear auth-stale flag immediately on successful re-auth so
+        # the banner / chip disappears without waiting for the next
+        # poll.
+        from email_triage.web.app import _clear_auth_stale
+        _clear_auth_stale(db, account_id)
 
-    # #95 sub-B — auto-chain OAuth → watch start. When the install
+    await db_call(_callback_token_db_work)
+
+    #  sub-B — auto-chain OAuth → watch start. When the install
     # has Pub/Sub configured AND push is enabled on the account
     # AND no watch is currently live, fire watch-start automatically
     # so the operator doesn't have to return to the edit page and
@@ -455,27 +487,26 @@ async def oauth_google_callback(request: Request):
         # Don't double-fire if a real (non-poll-mode) watch already
         # exists with a future expires_at.
         from email_triage.web.db import get_gmail_watch
-        existing_watch = get_gmail_watch(db, account_id)
+        existing_watch = await db_call(get_gmail_watch, db, account_id)
         watch_already_live = False
         if existing_watch:
             topic = (existing_watch.get("topic_name") or "").strip()
             if topic:
-                try:
-                    exp = datetime.fromisoformat(
-                        str(existing_watch.get("expires_at", ""))
-                        .replace("Z", "+00:00")
-                    )
+                exp = parse_iso(existing_watch.get("expires_at", ""))
+                if exp is not None:
+                    if exp.tzinfo is None:
+                        exp = exp.replace(tzinfo=timezone.utc)
                     if exp > datetime.now(timezone.utc):
                         watch_already_live = True
-                except Exception:
-                    pass
         if (
             push_topic and push_enabled
             and not watch_already_live
             and acct.get("provider_type") == "gmail_api"
         ):
             from email_triage.providers.gmail_api import GmailApiProvider
-            provider = _create_provider_from_account(acct, secrets)
+            provider = await db_call(
+                _create_provider_from_account, acct, secrets,
+            )
             if isinstance(provider, GmailApiProvider):
                 try:
                     data = await provider.register_watch(push_topic)
@@ -502,7 +533,8 @@ async def oauth_google_callback(request: Request):
                     ).strip()
                     if new_email:
                         from email_triage.web.db import upsert_gmail_watch
-                        upsert_gmail_watch(
+                        await db_call(
+                            upsert_gmail_watch,
                             db,
                             account_id=account_id,
                             email_address=new_email,

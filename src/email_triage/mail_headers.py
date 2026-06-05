@@ -28,7 +28,7 @@ triage entry point:
 * :func:`build_self_skip_query` rewrites a provider-specific search
   query so the install's own outbound from-address is excluded at
   the SEARCH stage. Saves a fetch + classifier call per self-mail
-  on every poll cycle (#117).
+  on every poll cycle.
 * :func:`is_self_origin` is the defense-in-depth secondary check on
   ``message.sender`` matching ``smtp.from_addr`` — fires even when
   a downstream MTA stripped the ``X-Email-Triage`` header (custom

@@ -1,4 +1,4 @@
-"""Tests for #121-A — explain-this-error AI button.
+"""Tests for -A — explain-this-error AI button.
 
 Covers:
 
@@ -336,7 +336,7 @@ class TestExplainErrorAccountResolution:
         assert "prod" in prompt
         assert "admin@test.com" in prompt
         # The numeric id MUST NOT appear by itself in the prompt
-        # (the rule is "never render Account #42 alone").
+        # (the rule is "never render Account  alone").
         assert f"#{acct_id}" not in prompt
         assert f"account_id={acct_id}" not in prompt
 

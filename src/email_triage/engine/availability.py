@@ -184,7 +184,7 @@ def find_free_slots(
             # ``.astimezone(tz).date()`` which shifted UTC-midnight
             # BACK by the offset (UTC-4 → 2026-05-18 20:00 EDT →
             # date() == May 18), producing a busy-block on the wrong
-            # day. Operator-symptom: (redacted personal event) (stored as
+            # day. Operator-symptom: an all-day birthday (stored as
             # date "2026-05-19") landed on Mon 5/18 in the slot
             # finder, blanking Monday from meeting suggestions.
             # Fix: read the date AS-IS from the start datetime; only

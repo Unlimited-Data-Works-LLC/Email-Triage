@@ -1,4 +1,4 @@
-"""Tests for #51 — per-mailbox route overrides."""
+"""Tests for  — per-mailbox route overrides."""
 
 from email_triage.web.db import (
     create_email_account,

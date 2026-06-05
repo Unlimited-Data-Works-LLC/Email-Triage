@@ -26,6 +26,21 @@ This protects against duplicate drafts (the painful case — Gmail
 call), duplicate notify emails, etc. ``label`` is genuinely
 idempotent at the provider level but still records for audit so
 the same surface answers "did this run?" for every action.
+
+Durable store
+--------------------
+
+The state_bag record above only survives a retry when the engine
+persists the state_bag — which the ``FlowEngine`` path does, but the
+watcher / runner / bulk ingestion paths do NOT (they build a
+throwaway ``FlowState`` per action). So ``check_idempotent_already_done``
+/ ``record_idempotent_done`` now ALSO write/read a durable table,
+``action_idempotency`` (migration v34), keyed
+``(account_id, rfc_message_id, action_name)``. When the flow's
+state_bag carries a db connection + ``account_id`` and the message
+has an RFC Message-ID, the durable table is authoritative and the
+skip survives a retry-queue re-run or a container restart. Otherwise
+the helpers fall back to the legacy per-flow state_bag record.
 """
 
 from __future__ import annotations
@@ -64,19 +79,77 @@ def _compute_idempotency_key(
     return hashlib.sha256(blob).hexdigest()
 
 
-def check_idempotent_already_done(
+def _message_rfc_id(message: EmailMessage) -> str:
+    """The RFC 5322 Message-ID of ``message``, or '' when absent.
+
+    The durable idempotency store keys on this rather than the
+    provider message id: an IMAP UID is unique only within a mailbox,
+    so a UID could collide across two mailboxes of the same account.
+    The RFC Message-ID is globally unique.
+    """
+    try:
+        from email_triage.mail_headers import get_rfc_message_id
+        return get_rfc_message_id(getattr(message, "headers", {}) or {})
+    except Exception:
+        return ""
+
+
+async def check_idempotent_already_done(
     flow: FlowState, message: EmailMessage, action_name: str,
 ) -> ActionOutput | None:
     """Return a SKIPPED ActionOutput if this action already ran for
-    this (flow, message); else None.
+    this message; else None.
 
     Call from the top of an Action.execute() that has external side
-    effects. The ``message_id`` used for hashing is whichever the
-    provider returns — Gmail thread IDs, IMAP UIDs, Office365
-    message IDs all qualify, since we're hashing for equality, not
-    cross-provider correlation.
+    effects.
+
+     — when the flow's ``state_bag`` carries a db connection +
+    ``account_id`` and the message has an RFC Message-ID, this consults
+    the DURABLE ``action_idempotency`` table, so the skip survives a
+    retry-queue re-run or a container restart. Without those (the
+    FlowEngine path, or mail with no Message-ID) it falls back to the
+    legacy per-flow ``state_bag`` record.
+
+     — ``async def`` so the durable-path ``action_idempotency``
+    read can hop to the threadpool via ``db_call``. Action.execute is
+    invoked on the event-loop thread, so a bare ``db.execute`` here ran
+    SQLite work on the loop and could race a concurrent ``db_call``
+    worker on the one shared connection. Every caller awaits this.
     """
     bag = flow.state_bag or {}
+    db = bag.get("db")
+    account_id = bag.get("account_id")
+    rfc_id = _message_rfc_id(message)
+    if db is not None and account_id is not None and rfc_id:
+        # Durable path.
+        from email_triage.web.db_threadpool import db_call
+
+        def _idempotency_row_lookup():
+            return db.execute(
+                "SELECT external_id, completed_at FROM action_idempotency "
+                "WHERE account_id=? AND rfc_message_id=? AND action_name=?",
+                (int(account_id), rfc_id, action_name),
+            ).fetchone()
+
+        try:
+            row = await db_call(_idempotency_row_lookup)
+        except Exception:
+            # Table missing / DB error — fail safe: let the action run.
+            return None
+        if row is None:
+            return None
+        ext = row["external_id"] if hasattr(row, "keys") else row[0]
+        done_at = row["completed_at"] if hasattr(row, "keys") else row[1]
+        return ActionOutput(
+            result=ActionResult.SKIPPED,
+            data={
+                "skipped_idempotent": True,
+                "previous_run_at": done_at,
+                "previous_external_id": ext,
+            },
+        )
+
+    # Legacy fallback — per-flow state_bag (FlowEngine / no Message-ID).
     results = bag.get("action_results") or {}
     record = results.get(action_name)
     if not record:
@@ -100,20 +173,59 @@ def check_idempotent_already_done(
     )
 
 
-def record_idempotent_done(
+async def record_idempotent_done(
     flow: FlowState,
     message: EmailMessage,
     action_name: str,
     *,
     external_id: str | None = None,
 ) -> None:
-    """Stamp the state_bag entry that ``check_idempotent_already_done``
-    consumes on retry.
+    """Record that ``action_name`` completed for this message so a
+    later ``check_idempotent_already_done`` skips it.
 
-    Mutates ``flow.state_bag`` in place. The engine's update_flow
-    after the action chain finishes persists state_bag back to
-    the flows row.
+     — durable when the ``state_bag`` carries db + ``account_id``
+    and the message has an RFC Message-ID (writes the
+    ``action_idempotency`` table); otherwise the legacy per-flow
+    ``state_bag`` record (which the FlowEngine path persists via
+    update_flow).
+
+     — ``async def`` so the durable INSERT+commit hops to the
+    threadpool via ``db_call``. Action.execute runs on the event-loop
+    thread; the previous bare ``db.execute`` + ``db.commit()`` here
+    ran on the loop AND took no write lock — it could both freeze the
+    loop and race a concurrent ``db_call`` worker on the shared
+    connection. Every caller awaits this.
     """
+    bag = flow.state_bag or {}
+    db = bag.get("db")
+    account_id = bag.get("account_id")
+    rfc_id = _message_rfc_id(message)
+    now = datetime.now(timezone.utc).isoformat()
+    if db is not None and account_id is not None and rfc_id:
+        # Durable path.
+        from email_triage.web.db_threadpool import db_call
+
+        def _idempotency_upsert():
+            db.execute(
+                "INSERT INTO action_idempotency "
+                "(account_id, rfc_message_id, action_name, external_id, "
+                " completed_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_id, rfc_message_id, action_name) "
+                "DO UPDATE SET external_id=excluded.external_id, "
+                "  completed_at=excluded.completed_at",
+                (int(account_id), rfc_id, action_name, external_id, now),
+            )
+            db.commit()
+
+        try:
+            await db_call(_idempotency_upsert)
+            return
+        except Exception:
+            # Durable write failed — fall through to the state_bag
+            # record so the in-flow retry path still skips.
+            pass
+
+    # Legacy fallback — per-flow state_bag.
     if flow.state_bag is None:
         flow.state_bag = {}
     results = flow.state_bag.setdefault("action_results", {})
@@ -123,7 +235,7 @@ def record_idempotent_done(
             getattr(message, "message_id", None),
         ),
         "external_id": external_id,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": now,
     }
 
 
@@ -154,7 +266,7 @@ def build_action_log_extras(
     fetched from a HIPAA-flagged account), ``sender`` and ``subject``
     are not surfaced to logs. ``account_id``, ``account_name``, and
     ``owner`` ARE surfaced regardless — those are workforce
-    identifiers (per item #11), not PHI even on HIPAA accounts; the
+    identifiers (per item ), not PHI even on HIPAA accounts; the
     HIPAA-mode log filter blocks them at sink-time only when
     ``hipaa.session_redact_account_chips`` is on, which is the
     operator's choice and not relevant to the action-emission shape.

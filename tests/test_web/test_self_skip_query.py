@@ -1,4 +1,4 @@
-"""Query-stage self-skip + defense-in-depth secondary check (#117).
+"""Query-stage self-skip + defense-in-depth secondary check.
 
 The X-Email-Triage header is the primary loop guard, but every triage
 run still pays a per-message FETCH on its own outbound digests / draft

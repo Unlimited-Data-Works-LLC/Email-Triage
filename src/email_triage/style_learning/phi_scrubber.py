@@ -1,4 +1,4 @@
-"""Layered PHI scrubber for the HIPAA describe-and-discard pipeline (#152 S2).
+"""Layered PHI scrubber for the HIPAA describe-and-discard pipeline.
 
 Three layers, applied in order. Any layer detecting PHI in a field that
 must not contain PHI marks the whole descriptor as failing — the caller
@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -369,7 +370,40 @@ NER_BLOCKED_ENTITY_TYPES = frozenset({
 })
 
 
+# Module-scope cache for the NER analyzer. _build_ner_analyzer()
+# re-imports presidio/spacy and re-instantiates AnalyzerEngine /
+# spacy.load("en_core_web_sm") — multi-second — so without this it
+# paid that cost on every scrub_descriptor() call. The result
+# may legitimately be None (no NER lib installed), so a separate
+# "loaded" flag distinguishes a cached None from "not yet built".
+_NER_ANALYZER_CACHE: Any | None = None
+_NER_ANALYZER_LOADED = False
+#  — ``scrub_descriptor`` runs from the style-mining threadpool, so
+# ``_load_ner_analyzer`` can be entered concurrently. Without this lock
+# two threads both observe ``_NER_ANALYZER_LOADED == False`` and each
+# pay the multi-second presidio/spacy build — and one's result is then
+# discarded. The lock makes the build happen exactly once.
+_NER_ANALYZER_LOCK = threading.Lock()
+
+
 def _load_ner_analyzer() -> Any | None:
+    """Return the NER analyzer callable, building it once and caching
+    it for the process lifetime."""
+    global _NER_ANALYZER_CACHE, _NER_ANALYZER_LOADED
+    # Fast path: already built — no lock needed (a plain read of a
+    # module global is atomic under the GIL).
+    if _NER_ANALYZER_LOADED:
+        return _NER_ANALYZER_CACHE
+    with _NER_ANALYZER_LOCK:
+        # Re-check inside the lock — another thread may have built it
+        # while this one waited.
+        if not _NER_ANALYZER_LOADED:
+            _NER_ANALYZER_CACHE = _build_ner_analyzer()
+            _NER_ANALYZER_LOADED = True
+        return _NER_ANALYZER_CACHE
+
+
+def _build_ner_analyzer() -> Any | None:
     """Return a callable that takes a string and yields entity type
     names, or None when no NER library is installed.
 
@@ -612,9 +646,11 @@ def scrub_descriptor(
                 layer3_entities.append((field_name, ent_type))
                 structural_fail = True
         # Scan filtered phrases too — a phrase NER spotted as a person/
-        # location after layer-2 missed it should fail the descriptor
-        # (the descriptor's contract is no PHI, even in the phrase
-        # list, after the full layered pass).
+        # location after layer-2 missed it is DROPPED (the offending
+        # phrase only), not a structural fail. ``common_phrases`` is the
+        # intended free-text surface: a PHI hit there drops that one
+        # phrase and keeps the rest, matching the layer-2 phrase
+        # handling above and the module docstring's contract.
         clean_phrases: list[str] = []
         for ph in cleaned.get("common_phrases", []):
             ent_types = _layer3_scan_string(ph, analyzer)

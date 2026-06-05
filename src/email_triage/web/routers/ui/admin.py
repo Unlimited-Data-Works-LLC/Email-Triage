@@ -1,6 +1,6 @@
 """Routes for the admin concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,8 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
+    RequireUser,
+    RequireUserFragment,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +51,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.admin")
 
 router = APIRouter()
@@ -58,7 +60,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -122,7 +124,7 @@ async def service_worker():
 
 
 # ---------------------------------------------------------------------------
-# PWA offline shell (#124)
+# PWA offline shell
 # ---------------------------------------------------------------------------
 
 @router.get("/offline", response_class=HTMLResponse)
@@ -141,7 +143,7 @@ async def offline_shell(request: Request):
     content and must be reachable when no session cookie is present.
     """
     templates = get_templates(request)
-    return _render(templates, request, "offline.html", {})
+    return await _render(templates, request, "offline.html", {})
 
 
 # ---------------------------------------------------------------------------
@@ -149,35 +151,26 @@ async def offline_shell(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
+async def root(request: Request, user: RequireUser):
     return RedirectResponse("/dashboard", status_code=303)
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
+async def dashboard(request: Request, user: RequireUser):
     templates = get_templates(request)
 
-    # #135: dashboard build is read-heavy (getting-started, recent runs,
+    # : dashboard build is read-heavy (getting-started, recent runs,
     # health-chip rollup, watcher-banner account fetch). Run the whole
     # build off the event loop so concurrent /health polls + other
     # operator surfaces don't serialise behind it.
     ctx = await db_call(_build_dashboard_context, request, user)
 
-    return _render(templates, request, "dashboard.html", ctx)
+    return await _render(templates, request, "dashboard.html", ctx)
 
 
 @router.post("/dashboard/dismiss-step", response_class=HTMLResponse)
-async def dashboard_dismiss_step(request: Request):
+async def dashboard_dismiss_step(request: Request, user: RequireUserFragment):
     """Mark a getting-started checklist step as dismissed for the user."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     db = get_db(request)
     form = await request.form()
     step_id = (form.get("step_id") or "").strip()
@@ -187,10 +180,17 @@ async def dashboard_dismiss_step(request: Request):
     from email_triage.web.db import (
         get_dashboard_dismissed_steps, set_dashboard_dismissed_steps,
     )
-    current = get_dashboard_dismissed_steps(db, user["id"])
-    if step_id not in current:
-        current.append(step_id)
-        set_dashboard_dismissed_steps(db, user["id"], current)
+
+    def _dismiss_step_db_work() -> None:
+        """/ — read current dismissed set + append + write,
+        all in one threadpool hop.
+        """
+        current = get_dashboard_dismissed_steps(db, user["id"])
+        if step_id not in current:
+            current.append(step_id)
+            set_dashboard_dismissed_steps(db, user["id"], current)
+
+    await db_call(_dismiss_step_db_work)
     # HTMX: swap out with an empty fragment (card disappears).
     return HTMLResponse("")
 
@@ -203,7 +203,7 @@ async def admin_stats_page(request: Request):
     the dashboard can focus on orientation. Default window is last 24h;
     the dropdown bumps to 1h / 7d / 30d.
     """
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -229,7 +229,7 @@ async def admin_stats_page(request: Request):
         )
         health_payload = {}
 
-    return _render(templates, request, "admin/stats.html", {
+    return await _render(templates, request, "admin/stats.html", {
         "user": user,
         **snap,
         "health": health_payload,
@@ -241,11 +241,8 @@ async def admin_stats_page(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.get("/logs", response_class=HTMLResponse)
-async def logs_page(request: Request):
+async def logs_page(request: Request, user: RequireUser):
     """Admin log viewer showing recent log entries from SQLite."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -253,7 +250,7 @@ async def logs_page(request: Request):
     templates = get_templates(request)
 
     level_filter = request.query_params.get("level", "").upper() or None
-    offset = int(request.query_params.get("offset", "0"))
+    offset = _safe_int(request.query_params.get("offset"), 0)
     # Free-text search — matches message + logger + extras (JSON blob).
     query = (request.query_params.get("q") or "").strip() or None
 
@@ -261,7 +258,7 @@ async def logs_page(request: Request):
         _logs_page_snapshot, db, level_filter, offset, query,
     )
 
-    return _render(templates, request, "logs.html", {
+    return await _render(templates, request, "logs.html", {
         "user": user,
         "entries": snap["entries"],
         "rows": snap["rows"],
@@ -287,7 +284,7 @@ async def admin_tls_legacy(request: Request):
     preserves the pre-refactor contract that
     ``follow_redirects=False`` tests pin against.
     """
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
     qs = request.url.query
@@ -308,7 +305,7 @@ async def admin_compliance_security_legacy(request: Request):
     so anonymous users still bounce to /login and non-admin users
     still get 403.
     """
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
     qs = request.url.query
@@ -325,7 +322,7 @@ async def compliance_page(request: Request):
     Shows: system HIPAA flag, per-account breakdown with lock state,
     recent boundary events. Used for audits.
     """
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
 
@@ -334,7 +331,7 @@ async def compliance_page(request: Request):
 
     snap = await db_call(_compliance_page_snapshot, db, request.app.state)
 
-    return _render(templates, request, "compliance.html", {
+    return await _render(templates, request, "compliance.html", {
         "user": user,
         **snap,
     })
@@ -347,13 +344,13 @@ async def compliance_page(request: Request):
 @router.get("/admin/watches", response_class=HTMLResponse)
 async def admin_watches_page(request: Request):
     """List every watch across every account on the install."""
-    user, err = _require_admin_user(request)
+    user, err = await db_call(_require_admin_user, request)
     if err:
         return err
     db = get_db(request)
     items = await db_call(_build_admin_watches_snapshot, db)
     templates = get_templates(request)
-    return _render(
+    return await _render(
         templates, request, "admin/watches.html",
         {"items": items, "user": user},
     )
@@ -370,7 +367,7 @@ _CONFIG_TAB_SLUGS = (
 
 
 @router.get("/config", response_class=HTMLResponse)
-async def config_page(request: Request):
+async def config_page(request: Request, user: RequireUser):
     """Unified admin configuration page (admin only).
 
     Five tabs collapse the legacy /config + /admin/integrations +
@@ -389,9 +386,6 @@ async def config_page(request: Request):
       backup       -> ``backup.build_backup_context``
       security     -> ``auth_keys.build_dev_keys_context``
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -403,7 +397,7 @@ async def config_page(request: Request):
     config = get_config(request)
     templates = get_templates(request)
 
-    # #171-D — ``baa_banner`` is auto-injected by ``_shared._render``
+    # -D — ``baa_banner`` is auto-injected by ``_shared._render``
     # for admin users (canonical source). Removed from per-handler ctx
     # so the banner has a single source of truth across every admin
     # page (not just /config + /config/ai-backends).
@@ -415,7 +409,7 @@ async def config_page(request: Request):
 
     if tab == "general":
         snap = await db_call(_config_page_snapshot, db, config)
-        # #125 partial — schema-compat version banner. Lives on the
+        #  partial — schema-compat version banner. Lives on the
         # General tab so the admin sees it on every visit to /config.
         # gather_version_status reads its three numbers cheaply (one
         # read-only DB query for db_schema_version; the rest is in
@@ -423,8 +417,12 @@ async def config_page(request: Request):
         version_status = None
         try:
             from email_triage.version import gather_version_status
-            version_status = gather_version_status(
-                config.persistence.db_path,
+            #  — gather_version_status opens a SQLite connection
+            # and runs a schema-version read; dispatch it off the
+            # event loop through db_call so the blocking I/O does not
+            # stall the loop.
+            version_status = await db_call(
+                gather_version_status, config.persistence.db_path,
             )
         except Exception:
             # Banner is informational; never break /config on the
@@ -434,7 +432,7 @@ async def config_page(request: Request):
             "runtime": snap["runtime"],
             "classifier_baa_status": snap["classifier_baa_status"],
             "anti_ai_style_guide_global": snap["anti_ai_style_guide_global"],
-            # #161 — style-learning admin knobs surfaced in the new
+            #  — style-learning admin knobs surfaced in the new
             # Style learning section of /config General tab.
             "style_learning_capture_interval_hours": snap.get(
                 "style_learning_capture_interval_hours", 6,
@@ -535,7 +533,7 @@ async def config_page(request: Request):
             "save_msg": request.query_params.get("save_msg", ""),
             "save_error": request.query_params.get("save_error", ""),
         })
-        # #180 — lazy-install state for the local embedding stack.
+        #  — lazy-install state for the local embedding stack.
         # The card sits between the "Currently running" + metrics
         # blocks; the template uses HTMX self-polling on in-flight
         # states. Defensive try: an unmigrated DB (somehow) renders
@@ -544,7 +542,9 @@ async def config_page(request: Request):
             from email_triage.embedding_bits import (
                 get_install_status, is_runtime_ready,
             )
-            install_state = get_install_status(db)
+            #  — get_install_status reads the shared connection;
+            # dispatch it off the event loop through db_call.
+            install_state = await db_call(get_install_status, db)
             manifest_sha = install_state.get("manifest_sha256") or ""
             ctx.update({
                 "install_state": install_state,
@@ -567,7 +567,7 @@ async def config_page(request: Request):
         ctx.update(await db_call(build_dev_keys_context, request, user))
     # tab == "tls": no extra context needed — static card grid.
 
-    return _render(templates, request, "config.html", ctx)
+    return await _render(templates, request, "config.html", ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +575,7 @@ async def config_page(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.get("/admin/security", response_class=HTMLResponse)
-async def admin_security_page(request: Request):
+async def admin_security_page(request: Request, user: RequireUser):
     """Security & compliance settings page.
 
     Single landing page for everything an auditor cares about that
@@ -584,9 +584,6 @@ async def admin_security_page(request: Request):
     classifier BAA acknowledgments (managed on /config alongside the
     LLM picker).
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -596,7 +593,7 @@ async def admin_security_page(request: Request):
 
     snap = await db_call(_admin_security_snapshot, db, config)
 
-    return _render(templates, request, "admin/security.html", {
+    return await _render(templates, request, "admin/security.html", {
         "user": user,
         "auth": getattr(config, "auth", None),
         "tls_csrf_enforce": bool(
@@ -619,7 +616,7 @@ async def admin_security_page(request: Request):
 
 
 @router.post("/admin/security/save", response_class=HTMLResponse)
-async def admin_security_save(request: Request):
+async def admin_security_save(request: Request, user: RequireUser):
     """Persist HIPAA toggle + CSRF enforce + session TTL.
 
     HIPAA flip records a hipaa_boundary_events row (mirrors the
@@ -627,9 +624,6 @@ async def admin_security_save(request: Request):
     transition. The boundary detector supervised task (PR 9 / D3)
     additionally guards against direct-DB-edit drift.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -642,24 +636,39 @@ async def admin_security_save(request: Request):
     # operator used.
     from email_triage.triage_logging import is_hipaa_mode as _was_hipaa
     pre_hipaa = _was_hipaa()
-    runtime = _get_runtime_settings(db)
-    new_runtime = dict(runtime)
-    new_runtime["hipaa"] = "hipaa" in form
-    from email_triage.web.db import set_setting
-    set_setting(db, _RUNTIME_SETTINGS_KEY, new_runtime)
-    _apply_runtime_settings(new_runtime)
-    if pre_hipaa != new_runtime["hipaa"]:
-        from email_triage.web.db import record_hipaa_boundary
-        direction = "on" if new_runtime["hipaa"] else "off"
-        record_hipaa_boundary(
-            db, "system", direction,
-            actor_id=user["id"],
-            reason="security page toggle",
-        )
-        _log.warning(
-            "System HIPAA mode changed",
-            direction=direction, actor=user["email"],
-        )
+    hipaa_flag = "hipaa" in form
+
+    def _security_save_hipaa_db_work() -> None:
+        """/ — runtime-settings read + write + (on flip) the
+        boundary-event row, all in one threadpool hop. The pure-Python
+        _apply_runtime_settings is folded in too — it has no I/O.
+        """
+        runtime = _get_runtime_settings(db)
+        new_runtime = dict(runtime)
+        new_runtime["hipaa"] = hipaa_flag
+        from email_triage.web.db import set_setting
+        set_setting(db, _RUNTIME_SETTINGS_KEY, new_runtime)
+        # Bundle E5  / Q4 — admin_security_save is the CANONICAL
+        # HIPAA off-ramp and the ONLY source location that should pass
+        # allow_hipaa_change=True. The Sub-check D test at
+        # tests/test_web/test_runtime_settings_hipaa_gate.py enforces
+        # "exactly one call site"; copy-pasting this kwarg into a new
+        # caller fires that test immediately.
+        _apply_runtime_settings(new_runtime, allow_hipaa_change=True)
+        if pre_hipaa != new_runtime["hipaa"]:
+            from email_triage.web.db import record_hipaa_boundary
+            direction = "on" if new_runtime["hipaa"] else "off"
+            record_hipaa_boundary(
+                db, "system", direction,
+                actor_id=user["id"],
+                reason="security page toggle",
+            )
+            _log.warning(
+                "System HIPAA mode changed",
+                direction=direction, actor=user["email"],
+            )
+
+    await db_call(_security_save_hipaa_db_work)
 
     # CSRF enforce — live update on app.state so the change takes
     # effect immediately without a restart (unlike tls.enabled).
@@ -669,7 +678,7 @@ async def admin_security_save(request: Request):
     config.tls.csrf_enforce = csrf_enforce
     request.app.state.csrf_enforce = csrf_enforce
 
-    # #82 item 4 — operator-defined CSRF exempt path prefixes.
+    #  item 4 — operator-defined CSRF exempt path prefixes.
     # Form field is a newline-separated textarea; each line that
     # starts with '/' becomes an entry. Empty / non-/-prefixed lines
     # silently dropped (matches the YAML-loader contract). Refresh
@@ -702,7 +711,7 @@ async def admin_security_save(request: Request):
     except (TypeError, ValueError):
         pass
 
-    # #92 login rate-limit tunables. Sane-range clamps mirror the
+    #  login rate-limit tunables. Sane-range clamps mirror the
     # YAML loader so an operator can't wedge themselves out of the
     # login surface with a typo. ``max=0`` is the documented kill
     # switch (rate-limit off for that scope) and is preserved.
@@ -742,17 +751,14 @@ async def admin_security_save(request: Request):
 
 
 @router.post("/config/baa-ack", response_class=HTMLResponse)
-async def config_baa_ack(request: Request):
-    """Toggle BAA acknowledgment for the (backend, host) tuple (#59).
+async def config_baa_ack(request: Request, user: RequireUserFragment):
+    """Toggle BAA acknowledgment for the (backend, host) tuple.
 
     Admin-only. Persisted via the BAA gate module; the gate itself
     is consulted at classify time on every HIPAA-flagged message.
     Acknowledgments are scoped to the exact (backend, host) tuple,
     so swapping vendors revokes consent automatically.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -770,33 +776,36 @@ async def config_baa_ack(request: Request):
     from email_triage.classify.baa_gate import (
         set_baa_ack, revoke_baa_ack, classifier_baa_status,
     )
-    if acked:
-        set_baa_ack(db, backend, host, user_id=user["id"])
-        _log.info(
-            "BAA acknowledged",
-            backend=backend, host=host, by_user_id=user["id"],
-        )
-    else:
-        revoke_baa_ack(db, backend, host)
-        _log.info(
-            "BAA acknowledgment revoked",
-            backend=backend, host=host, by_user_id=user["id"],
-        )
 
-    # Re-render the chip with the new state.
-    cls = _build_classifier_from_config(config)
-    baa_status = classifier_baa_status(db, cls)
-    return _render(templates, request, "config/_baa_chip.html", {
+    def _baa_ack_db_work() -> dict:
+        """/ — ack write/revoke + baa-status re-read in one
+        threadpool hop. Returns the fresh classifier BAA status dict.
+        """
+        if acked:
+            set_baa_ack(db, backend, host, user_id=user["id"])
+            _log.info(
+                "BAA acknowledged",
+                backend=backend, host=host, by_user_id=user["id"],
+            )
+        else:
+            revoke_baa_ack(db, backend, host)
+            _log.info(
+                "BAA acknowledgment revoked",
+                backend=backend, host=host, by_user_id=user["id"],
+            )
+        # Re-render the chip with the new state.
+        cls = _build_classifier_from_config(config)
+        return classifier_baa_status(db, cls)
+
+    baa_status = await db_call(_baa_ack_db_work)
+    return await _render(templates, request, "config/_baa_chip.html", {
         "classifier_baa_status": baa_status,
     })
 
 
 @router.post("/config/save", response_class=HTMLResponse)
-async def config_save(request: Request):
+async def config_save(request: Request, user: RequireUser):
     """Save all settings (admin only)."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -807,58 +816,90 @@ async def config_save(request: Request):
     form = await request.form()
 
     # ── Runtime settings (DB-persisted) ──
-    # HIPAA mode is now managed on /admin/security; this page renders
-    # a read-only mirror. Preserve the existing DB value here so a
-    # /config save can't zero it out via the absent form field.
-    existing_runtime = _get_runtime_settings(db)
-    # #101 — bulk triage knobs. Clamped to the documented min/max
-    # ceilings; out-of-range or non-numeric input falls back to the
-    # current saved value (don't clobber on bad parse).
-    try:
-        bulk_rate = int(form.get("bulk_triage_rate_msg_per_min", "") or 0)
-    except (TypeError, ValueError):
-        bulk_rate = int(existing_runtime.get(
-            "bulk_triage_rate_msg_per_min",
-            _RUNTIME_DEFAULTS["bulk_triage_rate_msg_per_min"],
-        ))
-    bulk_rate = max(BULK_TRIAGE_RATE_MIN, min(BULK_TRIAGE_RATE_MAX, bulk_rate))
-    try:
-        bulk_conc = int(form.get("bulk_triage_concurrency", "") or 0)
-    except (TypeError, ValueError):
-        bulk_conc = int(existing_runtime.get(
-            "bulk_triage_concurrency",
-            _RUNTIME_DEFAULTS["bulk_triage_concurrency"],
-        ))
-    bulk_conc = max(
-        BULK_TRIAGE_CONCURRENCY_MIN,
-        min(BULK_TRIAGE_CONCURRENCY_MAX, bulk_conc),
-    )
-    # #145.2 — burst depth, same clamp pattern (out-of-range / bad
-    # parse falls back to the saved value rather than zeroing it out).
-    try:
-        bulk_burst = int(form.get("bulk_triage_burst", "") or 0)
-    except (TypeError, ValueError):
-        bulk_burst = int(existing_runtime.get(
-            "bulk_triage_burst",
-            _RUNTIME_DEFAULTS["bulk_triage_burst"],
-        ))
-    bulk_burst = max(
-        BULK_TRIAGE_BURST_MIN,
-        min(BULK_TRIAGE_BURST_MAX, bulk_burst),
-    )
+    #  — read-clamp-write is one atomic critical section. Two admins
+    # saving /config at once previously interleaved: each read the
+    # runtime blob in its own db_call, then each wrote in a separate
+    # one, so the second write clobbered the first on the WHOLE blob
+    # (last-writer-wins, including fields the loser never touched —
+    # e.g. the absent-field ``hipaa`` preserve). The read, the clamp,
+    # and the write now happen inside a single db_call while holding
+    # the process-wide DB write lock, so a concurrent save is
+    # serialised against this one end-to-end.
+    #
+    # Raw form values are parsed up front (no I/O); only the
+    # read-clamp-write touches the DB.
+    raw_dry_run = "dry_run" in form
+    raw_log_level = form.get("log_level", "INFO")
+    raw_bulk_rate = form.get("bulk_triage_rate_msg_per_min", "")
+    raw_bulk_conc = form.get("bulk_triage_concurrency", "")
+    raw_bulk_burst = form.get("bulk_triage_burst", "")
 
-    new_runtime = {
-        "dry_run": "dry_run" in form,
-        "log_level": form.get("log_level", "INFO"),
-        "hipaa": bool(existing_runtime.get("hipaa", False)),
-        "bulk_triage_rate_msg_per_min": bulk_rate,
-        "bulk_triage_concurrency": bulk_conc,
-        "bulk_triage_burst": bulk_burst,
-    }
+    def _save_runtime_settings_atomic() -> dict:
+        """/.2/ — clamp the bulk knobs against the CURRENT
+        saved values and persist, all under the write lock so the
+        read-modify-write is atomic w.r.t. any other writer. Returns
+        the persisted runtime blob so the handler can render it.
 
-    from email_triage.web.db import set_setting
-    set_setting(db, _RUNTIME_SETTINGS_KEY, new_runtime)
-    _apply_runtime_settings(new_runtime)
+        Out-of-range or non-numeric input falls back to the saved
+        value (don't clobber on bad parse). HIPAA mode is managed on
+        /admin/security; the absent form field must preserve the
+        existing DB value, not zero it.
+        """
+        from email_triage.web.db import set_setting
+        from email_triage.web.db_writelock import get_write_lock
+
+        with get_write_lock():
+            existing_runtime = _get_runtime_settings(db)
+            try:
+                bulk_rate = int(raw_bulk_rate or 0)
+            except (TypeError, ValueError):
+                bulk_rate = int(existing_runtime.get(
+                    "bulk_triage_rate_msg_per_min",
+                    _RUNTIME_DEFAULTS["bulk_triage_rate_msg_per_min"],
+                ))
+            bulk_rate = max(
+                BULK_TRIAGE_RATE_MIN, min(BULK_TRIAGE_RATE_MAX, bulk_rate),
+            )
+            try:
+                bulk_conc = int(raw_bulk_conc or 0)
+            except (TypeError, ValueError):
+                bulk_conc = int(existing_runtime.get(
+                    "bulk_triage_concurrency",
+                    _RUNTIME_DEFAULTS["bulk_triage_concurrency"],
+                ))
+            bulk_conc = max(
+                BULK_TRIAGE_CONCURRENCY_MIN,
+                min(BULK_TRIAGE_CONCURRENCY_MAX, bulk_conc),
+            )
+            try:
+                bulk_burst = int(raw_bulk_burst or 0)
+            except (TypeError, ValueError):
+                bulk_burst = int(existing_runtime.get(
+                    "bulk_triage_burst",
+                    _RUNTIME_DEFAULTS["bulk_triage_burst"],
+                ))
+            bulk_burst = max(
+                BULK_TRIAGE_BURST_MIN,
+                min(BULK_TRIAGE_BURST_MAX, bulk_burst),
+            )
+
+            new_runtime = {
+                "dry_run": raw_dry_run,
+                "log_level": raw_log_level,
+                # HIPAA managed on /admin/security; preserve the DB
+                # value read inside this same locked section.
+                "hipaa": bool(existing_runtime.get("hipaa", False)),
+                "bulk_triage_rate_msg_per_min": bulk_rate,
+                "bulk_triage_concurrency": bulk_conc,
+                "bulk_triage_burst": bulk_burst,
+            }
+            set_setting(db, _RUNTIME_SETTINGS_KEY, new_runtime)
+        # _apply_runtime_settings is pure-Python (no I/O); run it
+        # after releasing the lock with the just-persisted blob.
+        _apply_runtime_settings(new_runtime)
+        return new_runtime
+
+    new_runtime = await db_call(_save_runtime_settings_atomic)
 
     # ── Classifier settings (in-memory + YAML) ──
     config.classifier.backend = form.get("classifier_backend", config.classifier.backend)
@@ -870,13 +911,13 @@ async def config_save(request: Request):
 
     # ── SMTP settings (in-memory + YAML) ──
     config.smtp.host = form.get("smtp_host", config.smtp.host).strip()
-    config.smtp.port = int(form.get("smtp_port", config.smtp.port) or 587)
+    config.smtp.port = _safe_int(form.get("smtp_port"), config.smtp.port)
     config.smtp.username = form.get("smtp_username", config.smtp.username).strip()
     config.smtp.from_addr = form.get("smtp_from_addr", config.smtp.from_addr).strip()
     config.smtp.from_name = form.get("smtp_from_name", config.smtp.from_name).strip()
     config.smtp.use_tls = "smtp_use_tls" in form
 
-    # ── Daily health (#27) + Admin email recipients (CR-2c) + summary sig (#33) ──
+    # ── Daily health + Admin email recipients (CR-2c) + summary sig ──
     config.health_email.enabled = "health_email_enabled" in form
     # CR-2c rename. Canonical field is ``admin_email_recipients`` now.
     # The legacy ``health_email_recipients`` field is honoured as a
@@ -939,7 +980,7 @@ async def config_save(request: Request):
     _anti_ai_global_raw = (
         form.get("anti_ai_style_guide_global") or ""
     ).strip()[:ANTI_AI_STYLE_GUIDE_MAX_LEN]
-    set_global_anti_ai_style_guide(db, _anti_ai_global_raw)
+    await db_call(set_global_anti_ai_style_guide, db, _anti_ai_global_raw)
 
     # Google OAuth + Office 365 OAuth install-level credentials moved
     # to /admin/integrations on 2026-05-10 — see
@@ -990,7 +1031,7 @@ async def config_save(request: Request):
         poll_iv, config.ingestion.POLL_MIN, config.ingestion.POLL_MAX, config.ingestion.STEP,
     )
 
-    # ── Style learning — auto-scan cadence + default mine size (#161) ──
+    # ── Style learning — auto-scan cadence + default mine size ──
     # Persisted in the ``settings`` table (DB), not the YAML config —
     # both are install-wide operator knobs that the admin tunes
     # without needing to touch the YAML. The helper clamps to the
@@ -1007,7 +1048,10 @@ async def config_save(request: Request):
             form.get("style_learning_capture_interval_hours") or 0
         )
         if _cadence_hours > 0:
-            set_style_learning_capture_interval_hours(db, _cadence_hours)
+            await db_call(
+                set_style_learning_capture_interval_hours,
+                db, _cadence_hours,
+            )
     except (TypeError, ValueError):
         pass
     try:
@@ -1015,7 +1059,9 @@ async def config_save(request: Request):
             form.get("style_learning_mine_limit_default") or 0
         )
         if _mine_limit > 0:
-            set_style_learning_mine_limit_default(db, _mine_limit)
+            await db_call(
+                set_style_learning_mine_limit_default, db, _mine_limit,
+            )
     except (TypeError, ValueError):
         pass
 
@@ -1034,17 +1080,23 @@ async def config_save(request: Request):
               classifier_backend=config.classifier.backend,
               classifier_model=config.classifier.model)
 
-    return _render(templates, request, "config.html", {
+    # / — the two style-learning re-reads for the render off
+    # the loop in one hop.
+    def _style_learning_render_reads() -> tuple[int, int]:
+        return (
+            get_style_learning_capture_interval_hours(db),
+            get_style_learning_mine_limit_default(db),
+        )
+
+    _sl_cadence, _sl_mine = await db_call(_style_learning_render_reads)
+
+    return await _render(templates, request, "config.html", {
         "user": user,
         "config": config,
         "runtime": new_runtime,
         "anti_ai_style_guide_global": _anti_ai_global_raw,
-        "style_learning_capture_interval_hours": (
-            get_style_learning_capture_interval_hours(db)
-        ),
-        "style_learning_mine_limit_default": (
-            get_style_learning_mine_limit_default(db)
-        ),
+        "style_learning_capture_interval_hours": _sl_cadence,
+        "style_learning_mine_limit_default": _sl_mine,
         "inline_limit_ceiling": STYLE_LEARNING_INLINE_LIMIT_CEILING,
         "save_msg": msg,
         "save_error": save_error,
@@ -1058,7 +1110,7 @@ async def config_save(request: Request):
 
 
 @router.post("/config/ai-backends/save", response_class=HTMLResponse)
-async def config_ai_backends_save(request: Request):
+async def config_ai_backends_save(request: Request, user: RequireUser):
     """Persist the AI backend config (embedding primary + fallback).
 
     Writes to the in-memory ``app.state.config`` (so subsequent /config
@@ -1068,9 +1120,6 @@ async def config_ai_backends_save(request: Request):
     and is constructed once at boot. The save-message banner tells
     the operator to restart.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -1122,16 +1171,13 @@ async def config_ai_backends_save(request: Request):
 
 
 @router.post("/config/health-email/send-now", response_class=HTMLResponse)
-async def health_email_send_now(request: Request):
+async def health_email_send_now(request: Request, user: RequireUser):
     """Fire the daily health digest on demand (admin only).
 
     Uses the same codepath as the background scheduler — just with
     ``force=True`` so ``quiet_mode`` doesn't suppress a test send when
     the day is boringly healthy.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -1142,13 +1188,19 @@ async def health_email_send_now(request: Request):
     watcher_mgr = getattr(request.app.state, "watcher_manager", None)
 
     from email_triage.web.daily_health import send_daily_health_email
-    sent, reason = send_daily_health_email(
-        db, config, secrets, watcher_mgr, force=True,
-    )
 
+    def _health_send_db_work() -> tuple[bool, str, dict]:
+        """/ — the daily-health send (DB reads + SMTP) plus the
+        runtime-settings re-read, all off the event loop in one hop.
+        """
+        sent_, reason_ = send_daily_health_email(
+            db, config, secrets, watcher_mgr, force=True,
+        )
+        return sent_, reason_, _get_runtime_settings(db)
+
+    sent, reason, runtime = await db_call(_health_send_db_work)
     msg = f"Daily health email: {reason}" if sent else f"Not sent — {reason}"
-    runtime = _get_runtime_settings(db)
-    return _render(templates, request, "config.html", {
+    return await _render(templates, request, "config.html", {
         "user": user,
         "config": config,
         "runtime": runtime,
@@ -1160,7 +1212,7 @@ async def health_email_send_now(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# #121-A — Explain-this-error endpoint
+# -A — Explain-this-error endpoint
 #
 # HTMX-driven button on /logs (per-error chip) and on the O365 probe
 # failure chip. Submits the verbatim error string + provider/class
@@ -1171,7 +1223,7 @@ async def health_email_send_now(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/explain-error", response_class=HTMLResponse)
-async def explain_error_endpoint(request: Request):
+async def explain_error_endpoint(request: Request, user: RequireUserFragment):
     """Render an AI-generated plain-English explanation of an
     integration error string.
 
@@ -1191,9 +1243,6 @@ async def explain_error_endpoint(request: Request):
     account-edit / probe surface. Without an account_id we just
     require admin role (errors are operator-facing).
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     if user["role"] != "admin":
         return HTMLResponse("Forbidden", status_code=403)
 
@@ -1225,38 +1274,52 @@ async def explain_error_endpoint(request: Request):
         from email_triage.web.db import (
             can_manage_account, get_email_account,
         )
-        acct = get_email_account(db, account_id)
-        if acct is None:
+
+        def _explain_hipaa_gate() -> tuple[bool, bool]:
+            """/ — fetch + can-manage check in one hop. Returns
+            ``(exists, can_manage)``.
+            """
+            acct = get_email_account(db, account_id)
+            if acct is None:
+                return False, False
+            return True, can_manage_account(db, user, acct)
+
+        exists, can_manage = await db_call(_explain_hipaa_gate)
+        if not exists:
             return HTMLResponse("Account not found", status_code=404)
-        if not can_manage_account(db, user, acct):
+        if not can_manage:
             return HTMLResponse("Forbidden", status_code=403)
 
     # Audit row so the operator can see the AI was consulted. Detail
     # carries the error_class + provider for cross-row correlation
     # but NEVER the raw error_text (could include partial PHI in
     # exotic provider responses).
-    try:
-        from email_triage.web.db import record_auth_event
-        detail_parts = []
-        if provider:
-            detail_parts.append(f"provider={provider}")
-        if error_class:
-            detail_parts.append(f"class={error_class}")
-        if account_id is not None:
-            detail_parts.append(f"account_id={account_id}")
-        record_auth_event(
-            db,
-            event_type="explain_error",
-            email=user.get("email", ""),
-            user_id=user.get("id"),
-            outcome="success",
-            detail=", ".join(detail_parts) or None,
-        )
-    except Exception as e:
-        _log.warning(
-            "explain_error: audit write failed (continuing)",
-            error=fmt_exc(e),
-        )
+    def _explain_audit_db_work() -> None:
+        """/ — best-effort explain_error audit row off the loop."""
+        try:
+            from email_triage.web.db import record_auth_event
+            detail_parts = []
+            if provider:
+                detail_parts.append(f"provider={provider}")
+            if error_class:
+                detail_parts.append(f"class={error_class}")
+            if account_id is not None:
+                detail_parts.append(f"account_id={account_id}")
+            record_auth_event(
+                db,
+                event_type="explain_error",
+                email=user.get("email", ""),
+                user_id=user.get("id"),
+                outcome="success",
+                detail=", ".join(detail_parts) or None,
+            )
+        except Exception as e:
+            _log.warning(
+                "explain_error: audit write failed (continuing)",
+                error=fmt_exc(e),
+            )
+
+    await db_call(_explain_audit_db_work)
 
     from email_triage.web.error_explain import explain_error
     explanation = await explain_error(

@@ -1,15 +1,18 @@
-"""Tests for the LLM-backend circuit breaker (#149 Bundle B)."""
+"""Tests for the LLM-backend circuit breaker."""
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
+from email_triage.classify.gemini import GeminiClassifier
 from email_triage.classify.ollama import OllamaClassifier
+from email_triage.classify.openai_compat import OpenAICompatClassifier
 from email_triage.engine.models import EmailMessage
 from email_triage.llm_health import (
     LLMBackendUnreachableError,
@@ -20,6 +23,7 @@ from email_triage.llm_health import (
     is_healthy,
     is_unreachable_error,
     set_unhealthy,
+    translate_unreachable,
 )
 
 
@@ -115,7 +119,7 @@ async def test_classify_raises_typed_error_and_trips_breaker(monkeypatch):
     wrapper sets the unhealthy flag AND re-raises a typed
     LLMBackendUnreachableError carrying host + port."""
     classifier = OllamaClassifier(
-        model="[local-llm-model]
+        model="qwen3.5:35b",
         base_url="http://llm-host:11434",
         prefer_loaded=False,
     )
@@ -167,7 +171,7 @@ async def test_classify_raises_typed_error_and_trips_breaker(monkeypatch):
 async def test_classify_does_not_trip_breaker_on_decode_error(monkeypatch):
     """Backend returns 200 but bad JSON → does NOT trip breaker."""
     classifier = OllamaClassifier(
-        model="[local-llm-model]
+        model="qwen3.5:35b",
         base_url="http://llm-host:11434",
         prefer_loaded=False,
     )
@@ -207,3 +211,138 @@ async def test_classify_does_not_trip_breaker_on_decode_error(monkeypatch):
 
     # Breaker stays closed.
     assert is_healthy("ollama") is True
+
+
+# ---------------------------------------------------------------------------
+#  — shared translate_unreachable helper
+# ---------------------------------------------------------------------------
+
+class TestTranslateUnreachable:
+    """The shared circuit-breaker translation helper — used by every
+    HTTP classifier backend (Ollama, OpenAI-compatible, Gemini)."""
+
+    def test_connect_error_trips_breaker_and_raises_typed(self):
+        with pytest.raises(LLMBackendUnreachableError) as ei:
+            with translate_unreachable(
+                "openai", "https://api.openai.com/v1", default_port=443,
+            ):
+                raise httpx.ConnectError("All connection attempts failed")
+        err = ei.value
+        assert err.backend == "openai"
+        assert err.host == "api.openai.com"
+        assert err.port == 443
+        assert is_healthy("openai") is False
+
+    def test_decode_error_passes_through_breaker_closed(self):
+        """A non-connect error (parse / 500) propagates unchanged and
+        does NOT trip the breaker."""
+        with pytest.raises(ValueError):
+            with translate_unreachable(
+                "gemini", "https://x/v1beta", default_port=443,
+            ):
+                raise ValueError("could not parse JSON")
+        assert is_healthy("gemini") is True
+
+    def test_success_path_no_breaker_change(self):
+        with translate_unreachable(
+            "openai", "https://api.openai.com/v1", default_port=443,
+        ):
+            pass
+        assert is_healthy("openai") is True
+
+    def test_connection_refused_substring_trips_breaker(self):
+        with pytest.raises(LLMBackendUnreachableError):
+            with translate_unreachable(
+                "gemini", "https://x/v1beta", default_port=443,
+            ):
+                raise RuntimeError("Connection refused")
+        assert is_healthy("gemini") is False
+
+
+def _stub_http_bomb(classifier):
+    """Swap the classifier's pooled client for one whose .post() raises
+    a connect error — mirrors the test_openai_compat / test_gemini
+    _mock_http stub shape."""
+    bomb = AsyncMock()
+    bomb.post.side_effect = httpx.ConnectError("All connection attempts failed")
+    classifier._http = SimpleNamespace(
+        get=AsyncMock(return_value=bomb),
+        aclose=AsyncMock(),
+    )
+
+
+def _email():
+    return EmailMessage(
+        message_id="m1",
+        provider="imap",
+        sender="from@example.com",
+        recipients=["to@example.com"],
+        subject="hi",
+        body_text="hello",
+        date=datetime(2026, 5, 21, 12, 0, tzinfo=timezone.utc),
+    )
+
+
+class TestCloudClassifierBreaker:
+    """ — the cloud classifiers (OpenAI-compatible, Gemini) now
+    translate a transport error into the circuit breaker, keyed per
+    backend, exactly as Ollama has since ."""
+
+    async def test_openai_compat_classify_trips_openai_breaker(self):
+        classifier = OpenAICompatClassifier(
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o",
+            api_key="sk-test",
+        )
+        _stub_http_bomb(classifier)
+        with pytest.raises(LLMBackendUnreachableError) as ei:
+            await classifier.classify(_email(), {"to-respond": "x"}, None)
+        assert ei.value.backend == "openai"
+        # Breaker keyed "openai" — matches config.classifier.backend.
+        assert is_healthy("openai") is False
+        # Ollama's breaker is untouched.
+        assert is_healthy("ollama") is True
+
+    async def test_openai_compat_complete_trips_openai_breaker(self):
+        classifier = OpenAICompatClassifier(
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o",
+            api_key="sk-test",
+        )
+        _stub_http_bomb(classifier)
+        with pytest.raises(LLMBackendUnreachableError):
+            await classifier.complete("explain this")
+        assert is_healthy("openai") is False
+
+    async def test_gemini_classify_trips_gemini_breaker(self):
+        classifier = GeminiClassifier(
+            model="gemini-2.0-flash", api_key="test-key",
+        )
+        _stub_http_bomb(classifier)
+        with pytest.raises(LLMBackendUnreachableError) as ei:
+            await classifier.classify(_email(), {"to-respond": "x"}, None)
+        assert ei.value.backend == "gemini"
+        assert is_healthy("gemini") is False
+        assert is_healthy("ollama") is True
+
+    async def test_openai_compat_decode_error_does_not_trip_breaker(self):
+        """A 200 with unparseable JSON must NOT trip the breaker."""
+        classifier = OpenAICompatClassifier(
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o",
+            api_key="sk-test",
+        )
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "not-json"}}],
+        }
+        mock_resp.raise_for_status = lambda: None
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_resp
+        classifier._http = SimpleNamespace(
+            get=AsyncMock(return_value=mock_client),
+            aclose=AsyncMock(),
+        )
+        with pytest.raises(ValueError):
+            await classifier.classify(_email(), {"to-respond": "x"}, None)
+        assert is_healthy("openai") is True

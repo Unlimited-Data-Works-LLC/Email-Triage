@@ -1,6 +1,6 @@
 """Routes for the openclaw concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,6 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +49,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.openclaw")
 
 router = APIRouter()
@@ -58,7 +58,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -103,7 +103,7 @@ async def openclaw_editor_fragment(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Return the inline form for editing OpenClaw quiet-hours / pause."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
 
     from email_triage.web.events import get_openclaw_quiet_settings
@@ -135,7 +135,7 @@ async def openclaw_editor_fragment(
 async def openclaw_chip_fragment(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     chip = await db_call(_render_openclaw_chip, db, account_id)
     return HTMLResponse(chip)
@@ -145,7 +145,7 @@ async def openclaw_chip_fragment(
 async def openclaw_quiet_hours_save(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
 
     form = await request.form()
@@ -163,7 +163,7 @@ async def openclaw_quiet_hours_save(
 
 
 # ---------------------------------------------------------------------------
-# Email watches UI (#100)
+# Email watches UI
 # ---------------------------------------------------------------------------
 #
 # Per-account watches list lives on /accounts/{id}/edit?tab=watches.

@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.gmail_push_auth import (
     GmailPushVerificationError,
     _CertCache,
@@ -104,7 +105,9 @@ async def gmail_push(request: Request):
         return JSONResponse({"status": "error", "reason": "no_db"}, status_code=503)
 
     from email_triage.web.db import get_gmail_watch_by_email
-    watch = get_gmail_watch_by_email(db, email_address)
+    # ASYNC-DB: watch demux read off the event loop — this is the
+    # live Gmail push-ingestion path.
+    watch = await db_call(get_gmail_watch_by_email, db, email_address)
     if watch is None:
         # In-flight delivery after stop_watch, or an email we never watched.
         # Return 200 so Pub/Sub stops retrying.
@@ -126,14 +129,16 @@ async def gmail_push(request: Request):
         _inc_counter(request, "gmail_push.queue_full")
         return JSONResponse({"status": "error", "reason": "queue_full"}, status_code=503)
 
-    # #166 — persist a per-day per-account delivery row for the
+    #  — persist a per-day per-account delivery row for the
     # /admin/stats rollup. Best-effort: any failure here MUST NOT
     # 5xx the webhook (Pub/Sub would retry, double-counting and
     # double-queueing). The in-memory counter at _inc_counter
     # remains for live debug; this writes the persisted shape.
     try:
         from email_triage.web.db import record_push_delivery
-        record_push_delivery(
+        # ASYNC-DB: delivery-counter write off the event loop.
+        await db_call(
+            record_push_delivery,
             db, account_id=watch["account_id"], provider="gmail",
         )
     except Exception:
@@ -179,7 +184,7 @@ def _inc_counter_local(request: Request, key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Microsoft Graph webhook receiver  (#53)
+# Microsoft Graph webhook receiver
 # ---------------------------------------------------------------------------
 
 async def _office365_webhook(request: Request):
@@ -268,7 +273,10 @@ async def _office365_webhook(request: Request):
         watch = None
         if db is not None and get_o365_subscription_by_subscription_id is not None:
             try:
-                watch = get_o365_subscription_by_subscription_id(db, sub_id)
+                # ASYNC-DB: subscription demux read off the loop.
+                watch = await db_call(
+                    get_o365_subscription_by_subscription_id, db, sub_id,
+                )
             except Exception:
                 watch = None
 
@@ -284,7 +292,7 @@ async def _office365_webhook(request: Request):
             continue
 
         # clientState verification — constant-time compare.
-        # #132 — when no clientState secret is stored for this
+        #  — when no clientState secret is stored for this
         # account (neither per-account nor install-wide), the prior
         # implementation skipped the compare entirely. That meant any
         # actor who learned the subscriptionId (Microsoft Graph leaks
@@ -306,7 +314,9 @@ async def _office365_webhook(request: Request):
             try:
                 from email_triage.web.db import record_auth_event
                 if db is not None:
-                    record_auth_event(
+                    # ASYNC-DB: auth-event write off the loop.
+                    await db_call(
+                        record_auth_event,
                         db,
                         event_type="o365_webhook_auth",
                         email="",
@@ -340,7 +350,9 @@ async def _office365_webhook(request: Request):
             try:
                 from email_triage.web.db import record_auth_event
                 if db is not None:
-                    record_auth_event(
+                    # ASYNC-DB: auth-event write off the loop.
+                    await db_call(
+                        record_auth_event,
                         db,
                         event_type="o365_webhook_auth",
                         email="",
@@ -366,7 +378,8 @@ async def _office365_webhook(request: Request):
         # Stamp last_notification_at heartbeat.
         if record_o365_notification is not None:
             try:
-                record_o365_notification(db, sub_id)
+                # ASYNC-DB: heartbeat write off the loop.
+                await db_call(record_o365_notification, db, sub_id)
             except Exception:
                 pass
 
@@ -381,13 +394,15 @@ async def _office365_webhook(request: Request):
                     "message_id": message_id,
                 })
                 queued += 1
-                # #166 — persist a per-day per-account delivery row
+                #  — persist a per-day per-account delivery row
                 # for the /admin/stats rollup. Best-effort: any
                 # failure here MUST NOT 5xx the webhook (Graph
                 # would retry, double-counting + double-queueing).
                 try:
                     from email_triage.web.db import record_push_delivery
-                    record_push_delivery(
+                    # ASYNC-DB: delivery-counter write off the loop.
+                    await db_call(
+                        record_push_delivery,
                         db,
                         account_id=watch.get("account_id"),
                         provider="office365",
@@ -436,7 +451,7 @@ def _expected_client_state(request: Request, watch: dict) -> str:
     set, and finally to empty string. Empty-string return is treated
     by the receiver as "needs re-registration" — the receiver MUST
     fail-closed (HTTP 401) rather than skipping the compare. See
-    #132 for the security gap that caused this contract change:
+     for the security gap that caused this contract change:
     pre-fix subscriptions registered with ``client_state=""`` on the
     Graph side stay deliverable until the operator clicks Stop +
     Start in /admin/integrations to re-register with a freshly-
@@ -461,7 +476,7 @@ def _expected_client_state(request: Request, watch: dict) -> str:
 
 @router.post("/office365")
 async def office365_push(request: Request):
-    """Canonical O365/Graph webhook receiver path (#53)."""
+    """Canonical O365/Graph webhook receiver path."""
     return await _office365_webhook(request)
 
 
@@ -469,7 +484,7 @@ async def office365_push(request: Request):
 async def graph_push(request: Request):
     """Back-compat alias for ``/webhooks/office365``.
 
-    Older subscriptions registered before #53 used ``/webhooks/graph``
+    Older subscriptions registered before  used ``/webhooks/graph``
     as the notificationUrl; keep the alias around so they don't go
     silent during the transition window.
     """

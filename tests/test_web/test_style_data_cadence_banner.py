@@ -1,4 +1,4 @@
-"""#161 item 1 — cadence banner at the top of /profile/style-data.
+""" item 1 — cadence banner at the top of /profile/style-data.
 
 The banner surfaces the live install-wide capture-loop cadence so the
 user knows how often the AI refreshes its view of their writing voice

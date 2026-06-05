@@ -1,4 +1,4 @@
-"""Admin-driven backup export (punch-list #65).
+"""Admin-driven backup export (the backlog ).
 
 Two POST routes that produce encrypted bundle downloads + a GET that
 renders the form. Both routes:
@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from email_triage import backup as backup_mod
 from email_triage._errfmt import fmt_exc
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 
 log = logging.getLogger("email_triage.web.routers.backup")
@@ -51,9 +52,11 @@ def _get_templates(request: Request):
     return request.app.state.templates
 
 
-def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
+async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
+    """ / Option B — async wrapper delegating to the shared async
+    ``_render``; callers ``await`` it."""
     from email_triage.web.routers.ui import _render as _render_ui
-    return _render_ui(_get_templates(request), request, name, ctx or {})
+    return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
 def _require_admin(request: Request):
@@ -124,10 +127,11 @@ def _make_bootstrap_provider(config):
         backend=config.secrets.backend,
         keyfile_path=config.secrets.keyfile_path,
         external_config=config.secrets.external,
+        master_key_name=config.secrets.master_key_name,
     )
 
 
-def _audit_event(
+async def _audit_event(
     db: sqlite3.Connection,
     *,
     event_type: str,
@@ -139,12 +143,16 @@ def _audit_event(
     JSON-encoded into the ``detail`` column. Failure to record is
     logged but never fails the download -- audit gap is less bad
     than denying a working backup.
+
+    ASYNC-DB: the write runs off the event loop. Every caller is
+    an ``async def`` handler, so this stays awaitable.
     """
     try:
         import json
         from email_triage.web.db import record_auth_event
         detail = json.dumps(metadata or {}, separators=(",", ":"))
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type=event_type,
             email=email,
@@ -191,7 +199,7 @@ async def admin_backup_legacy(request: Request):
     and non-admin users still get 403 — preserves the pre-refactor
     contract that ``follow_redirects=False`` tests pin against.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     qs = request.url.query
@@ -230,7 +238,7 @@ async def admin_backup_export_full(
 ):
     """Build + stream a full backup bundle. Form fields are
     URL-encoded; checkboxes carry "1" when checked, "" when not."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -250,7 +258,14 @@ async def admin_backup_export_full(
     inc_logs = include_logs in ("1", "on", "true")
 
     try:
-        bundle = backup_mod.build_full_bundle(
+        # ASYNC-DB: the bundle build calls
+        # ``sqlite3.Connection.backup()`` on the shared connection —
+        # a blocking, page-by-page snapshot. Dispatching the whole
+        # build through ``db_call`` runs it off the event loop AND
+        # under the / lock, so a concurrent request can't
+        # collide on the shared connection mid-snapshot.
+        bundle = await db_call(
+            backup_mod.build_full_bundle,
             db_conn=db,
             config_path=_resolve_config_path(config),
             data_dir=_resolve_data_dir(config),
@@ -269,7 +284,7 @@ async def admin_backup_export_full(
             ),
         )
     except backup_mod.WeakPassphraseError as e:
-        _audit_event(
+        await _audit_event(
             db,
             event_type="backup_export_full",
             email=user.get("email", ""),
@@ -285,7 +300,7 @@ async def admin_backup_export_full(
             "Full bundle build failed",
             extra={"_extra": {"error": fmt_exc(e), "type": type(e).__name__}},
         )
-        _audit_event(
+        await _audit_event(
             db,
             event_type="backup_export_full",
             email=user.get("email", ""),
@@ -297,7 +312,7 @@ async def admin_backup_export_full(
             status_code=303,
         )
 
-    _audit_event(
+    await _audit_event(
         db,
         event_type="backup_export_full",
         email=user.get("email", ""),
@@ -350,7 +365,7 @@ async def admin_backup_export_key(
     """Build + stream a key-only bundle. Tiny payload (~hundred bytes
     encrypted). Operator stores this separately from the full bundle
     so an attacker who gets one bundle can't decrypt the install."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -372,7 +387,7 @@ async def admin_backup_export_key(
             hostname=_filename(config, "x", "x").split("-")[2],
         )
     except backup_mod.WeakPassphraseError as e:
-        _audit_event(
+        await _audit_event(
             db,
             event_type="backup_export_key",
             email=user.get("email", ""),
@@ -388,7 +403,7 @@ async def admin_backup_export_key(
             "Key-only bundle build failed",
             extra={"_extra": {"error": fmt_exc(e), "type": type(e).__name__}},
         )
-        _audit_event(
+        await _audit_event(
             db,
             event_type="backup_export_key",
             email=user.get("email", ""),
@@ -400,7 +415,7 @@ async def admin_backup_export_key(
             status_code=303,
         )
 
-    _audit_event(
+    await _audit_event(
         db,
         event_type="backup_export_key",
         email=user.get("email", ""),

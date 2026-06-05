@@ -1,0 +1,104 @@
+# email-triage-api — OpenClaw skill
+
+Thin Python wrapper around email-triage's `/api/openclaw/*` HTTP
+surface. Lives in this repo (versioned with the API it wraps) and
+deploys to the OpenClaw host at `~/.openclaw/skills/email-triage-api/` —
+the OpenClaw **managed** skills directory, scanned automatically for
+every agent on the gateway. One physical install, one `users.json`,
+zero drift.
+
+## Deploy to the OpenClaw host
+
+From the email-triage repo root:
+
+```bash
+ssh <openclaw-host> "mkdir -p ~/.openclaw/skills"
+tar -cC openclaw/skills email-triage-api | \
+  ssh <openclaw-host> "tar -xC ~/.openclaw/skills/"
+```
+
+Then one edit in `~/.openclaw/openclaw.json` — the skill entry.
+OpenClaw scans `~/.openclaw/skills/` as the managed source for **every**
+agent automatically, so no path configuration is needed:
+
+```jsonc
+{
+  "skills": {
+    "entries": {
+      "email-triage-api": {
+        "enabled": true,
+        "env": {
+          "EMAIL_TRIAGE_URL": "https://triage.example.com:8080"
+        }
+      }
+    }
+  }
+}
+```
+
+`EMAIL_TRIAGE_URL` must be the HTTPS endpoint the email-triage container
+serves on (the cert hostname). Plain HTTP is rejected.
+
+Restart: `systemctl --user restart openclaw-gateway`.
+
+**Do NOT add `skills.load.extraDirs` pointing at the managed dir** —
+it's redundant (the managed scan already covers it). An operator-
+private handover doc captures the dead-end iterations that surfaced
+this gotcha.
+
+**No token in openclaw.json.** Tokens are per-user and live in a
+separate `users.json` at the skill root (see below).
+
+## Token layout — one per user, self-serve
+
+A single `~/.openclaw/skills/email-triage-api/users.json` (mode
+`0600`, owned by `openclaw`) maps short aliases to tokens:
+
+```jsonc
+{
+  "default": "et_...",      // fallback when no --as is given
+  "bob":   "et_...",
+  "alice": "et_..."
+}
+```
+
+Each agent passes `--as <alias>` on every call so the right token is
+used. The skill falls back to `users.json["default"]`, then to the
+legacy `EMAIL_TRIAGE_TOKEN` env var, only when `--as` isn't given.
+
+### User self-serve workflow
+
+1. Log into email-triage → **Accounts** → **🔑 Access Tokens** →
+   **Create a token**.
+2. The success panel shows the `et_...` value and a sentence to paste
+   into their AI assistant's chat, like:
+   > *Please save my new email-triage token. Run this command:
+   > `email-triage-api register-me --as alice --token et_...`*
+3. The assistant runs the command once. The skill writes the new
+   alias to `users.json` (append-or-overwrite). Done.
+
+### Manual token management
+
+```bash
+python3 ~/.openclaw/skills/email-triage-api/scripts/email-triage-api.py register-me \
+    --as alice --token et_...
+python3 ~/.openclaw/skills/email-triage-api/scripts/email-triage-api.py list-aliases
+python3 ~/.openclaw/skills/email-triage-api/scripts/email-triage-api.py forget-me \
+    --as alice
+```
+
+`register-me` / `forget-me` / `list-aliases` are pure local-file ops —
+they don't hit the server and don't need a URL or token configured.
+
+## Smoke test after deploy
+
+```bash
+ssh <openclaw-host> "python3 ~/.openclaw/skills/email-triage-api/scripts/email-triage-api.py accounts-list"
+```
+
+Expect: JSON list of your non-HIPAA accounts. (Uses the `default`
+alias from `users.json` or the env-var fallback.)
+
+## Full command reference
+
+See [SKILL.md](SKILL.md) — the canonical manifest + command table.

@@ -8,8 +8,26 @@ point that idempotently creates every table and index.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
+
+from email_triage.web.db_writelock import db_write
+from email_triage.db._helpers import apply_compatible_row_factory, row_get
+
+# Audit cluster — DDL constants live in db/audit.py. Imported
+# here for _ALL_DDL ordering; the functions over these tables are
+# re-exported via the back-compat shim at the bottom of this module.
+from email_triage.db.audit import (
+    _ACCESS_LOG_DDL,
+    _API_KEY_EVENTS_DDL,
+    _AUTH_EVENTS_DDL,
+    _DISCOVER_RUNS_DDL,
+    _HIPAA_ACCESS_EVENTS_DDL,
+    _HIPAA_BOUNDARY_EVENTS_DDL,
+    _LOG_ENTRIES_DDL,
+    _USER_STATUS_EVENTS_DDL,
+)
 
 # ---------------------------------------------------------------------------
 # DDL statements  (each block is idempotent via IF NOT EXISTS)
@@ -51,19 +69,6 @@ CREATE TABLE IF NOT EXISTS users (
     disabled_by_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-"""
-
-_USER_STATUS_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS user_status_events (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts             TEXT NOT NULL,
-    target_user_id INTEGER NOT NULL,
-    actor_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    event          TEXT NOT NULL,
-    reason         TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_user_status_events_target ON user_status_events(target_user_id);
-CREATE INDEX IF NOT EXISTS idx_user_status_events_ts ON user_status_events(ts);
 """
 
 _CLASSIFICATION_LISTS_DDL = """\
@@ -159,56 +164,6 @@ CREATE TABLE IF NOT EXISTS email_accounts (
 CREATE INDEX IF NOT EXISTS idx_email_accounts_user ON email_accounts(user_id);
 """
 
-_HIPAA_BOUNDARY_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS hipaa_boundary_events (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts        TEXT NOT NULL,
-    scope     TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    actor_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    reason    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hipaa_boundary_ts    ON hipaa_boundary_events(ts);
-CREATE INDEX IF NOT EXISTS idx_hipaa_boundary_scope ON hipaa_boundary_events(scope);
-"""
-
-
-# PR 9 / D4 — append-only audit trail for credential use. The
-# pre-PR-9 shape was: dev_keys.last_used_at + dev_keys.last_used_ip
-# overwrite the row on every successful auth; same for hardware_keys.
-# Operators auditing "when did key X authenticate, from where, for
-# whom" historically had ONLY the most-recent value -- prior uses
-# were silently lost. This table records each use as a row so the
-# full history is preserved.
-#
-# event_type:
-#   "login_otp"          -- standard email-OTP login.
-#   "login_dev_keypair"  -- admin-managed Ed25519 keypair login.
-#   "login_webauthn"     -- per-user FIDO2 hardware key.
-#
-# key_id is NULL for OTP (no key); for the other two, it points to
-# dev_keys.id or hardware_keys.id respectively. outcome is
-# "success" / "denied:<reason>" so failed attempts (wrong sig, key
-# revoked, hardware-key-wins block) leave a trace too.
-_AUTH_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS auth_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          TEXT    NOT NULL,
-    event_type  TEXT    NOT NULL,
-    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    email       TEXT    NOT NULL,
-    key_id      INTEGER,
-    ip          TEXT,
-    user_agent  TEXT,
-    outcome     TEXT    NOT NULL,
-    detail      TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_auth_events_ts      ON auth_events(ts);
-CREATE INDEX IF NOT EXISTS idx_auth_events_user    ON auth_events(user_id);
-CREATE INDEX IF NOT EXISTS idx_auth_events_event   ON auth_events(event_type);
-CREATE INDEX IF NOT EXISTS idx_auth_events_outcome ON auth_events(outcome);
-"""
-
 _ACCOUNT_ROUTES_DDL = """\
 CREATE TABLE IF NOT EXISTS account_routes (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,22 +205,6 @@ CREATE INDEX IF NOT EXISTS idx_triage_runs_acct ON triage_runs(account_id);
 CREATE INDEX IF NOT EXISTS idx_triage_runs_created ON triage_runs(created_at);
 """
 
-_LOG_ENTRIES_DDL = """\
-CREATE TABLE IF NOT EXISTS log_entries (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    level      TEXT NOT NULL,
-    logger     TEXT NOT NULL DEFAULT '',
-    message    TEXT NOT NULL DEFAULT '',
-    extra_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    prev_hash  TEXT NOT NULL DEFAULT '',
-    row_hash   TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_log_entries_ts ON log_entries(ts);
-CREATE INDEX IF NOT EXISTS idx_log_entries_level ON log_entries(level);
-"""
-
 _USER_ESCALATION_PREFS_DDL = """\
 CREATE TABLE IF NOT EXISTS user_escalation_prefs (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,20 +227,6 @@ CREATE TABLE IF NOT EXISTS secrets_store (
 );
 """
 
-_HIPAA_ACCESS_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS hipaa_access_events (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts            TEXT NOT NULL,
-    actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    account_id    INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
-    operation     TEXT NOT NULL,
-    outcome       TEXT NOT NULL,
-    detail        TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hipaa_access_ts      ON hipaa_access_events(ts);
-CREATE INDEX IF NOT EXISTS idx_hipaa_access_account ON hipaa_access_events(account_id);
-"""
-
 _GMAIL_WATCHES_DDL = """\
 CREATE TABLE IF NOT EXISTS gmail_watches (
     account_id    INTEGER PRIMARY KEY REFERENCES email_accounts(id) ON DELETE CASCADE,
@@ -316,7 +241,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_gmail_watches_email ON gmail_watches(email
 CREATE INDEX IF NOT EXISTS idx_gmail_watches_expires ON gmail_watches(expires_at);
 """
 
-# #50 — per-account delegation. Lets the account owner (or an admin)
+#  — per-account delegation. Lets the account owner (or an admin)
 # grant a non-admin user the right to manage a specific account
 # (routes, watcher, folder prefs, digest schedules, run-triage).
 # Restricted out of delegate scope: HIPAA flag flip + account
@@ -324,7 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_gmail_watches_expires ON gmail_watches(expires_at
 # that should stay with the responsible party).
 #
 # Audit: delegate add / remove emit INFO log lines via the standard
-# logger; the ASGI access-audit middleware (#41) covers the broader
+# logger; the ASGI access-audit middleware covers the broader
 # "who hit which route" trail.
 _ACCOUNT_DELEGATES_DDL = """\
 CREATE TABLE IF NOT EXISTS account_delegates (
@@ -339,22 +264,6 @@ CREATE INDEX IF NOT EXISTS idx_account_delegates_user
     ON account_delegates(user_id);
 CREATE INDEX IF NOT EXISTS idx_account_delegates_account
     ON account_delegates(account_id);
-"""
-
-_API_KEY_EVENTS_DDL = """\
-CREATE TABLE IF NOT EXISTS api_key_events (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts             TEXT NOT NULL,
-    event          TEXT NOT NULL,
-    key_id         INTEGER NOT NULL,
-    actor_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    name           TEXT NOT NULL DEFAULT '',
-    expires_at     TEXT,
-    source         TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_api_key_events_ts ON api_key_events(ts);
-CREATE INDEX IF NOT EXISTS idx_api_key_events_target ON api_key_events(target_user_id);
 """
 
 # Loop-prevention dedup table. When a message is moved/labeled into
@@ -380,37 +289,7 @@ CREATE TABLE IF NOT EXISTS triaged_messages (
 CREATE INDEX IF NOT EXISTS idx_triaged_messages_ts ON triaged_messages(ts);
 """
 
-# #41 — generic access-audit log (HIPAA §164.312(b)). Sibling of
-# hipaa_access_events but covers every authenticated PHI-surface
-# request, not only triage-pipeline writes. The middleware in
-# web/app.py records here on every request whose path matches a
-# PHI-touch prefix (/classify, /triage/run, /accounts/<id>/{messages,
-# digest, folders, discover, bulk}, /api/openclaw, /runs/<id>).
-#
-# No PHI is persisted: route + method + status + actor are stamped;
-# the request body is never logged. account_id and message_id are
-# extracted from the URL path when present so the auditor can answer
-# "who looked at this account / message, and when?" without scraping
-# the path themselves.
-_ACCESS_LOG_DDL = """\
-CREATE TABLE IF NOT EXISTS access_log (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts             TEXT NOT NULL,
-    actor_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    method         TEXT NOT NULL,
-    route          TEXT NOT NULL,
-    account_id     INTEGER REFERENCES email_accounts(id) ON DELETE SET NULL,
-    message_id     TEXT,
-    status_code    INTEGER NOT NULL,
-    outcome        TEXT NOT NULL,
-    detail         TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_access_log_ts        ON access_log(ts);
-CREATE INDEX IF NOT EXISTS idx_access_log_actor     ON access_log(actor_user_id);
-CREATE INDEX IF NOT EXISTS idx_access_log_account   ON access_log(account_id);
-"""
-
-# #67 — admin-managed dev-keypair table. Per-key TTL + per-email
+#  — admin-managed dev-keypair table. Per-key TTL + per-email
 # allowlist + audit fields. Public key stored in OpenSSH
 # "ssh-ed25519 AAAA... user@host" format; fingerprint is
 # SHA256:<b64> matching `ssh-keygen -lf` output. Login uses
@@ -435,7 +314,7 @@ CREATE INDEX IF NOT EXISTS idx_dev_keys_fingerprint ON dev_keys(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_dev_keys_active     ON dev_keys(revoked_at, expires_at);
 """
 
-# #67 — WebAuthn / FIDO2 hardware-key registrations. credential_id is
+#  — WebAuthn / FIDO2 hardware-key registrations. credential_id is
 # the WebAuthn cred id (16-1023 bytes per spec); public_key is the
 # COSE-encoded public key the browser produced at registration.
 # sign_count is a monotonic counter the authenticator increments per
@@ -458,7 +337,7 @@ CREATE TABLE IF NOT EXISTS hardware_keys (
 CREATE INDEX IF NOT EXISTS idx_hw_keys_user_active ON hardware_keys(user_id, revoked_at);
 """
 
-# #67 — short-lived ceremony challenges for WebAuthn register +
+#  — short-lived ceremony challenges for WebAuthn register +
 # authenticate flows. 5-minute TTL, prune-on-read. Cookie-carried
 # challenges leak under MITM; in-memory dies on restart and breaks
 # multi-worker. DB matches the existing `otp_codes` pattern.
@@ -476,7 +355,7 @@ CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_user  ON webauthn_challenges(
 CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_exp   ON webauthn_challenges(expires_at);
 """
 
-# #67 — ACME renewal log. One row per renewal attempt (success or
+#  — ACME renewal log. One row per renewal attempt (success or
 # failure); /admin/acme-status reads from here.
 _ACME_RENEWAL_LOG_DDL = """\
 CREATE TABLE IF NOT EXISTS acme_renewal_log (
@@ -489,6 +368,48 @@ CREATE TABLE IF NOT EXISTS acme_renewal_log (
     error       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_acme_renewal_log_ts ON acme_renewal_log(ts);
+"""
+
+# H-05 (Cycle 7, 2026-05-24) — printable single-use recovery codes for
+# MFA fallback. Operator-driven at enrollment time via `user enroll-mfa`
+# CLI; user prints + stores physically. Codes are SHA-256 hashed at
+# rest (same pattern as `otp_codes`); never logged or echoed plaintext.
+# Default count per code-set: 10 (matches AWS / GitHub's lower bound).
+# One-time consumption: `used_at` is stamped on first valid presentation,
+# subsequent attempts return invalid + emit `record_auth_event`
+# outcome="denied:recovery_code_already_used".
+_RECOVERY_CODES_DDL = """\
+CREATE TABLE IF NOT EXISTS recovery_codes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash   TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    used_at     TEXT,
+    UNIQUE(user_id, code_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_recovery_codes_user ON recovery_codes(user_id);
+CREATE INDEX IF NOT EXISTS idx_recovery_codes_used ON recovery_codes(user_id, used_at);
+"""
+
+# H-05 (Cycle 7, 2026-05-24) — operator-key recovery tokens (last-
+# resort MFA recovery). Generated by `user reset-mfa <target_user>`
+# CLI; operator hands the printed token to the target user via an
+# out-of-band channel; target user consumes once at /auth/mfa/recovery.
+# Single-use + short TTL (24h default per design Q3) so a leaked
+# token has a bounded blast radius. Token is SHA-256 hashed at rest;
+# the plaintext is printed to CLI stdout ONCE and never persisted.
+_OPERATOR_RECOVERY_KEYS_DDL = """\
+CREATE TABLE IF NOT EXISTS operator_recovery_keys (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    operator_user_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    token_hash         TEXT NOT NULL UNIQUE,
+    created_at         TEXT NOT NULL,
+    expires_at         TEXT NOT NULL,
+    used_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_operator_recovery_target ON operator_recovery_keys(target_user_id);
+CREATE INDEX IF NOT EXISTS idx_operator_recovery_expires ON operator_recovery_keys(expires_at);
 """
 
 _ALL_DDL = [
@@ -520,7 +441,29 @@ _ALL_DDL = [
     _HARDWARE_KEYS_DDL,
     _WEBAUTHN_CHALLENGES_DDL,
     _ACME_RENEWAL_LOG_DDL,
+    _RECOVERY_CODES_DDL,
+    _OPERATOR_RECOVERY_KEYS_DDL,
 ]
+
+
+def _rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Map a ``fetchall()`` result to a list of plain dicts.
+
+    The ``[dict(r) for r in rows]`` idiom appeared ~22× verbatim across
+    this module's read helpers; this is the single home for it.
+    """
+    return [dict(row) for row in rows]
+
+
+def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    """Map a ``fetchone()`` result to a plain dict, or ``None``.
+
+    Standardises the ``dict(row) if row ... else None`` idiom on an
+    explicit ``is None`` test — a couple of call sites used a bare
+    truthiness check, which differs only for a degenerate zero-column
+    Row but is worth not having two spellings of.
+    """
+    return None if row is None else dict(row)
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -529,6 +472,7 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row["name"] == column for row in rows)
 
 
+@db_write
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Apply idempotent column additions for schema upgrades.
 
@@ -548,7 +492,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     sentinel row (or ``user_version`` PRAGMA) can be introduced at
     that time.
     """
-    # #42 — log_entries hash-chain columns. Existing rows get empty
+    #  — log_entries hash-chain columns. Existing rows get empty
     # strings; the verifier treats them as pre-chain (skipped) and
     # validates from the first row written by a hash-aware emit.
     if not _column_exists(conn, "log_entries", "prev_hash"):
@@ -558,6 +502,23 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "log_entries", "row_hash"):
         conn.execute(
             "ALTER TABLE log_entries ADD COLUMN row_hash TEXT NOT NULL DEFAULT ''"
+        )
+
+    # H-02a (Cycle 6, 2026-05-23) — HMAC-SHA256 migration columns. See
+    # internal documentation H-02a + db/audit.py _LOG_ENTRIES_DDL
+    # rationale block. NOT-NULL defaults make this a safe idempotent upgrade:
+    # legacy rows keep ('sha256', 0) and remain verifiable forever per
+    # §164.316(b)(2)(i) 6-year retention; new rows post-deploy stamp
+    # ('hmac-sha256-v1', <current master version>) and verify under HMAC.
+    if not _column_exists(conn, "log_entries", "hash_alg"):
+        conn.execute(
+            "ALTER TABLE log_entries ADD COLUMN "
+            "hash_alg TEXT NOT NULL DEFAULT 'sha256'"
+        )
+    if not _column_exists(conn, "log_entries", "master_key_version"):
+        conn.execute(
+            "ALTER TABLE log_entries ADD COLUMN "
+            "master_key_version INTEGER NOT NULL DEFAULT 0"
         )
 
     # v10-era: per-account HIPAA flag + creation-under-system-HIPAA marker.
@@ -576,21 +537,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # privilege and needs an audit row regardless of the HIPAA flag. Metadata
     # only (no sender / subject / raw_description / raw_category) because the
     # scan output is proposals-in-review, not actions taken.
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS discover_runs (
-        id             INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_id     INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE CASCADE,
-        account_name   TEXT NOT NULL DEFAULT '',
-        actor_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
-        scanned_count  INTEGER NOT NULL DEFAULT 0,
-        errors_count   INTEGER NOT NULL DEFAULT 0,
-        folders        TEXT NOT NULL DEFAULT '[]',
-        elapsed_secs   REAL NOT NULL DEFAULT 0,
-        created_at     TEXT NOT NULL
-    );
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_discover_runs_acct ON discover_runs(account_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_discover_runs_created ON discover_runs(created_at);")
+    #
+    # #277a (2026-05-23): the inline DDL was lifted to db.audit._DISCOVER_RUNS_DDL
+    # for cluster cohesion. Still re-applied here (idempotent IF NOT EXISTS) so
+    # upgrade installs that pre-date #277a continue to bootstrap the table
+    # without needing a separate migration step.
+    conn.executescript(_DISCOVER_RUNS_DDL)
 
     # v14: who clicked "Run triage" for audit. NULL = system-initiated
     # (push consumer, watcher, scheduled digest). UI manual triage path
@@ -613,14 +565,14 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "REFERENCES users(id) ON DELETE SET NULL"
         )
 
-    # #67: WebAuthn per-user handle. Server-assigned 16-64 byte stable
+    # : WebAuthn per-user handle. Server-assigned 16-64 byte stable
     # identifier; populated lazily on first hardware-key registration.
     if not _column_exists(conn, "users", "webauthn_user_handle"):
         conn.execute(
             "ALTER TABLE users ADD COLUMN webauthn_user_handle BLOB"
         )
 
-    # #67: access_log gains auth_source + auth_key_id so every audit
+    # : access_log gains auth_source + auth_key_id so every audit
     # row is traceable to the auth path that minted the session.
     if not _column_exists(conn, "access_log", "auth_source"):
         conn.execute("ALTER TABLE access_log ADD COLUMN auth_source TEXT")
@@ -638,9 +590,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "ON access_log(request_id)"
         )
 
+    #  — per-user session epoch for stateless-token revocation.
+    # create_session_token stamps the user's current epoch into the
+    # signed cookie; get_current_user rejects a token whose epoch no
+    # longer matches. Bumping the epoch (set_user_disabled, the
+    # "sign out all sessions" control) instantly invalidates every
+    # outstanding session for that user. Existing users default to 0;
+    # a token minted before this column existed carries no epoch field
+    # and decodes as epoch 0 — it stays valid until its TTL, matching
+    # the pre-#205 behaviour.
+    if not _column_exists(conn, "users", "session_epoch"):
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL "
+            "DEFAULT 0"
+        )
+
     conn.commit()
 
 
+@db_write
 def migrate_oauth_creds_to_install_level(conn: sqlite3.Connection) -> tuple[str, str] | None:
     """One-shot: lift per-account Gmail client_id/secret up to install level.
 
@@ -683,6 +651,7 @@ def migrate_oauth_creds_to_install_level(conn: sqlite3.Connection) -> tuple[str,
     return found
 
 
+@db_write
 def migrate_o365_creds_to_install_level(
     conn: sqlite3.Connection,
     secrets,
@@ -790,6 +759,7 @@ def migrate_o365_creds_to_install_level(
     return (chosen_tenant, chosen_cid, chosen_csec)
 
 
+@db_write
 def scrub_queue_summary_from_routes(conn: sqlite3.Connection) -> int:
     """Strip the deprecated `queue_summary` action from saved routes.
 
@@ -800,6 +770,8 @@ def scrub_queue_summary_from_routes(conn: sqlite3.Connection) -> int:
 
     Returns the number of route rows that were updated.
     """
+    import json
+
     rows = conn.execute(
         "SELECT id, actions_json FROM account_routes "
         "WHERE actions_json LIKE '%queue_summary%'"
@@ -813,10 +785,16 @@ def scrub_queue_summary_from_routes(conn: sqlite3.Connection) -> int:
         kept = [a for a in actions if (a or {}).get("action") != "queue_summary"]
         if len(kept) == len(actions):
             continue
+        # v0.1.2 dialect-portability fix: Python-side ISO timestamp instead
+        # of SQLite-specific strftime('%Y-%m-%dT%H:%M:%fZ', 'now'). Same wire
+        # format; portable to Postgres for v0.2.0  retrofit.
+        from datetime import datetime, timezone
+
+        _now_iso = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "UPDATE account_routes SET actions_json = ?, "
-            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-            (json.dumps(kept), row["id"]),
+            "updated_at = ? WHERE id = ?",
+            (json.dumps(kept), _now_iso, row["id"]),
         )
         updated += 1
     if updated:
@@ -828,23 +806,43 @@ def scrub_queue_summary_from_routes(conn: sqlite3.Connection) -> int:
 # Public API
 # ---------------------------------------------------------------------------
 
-def init_db(db_path: str | Path = ":memory:") -> sqlite3.Connection:
-    """Open (or create) the database and ensure all tables exist.
+def _bootstrap_schema(
+    conn: sqlite3.Connection, db_path: str
+) -> sqlite3.Connection:
+    """Configure an already-opened connection + ensure the full schema.
 
-    Returns a connection with WAL mode and foreign keys enabled.
-    Uses ``check_same_thread=False`` because FastAPI serves requests
-    in a threadpool while the connection is created at startup.
-    This is safe because the system is single-writer by design.
+    Factored out of :func:`init_db` so BOTH the plaintext
+    path (``init_db``) and the SQLCipher path (``init_db_encrypted``)
+    share one identical bootstrap body — same PRAGMAs, same DDL, same
+    migrations, same idempotent scrubs. The ONLY difference between the
+    two entry points is HOW the connection was opened (stdlib ``sqlite3``
+    vs ``sqlcipher3`` with ``PRAGMA key`` already applied); everything
+    downstream of the open is the same, so it lives here.
+
+    The caller is responsible for having already run the encryption
+    ``PRAGMA key`` (if any) — by the time the connection reaches this
+    function it must be a fully-usable, decrypted handle.
     """
-    # Drop the in-process settings cache (#140.2) — a fresh DB
-    # invalidates any cached read by definition. Production calls
-    # init_db once at startup; tests call it per fixture and need
-    # the cache cleared so cross-test reuse doesn't leak entries.
-    invalidate_setting_cache()
-
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    # : cache the resolved path so single_flight._open_lock_conn
+    # does not need to issue a concurrent PRAGMA database_list to
+    # discover it. Routed via :func:`set_cached_db_path` because
+    # sqlite3.Connection in CPython 3.13 silently rejects
+    # ``setattr(conn, ...)`` (the class has no ``__dict__``).
+    from email_triage.single_flight import set_cached_db_path
+    set_cached_db_path(conn, db_path)
+    # N-16: resolve the Row factory from the conn's own dbapi module —
+    # stdlib sqlite3.Row type-rejects a sqlcipher3 cursor, so a bare
+    # ``conn.row_factory = sqlite3.Row`` crashes the encrypted boot.
+    apply_compatible_row_factory(conn)
     conn.execute("PRAGMA journal_mode=WAL")
+    # Wait up to 30s for a held write lock instead of failing instantly
+    # with SQLITE_BUSY. Many background tasks write concurrently
+    # at container startup — every interval loop fires its first tick
+    # in the same ~5s window, and pre-#287 the 5s busy_timeout was
+    # narrower than that burst, causing `database is locked` storms
+    # that flipped /health to 503 for the entire deploy.sh 60s window
+    # and triggered the rollback safety net.
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
 
     for ddl in _ALL_DDL:
@@ -853,7 +851,7 @@ def init_db(db_path: str | Path = ":memory:") -> sqlite3.Connection:
     # Apply idempotent ALTER-TABLE migrations for upgraded DBs.
     _apply_migrations(conn)
 
-    # Per-user categories migration + index creation (#62). Must run
+    # Per-user categories migration + index creation. Must run
     # from init_db so tests that use init_db directly (without going
     # through app.lifespan) get the new schema + partial unique index.
     ensure_categories_user_id_migration(conn)
@@ -872,10 +870,105 @@ def init_db(db_path: str | Path = ":memory:") -> sqlite3.Connection:
     return conn
 
 
+def init_db(db_path: str | Path = ":memory:") -> sqlite3.Connection:
+    """Open (or create) the PLAINTEXT database and ensure all tables exist.
+
+    Returns a connection with WAL mode and foreign keys enabled.
+    Uses ``check_same_thread=False`` because FastAPI serves requests
+    in a threadpool while the connection is created at startup.
+    This is safe because the system is single-writer by design.
+
+    This is the default, unchanged path for every existing install and
+    every test/fixture. The SQLCipher-encrypted equivalent is
+    :func:`init_db_encrypted`, routed at boot only when
+    ``persistence.encryption_enabled`` resolves ON.
+    """
+    # Drop the in-process settings cache — a fresh DB
+    # invalidates any cached read by definition. Production calls
+    # init_db once at startup; tests call it per fixture and need
+    # the cache cleared so cross-test reuse doesn't leak entries.
+    invalidate_setting_cache()
+
+    #  Cycle 10 Phase 0:
+    # - ``cached_statements=0`` mitigates CPython issue #118172
+    #   (3.12/3.13 multi-thread cursor-cache silent corruption).
+    #   On a shared connection with check_same_thread=False, the
+    #   driver-side prepared-statement cache can return wrong-row
+    #   results or hit SystemError under concurrent reads. Setting
+    #   cached_statements=0 disables that cache; ~5-10% per-call
+    #   regression on cached paths, but eliminates the corruption
+    #   class entirely. See https://github.com/python/cpython/issues/118172
+    # - ``timeout=30.0`` is belt-and-suspenders — the PRAGMA
+    #   busy_timeout=30000 set inside _bootstrap_schema already configures
+    #   the same underlying sqlite3_busy_timeout() primitive; setting
+    #   both ensures the value is in effect during init even before
+    #   the PRAGMA runs.
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=30.0,
+        check_same_thread=False,
+        cached_statements=0,
+    )
+    return _bootstrap_schema(conn, str(db_path))
+
+
+def init_db_encrypted(
+    db_path: str | Path,
+    master_key: str | bytes,
+    *,
+    purpose: str = "triage",
+) -> sqlite3.Connection:
+    """Open (or create) the SQLCipher-ENCRYPTED database + ensure schema.
+
+    The encrypted analogue of :func:`init_db`. Opens the
+    single-file SQLCipher connection via
+    :func:`email_triage.db._engine._make_encrypted_conn` — which applies
+    ``PRAGMA key`` (HKDF-derived raw-hex key) as the FIRST SQL the
+    connection sees, BEFORE any read — then runs the identical
+    :func:`_bootstrap_schema` body as the plaintext path.
+
+    The returned object is a ``sqlcipher3`` connection, which is a
+    DBAPI-2.0 / stdlib-``sqlite3``-compatible handle: every existing
+    helper, the ``WriteSession`` Protocol, and ``set_cached_db_path``
+    work against it unchanged. The ONE incompatibility is the row
+    factory: stdlib ``sqlite3.Row`` is a C type that type-rejects a
+    foreign (sqlcipher3) cursor, so ``conn.row_factory = sqlite3.Row``
+    raises ``TypeError`` on this handle (N-16). ``_bootstrap_schema``
+    therefore uses :func:`apply_compatible_row_factory`, which selects
+    ``sqlcipher3.dbapi2.Row`` for this connection and ``sqlite3.Row``
+    for the plaintext one.
+
+    This function assumes the caller has ALREADY verified
+    (:func:`email_triage.db._engine.enforce_db_encryption_boot_contract`)
+    that ``sqlcipher3`` is importable and ``master_key`` is real. It
+    raises if ``sqlcipher3`` cannot be imported (defensive — the contract
+    should have caught it first), and NEVER falls back to plaintext.
+
+    Args:
+        db_path: filesystem path to the single encrypted DB file.
+        master_key: the Fernet master key from the secrets backend; the
+            SQLCipher storage key is HKDF-derived from it.
+        purpose: HKDF namespace tag — ``"triage"`` under single-file encryption;
+            reserved for v0.2.0  per-tablespace expansion.
+    """
+    # Late import: ``_engine`` pulls in SQLAlchemy lazily; keeping the
+    # import inside the function avoids loading SA on the plaintext path
+    # and matches the lazy-import convention used elsewhere in this file.
+    from email_triage.db._engine import _make_encrypted_conn
+
+    # Drop the in-process settings cache — same rationale as
+    # init_db; a freshly-opened DB invalidates any cached read.
+    invalidate_setting_cache()
+
+    conn = _make_encrypted_conn(str(db_path), master_key, purpose=purpose)
+    return _bootstrap_schema(conn, str(db_path))
+
+
 # ---------------------------------------------------------------------------
 # Category helpers
 # ---------------------------------------------------------------------------
 
+@db_write
 def ensure_categories_indexes(conn: sqlite3.Connection) -> None:
     """Create the user_id + partial system-slug unique indexes.
 
@@ -894,6 +987,7 @@ def ensure_categories_indexes(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@db_write
 def ensure_categories_user_id_migration(conn: sqlite3.Connection) -> bool:
     """Migrate legacy ``categories`` table to include ``user_id`` column
     and a composite ``UNIQUE(user_id, slug)`` constraint.
@@ -908,7 +1002,9 @@ def ensure_categories_user_id_migration(conn: sqlite3.Connection) -> bool:
     Idempotent: if the column already exists, no-op.
     """
     cols = conn.execute("PRAGMA table_info(categories)").fetchall()
-    col_names = {c["name"] if isinstance(c, sqlite3.Row) else c[1] for c in cols}
+    # N-16: row_get duck-types on keys() so a sqlcipher3 Row takes the
+    # keyed branch too — isinstance(c, sqlite3.Row) would mis-steer it.
+    col_names = {row_get(c, "name", 1) for c in cols}
     if "user_id" in col_names:
         # Legacy upgrade path where user_id already exists: still make
         # sure the user_id + system-slug indexes are present.
@@ -946,6 +1042,7 @@ def ensure_categories_user_id_migration(conn: sqlite3.Connection) -> bool:
     return True
 
 
+@db_write
 def seed_categories(conn: sqlite3.Connection, categories: dict[str, str]) -> int:
     """Seed categories from config if the table is empty.
 
@@ -988,6 +1085,7 @@ _UPGRADE_CATEGORIES: dict[str, str] = {
 }
 
 
+@db_write
 def ensure_upgrade_categories(conn: sqlite3.Connection) -> int:
     """Insert any ``_UPGRADE_CATEGORIES`` rows that are missing.
 
@@ -1068,7 +1166,7 @@ def list_categories(
                 "WHERE user_id IS NULL OR user_id = ? ORDER BY sort_order, id",
                 (user_id,),
             ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def get_categories_dict(
@@ -1088,19 +1186,19 @@ def get_categories_dict(
         ).fetchall()
         return {r["slug"]: r["description"] for r in rows}
 
-    result: dict[str, str] = {}
-    sys_rows = conn.execute(
+    #  — one query instead of two. System rows (user_id IS NULL)
+    # sort before personal rows via `user_id IS NOT NULL` (0 then 1),
+    # so the dict build applies personal descriptions last and the
+    # user's wording wins on a slug collision — same override + order
+    # as the prior system-then-user two-SELECT.
+    rows = conn.execute(
         "SELECT slug, description FROM categories "
-        "WHERE user_id IS NULL ORDER BY sort_order, id"
-    ).fetchall()
-    for r in sys_rows:
-        result[r["slug"]] = r["description"]
-    user_rows = conn.execute(
-        "SELECT slug, description FROM categories "
-        "WHERE user_id = ? ORDER BY sort_order, id",
+        "WHERE user_id IS NULL OR user_id = ? "
+        "ORDER BY (user_id IS NOT NULL), sort_order, id",
         (user_id,),
     ).fetchall()
-    for r in user_rows:
+    result: dict[str, str] = {}
+    for r in rows:
         result[r["slug"]] = r["description"]
     return result
 
@@ -1119,9 +1217,10 @@ def get_category(conn: sqlite3.Connection, category_id: int) -> dict | None:
         "SELECT id, user_id, slug, description, sort_order FROM categories WHERE id = ?",
         (category_id,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
+@db_write
 def create_category(
     conn: sqlite3.Connection,
     slug: str,
@@ -1155,6 +1254,7 @@ def create_category(
     return cursor.lastrowid
 
 
+@db_write
 def update_category(conn: sqlite3.Connection, category_id: int, slug: str, description: str) -> bool:
     """Update a category. Returns True if updated."""
     from datetime import datetime, timezone
@@ -1167,6 +1267,7 @@ def update_category(conn: sqlite3.Connection, category_id: int, slug: str, descr
     return cursor.rowcount > 0
 
 
+@db_write
 def delete_category(conn: sqlite3.Connection, category_id: int) -> bool:
     """Delete a category. Returns True if deleted."""
     cursor = conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
@@ -1174,6 +1275,7 @@ def delete_category(conn: sqlite3.Connection, category_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+@db_write
 def promote_category_to_system(conn: sqlite3.Connection, category_id: int) -> bool:
     """Promote a personal category (user_id != NULL) to system (user_id = NULL).
 
@@ -1205,6 +1307,7 @@ def promote_category_to_system(conn: sqlite3.Connection, category_id: int) -> bo
     return cursor.rowcount > 0
 
 
+@db_write
 def demote_category_to_user(
     conn: sqlite3.Connection, category_id: int, target_user_id: int,
 ) -> bool:
@@ -1263,7 +1366,7 @@ def demote_category_to_user(
 # ---------------------------------------------------------------------------
 # Settings helpers (key-value store)
 #
-# Architecture (#140.1 + #140.2):
+# Architecture:
 #
 # * **Single-writer.** Only ``set_setting`` and ``delete_setting`` mutate
 #   the ``settings`` table (with one in-tree exception: the audit chain
@@ -1275,7 +1378,7 @@ def demote_category_to_user(
 #   handle. The cache is in-memory only; it does NOT survive a process
 #   restart, and is NOT shared between processes / workers — DB is the
 #   source of truth, the cache is a per-process accelerator.
-# * **Corrupt-row defensive** (#140.1): ``get_setting`` wraps
+# * **Corrupt-row defensive**: ``get_setting`` wraps
 #   ``json.loads`` in try/except. A row with mangled JSON (operator
 #   manual SQL edit, partial write, encoding issue) used to bubble a
 #   ``JSONDecodeError`` up through every caller — digest scheduler
@@ -1292,6 +1395,13 @@ def demote_category_to_user(
 # small value (or to 0 to disable the cache).
 _SETTINGS_CACHE_TTL_SECONDS: float = 60.0
 _settings_cache: dict[str, tuple[Any, float]] = {}
+# ``get_setting`` runs on the threadpool workers (every ``db_call``),
+# so concurrent reads/writes hit ``_settings_cache`` from multiple
+# threads. dict ops are individually atomic under CPython's GIL, but a
+# read-modify (``get`` then ``pop`` on expiry) is not — two threads can
+# race the pop and one hits a KeyError-shaped surprise, or a clear()
+# can interleave a mid-iteration mutation. Guard every mutation.
+_settings_cache_lock = threading.Lock()
 
 
 def invalidate_setting_cache(key: str | None = None) -> None:
@@ -1302,10 +1412,11 @@ def invalidate_setting_cache(key: str | None = None) -> None:
     UPSERTs the settings row inside its own transaction) and any future
     in-tree direct writer can keep the cache coherent.
     """
-    if key is None:
-        _settings_cache.clear()
-    else:
-        _settings_cache.pop(key, None)
+    with _settings_cache_lock:
+        if key is None:
+            _settings_cache.clear()
+        else:
+            _settings_cache.pop(key, None)
 
 
 def get_setting(conn: sqlite3.Connection, key: str) -> dict | None:
@@ -1319,13 +1430,14 @@ def get_setting(conn: sqlite3.Connection, key: str) -> dict | None:
     import time as _time
 
     # Cache hit.
-    cached = _settings_cache.get(key)
-    if cached is not None:
-        value, expires_at = cached
-        if _time.monotonic() < expires_at:
-            return value
-        # Expired — fall through to re-read.
-        _settings_cache.pop(key, None)
+    with _settings_cache_lock:
+        cached = _settings_cache.get(key)
+        if cached is not None:
+            value, expires_at = cached
+            if _time.monotonic() < expires_at:
+                return value
+            # Expired — drop it and fall through to re-read.
+            _settings_cache.pop(key, None)
 
     row = conn.execute(
         "SELECT value_json FROM settings WHERE key = ?", (key,),
@@ -1335,13 +1447,14 @@ def get_setting(conn: sqlite3.Connection, key: str) -> dict | None:
         # TTL window. The cache invalidates on set_setting, so a later
         # write becomes visible.
         if _SETTINGS_CACHE_TTL_SECONDS > 0:
-            _settings_cache[key] = (None, _time.monotonic() + _SETTINGS_CACHE_TTL_SECONDS)
+            with _settings_cache_lock:
+                _settings_cache[key] = (None, _time.monotonic() + _SETTINGS_CACHE_TTL_SECONDS)
         return None
 
     try:
         value = json.loads(row["value_json"])
     except json.JSONDecodeError as exc:
-        # #140.1 — defensive on corrupt JSON. Log key only (value is
+        # .1 — defensive on corrupt JSON. Log key only (value is
         # suspect / potentially sensitive). Treat as missing so callers
         # don't crash. Skip the cache so a fix-via-set takes effect.
         from email_triage.triage_logging import get_logger
@@ -1353,10 +1466,12 @@ def get_setting(conn: sqlite3.Connection, key: str) -> dict | None:
         return None
 
     if _SETTINGS_CACHE_TTL_SECONDS > 0:
-        _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_CACHE_TTL_SECONDS)
+        with _settings_cache_lock:
+            _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_CACHE_TTL_SECONDS)
     return value
 
 
+@db_write
 def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
     """Set a setting (upsert) and invalidate the in-process cache."""
     import json
@@ -1371,6 +1486,7 @@ def set_setting(conn: sqlite3.Connection, key: str, value: Any) -> None:
     invalidate_setting_cache(key)
 
 
+@db_write
 def delete_setting(conn: sqlite3.Connection, key: str) -> bool:
     """Delete a setting. Returns True if deleted."""
     cursor = conn.execute("DELETE FROM settings WHERE key = ?", (key,))
@@ -1380,7 +1496,7 @@ def delete_setting(conn: sqlite3.Connection, key: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Bool-setting convenience helpers (#145.7)
+# Bool-setting convenience helpers
 #
 # Many call sites store ``{"enabled": bool}`` under a settings key. Going
 # through ``set_setting`` / ``get_setting`` directly works, but the
@@ -1442,7 +1558,7 @@ def set_bool_setting(
 # ---------------------------------------------------------------------------
 
 def _hwm_key_for(account_id: int, mailbox: str) -> str:
-    # #140.3 — registry-backed, but keep the helper for backwards-compat
+    # .3 — registry-backed, but keep the helper for backwards-compat
     # so existing call sites don't churn.
     from email_triage.web.settings_keys import watch_hwm_mailbox
     return watch_hwm_mailbox(account_id, mailbox)
@@ -1495,111 +1611,14 @@ def delete_mailbox_hwm(
 # Email account helpers
 # ---------------------------------------------------------------------------
 
-def get_mailbox_route_overrides(
-    conn: sqlite3.Connection,
-    account_id: int,
-    mailbox: str,
-) -> list[dict]:
-    """#51 — per-(account, mailbox) route overrides.
-
-    Stored under the settings key ``mailbox_routes:<account_id>:<mailbox>``
-    as a JSON list of ``{category, actions: [...]}`` rows. Returns an
-    empty list when no overrides exist for that mailbox (caller should
-    then fall back to the account-wide ``account_routes`` table).
-    """
-    raw = get_setting(conn, f"mailbox_routes:{account_id}:{mailbox}")
-    if not isinstance(raw, list):
-        return []
-    return [r for r in raw if isinstance(r, dict)]
 
 
-def set_mailbox_route_overrides(
-    conn: sqlite3.Connection,
-    account_id: int,
-    mailbox: str,
-    routes: list[dict],
-) -> None:
-    """Persist per-(account, mailbox) route overrides. Pass an empty
-    list to clear all overrides for that mailbox."""
-    key = f"mailbox_routes:{account_id}:{mailbox}"
-    if not routes:
-        # Empty -> drop the row so the account-wide fallback kicks in
-        # cleanly without a stub override. delete_setting() invalidates
-        # the in-process cache (#140.2).
-        delete_setting(conn, key)
-        return
-    set_setting(conn, key, routes)
 
 
-def effective_routes_by_cat(
-    conn: sqlite3.Connection,
-    account_id: int,
-    mailbox: str | None = None,
-) -> dict[str, list[dict]]:
-    """Return ``{category: actions}`` for the given mailbox.
-
-    Per-mailbox overrides (if any) layer on top of the account-wide
-    ``account_routes`` table. Per-category granularity: a mailbox can
-    override one category and inherit the rest. Pass ``mailbox=None``
-    (or a mailbox with no overrides) to get the legacy account-wide
-    map unchanged.
-    """
-    base = {
-        r["category"]: r["actions"]
-        for r in list_account_routes(conn, account_id)
-    }
-    if not mailbox:
-        return base
-    overrides = get_mailbox_route_overrides(conn, account_id, mailbox)
-    for r in overrides:
-        cat = r.get("category")
-        if not cat:
-            continue
-        actions = r.get("actions") or []
-        if isinstance(actions, list):
-            base[cat] = actions
-    return base
 
 
-def _account_mailboxes(cfg: dict) -> list[str]:
-    """Return the effective list of mailboxes for an IMAP account config.
-
-    Applies the legacy-compat shim then validates: must be a non-empty
-    list of non-empty strings. Falls back to ``["INBOX"]`` for any shape
-    that would otherwise leave us with nothing to watch.
-    """
-    if not isinstance(cfg, dict):
-        return ["INBOX"]
-    mbs = cfg.get("mailboxes")
-    if isinstance(mbs, list):
-        valid = [m for m in mbs if isinstance(m, str) and m.strip()]
-        if valid:
-            return valid
-    legacy = cfg.get("mailbox")
-    if isinstance(legacy, str) and legacy.strip():
-        return [legacy]
-    return ["INBOX"]
 
 
-def _apply_account_config_back_compat(cfg: dict) -> dict:
-    """Read-side shim: fill in ``mailboxes`` for legacy single-mailbox configs.
-
-    Older configs stored one folder as ``mailbox`` (str). The current
-    canonical shape is ``mailboxes`` (list[str]). We leave the legacy
-    ``mailbox`` key alone when present so any lingering readers of the
-    old key keep working; we only ADD ``mailboxes`` alongside it.
-
-    Idempotent — safe to call on already-migrated configs.
-    """
-    if not isinstance(cfg, dict):
-        return cfg
-    if "mailboxes" not in cfg and "mailbox" in cfg:
-        legacy = cfg.get("mailbox")
-        if isinstance(legacy, str) and legacy:
-            cfg["mailboxes"] = [legacy]
-        else:
-            cfg["mailboxes"] = ["INBOX"]
-    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -1620,1018 +1639,85 @@ def _apply_account_config_back_compat(cfg: dict) -> dict:
 # nothing has to be migrated at the DB layer — the three keys appear
 # once an account is saved again.
 
-INGESTION_POLL_MIN = 10
-INGESTION_POLL_MAX = 240
-INGESTION_POLL_STEP = 10
-INGESTION_POLL_DEFAULT = 60
 
 
-def clamp_poll_interval_minutes(value: int) -> int:
-    """Clamp a poll interval to [POLL_MIN, POLL_MAX] and snap to step 10.
-
-    Shared by the save handler, the back-compat shim, and any test that
-    needs to normalise an interval — keeps the "what's a valid cadence"
-    answer in one place.
-    """
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        return INGESTION_POLL_DEFAULT
-    v = max(INGESTION_POLL_MIN, min(INGESTION_POLL_MAX, v))
-    # Snap to nearest step.
-    v = INGESTION_POLL_MIN + round(
-        (v - INGESTION_POLL_MIN) / INGESTION_POLL_STEP
-    ) * INGESTION_POLL_STEP
-    return max(INGESTION_POLL_MIN, min(INGESTION_POLL_MAX, v))
 
 
-def apply_ingestion_back_compat(
-    conn: sqlite3.Connection,
-    account_id: int,
-    provider_type: str,
-    cfg: dict,
-    default_minutes: int = INGESTION_POLL_DEFAULT,
-) -> dict:
-    """Materialise ``push_enabled`` / ``poll_enabled`` / ``poll_interval_minutes``
-    onto ``cfg`` if any are missing.
-
-    Back-compat rules:
-      * ``push_enabled``: mirror legacy ``watch:{id}`` setting for IMAP
-        accounts (True when setting is enabled, False when missing or
-        disabled). For Gmail, True when an active gmail_watches row
-        exists (non-empty topic + unexpired). For other providers,
-        default to True (push_enabled is "start the provider's push
-        mechanism" — the WatcherManager decides whether to act).
-      * ``poll_enabled``: ALWAYS True for legacy accounts — dormant
-        accounts start getting 60-min polls. Operators can opt out via
-        the edit form.
-      * ``poll_interval_minutes``: carry forward the B3-era
-        ``poll_interval_override`` if set; otherwise use
-        ``default_minutes``. Always clamped + step-snapped.
-
-    Mutates and returns ``cfg``. Safe to call on already-migrated configs
-    (keys already present are left alone).
-
-    #134.2 — fast-path: when ``push_enabled``, ``poll_enabled``, AND
-    ``poll_interval_minutes`` are already present in ``cfg``, skip the
-    legacy ``settings``/``gmail_watches`` lookups entirely. Migrated rows
-    (the common case for new accounts created post-B3) take this path and
-    avoid 1-2 DB round-trips per account on every ``list_email_accounts``
-    fold.
-    """
-    if not isinstance(cfg, dict):
-        return cfg
-
-    # Fast path: already migrated, nothing to back-fill. Per-account
-    # ``list_email_accounts`` calls inside loops (digest scheduler,
-    # poll loop) used to issue a settings + gmail_watches SELECT for
-    # every row even when the cfg was already complete; this short-circuit
-    # eliminates that noise.
-    if (
-        "push_enabled" in cfg
-        and "poll_enabled" in cfg
-        and "poll_interval_minutes" in cfg
-    ):
-        # Defensive: still clamp the interval in case of out-of-band edit.
-        cfg["poll_interval_minutes"] = clamp_poll_interval_minutes(
-            cfg["poll_interval_minutes"],
-        )
-        return cfg
-
-    import json as _json
-
-    # poll_interval_minutes
-    if "poll_interval_minutes" not in cfg:
-        raw = cfg.get("poll_interval_override")
-        if isinstance(raw, int):
-            cfg["poll_interval_minutes"] = clamp_poll_interval_minutes(raw)
-        else:
-            cfg["poll_interval_minutes"] = clamp_poll_interval_minutes(
-                default_minutes,
-            )
-    else:
-        # Normalise in case someone hand-edited config_json out of band.
-        cfg["poll_interval_minutes"] = clamp_poll_interval_minutes(
-            cfg.get("poll_interval_minutes", default_minutes),
-        )
-
-    # poll_enabled — default True for every provider (legacy or fresh).
-    if "poll_enabled" not in cfg:
-        cfg["poll_enabled"] = True
-
-    # push_enabled — provider-specific inference.
-    # #138 phase 2 — table-driven dispatch via ProviderDispatcher.
-    # Each ptype's ``infer_push_enabled`` reads its own state row
-    # (settings ``watch:<id>`` for IMAP, ``gmail_watches`` for Gmail,
-    # default-only for O365 until Graph wiring lands).
-    if "push_enabled" not in cfg:
-        from email_triage.providers.dispatcher import get_dispatch
-        disp = get_dispatch(provider_type)
-        if disp is None:
-            cfg["push_enabled"] = True
-        else:
-            cfg["push_enabled"] = disp.infer_push_enabled(
-                conn, account_id, default=True,
-            )
-
-    return cfg
 
 
-def account_email(acct: dict | None) -> str:
-    """Resolve the operator-facing email address for an account.
-
-    Different provider types store the address under different keys:
-
-    - **Gmail (native)** stores it as ``config["account"]``
-      (the Google account selected via OAuth).
-    - **Office 365 (Graph)** stores it as ``config["account"]``
-      (the AAD identity from MSAL).
-    - **IMAP** prefers ``config["email_address"]`` (operator-set
-      on the account edit page, shipped 2026-05-13 after operator
-      hit the alias-mode bug where IMAP LOGIN usernames like
-      ``you`` collide with actual addresses like
-      ``you@example.com`` — Dovecot allows bare usernames +
-      a server-side default domain, so the LOGIN value isn't the
-      email). Falls back to ``config["username"]`` for older
-      accounts where the operator hasn't filled in the new field
-      yet — many IMAP installs do use the full address as the
-      LOGIN, so the legacy fallback stays correct for them.
-
-    Returns the first non-empty hit in priority order, or "" when
-    neither is set (account not yet saved). Single source of truth
-    for every read site; the alternative (each caller open-coding
-    the fallback) shipped silent gaps — see the "Send digest now
-    (test)" bug 2026-05-05 where the digest-test handler only read
-    ``config["account"]`` and rejected every IMAP account as
-    "no email address".
-    """
-    if not acct:
-        return ""
-    cfg = acct.get("config") or {}
-    addr = (cfg.get("account") or "").strip()
-    if addr:
-        return addr
-    email_addr = (cfg.get("email_address") or "").strip()
-    if email_addr:
-        return email_addr
-    return (cfg.get("username") or "").strip()
 
 
-def account_aliases(acct: dict | None) -> list[dict]:
-    """Return the list of additional addresses configured for an account.
-
-    Each entry is ``{"address": "...", "label": "..."}``. Stored as
-    ``email_accounts.aliases_json`` (JSON list, default ``[]``) and
-    surfaced on the read path by ``list_email_accounts`` /
-    ``get_email_account``. The primary address (``account_email``)
-    is NOT in this list — it's tracked separately in the provider
-    config. Use ``account_addresses`` when you want the union.
-
-    Returns an empty list on a missing or malformed value rather
-    than raising; the storage column is parsed once on read so
-    callers can treat the result as authoritative.
-    """
-    if not acct:
-        return []
-    raw = acct.get("aliases") or []
-    if isinstance(raw, list):
-        out: list[dict] = []
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            addr = str(entry.get("address") or "").strip().lower()
-            if not addr:
-                continue
-            label = str(entry.get("label") or "").strip()
-            out.append({"address": addr, "label": label})
-        return out
-    return []
 
 
-def account_addresses(acct: dict | None) -> set[str]:
-    """Return the full set of addresses that route to this account.
-
-    Union of the resolved primary address (``account_email``) and any
-    additional addresses configured under ``aliases_json`` (#106's
-    schema-backed storage) PLUS legacy ``config["aliases"]`` strings
-    (#107's pre-merge format — tolerated for back-compat with any
-    operator who set them via the older path). All values normalized
-    to lowercase + stripped so callers can compare with a normalized
-    incoming ``to_addr`` directly.
-
-    The primary is implicit-included; alias UI / save paths reject
-    storing the primary as an alias to keep the union de-duplicated
-    by construction. An account with no primary yet (fresh row, never
-    saved) yields just the alias addresses (or the empty set if none).
-
-    Used by:
-      - HIPAA recipient-mismatch guard (#106 + web/app.py)
-      - Recipient-digest collector (alias mail flows under parent acct)
-      - Triage-runner self-match (#107 self-sent event)
-    """
-    if not acct:
-        return set()
-    out: set[str] = set()
-    primary = account_email(acct).strip().lower()
-    if primary:
-        out.add(primary)
-    # #106 canonical path — JSON-array column.
-    for entry in account_aliases(acct):
-        addr = entry.get("address", "")
-        if addr:
-            out.add(addr)
-    # Legacy / pre-merge fallback: config["aliases"] as list[str] or
-    # comma-separated string. Kept so any account configured via the
-    # #107 ad-hoc path during the parallel-build window still routes
-    # correctly. Future cleanup can drop this once the operator
-    # confirms zero rows use the legacy shape.
-    cfg = acct.get("config") or {}
-    raw = cfg.get("aliases")
-    if isinstance(raw, list):
-        candidates = [str(x or "") for x in raw]
-    elif isinstance(raw, str):
-        candidates = []
-        for chunk in raw.replace("\n", ",").replace(";", ",").split(","):
-            candidates.append(chunk)
-    else:
-        candidates = []
-    for c in candidates:
-        addr = c.strip().lower()
-        if addr and "@" in addr:
-            out.add(addr)
-    return out
 
 
-def list_email_accounts(
-    conn: sqlite3.Connection,
-    user_id: int | None = None,
-    include_delegated: bool = True,
-) -> list[dict]:
-    """List email accounts. If user_id is None, returns all (admin view).
-
-    With ``user_id`` set:
-    * Returns accounts where this user is the owner.
-    * Plus accounts where this user is a delegate (#50) — unless
-      ``include_delegated=False`` (legacy callers that genuinely
-      want owner-only).
-
-    Each row includes ``is_delegate`` (False for owner-of, True
-    when surfaced via the delegates JOIN) so the UI can chip
-    appropriately.
-    """
-    import json
-    if user_id is not None:
-        # Owner rows.
-        owner_rows = conn.execute(
-            "SELECT ea.*, u.email AS owner_email, u.name AS owner_name, "
-            "       0 AS is_delegate "
-            "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-            "WHERE ea.user_id = ? ORDER BY ea.id",
-            (user_id,),
-        ).fetchall()
-        rows = list(owner_rows)
-        if include_delegated:
-            delegate_rows = conn.execute(
-                "SELECT ea.*, u.email AS owner_email, u.name AS owner_name, "
-                "       1 AS is_delegate "
-                "FROM email_accounts ea "
-                "JOIN users u ON ea.user_id = u.id "
-                "JOIN account_delegates ad ON ad.account_id = ea.id "
-                "WHERE ad.user_id = ? AND ea.user_id != ? "
-                "ORDER BY ea.id",
-                (user_id, user_id),
-            ).fetchall()
-            rows.extend(delegate_rows)
-    else:
-        rows = conn.execute(
-            "SELECT ea.*, u.email AS owner_email, u.name AS owner_name, "
-            "       0 AS is_delegate "
-            "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-            "ORDER BY u.email, ea.id",
-        ).fetchall()
-    result = []
-    for r in rows:
-        d = dict(r)
-        cfg = _apply_account_config_back_compat(
-            json.loads(d.pop("config_json", "{}")),
-        )
-        cfg = apply_ingestion_back_compat(conn, d["id"], d["provider_type"], cfg)
-        d["config"] = cfg
-        # Parse the alias list once on read. Stored as a JSON array of
-        # ``{"address","label"}`` dicts; malformed values fall back to
-        # an empty list so a corrupt row doesn't blow up the whole
-        # /accounts page render. Pre-aliases-column rows (legacy DBs
-        # before v10) surface as missing keys in the dict_factory
-        # output — also coerce to empty list.
-        raw_aliases = d.pop("aliases_json", "[]") or "[]"
-        try:
-            parsed_aliases = json.loads(raw_aliases)
-        except (TypeError, ValueError):
-            parsed_aliases = []
-        if not isinstance(parsed_aliases, list):
-            parsed_aliases = []
-        d["aliases"] = parsed_aliases
-        # Synthesize the resolved email address up-front so callers
-        # don't have to know the per-provider field-name dance. See
-        # ``account_email`` for the resolution rules.
-        d["email_address"] = account_email(d)
-        result.append(d)
-    return result
 
 
 # ---------------------------------------------------------------------------
-# Per-account delegation (#50)
+# Per-account delegation
 # ---------------------------------------------------------------------------
 
-def add_account_delegate(
-    conn: sqlite3.Connection,
-    account_id: int,
-    user_id: int,
-    granted_by: int | None,
-) -> bool:
-    """Grant a user delegate access to an account. Idempotent: returns
-    True on first add, False if the row already exists. Raises ValueError
-    if user_id == account_owner (owner is not a delegate of their own
-    account)."""
-    from datetime import datetime, timezone
-    owner = conn.execute(
-        "SELECT user_id FROM email_accounts WHERE id = ?",
-        (account_id,),
-    ).fetchone()
-    if owner is None:
-        raise ValueError(f"Account {account_id} not found")
-    if owner["user_id"] == user_id:
-        raise ValueError(
-            "Owner cannot be added as a delegate of their own account"
-        )
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO account_delegates "
-        "(account_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)",
-        (account_id, user_id, granted_by, now),
-    )
-    conn.commit()
-    return cur.rowcount > 0
 
 
-def remove_account_delegate(
-    conn: sqlite3.Connection,
-    account_id: int,
-    user_id: int,
-) -> bool:
-    """Revoke delegate access. Returns True if a row was removed."""
-    cur = conn.execute(
-        "DELETE FROM account_delegates "
-        "WHERE account_id = ? AND user_id = ?",
-        (account_id, user_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
 
 
-def list_account_delegates(
-    conn: sqlite3.Connection,
-    account_id: int,
-) -> list[dict]:
-    """Return delegates for ``account_id`` as ``[{user_id, email, name,
-    granted_by, granted_by_email, granted_at}, ...]`` ordered by grant
-    time."""
-    rows = conn.execute(
-        "SELECT ad.user_id, u.email, u.name, "
-        "       ad.granted_by, "
-        "       gu.email AS granted_by_email, "
-        "       ad.granted_at "
-        "FROM account_delegates ad "
-        "JOIN users u ON u.id = ad.user_id "
-        "LEFT JOIN users gu ON gu.id = ad.granted_by "
-        "WHERE ad.account_id = ? "
-        "ORDER BY ad.granted_at",
-        (account_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
-def is_account_delegate(
-    conn: sqlite3.Connection,
-    account_id: int,
-    user_id: int,
-) -> bool:
-    """True if ``user_id`` has delegate access to ``account_id``."""
-    row = conn.execute(
-        "SELECT 1 FROM account_delegates "
-        "WHERE account_id = ? AND user_id = ?",
-        (account_id, user_id),
-    ).fetchone()
-    return row is not None
 
 
-def can_manage_account(
-    conn: sqlite3.Connection,
-    user: dict | None,
-    acct: dict | None,
-) -> bool:
-    """Authz gate for per-account operations. True when:
-
-    * ``user`` has admin role, OR
-    * ``user`` is the account owner, OR
-    * ``user`` has a delegate row for this account.
-
-    Sensitive operations (HIPAA flag flip, account deletion) bypass
-    this and check admin/owner directly — delegates intentionally
-    cannot escalate or destroy the account.
-    """
-    if not user or not acct:
-        return False
-    if user.get("role") == "admin":
-        return True
-    if acct.get("user_id") == user.get("id"):
-        return True
-    return is_account_delegate(conn, acct["id"], user["id"])
 
 
-def get_email_account(conn: sqlite3.Connection, account_id: int) -> dict | None:
-    """Get a single email account by ID."""
-    import json
-    row = conn.execute(
-        "SELECT ea.*, u.email AS owner_email, u.name AS owner_name "
-        "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-        "WHERE ea.id = ?",
-        (account_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    d = dict(row)
-    cfg = _apply_account_config_back_compat(
-        json.loads(d.pop("config_json", "{}")),
-    )
-    cfg = apply_ingestion_back_compat(conn, d["id"], d["provider_type"], cfg)
-    d["config"] = cfg
-    raw_aliases = d.pop("aliases_json", "[]") or "[]"
-    try:
-        parsed_aliases = json.loads(raw_aliases)
-    except (TypeError, ValueError):
-        parsed_aliases = []
-    if not isinstance(parsed_aliases, list):
-        parsed_aliases = []
-    d["aliases"] = parsed_aliases
-    d["email_address"] = account_email(d)
-    return d
 
 
-def create_email_account(
-    conn: sqlite3.Connection,
-    user_id: int,
-    name: str,
-    provider_type: str,
-    config: dict,
-    hipaa: bool | None = None,
-    is_active: bool = True,
-) -> int:
-    """Create an email account. Returns the new ID.
-
-    If ``hipaa`` is None (the default), the per-account flag is inferred
-    from the current system HIPAA state — if system HIPAA is ON the
-    account is auto-flagged and ``created_under_system_hipaa`` is set
-    so the flag cannot be unset until system HIPAA is later turned off
-    ("sticky inheritance").  An explicit ``hipaa`` value from the
-    caller overrides the inference.
-
-    ``is_active`` defaults to True for full-form callers (manual-add
-    POST /accounts where every credential lands in one submit). The
-    new-account wizard's step-1 handler passes ``is_active=False`` so
-    the half-configured stub (empty ``config``) does not get polled
-    by background watchers / pollers / triage workers until the wizard
-    finishes (item #120). Step-5 submit flips to True via
-    ``set_account_active``. Background pollers already gate on
-    ``is_active`` (six call sites in app.py + ui.py), so flipping the
-    flag suppresses the "missing credentials" error spam that triggered
-    Nagios alerts on the homelab monitoring path.
-    """
-    import json
-    from datetime import datetime, timezone
-    from email_triage.triage_logging import is_hipaa_mode
-    now = datetime.now(timezone.utc).isoformat()
-    system_hipaa = is_hipaa_mode()
-    if hipaa is None:
-        hipaa = system_hipaa
-    created_under = 1 if system_hipaa else 0
-    cursor = conn.execute(
-        "INSERT INTO email_accounts "
-        "(user_id, name, provider_type, config_json, hipaa, "
-        " created_under_system_hipaa, is_active, "
-        " created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (user_id, name, provider_type, json.dumps(config),
-         int(bool(hipaa)), created_under, int(bool(is_active)),
-         now, now),
-    )
-    conn.commit()
-    return cursor.lastrowid
 
 
-def set_account_active(
-    conn: sqlite3.Connection,
-    account_id: int,
-    active: bool,
-) -> bool:
-    """Flip ``is_active`` without touching name / provider_type / config.
-
-    Used by the wizard's step-5 finish handler to enable an account
-    that was created in the disabled state at step 1 (item #120).
-    Also useful for an admin "pause this account" surface that we
-    might add later.
-
-    Returns True when a row was updated.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "UPDATE email_accounts SET is_active = ?, updated_at = ? "
-        "WHERE id = ?",
-        (int(bool(active)), now, account_id),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
 
 
-def set_account_hipaa(
-    conn: sqlite3.Connection,
-    account_id: int,
-    hipaa: bool,
-    actor_id: int | None = None,
-    reason: str = "",
-) -> dict:
-    """Flip an account's HIPAA flag and record the boundary event.
-
-    Enforces the lock rule: if the account was created while system
-    HIPAA was on AND system HIPAA is still on, the flag cannot be
-    turned off.  Raises ``PermissionError`` in that case.  The flip
-    and the boundary-event write happen in a single transaction.
-
-    Returns the refreshed account dict.
-    """
-    from email_triage.triage_logging import is_hipaa_mode, is_account_hipaa_locked
-    acct = get_email_account(conn, account_id)
-    if acct is None:
-        raise ValueError(f"Account {account_id} not found")
-
-    # No-op: flag already in the requested state.
-    current = bool(acct.get("hipaa", False))
-    if current == bool(hipaa):
-        return acct
-
-    # Lock enforcement.
-    if not hipaa and is_account_hipaa_locked(acct):
-        raise PermissionError(
-            "Cannot unset HIPAA flag while system HIPAA mode is active "
-            "for an account that was created under system HIPAA."
-        )
-
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    direction = "on" if hipaa else "off"
-    scope = f"account:{account_id}"
-    try:
-        conn.execute("BEGIN")
-        conn.execute(
-            "UPDATE email_accounts SET hipaa = ?, updated_at = ? WHERE id = ?",
-            (int(bool(hipaa)), now, account_id),
-        )
-        conn.execute(
-            "INSERT INTO hipaa_boundary_events "
-            "(ts, scope, direction, actor_id, reason) VALUES (?, ?, ?, ?, ?)",
-            (now, scope, direction, actor_id, reason),
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    return get_email_account(conn, account_id)
 
 
-def update_email_account(
-    conn: sqlite3.Connection,
-    account_id: int,
-    name: str,
-    provider_type: str,
-    config: dict,
-    is_active: bool = True,
-) -> bool:
-    """Update an email account. Returns True if updated."""
-    import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "UPDATE email_accounts SET name = ?, provider_type = ?, config_json = ?, "
-        "is_active = ?, updated_at = ? WHERE id = ?",
-        (name, provider_type, json.dumps(config), int(is_active), now, account_id),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
 
 
-def update_email_account_config(
-    conn: sqlite3.Connection, account_id: int, config: dict,
-) -> bool:
-    """Patch the config_json for an account without touching the other
-    columns. Used by the history-poll loop to clear a
-    ``poll_interval_override`` on push↔poll transitions."""
-    import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "UPDATE email_accounts SET config_json = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(config), now, account_id),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
 
 
-def update_account_config_keys(
-    conn: sqlite3.Connection,
-    account_id: int,
-    /,
-    **patches: Any,
-) -> bool:
-    """Read-modify-write a subset of an account's ``config_json`` keys
-    atomically.
-
-    Replaces the 7-site idiom::
-
-        config = dict(acct.get("config") or {})
-        config[k] = v
-        update_email_account_config(db, aid, config)
-
-    The read-modify-write happens inside a single ``BEGIN IMMEDIATE``
-    transaction so a concurrent writer cannot clobber an unrelated
-    key between the read and the write — the pre-fix idiom hit this
-    on the calendar-surrogate save vs the digest-schedule save when
-    both arrive in the same second. Other config keys not named in
-    ``patches`` are preserved verbatim.
-
-    Patches with value ``None`` mean "delete the key" (the operator
-    is clearing a setting). Patches with any other value overwrite.
-
-    Emits a single structured INFO log per call listing the keys
-    that changed (audit signal — operators reviewing config drift
-    can see which knob moved without enabling row-level audit). The
-    log line does NOT include values, since some config knobs (e.g.
-    ``imap.host``) may pin to operator-identifying infrastructure;
-    the keys-only shape is the conservative-safe surface.
-
-    Returns
-    -------
-    bool
-        True when the row was found and updated; False when
-        ``account_id`` does not exist.
-    """
-    import json
-    from datetime import datetime, timezone
-
-    # BEGIN IMMEDIATE acquires the write lock up front so a concurrent
-    # reader-then-writer can't slot in between our SELECT and UPDATE.
-    # SQLite's default deferred mode would hit "database is locked"
-    # under contention but only after the SELECT — too late. We fold
-    # the read + write into one transaction explicitly.
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = conn.execute(
-            "SELECT config_json FROM email_accounts WHERE id = ?",
-            (account_id,),
-        ).fetchone()
-        if row is None:
-            conn.execute("ROLLBACK")
-            return False
-        try:
-            current = json.loads(row[0] or "{}")
-        except (TypeError, ValueError):
-            current = {}
-        if not isinstance(current, dict):
-            current = {}
-
-        merged = dict(current)
-        changed_keys: list[str] = []
-        for key, value in patches.items():
-            if value is None:
-                if key in merged:
-                    merged.pop(key, None)
-                    changed_keys.append(key)
-            else:
-                if merged.get(key) != value:
-                    merged[key] = value
-                    changed_keys.append(key)
-
-        if not changed_keys:
-            conn.execute("ROLLBACK")
-            return True  # No-op write — row exists, nothing to change.
-
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE email_accounts "
-            "SET config_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(merged), now, account_id),
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-
-    # Structured-log emission AFTER the commit so a log failure
-    # cannot orphan a successful write. owner + account_name surface
-    # per ``feedback_no_account_id_alone.md`` — the numeric account_id
-    # is a tiebreaker only; logs use the human-readable owner +
-    # account_name as the primary key.
-    try:
-        meta = conn.execute(
-            "SELECT ea.name AS account_name, "
-            "       u.email AS owner, u.name AS owner_name "
-            "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-            "WHERE ea.id = ?",
-            (account_id,),
-        ).fetchone()
-        import logging
-        logger = logging.getLogger("email_triage.web.db")
-        log_extra: dict[str, Any] = {"account_id": account_id}
-        if meta is not None:
-            d = dict(meta)
-            if d.get("owner_name"):
-                log_extra["owner"] = d["owner_name"]
-            elif d.get("owner"):
-                log_extra["owner"] = d["owner"]
-            if d.get("account_name"):
-                log_extra["account_name"] = d["account_name"]
-        log_extra["changed_keys"] = sorted(changed_keys)
-        logger.info(
-            "Account config keys updated",
-            extra={"_extra": log_extra},
-        )
-    except Exception:
-        # Log emission must never sink the call — the write already
-        # landed. Best-effort only.
-        pass
-    return True
 
 
-class AliasValidationError(ValueError):
-    """Raised when a proposed alias list violates the storage contract.
-
-    Constructor takes a single human-readable reason that's safe to
-    surface to the operator (the UI just renders this string verbatim
-    above the alias form).
-    """
 
 
-def _looks_like_email(addr: str) -> bool:
-    """Lightweight RFC-shaped check used by the alias validator.
-
-    Intentionally conservative: requires an ``@`` plus at least one
-    dot in the host part. Doesn't try to validate the local part —
-    real RFC 5322 grammar is too permissive to be useful as a UI
-    gate, and we already let the SMTP / IMAP layer reject impossible
-    addresses at the actual-use point.
-    """
-    s = (addr or "").strip()
-    if "@" not in s:
-        return False
-    host = s.split("@")[-1]
-    return "." in host and len(host) > 2
 
 
-def normalize_aliases(
-    raw: list[dict],
-    *,
-    primary: str = "",
-) -> list[dict]:
-    """Validate + normalize an alias list before write.
-
-    Rules:
-    * Each entry must be a dict with at least an ``address`` key.
-    * Address must be RFC-shaped (``_looks_like_email``).
-    * Address is lowercased + stripped.
-    * Label is stripped (empty allowed).
-    * The primary address (when supplied) cannot also be an alias.
-    * Duplicate addresses across entries are rejected.
-
-    Raises :class:`AliasValidationError` on first violation with a
-    plain-language reason. Returns the cleaned list on success.
-    """
-    norm_primary = (primary or "").strip().lower()
-    seen: set[str] = set()
-    out: list[dict] = []
-    for entry in raw or []:
-        if not isinstance(entry, dict):
-            raise AliasValidationError(
-                "Each additional address must be a name/value entry."
-            )
-        addr = str(entry.get("address") or "").strip().lower()
-        label = str(entry.get("label") or "").strip()
-        if not addr:
-            raise AliasValidationError(
-                "Address can't be blank — type the email address you want to add."
-            )
-        if not _looks_like_email(addr):
-            raise AliasValidationError(
-                f"'{addr}' doesn't look like a valid email address. "
-                f"It needs an @ and a dot in the part after the @."
-            )
-        if norm_primary and addr == norm_primary:
-            raise AliasValidationError(
-                "That's already this account's main address — "
-                "no need to add it again."
-            )
-        if addr in seen:
-            raise AliasValidationError(
-                f"'{addr}' is listed twice. Each address can only appear once."
-            )
-        seen.add(addr)
-        out.append({"address": addr, "label": label})
-    return out
 
 
-def update_email_account_aliases(
-    conn: sqlite3.Connection,
-    account_id: int,
-    aliases: list[dict],
-) -> bool:
-    """Replace the stored alias list for an account.
-
-    ``aliases`` should already be validated via :func:`normalize_aliases`
-    — this writer is dumb (json.dumps + UPDATE). Returns True if a row
-    was updated.
-    """
-    import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "UPDATE email_accounts SET aliases_json = ?, updated_at = ? "
-        "WHERE id = ?",
-        (json.dumps(aliases), now, account_id),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
 
 
-def delete_email_account(conn: sqlite3.Connection, account_id: int) -> bool:
-    """Delete an email account. Returns True if deleted."""
-    cursor = conn.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
-    conn.commit()
-    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
 # Account route helpers (per-account category→action mappings)
 # ---------------------------------------------------------------------------
 
-def list_account_routes(conn: sqlite3.Connection, account_id: int) -> list[dict]:
-    """Return all route mappings for an account."""
-    import json
-    rows = conn.execute(
-        "SELECT id, account_id, category, actions_json, created_at, updated_at "
-        "FROM account_routes WHERE account_id = ? ORDER BY category",
-        (account_id,),
-    ).fetchall()
-    result = []
-    for r in rows:
-        d = dict(r)
-        d["actions"] = json.loads(d.pop("actions_json", "[]"))
-        result.append(d)
-    return result
 
 
-def get_account_route(conn: sqlite3.Connection, account_id: int, category: str) -> dict | None:
-    """Get a single route mapping for an account + category."""
-    import json
-    row = conn.execute(
-        "SELECT id, account_id, category, actions_json FROM account_routes "
-        "WHERE account_id = ? AND category = ?",
-        (account_id, category),
-    ).fetchone()
-    if row is None:
-        return None
-    d = dict(row)
-    d["actions"] = json.loads(d.pop("actions_json", "[]"))
-    return d
 
 
-def upsert_account_route(
-    conn: sqlite3.Connection,
-    account_id: int,
-    category: str,
-    actions: list[dict],
-) -> int:
-    """Create or update a route mapping. Returns the row ID."""
-    import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    actions_json = json.dumps(actions)
-
-    existing = conn.execute(
-        "SELECT id FROM account_routes WHERE account_id = ? AND category = ?",
-        (account_id, category),
-    ).fetchone()
-
-    if existing:
-        conn.execute(
-            "UPDATE account_routes SET actions_json = ?, updated_at = ? WHERE id = ?",
-            (actions_json, now, existing["id"]),
-        )
-        conn.commit()
-        return existing["id"]
-    else:
-        cursor = conn.execute(
-            "INSERT INTO account_routes (account_id, category, actions_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (account_id, category, actions_json, now, now),
-        )
-        conn.commit()
-        return cursor.lastrowid
 
 
-def delete_account_route(conn: sqlite3.Connection, route_id: int) -> bool:
-    """Delete a route mapping. Returns True if deleted."""
-    cursor = conn.execute("DELETE FROM account_routes WHERE id = ?", (route_id,))
-    conn.commit()
-    return cursor.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
 # Account Folder Preferences
 # ---------------------------------------------------------------------------
 
-def get_folder_prefs(conn: sqlite3.Connection, account_id: int) -> dict[str, bool]:
-    """Return folder preferences as {folder_path: included}.
-
-    Folders not in the table are considered included (default behaviour).
-    Only explicitly excluded folders are stored with included=0.
-    """
-    rows = conn.execute(
-        "SELECT folder_path, included FROM account_folder_prefs WHERE account_id = ?",
-        (account_id,),
-    ).fetchall()
-    return {row["folder_path"]: bool(row["included"]) for row in rows}
 
 
-def save_folder_prefs(
-    conn: sqlite3.Connection,
-    account_id: int,
-    prefs: dict[str, bool],
-) -> None:
-    """Save folder include/exclude preferences.
-
-    *prefs* is ``{folder_path: included}``.  Existing prefs for the
-    account are replaced entirely (delete + re-insert).
-    """
-    conn.execute(
-        "DELETE FROM account_folder_prefs WHERE account_id = ?",
-        (account_id,),
-    )
-    for folder_path, included in prefs.items():
-        conn.execute(
-            "INSERT INTO account_folder_prefs (account_id, folder_path, included) "
-            "VALUES (?, ?, ?)",
-            (account_id, folder_path, int(included)),
-        )
-    conn.commit()
 
 
-def get_visible_folders(
-    conn: sqlite3.Connection,
-    account_id: int,
-    all_folders: list[str],
-    separator: str = ".",
-) -> list[str]:
-    """Filter a list of server folders by the account's preferences.
-
-    A folder is excluded if:
-    - It is explicitly excluded (included=0), OR
-    - Any of its ancestor folders are explicitly excluded.
-
-    Folders with no preference entry are included by default.
-    """
-    prefs = get_folder_prefs(conn, account_id)
-    # Build set of excluded paths.
-    excluded = {path for path, inc in prefs.items() if not inc}
-
-    visible = []
-    for folder in all_folders:
-        # Check if this folder or any ancestor is excluded.
-        is_excluded = False
-        for ex_path in excluded:
-            if folder == ex_path or folder.startswith(ex_path + separator):
-                is_excluded = True
-                break
-        if not is_excluded:
-            visible.append(folder)
-    return visible
 
 
 # ---------------------------------------------------------------------------
 # Triage run tracking
 # ---------------------------------------------------------------------------
 
+@db_write
 def record_triage_run(
     conn: sqlite3.Connection,
     account_id: int,
@@ -2700,7 +1786,7 @@ def list_triage_runs(
 
 
 # ---------------------------------------------------------------------------
-# triage_jobs — background whole-mailbox triage runs (#101)
+# triage_jobs — background whole-mailbox triage runs
 # ---------------------------------------------------------------------------
 #
 # Distinct from ``triage_runs`` (one row per completed inline run, holds
@@ -2721,6 +1807,7 @@ def _new_job_id() -> str:
     return "tjob_" + _secrets_mod.token_hex(6)
 
 
+@db_write
 def create_triage_job(
     conn: sqlite3.Connection,
     *,
@@ -2770,7 +1857,7 @@ def get_triage_job(
     row = conn.execute(
         "SELECT * FROM triage_jobs WHERE job_id = ?", (job_id,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
 def list_triage_jobs(
@@ -2796,7 +1883,7 @@ def list_triage_jobs(
         f"ORDER BY created_at DESC LIMIT ?",
         params,
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def count_active_triage_jobs_for_account(
@@ -2806,7 +1893,7 @@ def count_active_triage_jobs_for_account(
 
     Used by the run handler to refuse a second submit while an
     earlier job is still draining (one bulk job per account at a
-    time, per #101 design)."""
+    time, per  design)."""
     row = conn.execute(
         "SELECT COUNT(*) AS cnt FROM triage_jobs "
         "WHERE account_id = ? AND status IN ('queued', 'running')",
@@ -2815,6 +1902,7 @@ def count_active_triage_jobs_for_account(
     return int(row["cnt"]) if row else 0
 
 
+@db_write
 def claim_next_queued_triage_job(
     conn: sqlite3.Connection,
 ) -> dict | None:
@@ -2840,9 +1928,10 @@ def claim_next_queued_triage_job(
     )
     row = cursor.fetchone()
     conn.commit()
-    return dict(row) if row else None
+    return _row(row)
 
 
+@db_write
 def bump_triage_job_counters(
     conn: sqlite3.Connection,
     job_id: str,
@@ -2873,6 +1962,7 @@ def bump_triage_job_counters(
     conn.commit()
 
 
+@db_write
 def finish_triage_job(
     conn: sqlite3.Connection,
     job_id: str,
@@ -2899,6 +1989,7 @@ def finish_triage_job(
     conn.commit()
 
 
+@db_write
 def request_triage_job_cancel(
     conn: sqlite3.Connection, job_id: str,
 ) -> bool:
@@ -2918,6 +2009,7 @@ def request_triage_job_cancel(
     return cursor.rowcount > 0
 
 
+@db_write
 def update_triage_job_cursor(
     conn: sqlite3.Connection,
     job_id: str,
@@ -2961,6 +2053,7 @@ def is_message_processed_in_job(
     return row is not None
 
 
+@db_write
 def record_processed_message(
     conn: sqlite3.Connection,
     job_id: str,
@@ -3007,6 +2100,7 @@ def count_processed_messages_in_job(
     return out
 
 
+@db_write
 def requeue_orphaned_triage_jobs(
     conn: sqlite3.Connection,
 ) -> int:
@@ -3029,261 +2123,41 @@ def requeue_orphaned_triage_jobs(
     return cursor.rowcount
 
 
-def get_triage_stats(conn: sqlite3.Connection) -> dict:
-    """Get aggregate triage stats for the dashboard."""
-    stats = {}
-
-    # Total runs.
-    row = conn.execute("SELECT COUNT(*) AS cnt FROM triage_runs").fetchone()
-    stats["total_runs"] = row["cnt"] if row else 0
-
-    # Total messages processed.
-    row = conn.execute("SELECT COALESCE(SUM(total_messages), 0) AS cnt FROM triage_runs").fetchone()
-    stats["total_messages"] = row["cnt"] if row else 0
-
-    # Recent runs (last 10).
-    stats["recent_runs"] = list_triage_runs(conn, limit=10)
-
-    # Category breakdown from all results.
-    import json
-    rows = conn.execute("SELECT results_json FROM triage_runs").fetchall()
-    cat_counts: dict[str, int] = {}
-    for r in rows:
-        for entry in json.loads(r["results_json"] or "[]"):
-            cat = entry.get("category", "unknown")
-            cat_counts[cat] = cat_counts.get(cat, 0) + 1
-    stats["category_counts"] = dict(sorted(cat_counts.items(), key=lambda x: -x[1]))
-
-    return stats
-
-
-# ---------------------------------------------------------------------------
-# Log entries (for admin log viewer)
-# ---------------------------------------------------------------------------
-
-def insert_log_entry(
+@db_write
+def prune_triage_runs(
     conn: sqlite3.Connection,
-    ts: str,
-    level: str,
-    logger: str,
-    message: str,
-    extra: dict | None = None,
-) -> None:
-    """Insert a log entry into the database — chain-aware.
-
-    .. warning::
-
-        This helper exists for tests and for non-stdlib-logging surfaces
-        (structured-event sinks, fixture seeding). The stdlib
-        ``logging`` path goes through :class:`SQLiteLogHandler` and
-        MUST stay there — that handler caches the last row hash on the
-        instance, eliminating a SELECT per emit on the hot path.
-
-        Helper writers MUST keep this chain-aware. Inserting empty
-        ``prev_hash`` / ``row_hash`` strings here re-introduces the
-        legacy "pre-chain row" gap that
-        :func:`verify_log_chain` skips silently — leaving entire
-        windows of activity outside the integrity envelope. HIPAA
-        §164.312(c)(1) integrity rests on every row being chained.
-
-    Computes ``prev_hash`` + ``row_hash`` via :func:`compute_log_row_hash`
-    against the current chain tail (:func:`get_last_log_row_hash`).
-    Caller still owns commit timing — pass an autocommit connection or
-    commit explicitly.
-    """
-    import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    extra_json = json.dumps(extra or {})
-    prev_hash = get_last_log_row_hash(conn)
-    row_hash = compute_log_row_hash(
-        prev_hash, ts, level, logger, message, extra_json,
-    )
-    conn.execute(
-        "INSERT INTO log_entries "
-        "(ts, level, logger, message, extra_json, created_at, "
-        " prev_hash, row_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (ts, level, logger, message, extra_json, now, prev_hash, row_hash),
-    )
-    # Don't commit every entry — caller should batch or use autocommit.
-
-
-def list_log_entries(
-    conn: sqlite3.Connection,
-    limit: int = 200,
-    level: str | None = None,
-    offset: int = 0,
-    query: str | None = None,
-) -> list[dict]:
-    """Return recent log entries, newest first.
-
-    ``query`` is a case-insensitive substring filter that matches
-    against message + logger + extra_json. Useful for correlating on
-    flow_id, account_name, uid, or any text the caller threaded into
-    log extras.
-    """
-    import json
-    clauses: list[str] = []
-    params: list = []
-    if level:
-        clauses.append("level = ?")
-        params.append(level.upper())
-    if query:
-        # Match anywhere in message / logger / extras. LIKE with lower()
-        # for case-insensitive; % wildcards wrap the query term.
-        q_like = f"%{query.lower()}%"
-        clauses.append(
-            "(LOWER(message) LIKE ? OR LOWER(logger) LIKE ? "
-            "OR LOWER(extra_json) LIKE ?)"
-        )
-        params.extend([q_like, q_like, q_like])
-    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-    sql = (
-        f"SELECT * FROM log_entries {where}"
-        f"ORDER BY id DESC LIMIT ? OFFSET ?"
-    )
-    params.extend([limit, offset])
-    rows = conn.execute(sql, params).fetchall()
-    result = []
-    for r in rows:
-        d = dict(r)
-        extra = json.loads(d.pop("extra_json", "{}"))
-        # Render-time legacy unpack: rows emitted before the
-        # ec06f21 fix landed with shape {"_extra": "<stringified
-        # dict>"} (the SQLite handler's old emit() walked
-        # vars(record) and stored record._extra as a
-        # str()-coerced single key instead of hoisting the inner
-        # keys to top-level). Detect that shape + parse the
-        # stringified dict via ast.literal_eval (it's a Python
-        # repr, not JSON — single-quoted strings) so the /logs
-        # pill renderer + Details column can see the actual
-        # error / account / uid / flow_id fields. Backfilling the
-        # rows would invalidate the audit hash chain (#131); the
-        # render-time unpack leaves storage intact.
-        if (
-            isinstance(extra, dict)
-            and len(extra) == 1
-            and "_extra" in extra
-            and isinstance(extra["_extra"], str)
-        ):
-            import ast as _ast
-            try:
-                inner = _ast.literal_eval(extra["_extra"])
-                if isinstance(inner, dict):
-                    extra = {str(k): v for k, v in inner.items()}
-            except (ValueError, SyntaxError):
-                # Malformed; leave the original shape so the
-                # operator can still see something even if pills
-                # don't render.
-                pass
-        d["extra"] = extra
-        result.append(d)
-    return result
-
-
-_AUDIT_CHAIN_ANCHOR_KEY = "audit:chain_anchor"
-
-
-def _capture_chain_anchor(conn: sqlite3.Connection) -> None:
-    """Stamp the post-prune chain head into the settings table.
-
-    Called inside the same transaction as a prune so anchor + DELETE are
-    atomic. After the oldest rows are gone, the new chain-aware head row
-    no longer has its predecessor in the table — its ``prev_hash`` would
-    otherwise look like a chain break to :func:`verify_log_chain`. The
-    anchor seeds the verifier with the head's recorded ``prev_hash`` so
-    the chain validates from that boundary forward.
-
-    Stored shape (settings table, key ``audit:chain_anchor``)::
-
-        {"head_id": int, "head_prev_hash": str, "anchored_at": iso}
-
-    No-op when the table is empty post-prune (nothing to anchor).
-    """
-    from datetime import datetime, timezone
-    head = conn.execute(
-        "SELECT id, prev_hash FROM log_entries "
-        "WHERE row_hash != '' "
-        "ORDER BY id ASC LIMIT 1"
-    ).fetchone()
-    if head is None:
-        return
-    anchor = {
-        "head_id": int(head["id"]),
-        "head_prev_hash": head["prev_hash"] or "",
-        "anchored_at": datetime.now(timezone.utc).isoformat(),
-    }
-    # Inline UPSERT — avoid set_setting() because that helper auto-commits
-    # and we need the anchor write to share the prune transaction.
-    import json as _json
-    conn.execute(
-        "INSERT INTO settings (key, value_json, updated_at) "
-        "VALUES (?, ?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET "
-        "value_json = excluded.value_json, "
-        "updated_at = excluded.updated_at",
-        (_AUDIT_CHAIN_ANCHOR_KEY, _json.dumps(anchor), anchor["anchored_at"]),
-    )
-    # Keep the in-process settings cache (#140.2) coherent with this
-    # transactional write. The cache otherwise serves a stale value
-    # for up to TTL seconds after a prune sweep.
-    invalidate_setting_cache(_AUDIT_CHAIN_ANCHOR_KEY)
-
-
-def prune_log_entries(conn: sqlite3.Connection, keep: int = 5000) -> int:
-    """Delete old log entries, keeping the most recent *keep* rows.
-
-    Legacy count-only helper. Kept for back-compat with any external
-    callers — prefer :func:`prune_log_entries_by_age_and_count`, which
-    the web app wires up at startup + every 30 min.
-
-    Captures the new head row's ``prev_hash`` into ``audit:chain_anchor``
-    inside the same transaction as the DELETE so the verifier doesn't
-    flag the post-prune boundary as a chain break (#131).
-    """
-    cursor = conn.execute(
-        "DELETE FROM log_entries WHERE id NOT IN "
-        "(SELECT id FROM log_entries ORDER BY id DESC LIMIT ?)",
-        (keep,),
-    )
-    if cursor.rowcount > 0:
-        _capture_chain_anchor(conn)
-    conn.commit()
-    return cursor.rowcount
-
-
-def prune_log_entries_by_age_and_count(
-    conn: sqlite3.Connection,
-    *,
-    retention_days: int = 30,
-    max_rows: int = 50000,
+    retention_days: int = 90,
 ) -> int:
-    """Delete rows older than ``retention_days`` OR beyond ``max_rows``.
+    """Delete ``triage_runs`` rows older than ``retention_days``.
 
-    Combined rotation policy (item #26c): an age axis bounds long-tail
-    retention, a count axis bounds explosive-growth edge cases (debug
-    bursts, log-level churn). Whichever axis trims more wins — they are
-    applied with an OR in a single DELETE for atomicity.
-
-    Captures the new head row's ``prev_hash`` into ``audit:chain_anchor``
-    inside the same transaction as the DELETE so the verifier doesn't
-    flag the post-prune boundary as a chain break (#131 — HIPAA
-    §164.312(c)(1) integrity).
-
-    Returns the number of rows deleted. Idempotent — a second call on
-    an already-bounded table is a no-op.
+    ``triage_runs`` records one row per completed inline triage run and
+    grew unbounded — nothing trimmed it. This mirrors
+    :func:`prune_triaged_messages`: an age-based DELETE on the indexed
+    ``created_at`` column, idempotent, run on the same cadence as the
+    log-entries prune loop. Returns the number of rows removed.
     """
-    cursor = conn.execute(
-        "DELETE FROM log_entries WHERE "
-        "ts < datetime('now', ?) "
-        "OR id NOT IN (SELECT id FROM log_entries ORDER BY id DESC LIMIT ?)",
-        (f"-{int(retention_days)} days", int(max_rows)),
-    )
-    if cursor.rowcount > 0:
-        _capture_chain_anchor(conn)
-    conn.commit()
-    return cursor.rowcount
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=int(retention_days))).isoformat()
+    try:
+        cur = conn.execute(
+            "DELETE FROM triage_runs WHERE created_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception:
+        # Best-effort prune — a swallowed exception here is invisible to
+        # the ``@db_write`` decorator's rollback path. If the DELETE
+        # opened an implicit transaction and ``commit()`` failed, roll
+        # it back so the next explicit-``BEGIN`` helper does not raise
+        # "cannot start a transaction within a transaction".
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except Exception:
+            pass
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3299,6 +2173,7 @@ def get_user_escalation_categories(conn: sqlite3.Connection, user_id: int) -> se
     return {r["category"] for r in rows}
 
 
+@db_write
 def set_user_escalation_categories(
     conn: sqlite3.Connection,
     user_id: int,
@@ -3374,7 +2249,7 @@ def is_user_disabled(conn: sqlite3.Connection, user_id: int) -> bool:
 def disabled_user_ids(conn: sqlite3.Connection) -> set[int]:
     """Return the set of currently-disabled user ids.
 
-    #134.4 — single query, replaces ``is_user_disabled(db, owner_id)``
+    .4 — single query, replaces ``is_user_disabled(db, owner_id)``
     inside per-account loops in app.py (watcher restore, digest sender,
     unified poll). Callers build this set once per loop iteration and
     do O(1) ``owner_id in disabled`` membership checks.
@@ -3390,854 +2265,6 @@ def disabled_user_ids(conn: sqlite3.Connection) -> set[int]:
     return {int(r["id"]) for r in rows}
 
 
-def record_user_status_event(
-    conn: sqlite3.Connection,
-    target_user_id: int,
-    actor_user_id: int | None,
-    event: str,
-    reason: str = "",
-) -> int:
-    """Record a user-status change (disabled/enabled).  Returns the new row id."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO user_status_events "
-        "(ts, target_user_id, actor_user_id, event, reason) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (now, target_user_id, actor_user_id, event, reason or ""),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def set_user_disabled(
-    conn: sqlite3.Connection,
-    target_user_id: int,
-    disabled: bool,
-    actor_user_id: int | None = None,
-    reason: str = "",
-) -> bool:
-    """Flip a user's ``disabled`` flag and record the audit row atomically.
-
-    Returns True if the flag actually changed, False if it was already
-    in the requested state (no-op, no event recorded).
-    """
-    from datetime import datetime, timezone
-    row = conn.execute(
-        "SELECT disabled FROM users WHERE id = ?", (target_user_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"User {target_user_id} not found")
-    current = bool(row["disabled"])
-    if current == bool(disabled):
-        return False
-
-    now = datetime.now(timezone.utc).isoformat()
-    event = "disabled" if disabled else "enabled"
-    try:
-        conn.execute("BEGIN")
-        if disabled:
-            conn.execute(
-                "UPDATE users SET disabled = 1, disabled_at = ?, "
-                "disabled_by_user_id = ? WHERE id = ?",
-                (now, actor_user_id, target_user_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE users SET disabled = 0, disabled_at = NULL, "
-                "disabled_by_user_id = NULL WHERE id = ?",
-                (target_user_id,),
-            )
-        conn.execute(
-            "INSERT INTO user_status_events "
-            "(ts, target_user_id, actor_user_id, event, reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (now, target_user_id, actor_user_id, event, reason or ""),
-        )
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    return True
-
-
-def list_user_status_events(
-    conn: sqlite3.Connection,
-    target_user_id: int | None = None,
-    limit: int = 200,
-) -> list[dict]:
-    """List user-status events newest-first, optionally filtered by target."""
-    if target_user_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM user_status_events WHERE target_user_id = ? "
-            "ORDER BY id DESC LIMIT ?",
-            (target_user_id, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM user_status_events ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# HIPAA boundary event helpers
-# ---------------------------------------------------------------------------
-
-def record_auth_event(
-    conn: sqlite3.Connection,
-    *,
-    event_type: str,
-    email: str,
-    user_id: int | None = None,
-    key_id: int | None = None,
-    ip: str | None = None,
-    user_agent: str | None = None,
-    outcome: str = "success",
-    detail: str | None = None,
-) -> int:
-    """Append an auth_events row. Returns the new row id.
-
-    PR 9 / D4. Captures every credential-use attempt (success or
-    failure) for HIPAA-flavoured audit. Does NOT replace the
-    last_used_at columns on dev_keys / hardware_keys (those drive
-    the admin UI's "last used N min ago" display) -- this table
-    is the historical source of truth.
-
-    The function does not swallow exceptions; the caller decides
-    whether an audit-write failure should poison the auth flow.
-    Standard pattern: log at WARNING and proceed (auth succeeded;
-    audit drift is a degraded condition, not a denial).
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO auth_events "
-        "(ts, event_type, user_id, email, key_id, ip, user_agent, "
-        " outcome, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (now, event_type, user_id, email, key_id, ip, user_agent,
-         outcome, detail),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def list_auth_events(
-    conn: sqlite3.Connection,
-    *,
-    limit: int = 100,
-    user_id: int | None = None,
-    event_type: str | None = None,
-) -> list[dict]:
-    """Return recent auth_events rows newest-first."""
-    where: list[str] = []
-    params: list = []
-    if user_id is not None:
-        where.append("user_id = ?")
-        params.append(user_id)
-    if event_type:
-        where.append("event_type = ?")
-        params.append(event_type)
-    sql = "SELECT * FROM auth_events"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ts DESC LIMIT ?"
-    params.append(int(limit))
-    rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def record_hipaa_boundary(
-    conn: sqlite3.Connection,
-    scope: str,
-    direction: str,
-    actor_id: int | None = None,
-    reason: str = "",
-) -> int:
-    """Record a HIPAA mode-change event. Returns the new row id.
-
-    ``scope`` is either the literal string ``"system"`` for the global
-    flag, or ``"account:{id}"`` for a per-account flip.  ``direction``
-    is ``"on"`` or ``"off"``.  The row is how the log viewer renders
-    "before this point PHI may be present / after this point it is
-    scrubbed" dividers.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO hipaa_boundary_events "
-        "(ts, scope, direction, actor_id, reason) VALUES (?, ?, ?, ?, ?)",
-        (now, scope, direction, actor_id, reason),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def list_hipaa_boundary_events(
-    conn: sqlite3.Connection,
-    since: str | None = None,
-    limit: int = 200,
-) -> list[dict]:
-    """List boundary events newest-first, optionally filtered by timestamp."""
-    if since:
-        rows = conn.execute(
-            "SELECT be.*, u.email AS actor_email "
-            "FROM hipaa_boundary_events be "
-            "LEFT JOIN users u ON u.id = be.actor_id "
-            "WHERE be.ts >= ? ORDER BY be.ts DESC LIMIT ?",
-            (since, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT be.*, u.email AS actor_email "
-            "FROM hipaa_boundary_events be "
-            "LEFT JOIN users u ON u.id = be.actor_id "
-            "ORDER BY be.ts DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def latest_hipaa_boundary(
-    conn: sqlite3.Connection,
-    scope: str,
-) -> dict | None:
-    """Return the most recent boundary event for the given scope, or None."""
-    row = conn.execute(
-        "SELECT be.*, u.email AS actor_email "
-        "FROM hipaa_boundary_events be "
-        "LEFT JOIN users u ON u.id = be.actor_id "
-        "WHERE be.scope = ? ORDER BY be.ts DESC LIMIT 1",
-        (scope,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def latest_hipaa_boundaries_for_accounts(
-    conn: sqlite3.Connection,
-) -> dict[str, dict]:
-    """Return the most recent ``account:<id>`` boundary event for every account.
-
-    #134.3 — single GROUP-BY query that replaces the per-account
-    :func:`latest_hipaa_boundary` round-trip in the compliance page loop.
-    Returns a dict keyed by ``scope`` (e.g. ``"account:42"``) mapping to
-    the same dict shape as :func:`latest_hipaa_boundary`. The ``actor_email``
-    join is preserved.
-
-    Implementation: rank rows per scope by ts DESC, take rank=1. Uses the
-    correlated-subquery flavour because SQLite's ROW_NUMBER() requires
-    3.25+ and we already index ``(scope, ts)`` via the schema.
-    """
-    rows = conn.execute(
-        "SELECT be.*, u.email AS actor_email "
-        "FROM hipaa_boundary_events be "
-        "LEFT JOIN users u ON u.id = be.actor_id "
-        "WHERE be.scope LIKE 'account:%' "
-        "  AND be.ts = ("
-        "      SELECT MAX(ts) FROM hipaa_boundary_events be2 "
-        "      WHERE be2.scope = be.scope"
-        "  ) "
-        "ORDER BY be.scope"
-    ).fetchall()
-    # If two rows share scope+ts (unlikely; ts is microsecond-resolution
-    # ISO-8601), we keep the first — duplicate-tick collisions don't
-    # affect the "most recent" rendering and are vanishingly rare.
-    out: dict[str, dict] = {}
-    for r in rows:
-        d = dict(r)
-        scope = d.get("scope")
-        if scope and scope not in out:
-            out[scope] = d
-    return out
-
-
-# ---------------------------------------------------------------------------
-# HIPAA access event helpers (§164.312(b) access-audit trail)
-# ---------------------------------------------------------------------------
-
-def record_hipaa_access_event(
-    conn: sqlite3.Connection,
-    actor_user_id: int,
-    account_id: int,
-    operation: str,
-    outcome: str = "ok",
-    detail: str | None = None,
-) -> int:
-    """Record a user-initiated access to a HIPAA-flagged account.
-
-    ``operation`` is one of ``"discover"`` / ``"manual_triage"``.
-    ``outcome`` is ``"ok"`` or ``"error"``. ``detail`` is a short
-    free-text field — never PHI (used for error classes, count of
-    messages touched, etc.).
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO hipaa_access_events "
-        "(ts, actor_user_id, account_id, operation, outcome, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (now, actor_user_id, account_id, operation, outcome, detail),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def update_hipaa_access_event(
-    conn: sqlite3.Connection,
-    event_id: int,
-    outcome: str,
-    detail: str | None = None,
-) -> None:
-    """Update outcome/detail on an event recorded at the start of an operation."""
-    conn.execute(
-        "UPDATE hipaa_access_events SET outcome = ?, detail = ? WHERE id = ?",
-        (outcome, detail, event_id),
-    )
-    conn.commit()
-
-
-def record_discover_run(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    account_name: str,
-    actor_user_id: int | None,
-    scanned_count: int,
-    errors_count: int,
-    folders: list[str],
-    elapsed_secs: float,
-) -> int:
-    """Record a completed Discover Categories scan for audit.
-
-    Unlike ``hipaa_access_events`` (which is HIPAA-only), every discover
-    run lands a row here — Discover exposes sender + subject of every
-    scanned message and is mail-read-level privilege. Answering "who
-    scanned which mailbox + scope" is the audit question.
-
-    Metadata only: no sender, subject, raw_description or raw_category.
-    Discover content is proposals in review, not actions taken.
-    """
-    import json as _json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO discover_runs "
-        "(account_id, account_name, actor_user_id, scanned_count, "
-        " errors_count, folders, elapsed_secs, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            account_id,
-            account_name or "",
-            actor_user_id,
-            int(scanned_count),
-            int(errors_count),
-            _json.dumps(list(folders or [])),
-            float(elapsed_secs),
-            now,
-        ),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def list_discover_runs(
-    conn: sqlite3.Connection,
-    account_id: int | None = None,
-    actor_user_id: int | None = None,
-    limit: int = 100,
-) -> list[dict]:
-    """List discover runs newest-first with optional filters."""
-    where: list[str] = []
-    params: list = []
-    if account_id is not None:
-        where.append("dr.account_id = ?")
-        params.append(account_id)
-    if actor_user_id is not None:
-        where.append("dr.actor_user_id = ?")
-        params.append(actor_user_id)
-    sql = (
-        "SELECT dr.*, u.email AS actor_email "
-        "FROM discover_runs dr "
-        "LEFT JOIN users u ON u.id = dr.actor_user_id"
-    )
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY dr.created_at DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def list_hipaa_access_events(
-    conn: sqlite3.Connection,
-    account_id: int | None = None,
-    actor_user_id: int | None = None,
-    since: str | None = None,
-    limit: int = 500,
-) -> list[dict]:
-    """List access events newest-first with optional filters."""
-    where: list[str] = []
-    params: list = []
-    if account_id is not None:
-        where.append("ae.account_id = ?")
-        params.append(account_id)
-    if actor_user_id is not None:
-        where.append("ae.actor_user_id = ?")
-        params.append(actor_user_id)
-    if since:
-        where.append("ae.ts >= ?")
-        params.append(since)
-    sql = (
-        "SELECT ae.*, u.email AS actor_email, ea.name AS account_name "
-        "FROM hipaa_access_events ae "
-        "LEFT JOIN users u ON u.id = ae.actor_user_id "
-        "LEFT JOIN email_accounts ea ON ea.id = ae.account_id"
-    )
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ae.ts DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# API key lifecycle event helpers (audit trail for create/delete)
-# ---------------------------------------------------------------------------
-
-def record_api_key_event(
-    conn: sqlite3.Connection,
-    *,
-    event: str,
-    key_id: int,
-    actor_user_id: int | None,
-    target_user_id: int | None,
-    name: str,
-    expires_at: str | None,
-    source: str,
-) -> int:
-    """Insert an api_key_events row. Returns the new row id.
-
-    ``event`` is ``"api_key_created"`` or ``"api_key_revoked"``. ``source``
-    is one of ``"ui"``, ``"api"``, ``"cli"``. ``key_id`` is intentionally
-    NOT a foreign key — revoked api_keys rows are deleted, but we want
-    the audit row to survive.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO api_key_events "
-        "(ts, event, key_id, actor_user_id, target_user_id, name, expires_at, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (now, event, key_id, actor_user_id, target_user_id, name, expires_at, source),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def list_api_key_events(
-    conn: sqlite3.Connection,
-    limit: int = 100,
-) -> list[dict]:
-    """Return recent api_key_events newest-first, joined with user emails.
-
-    Both actor and target user emails are looked up so the compliance UI
-    can render readable rows even after either user is deleted (the FK
-    is ON DELETE SET NULL so the row survives the user record).
-    """
-    rows = conn.execute(
-        "SELECT ake.*, "
-        "       au.email AS actor_email, "
-        "       tu.email AS target_email "
-        "FROM api_key_events ake "
-        "LEFT JOIN users au ON au.id = ake.actor_user_id "
-        "LEFT JOIN users tu ON tu.id = ake.target_user_id "
-        "ORDER BY ake.id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Access log (#41 — HIPAA §164.312(b))
-# ---------------------------------------------------------------------------
-
-def record_access_event(
-    conn: sqlite3.Connection,
-    *,
-    actor_user_id: int | None,
-    method: str,
-    route: str,
-    account_id: int | None,
-    message_id: str | None,
-    status_code: int,
-    outcome: str,
-    detail: str | None = None,
-    request_id: str | None = None,
-) -> int:
-    """Insert an access_log row. Returns the new row id.
-
-    Called by the access-audit middleware on every authenticated
-    request that hits a PHI-touch route prefix. No PHI is persisted —
-    only the route shape, method, status, and any account/message
-    identifiers extracted from the URL path. ``request_id`` (when
-    provided) correlates the row with the structured-log lines
-    emitted during the same request scope.
-
-    **Failure policy.** This function does NOT swallow exceptions.
-    The caller (``AccessAuditMiddleware.dispatch``) is responsible
-    for the failure-handling shape (re-raise in dev mode, log + count
-    in prod, never silent). A previous version silently returned 0
-    on error, which made ``access_log`` un-trustable as the HIPAA
-    audit source of truth. If you need an "audit must not crash the
-    request" boundary, put it at the caller, not here.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        cur = conn.execute(
-            "INSERT INTO access_log "
-            "(ts, actor_user_id, method, route, account_id, message_id, "
-            " status_code, outcome, detail, request_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (now, actor_user_id, method, route, account_id, message_id,
-             int(status_code), outcome, detail, request_id),
-        )
-        conn.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError as e:
-        # FK violation -- typically because the URL referenced an
-        # account_id (or actor_user_id) that no longer exists in
-        # the parent table. Don't fail the audit write; coerce the
-        # offending FK to NULL and stash the original in `detail`.
-        # The audit row still records what was tried, which is the
-        # whole point under HIPAA §164.312(b).
-        msg = str(e).lower()
-        stale_bits: list[str] = []
-        coerced_account = account_id
-        coerced_actor = actor_user_id
-        if "foreign key" in msg:
-            # We don't get column-level info from sqlite3's
-            # IntegrityError, so just NULL both FK columns and note
-            # the original values. Routes typically only carry one
-            # of these, so the noise is bounded.
-            if account_id is not None:
-                stale_bits.append(f"stale_account_id={account_id}")
-                coerced_account = None
-            if actor_user_id is not None:
-                stale_bits.append(f"stale_actor_user_id={actor_user_id}")
-                coerced_actor = None
-        merged_detail = detail or ""
-        if stale_bits:
-            tail = " ".join(stale_bits)
-            merged_detail = f"{merged_detail} | {tail}".strip(" |") if merged_detail else tail
-        cur = conn.execute(
-            "INSERT INTO access_log "
-            "(ts, actor_user_id, method, route, account_id, message_id, "
-            " status_code, outcome, detail, request_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (now, coerced_actor, method, route, coerced_account,
-             message_id, int(status_code), outcome, merged_detail,
-             request_id),
-        )
-        conn.commit()
-        return cur.lastrowid
-
-
-def list_access_events(
-    conn: sqlite3.Connection,
-    limit: int = 100,
-    actor_user_id: int | None = None,
-    account_id: int | None = None,
-) -> list[dict]:
-    """Return recent access_log rows newest-first, joined with actor email."""
-    where = []
-    params: list = []
-    if actor_user_id is not None:
-        where.append("al.actor_user_id = ?")
-        params.append(actor_user_id)
-    if account_id is not None:
-        where.append("al.account_id = ?")
-        params.append(account_id)
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    params.append(limit)
-    rows = conn.execute(
-        "SELECT al.*, "
-        "       u.email AS actor_email, "
-        "       ea.name AS account_name "
-        "FROM access_log al "
-        "LEFT JOIN users u ON u.id = al.actor_user_id "
-        "LEFT JOIN email_accounts ea ON ea.id = al.account_id "
-        f"{where_sql} "
-        "ORDER BY al.id DESC LIMIT ?",
-        params,
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# Log entries hash chain (#42 — tamper-evidence on log_entries)
-# ---------------------------------------------------------------------------
-
-def compute_log_row_hash(
-    prev_hash: str,
-    ts: str,
-    level: str,
-    logger: str,
-    message: str,
-    extra_json: str,
-) -> str:
-    """SHA-256 of the canonical row representation, chained off
-    ``prev_hash``.
-
-    Canonical form is ``prev_hash | ts | level | logger | message |
-    extra_json`` joined with the literal pipe — pipes inside any
-    field do NOT need escaping because the hash purpose is detection,
-    not parsing back. Two rows that hash to the same value implies
-    every field is equal AND the predecessor is the same; a tampered
-    row breaks the next row's input → next row's recomputed hash
-    diverges from stored.
-    """
-    import hashlib
-    canonical = f"{prev_hash}|{ts}|{level}|{logger}|{message}|{extra_json}"
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def get_last_log_row_hash(conn: sqlite3.Connection) -> str:
-    """Return the row_hash of the newest log_entries row, or empty
-    string if the table has no chain-aware rows yet."""
-    row = conn.execute(
-        "SELECT row_hash FROM log_entries "
-        "WHERE row_hash != '' "
-        "ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    return (row["row_hash"] if row else "") or ""
-
-
-def verify_log_chain(
-    conn: sqlite3.Connection,
-    limit: int | None = None,
-    since: str | None = None,
-    *,
-    app_state: Any = None,
-) -> dict:
-    """Walk log_entries newest-to-oldest (or oldest-to-newest with
-    limit on each end) and verify every chain-aware row's row_hash
-    matches recomputation against the stored prev_hash + row fields.
-
-    Args:
-        conn: open SQLite connection.
-        limit: optional cap on number of rows verified.
-        since: optional ISO-8601 timestamp. The full chain is still
-            walked end-to-end (hash verification is sequential by
-            construction), but breaks at rows with ``ts < since`` are
-            tolerated and not surfaced. Use to verify a window of
-            recent activity without flagging known pre-cutoff history.
-        app_state: optional ``starlette.datastructures.State`` (or any
-            attribute-bearing object) used as a watermark cache. When
-            provided, a previous clean verify result is cached as
-            ``app_state.audit_chain_verified =
-            {"valid_through_id": int, "expected_prev": str}`` and
-            subsequent calls walk only rows above the watermark — the
-            verified prefix is taken on trust. A break or any seek
-            argument (``limit``, ``since``) bypasses the cache and
-            re-walks from the beginning. NOT thread-safe across procs;
-            single-process FastAPI app.state is the intended scope.
-
-    Returns:
-        chain_length:    rows with non-empty row_hash
-        rows_checked:    rows actually verified this pass
-        valid_through_id: id of the highest-id row with intact chain
-        first_break_id:   id of the lowest-id chain-aware row whose
-                          stored row_hash differs from recomputed
-                          (None if no break found)
-        first_break_ts:   ts string of the broken row (None if no break)
-        first_break_expected: full expected hash at break (None if no
-                              break)
-        first_break_found: full stored hash at break (None if no break)
-        first_break_reason:  short human-readable description
-        prechain_count:  rows whose row_hash is empty (legacy /
-                         pre-migration); these are skipped, not
-                         flagged
-
-    Idempotent + read-only.
-    """
-    # ---- Watermark cache lookup (fast-path) -----------------------
-    # Only the no-arg verify (full clean walk) caches and only the
-    # no-arg verify reads the cache. ``limit``/``since`` callers want
-    # an explicit window — never use the cache for them.
-    cache_active = (
-        app_state is not None
-        and limit is None
-        and since is None
-    )
-    cached: dict | None = None
-    if cache_active:
-        cached = getattr(app_state, "audit_chain_verified", None)
-
-    # ---- Anchor seed (post-prune chain start) ---------------------
-    # When the oldest chain-aware rows have been pruned, the new head's
-    # ``prev_hash`` is no longer "" — it points at a row that no longer
-    # exists in the table. Seed ``expected_prev`` from the anchor that
-    # the pruner stamped so the boundary doesn't look like a break.
-    anchor = None
-    try:
-        anchor = get_setting(conn, _AUDIT_CHAIN_ANCHOR_KEY)
-    except Exception:
-        anchor = None
-
-    # ---- Build the row iterator ----------------------------------
-    if (
-        cached is not None
-        and isinstance(cached, dict)
-        and "valid_through_id" in cached
-        and "expected_prev" in cached
-        and cached["valid_through_id"] is not None
-    ):
-        # Skip rows already verified clean.
-        rows = conn.execute(
-            "SELECT id, ts, level, logger, message, extra_json, "
-            "       prev_hash, row_hash "
-            "FROM log_entries WHERE id > ? ORDER BY id ASC",
-            (int(cached["valid_through_id"]),),
-        ).fetchall()
-        # Resume the walk; pre-watermark chain is on trust.
-        expected_prev = cached["expected_prev"] or ""
-        # rows-already-verified contribute to chain_length on prior passes
-        # but for THIS call rows_checked is just what we walk now.
-        seeded_from_cache = True
-    else:
-        rows = conn.execute(
-            "SELECT id, ts, level, logger, message, extra_json, "
-            "       prev_hash, row_hash "
-            "FROM log_entries ORDER BY id ASC"
-        ).fetchall()
-        # If an anchor exists, seed from the head row's recorded
-        # prev_hash. The anchor's head_id may already be gone (next
-        # prune cycle); the anchor still holds the prev_hash it had
-        # when stamped, which is what we need.
-        if anchor and isinstance(anchor, dict):
-            expected_prev = anchor.get("head_prev_hash", "") or ""
-        else:
-            expected_prev = ""
-        seeded_from_cache = False
-
-    chain_length = 0
-    prechain_count = 0
-    rows_checked = 0
-    last_valid_id: int | None = (
-        int(cached["valid_through_id"]) if seeded_from_cache else None
-    )
-    first_break_id: int | None = None
-    first_break_ts: str | None = None
-    first_break_expected: str | None = None
-    first_break_found: str | None = None
-    first_break_reason: str | None = None
-    for r in rows:
-        if not r["row_hash"]:
-            prechain_count += 1
-            continue
-        chain_length += 1
-        rows_checked += 1
-        # Verify prev_hash links cleanly to predecessor row's hash.
-        if r["prev_hash"] != expected_prev:
-            # Tolerate breaks before the --since cutoff: hash
-            # verification is sequential, so we can't skip the row,
-            # but we can suppress reporting it. Resync expected_prev
-            # to the stored prev_hash so subsequent rows compare
-            # against actual chain state, and continue walking.
-            if since is not None and r["ts"] < since:
-                expected_prev = r["row_hash"]
-                last_valid_id = r["id"]
-                continue
-            if first_break_id is None:
-                first_break_id = r["id"]
-                first_break_ts = r["ts"]
-                first_break_expected = expected_prev
-                first_break_found = r["prev_hash"]
-                first_break_reason = (
-                    f"prev_hash mismatch at id={r['id']}: "
-                    f"expected {expected_prev[:12]}..., "
-                    f"stored {r['prev_hash'][:12]}..."
-                )
-            break
-        # Verify row_hash matches recomputation from canonical fields.
-        recomputed = compute_log_row_hash(
-            r["prev_hash"], r["ts"], r["level"], r["logger"],
-            r["message"], r["extra_json"],
-        )
-        if recomputed != r["row_hash"]:
-            if since is not None and r["ts"] < since:
-                expected_prev = r["row_hash"]
-                last_valid_id = r["id"]
-                continue
-            if first_break_id is None:
-                first_break_id = r["id"]
-                first_break_ts = r["ts"]
-                first_break_expected = recomputed
-                first_break_found = r["row_hash"]
-                first_break_reason = (
-                    f"row_hash mismatch at id={r['id']}: "
-                    f"recomputed {recomputed[:12]}..., "
-                    f"stored {r['row_hash'][:12]}..."
-                )
-            break
-        last_valid_id = r["id"]
-        expected_prev = r["row_hash"]
-        if limit is not None and rows_checked >= limit:
-            break
-
-    # When seeded from the watermark cache the per-pass walk only saw
-    # rows above the watermark. Restore the cumulative ``chain_length``
-    # by adding the trusted prefix size so consumers (compliance page,
-    # daily health email) don't see a sudden drop after the first cache
-    # hit.
-    if seeded_from_cache:
-        prefix_len = conn.execute(
-            "SELECT COUNT(*) AS c FROM log_entries "
-            "WHERE row_hash != '' AND id <= ?",
-            (int(cached["valid_through_id"]),),  # type: ignore[index]
-        ).fetchone()
-        chain_length += int(prefix_len["c"]) if prefix_len else 0
-
-    # Cache the watermark + chain tail when this was a clean full verify.
-    if (
-        cache_active
-        and first_break_id is None
-        and last_valid_id is not None
-    ):
-        try:
-            app_state.audit_chain_verified = {
-                "valid_through_id": int(last_valid_id),
-                "expected_prev": expected_prev or "",
-            }
-        except Exception:
-            # ``app_state`` may be a frozen mapping or otherwise
-            # unwritable; cache miss is acceptable.
-            pass
-    elif cache_active and first_break_id is not None:
-        # Break detected — invalidate the cache so the next call
-        # re-walks from the beginning.
-        try:
-            app_state.audit_chain_verified = None
-        except Exception:
-            pass
-
-    return {
-        "chain_length": chain_length,
-        "rows_checked": rows_checked,
-        "valid_through_id": last_valid_id,
-        "first_break_id": first_break_id,
-        "first_break_ts": first_break_ts,
-        "first_break_expected": first_break_expected,
-        "first_break_found": first_break_found,
-        "first_break_reason": first_break_reason,
-        "prechain_count": prechain_count,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Loop-prevention dedup (cross-folder, cross-provider)
 # ---------------------------------------------------------------------------
@@ -4251,6 +2278,7 @@ def _hash_msg_id(account_id: int, rfc_message_id: str) -> str:
     ).hexdigest()
 
 
+@db_write
 def mark_triaged(
     conn: sqlite3.Connection,
     account_id: int,
@@ -4271,8 +2299,18 @@ def mark_triaged(
         conn.commit()
     except Exception:
         # Loop-prevention is best-effort; a DB error here must not
-        # break the triage pipeline.
-        pass
+        # break the triage pipeline. But the swallowed exception means
+        # the ``@db_write`` decorator's rollback path never sees it —
+        # if the INSERT opened an implicit transaction and the
+        # ``commit()`` failed, ``conn.in_transaction`` stays True and
+        # the next explicit-``BEGIN`` helper raises "cannot start a
+        # transaction within a transaction". Roll back here so
+        # the next lock holder starts clean.
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except Exception:
+            pass
 
 
 def is_triaged(
@@ -4295,6 +2333,7 @@ def is_triaged(
     return row is not None
 
 
+@db_write
 def prune_triaged_messages(
     conn: sqlite3.Connection,
     retention_days: int = 90,
@@ -4313,6 +2352,14 @@ def prune_triaged_messages(
         conn.commit()
         return cur.rowcount or 0
     except Exception:
+        # Best-effort prune — see prune_triage_runs. Roll back any
+        # transaction the failed commit left open so the next
+        # explicit-``BEGIN`` helper starts clean.
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except Exception:
+            pass
         return 0
 
 
@@ -4320,6 +2367,7 @@ def prune_triaged_messages(
 # Gmail Pub/Sub watch state
 # ---------------------------------------------------------------------------
 
+@db_write
 def upsert_gmail_watch(
     conn: sqlite3.Connection,
     account_id: int,
@@ -4354,6 +2402,7 @@ def upsert_gmail_watch(
     conn.commit()
 
 
+@db_write
 def update_gmail_watch_history(
     conn: sqlite3.Connection, account_id: int, history_id: str,
 ) -> None:
@@ -4371,7 +2420,7 @@ def get_gmail_watch(conn: sqlite3.Connection, account_id: int) -> dict | None:
     row = conn.execute(
         "SELECT * FROM gmail_watches WHERE account_id = ?", (account_id,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
 def get_gmail_watch_by_email(conn: sqlite3.Connection, email_address: str) -> dict | None:
@@ -4389,9 +2438,10 @@ def get_gmail_watch_by_email(conn: sqlite3.Connection, email_address: str) -> di
         "SELECT * FROM gmail_watches WHERE LOWER(email_address) = ?",
         (needle,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
+@db_write
 def delete_gmail_watch(conn: sqlite3.Connection, account_id: int) -> None:
     conn.execute("DELETE FROM gmail_watches WHERE account_id = ?", (account_id,))
     conn.commit()
@@ -4415,24 +2465,25 @@ def list_gmail_watches_expiring(
         "ORDER BY expires_at ASC",
         (before_iso,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def list_gmail_watches(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM gmail_watches ORDER BY email_address ASC"
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 # ---------------------------------------------------------------------------
-# Office 365 / Microsoft Graph webhook subscriptions  (#53)
+# Office 365 / Microsoft Graph webhook subscriptions
 #
 # One row per account holding the active Graph subscription state.
 # Sister table to ``gmail_watches`` for the parallel push pipeline.
 # Created by migration v6 (``create_office365_subscriptions``).
 # ---------------------------------------------------------------------------
 
+@db_write
 def upsert_o365_subscription(
     conn: sqlite3.Connection,
     *,
@@ -4475,7 +2526,7 @@ def get_o365_subscription(
         "SELECT * FROM office365_subscriptions WHERE account_id = ?",
         (account_id,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
 def get_o365_subscription_by_subscription_id(
@@ -4488,9 +2539,10 @@ def get_o365_subscription_by_subscription_id(
         "SELECT * FROM office365_subscriptions WHERE subscription_id = ?",
         (subscription_id,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
+@db_write
 def delete_o365_subscription(
     conn: sqlite3.Connection, account_id: int,
 ) -> None:
@@ -4505,7 +2557,7 @@ def list_o365_subscriptions(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM office365_subscriptions ORDER BY account_id ASC"
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def list_o365_subscriptions_expiring(
@@ -4521,16 +2573,17 @@ def list_o365_subscriptions_expiring(
         "ORDER BY expiration_at ASC",
         (before_iso,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
+@db_write
 def record_push_delivery(
     conn: sqlite3.Connection,
     *,
     account_id: int,
     provider: str,
 ) -> None:
-    """Bump today's per-account push-delivery counter (#166).
+    """Bump today's per-account push-delivery counter.
 
     Called from the Gmail Pub/Sub + O365 Graph webhook handlers
     immediately after a successful ``queue.put_nowait``. The
@@ -4627,6 +2680,7 @@ def get_push_deliveries_window(
     ]
 
 
+@db_write
 def prune_push_deliveries(
     conn: sqlite3.Connection,
     *,
@@ -4657,9 +2711,18 @@ def prune_push_deliveries(
         conn.commit()
         return cur.rowcount or 0
     except Exception:
+        # Best-effort prune — see prune_triage_runs. Roll back any
+        # transaction the failed commit left open so the next
+        # explicit-``BEGIN`` helper starts clean.
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except Exception:
+            pass
         return 0
 
 
+@db_write
 def record_o365_notification(
     conn: sqlite3.Connection, subscription_id: str,
 ) -> None:
@@ -4680,6 +2743,7 @@ def record_o365_notification(
     conn.commit()
 
 
+@db_write
 def update_o365_subscription_delta_link(
     conn: sqlite3.Connection,
     *,
@@ -4704,6 +2768,7 @@ def update_o365_subscription_delta_link(
     conn.commit()
 
 
+@db_write
 def record_o365_subscription_renewal(
     conn: sqlite3.Connection,
     *,
@@ -4735,6 +2800,7 @@ def record_o365_subscription_renewal(
     conn.commit()
 
 
+@db_write
 def record_o365_subscription_error(
     conn: sqlite3.Connection,
     *,
@@ -4811,50 +2877,16 @@ def is_calendar_enabled(conn: sqlite3.Connection, account_id: int) -> bool:
 # read this same key.
 # ---------------------------------------------------------------------------
 
-def _style_profile_key(account_id: int) -> str:
-    from email_triage.web.settings_keys import style_profile
-    return style_profile(account_id)
 
 
-def get_style_profile(
-    conn: sqlite3.Connection, account_id: int,
-) -> dict | None:
-    """Return the persisted style-profile dict for ``account_id``.
-
-    Returns ``None`` when no profile has been built yet. Callers
-    typically pass the result to
-    :meth:`email_triage.actions.style_profile.StyleProfile.from_dict`
-    to rehydrate a typed object — that method tolerates missing keys
-    so a hand-edit or older schema does not crash startup.
-    """
-    raw = get_setting(conn, _style_profile_key(account_id))
-    if raw is None or not isinstance(raw, dict):
-        return None
-    return raw
 
 
-def set_style_profile(
-    conn: sqlite3.Connection, account_id: int, profile: dict,
-) -> None:
-    """Persist a style profile dict for ``account_id`` (upsert)."""
-    if not isinstance(profile, dict):
-        raise ValueError("style profile must be a dict")
-    set_setting(conn, _style_profile_key(account_id), profile)
 
 
-def delete_style_profile(
-    conn: sqlite3.Connection, account_id: int,
-) -> bool:
-    """Drop the persisted style profile for ``account_id``.
-
-    Returns True when a row was deleted. Used by the M-8 "Forget my
-    style profile" UI when it lands.
-    """
-    return delete_setting(conn, _style_profile_key(account_id))
 
 
 # ---------------------------------------------------------------------------
-# Alias-aware learning (punch list #162)
+# Alias-aware learning (punch list )
 #
 # When an operator has multiple addresses on one account (primary +
 # aliases) they can opt into a per-alias descriptor partition. The
@@ -4869,236 +2901,18 @@ def delete_style_profile(
 # read as the same alias bucket.
 # ---------------------------------------------------------------------------
 
-def normalise_from_address(value: str | None) -> str:
-    """Reduce a free-form ``From:`` header value to a comparable bare address.
-
-    Drops the display-name prefix, surrounding angle brackets, the
-    ``+suffix`` tag (Gmail-style "subaddress"), and casing. Empty /
-    invalid inputs collapse to ``""`` so callers can treat the result
-    as ``str`` unconditionally.
-
-    Examples
-    --------
-    >>> normalise_from_address('"Display Name" <Sam+work@Example.Tld>')
-    'sam@example.tld'
-    >>> normalise_from_address('alice@example.com')
-    'alice@example.com'
-    >>> normalise_from_address(None)
-    ''
-    """
-    if not value:
-        return ""
-    s = str(value).strip()
-    if not s:
-        return ""
-    # If a ``<addr>`` block is present, prefer its content over the
-    # display-name part. We deliberately don't try to be RFC 5322
-    # complete — the inputs are ``From:`` header values pulled from
-    # an ``EmailMessage`` that the providers have already normalised
-    # one level (display name + bare address coexisting is the
-    # mainstream shape).
-    if "<" in s and ">" in s:
-        lt = s.rfind("<")
-        gt = s.find(">", lt)
-        if lt != -1 and gt != -1 and gt > lt:
-            s = s[lt + 1: gt].strip()
-    # Drop any surrounding quotes / whitespace.
-    s = s.strip().strip('"').strip("'").strip()
-    if not s:
-        return ""
-    # Lowercase + split off the ``+suffix`` tag if present. The tag
-    # is part of the same delivery destination on Gmail-style "plus
-    # addressing" -- two captures of ``alice+work@x`` and ``alice@x``
-    # belong in the same bucket.
-    s = s.lower()
-    if "@" not in s:
-        return s
-    local, _, domain = s.partition("@")
-    if "+" in local:
-        local = local.split("+", 1)[0]
-    if not local or not domain:
-        return ""
-    return f"{local}@{domain}"
 
 
-def is_alias_mode_enabled_for_account(
-    conn: sqlite3.Connection, account_id: int,
-) -> bool:
-    """Return True when alias-aware learning is on for ``account_id``.
-
-    Default False so existing accounts retain single-descriptor
-    behaviour until the operator explicitly opts in on
-    ``/profile/style-data``. Pre-v23 DBs (no column) read as False.
-    """
-    try:
-        row = conn.execute(
-            "SELECT style_alias_mode_enabled FROM email_accounts "
-            "WHERE id = ?",
-            (int(account_id),),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return False
-    if row is None:
-        return False
-    val = row["style_alias_mode_enabled"] if hasattr(row, "keys") else row[0]
-    return bool(val)
 
 
-def set_alias_mode_enabled_for_account(
-    conn: sqlite3.Connection, account_id: int, *, enabled: bool,
-) -> None:
-    """Flip the alias-aware-learning toggle for ``account_id``."""
-    conn.execute(
-        "UPDATE email_accounts SET style_alias_mode_enabled = ? "
-        "WHERE id = ?",
-        (1 if enabled else 0, int(account_id)),
-    )
-    conn.commit()
 
 
-def get_account_style_per_alias(
-    conn: sqlite3.Connection, account_id: int, from_address: str,
-) -> dict | None:
-    """Return the per-alias descriptor dict, or None if absent.
-
-    ``from_address`` is normalised before lookup so the caller may
-    pass the raw header value. The empty string is a valid key (the
-    "no alias bucket / default" row) but the picker that consumes
-    this helper always falls back to the account-wide descriptor
-    when the per-alias row is missing.
-    """
-    addr = normalise_from_address(from_address)
-    try:
-        row = conn.execute(
-            "SELECT descriptor_json FROM account_style_per_alias "
-            "WHERE account_id = ? AND from_address = ?",
-            (int(account_id), addr),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        # Pre-v23 install -- treat as "no row".
-        return None
-    if row is None:
-        return None
-    import json as _json
-    raw = row["descriptor_json"] if hasattr(row, "keys") else row[0]
-    try:
-        parsed = _json.loads(raw or "{}")
-    except (TypeError, ValueError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
-def set_account_style_per_alias(
-    conn: sqlite3.Connection,
-    account_id: int,
-    from_address: str,
-    descriptor: dict,
-    *,
-    sample_count: int | None = None,
-) -> None:
-    """Upsert a per-alias descriptor.
-
-    ``from_address`` is normalised before write; the same address in
-    any case / display-name shape lands in the same row. The
-    ``sample_count`` argument lets the caller record the contributing
-    sample count without inspecting the dict (useful when the dict
-    came from a third-party shape that didn't include the field).
-    """
-    if not isinstance(descriptor, dict):
-        raise ValueError("descriptor must be a dict")
-    addr = normalise_from_address(from_address)
-    import json as _json
-    from datetime import datetime, timezone
-    sc = sample_count if sample_count is not None else int(
-        descriptor.get("sample_count") or 0,
-    )
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO account_style_per_alias "
-        "(account_id, from_address, descriptor_json, sample_count, updated_at) "
-        "VALUES (?, ?, ?, ?, ?) "
-        "ON CONFLICT(account_id, from_address) DO UPDATE SET "
-        "  descriptor_json = excluded.descriptor_json, "
-        "  sample_count    = excluded.sample_count, "
-        "  updated_at      = excluded.updated_at",
-        (int(account_id), addr, _json.dumps(descriptor), int(sc), now),
-    )
-    conn.commit()
 
 
-def list_account_style_per_alias(
-    conn: sqlite3.Connection, account_id: int,
-) -> list[dict]:
-    """Return all per-alias descriptor rows for ``account_id``.
-
-    Each entry is ``{"from_address": str, "descriptor": dict,
-    "sample_count": int, "updated_at": str}``. Ordered by
-    ``from_address`` (lexicographic) so the operator-facing picker
-    has a stable layout. Returns ``[]`` on pre-v23 installs.
-    """
-    try:
-        rows = conn.execute(
-            "SELECT from_address, descriptor_json, sample_count, updated_at "
-            "FROM account_style_per_alias "
-            "WHERE account_id = ? "
-            "ORDER BY from_address",
-            (int(account_id),),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    import json as _json
-    out: list[dict] = []
-    for r in rows:
-        raw = r["descriptor_json"] if hasattr(r, "keys") else r[1]
-        try:
-            desc = _json.loads(raw or "{}")
-        except (TypeError, ValueError):
-            desc = {}
-        if not isinstance(desc, dict):
-            desc = {}
-        out.append({
-            "from_address": (
-                r["from_address"] if hasattr(r, "keys") else r[0]
-            ),
-            "descriptor": desc,
-            "sample_count": int(
-                (r["sample_count"] if hasattr(r, "keys") else r[2]) or 0,
-            ),
-            "updated_at": (
-                r["updated_at"] if hasattr(r, "keys") else r[3]
-            ) or "",
-        })
-    return out
 
 
-def delete_account_style_per_alias(
-    conn: sqlite3.Connection,
-    account_id: int,
-    from_address: str | None = None,
-) -> int:
-    """Delete per-alias descriptor rows.
-
-    When ``from_address`` is None, every per-alias row for the account
-    is dropped. When given, only the matching row is dropped (the
-    address is normalised first so case / suffix variants resolve to
-    the same row).
-
-    Returns the number of rows deleted.
-    """
-    if from_address is None:
-        cur = conn.execute(
-            "DELETE FROM account_style_per_alias WHERE account_id = ?",
-            (int(account_id),),
-        )
-    else:
-        addr = normalise_from_address(from_address)
-        cur = conn.execute(
-            "DELETE FROM account_style_per_alias "
-            "WHERE account_id = ? AND from_address = ?",
-            (int(account_id), addr),
-        )
-    conn.commit()
-    return cur.rowcount or 0
 
 
 # ---------------------------------------------------------------------------
@@ -5115,105 +2929,18 @@ STYLE_TONE_CHOICES = ("formal", "neutral", "casual", "terse")
 STYLE_LENGTH_CHOICES = ("brief", "medium", "full")
 STYLE_GREETING_CHOICES = ("none", "first-name", "formal-name", "custom")
 
-STYLE_KNOB_DEFAULTS = {
-    "style_guide": "",
-    "style_tone": "neutral",
-    "style_length": "medium",
-    "style_signature": "",
-    "style_greeting": "first-name",
-    "style_greeting_custom": "",
-}
 
 
-def get_user_style_knobs(
-    conn: sqlite3.Connection, user_id: int | None,
-) -> dict:
-    """Return the user's style-knob dict, defaulted on missing keys.
-
-    Returns the canonical default dict (matching ``STYLE_KNOB_DEFAULTS``)
-    when ``user_id`` is None or the row is absent. Older DBs that
-    haven't yet run migration v11 don't have the columns; the
-    KeyError-on-row-access falls back to defaults so this is safe to
-    call before the migration runs.
-    """
-    if not user_id:
-        return dict(STYLE_KNOB_DEFAULTS)
-    try:
-        row = conn.execute(
-            "SELECT style_guide, style_tone, style_length, "
-            "       style_signature, style_greeting, style_greeting_custom "
-            "FROM users WHERE id = ?",
-            (int(user_id),),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        # Pre-v11 DB (columns don't exist yet).
-        return dict(STYLE_KNOB_DEFAULTS)
-    if row is None:
-        return dict(STYLE_KNOB_DEFAULTS)
-    out = dict(STYLE_KNOB_DEFAULTS)
-    for k in STYLE_KNOB_DEFAULTS:
-        v = row[k] if hasattr(row, "keys") else None
-        if v is None:
-            continue
-        out[k] = str(v)
-    return out
 
 
-def set_user_style_knobs(
-    conn: sqlite3.Connection, user_id: int, knobs: dict,
-) -> None:
-    """Persist the user's style knobs (full upsert across all columns).
-
-    Caller must validate values against the allowlists; this helper
-    only enforces type coercion (everything stored as TEXT). Missing
-    keys fall back to ``STYLE_KNOB_DEFAULTS`` so the DB stays in a
-    valid post-v11 state.
-    """
-    merged = dict(STYLE_KNOB_DEFAULTS)
-    for k in STYLE_KNOB_DEFAULTS:
-        if k in knobs and knobs[k] is not None:
-            merged[k] = str(knobs[k])
-    conn.execute(
-        "UPDATE users SET "
-        "  style_guide = ?, style_tone = ?, style_length = ?, "
-        "  style_signature = ?, style_greeting = ?, "
-        "  style_greeting_custom = ? "
-        "WHERE id = ?",
-        (
-            merged["style_guide"],
-            merged["style_tone"],
-            merged["style_length"],
-            merged["style_signature"],
-            merged["style_greeting"],
-            merged["style_greeting_custom"],
-            int(user_id),
-        ),
-    )
-    conn.commit()
 
 
-def is_style_learning_master_enabled(conn: sqlite3.Connection) -> bool:
-    """Return the install-wide style-learning master toggle.
-
-    Stored under settings key ``style_learning:master`` as
-    ``{"enabled": bool}``. Default ON when the row is missing — this
-    is the privacy-neutral default for user-stated knobs (no
-    cross-user inference involved). The Cross-cutting toggle at
-    /config flips this off when the operator wants to suppress all
-    style influence on draft replies.
-    """
-    return get_bool_setting(conn, "style_learning:master", default=True)
 
 
-def set_style_learning_master_enabled(
-    conn: sqlite3.Connection, enabled: bool,
-) -> None:
-    """Flip the install-wide style-learning master toggle."""
-    set_bool_setting(conn, "style_learning:master", enabled)
 
 
 # ---------------------------------------------------------------------------
-# Style-learning admin cadence + mine-limit defaults (#161 follow-up)
+# Style-learning admin cadence + mine-limit defaults
 #
 # Two install-wide knobs admin sets on /config Style learning section:
 #
@@ -5236,13 +2963,7 @@ def set_style_learning_master_enabled(
 # durable-infra surface like SMTP host + classifier backend).
 # ---------------------------------------------------------------------------
 
-STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS = 1
-STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS = 72
-STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS = 6
 
-STYLE_LEARNING_MINE_LIMIT_MIN = 1
-STYLE_LEARNING_MINE_LIMIT_MAX = 500
-STYLE_LEARNING_MINE_LIMIT_DEFAULT = 50
 
 # Threshold above which the inline mine-now / preview path is too slow
 # for an HTMX request and the operator gets handed off to the bulk
@@ -5255,132 +2976,18 @@ STYLE_LEARNING_MINE_LIMIT_DEFAULT = 50
 STYLE_LEARNING_INLINE_LIMIT_CEILING = 50
 
 
-def get_style_learning_capture_interval_hours(
-    conn: sqlite3.Connection,
-) -> int:
-    """Read the install-wide capture-loop cadence (hours).
-
-    Returns the operator-set value, or
-    :data:`STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS` when no
-    explicit value is stored. Out-of-range / non-numeric values
-    clamp into the documented range so the loop's sleep helper
-    never sees a value it can't honour."""
-    raw = get_setting(conn, "style_learning:capture_interval_hours")
-    hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-    if isinstance(raw, dict):
-        try:
-            hours = int(
-                raw.get("hours")
-                or STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-            )
-        except (TypeError, ValueError):
-            hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-    elif isinstance(raw, (int, float)):
-        try:
-            hours = int(raw)
-        except (TypeError, ValueError):
-            hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-    if hours < STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS:
-        hours = STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS
-    elif hours > STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS:
-        hours = STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS
-    return hours
 
 
-def set_style_learning_capture_interval_hours(
-    conn: sqlite3.Connection, hours: int,
-) -> None:
-    """Persist the install-wide capture-loop cadence (hours).
-
-    Clamps to the documented range; the YAML loader / loop reader
-    re-clamps defensively in case the row is hand-edited."""
-    try:
-        h = int(hours)
-    except (TypeError, ValueError):
-        h = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-    if h < STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS:
-        h = STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS
-    elif h > STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS:
-        h = STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS
-    set_setting(conn, "style_learning:capture_interval_hours", {"hours": h})
 
 
-def get_style_learning_mine_limit_default(
-    conn: sqlite3.Connection,
-) -> int:
-    """Read the install-wide default for the mine-now / preview limit.
-
-    Out-of-range / non-numeric values clamp into the documented range;
-    missing row falls back to
-    :data:`STYLE_LEARNING_MINE_LIMIT_DEFAULT` (50)."""
-    raw = get_setting(conn, "style_learning:mine_limit_default")
-    val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
-    if isinstance(raw, dict):
-        try:
-            val = int(
-                raw.get("limit") or STYLE_LEARNING_MINE_LIMIT_DEFAULT
-            )
-        except (TypeError, ValueError):
-            val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
-    elif isinstance(raw, (int, float)):
-        try:
-            val = int(raw)
-        except (TypeError, ValueError):
-            val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
-    if val < STYLE_LEARNING_MINE_LIMIT_MIN:
-        val = STYLE_LEARNING_MINE_LIMIT_MIN
-    elif val > STYLE_LEARNING_MINE_LIMIT_MAX:
-        val = STYLE_LEARNING_MINE_LIMIT_MAX
-    return val
 
 
-def set_style_learning_mine_limit_default(
-    conn: sqlite3.Connection, limit: int,
-) -> None:
-    """Persist the install-wide default mine-now / preview limit.
-
-    Clamps to the documented range so a typo doesn't wedge the inline
-    path with a giant scan."""
-    try:
-        v = int(limit)
-    except (TypeError, ValueError):
-        v = STYLE_LEARNING_MINE_LIMIT_DEFAULT
-    if v < STYLE_LEARNING_MINE_LIMIT_MIN:
-        v = STYLE_LEARNING_MINE_LIMIT_MIN
-    elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
-        v = STYLE_LEARNING_MINE_LIMIT_MAX
-    set_setting(conn, "style_learning:mine_limit_default", {"limit": v})
 
 
-def resolve_account_mine_limit(
-    conn: sqlite3.Connection, account: dict | None,
-) -> int:
-    """Resolve the effective mine-now / preview limit for one account.
-
-    Per-account override (``config_json.mine_limit_override``) wins
-    when present and positive; falls through to the install-wide
-    default. Empty / unset / non-positive override → install default.
-    """
-    if account is not None and isinstance(account, dict):
-        cfg = account.get("config") or {}
-        if isinstance(cfg, dict):
-            raw = cfg.get("mine_limit_override")
-            if raw is not None and raw != "":
-                try:
-                    v = int(raw)
-                    if v > 0:
-                        if v < STYLE_LEARNING_MINE_LIMIT_MIN:
-                            v = STYLE_LEARNING_MINE_LIMIT_MIN
-                        elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
-                            v = STYLE_LEARNING_MINE_LIMIT_MAX
-                        return v
-                except (TypeError, ValueError):
-                    pass
-    return get_style_learning_mine_limit_default(conn)
 
 
 # ---------------------------------------------------------------------------
-# Per-account "auto-scan on schedule" toggle (#161 item 2)
+# Per-account "auto-scan on schedule" toggle
 #
 # Lives in ``email_accounts.config_json["auto_scan_enabled"]`` as a
 # bool. Default: ON for non-HIPAA, OFF for HIPAA-flagged accounts —
@@ -5425,23 +3032,6 @@ def set_auto_scan_enabled_for_account(
     )
 
 
-def is_style_learning_account_enabled(account: dict | None) -> bool:
-    """Return the per-account style-learning toggle from config.
-
-    Pulled from ``account.config["style_learning_enabled"]``. Default
-    is True (on) — opt-out shape so existing accounts keep working
-    when columns are first added. Sites that mutate this go through
-    the standard account-edit save path which writes config_json.
-    """
-    if account is None:
-        return False
-    cfg = account.get("config") if isinstance(account, dict) else None
-    if not isinstance(cfg, dict):
-        return True
-    val = cfg.get("style_learning_enabled")
-    if val is None:
-        return True
-    return bool(val)
 
 
 # ---------------------------------------------------------------------------
@@ -5455,82 +3045,14 @@ def is_style_learning_account_enabled(account: dict | None) -> bool:
 # the privacy guarantee.
 # ---------------------------------------------------------------------------
 
-def _rag_sent_index_key(account_id: int) -> str:
-    from email_triage.web.settings_keys import rag_sent_index_enabled
-    return rag_sent_index_enabled(account_id)
 
 
-def is_rag_sent_index_enabled(
-    conn: sqlite3.Connection,
-    account_id: int,
-    *,
-    account: dict | None = None,
-) -> bool:
-    """Return True when the per-account RAG-over-sent-mail toggle is on.
-
-    Default-on / default-off is HIPAA-aware (#157, 2026-05-11). When
-    the operator has not explicitly toggled the setting, the per-render
-    default depends on the account's HIPAA flag:
-
-      * HIPAA-flagged account → default OFF. Owner must opt IN
-        explicitly. Under §164.502(a) the owner gets the choice but
-        the install does not auto-mine PHI mail.
-      * Non-HIPAA account → default ON. The "AI learns from your
-        past replies" experience is the project's mainline; new
-        accounts should benefit without a manual toggle.
-
-    Existing accounts with an explicitly-saved value keep that value;
-    the HIPAA-aware split applies only when no row exists in the
-    settings table. The HIPAA hard gates layered on the M-4 path
-    itself (e.g. ``SentMailIndex._hipaa_short_circuit``) are unchanged
-    — they still refuse a HIPAA-flagged account even if this helper
-    returned True; the toggle is the operator UX surface, the hard
-    gate is the privacy guarantee.
-
-    Parameters
-    ----------
-    conn:
-        Active SQLite connection.
-    account_id:
-        Account whose setting we're reading.
-    account:
-        Optional account dict (with ``hipaa`` field) for the
-        HIPAA-aware default. Callers that already have the dict in
-        hand (e.g. the background loop) should pass it to avoid a
-        round-trip; callers that don't fall through to the legacy
-        default-off behaviour (the conservative posture). When
-        ``account is None`` we do NOT load the account row ourselves
-        — the caller's path may not have the account_id privilege
-        check we'd need, and the conservative default cannot leak data.
-    """
-    raw = get_setting(conn, _rag_sent_index_key(account_id))
-    if raw is None:
-        # No explicit value saved — apply the HIPAA-aware default.
-        if account is not None:
-            from email_triage.triage_logging import is_account_hipaa
-            if is_account_hipaa(account):
-                return False
-            return True
-        # Caller didn't supply the account — use the conservative
-        # default to keep the existing posture for any pre-#157 path
-        # that doesn't yet know about the split.
-        return False
-    if isinstance(raw, dict):
-        if "enabled" in raw:
-            return bool(raw.get("enabled"))
-        return False
-    return bool(raw)
 
 
-def set_rag_sent_index_enabled(
-    conn: sqlite3.Connection, account_id: int, *, enabled: bool,
-) -> None:
-    """Persist the per-account RAG toggle (upsert)."""
-    set_bool_setting(conn, _rag_sent_index_key(account_id), enabled)
 
 
 # ---------------------------------------------------------------------------
-# Per-account M-1+M-2 HIPAA-allow opt-in (#152 Phase 2)
+# Per-account M-1+M-2 HIPAA-allow opt-in
 #
 # A boolean stored under ``style_knobs_hipaa_allow:<account_id>``. Default
 # is OFF; the operator opts in per HIPAA-flagged account via the
@@ -5544,36 +3066,18 @@ def set_rag_sent_index_enabled(
 # first-party — not PHI by construction. M-3 / M-4 / M-7 read the
 # operator's sent mail and stay hard-off regardless of this flag.
 #
-# See ``docs/m-series-hipaa-audit.md`` for the per-layer audit and
-# ``docs/privacy-audit-runbook.md`` for the sign-off log entry.
+# See ``internal documentation`` for the per-layer audit and
+# ``internal documentation`` for the sign-off log entry.
 # ---------------------------------------------------------------------------
 
-def _style_knobs_hipaa_allow_key(account_id: int) -> str:
-    from email_triage.web.settings_keys import style_knobs_hipaa_allow
-    return style_knobs_hipaa_allow(account_id)
 
 
-def is_style_knobs_hipaa_allow(
-    conn: sqlite3.Connection, account_id: int,
-) -> bool:
-    """Return True when the operator has opted in to M-1+M-2 for this
-    HIPAA-flagged account. Default False."""
-    return get_bool_setting(
-        conn, _style_knobs_hipaa_allow_key(account_id), default=False,
-    )
 
 
-def set_style_knobs_hipaa_allow(
-    conn: sqlite3.Connection, account_id: int, *, enabled: bool,
-) -> None:
-    """Persist the per-account M-1+M-2 HIPAA-allow opt-in (upsert)."""
-    set_bool_setting(
-        conn, _style_knobs_hipaa_allow_key(account_id), enabled,
-    )
 
 
 # ---------------------------------------------------------------------------
-# HIPAA-safe M-3 describe-and-discard descriptor (#152 phase 3)
+# HIPAA-safe M-3 describe-and-discard descriptor
 #
 # Storage lives in the dedicated ``hipaa_style_descriptors`` table (v25)
 # rather than under a settings row — see the migration docstring for the
@@ -5586,319 +3090,41 @@ def set_style_knobs_hipaa_allow(
 # ``is_style_knobs_hipaa_allow(conn, account_id)`` before touching mail.
 # ---------------------------------------------------------------------------
 
-#: Install-wide settings-table key for the phase-3 HIPAA distill flag.
-#: Default OFF. Lives on /config under the privacy section.
-STYLE_LEARNING_HIPAA_DISTILL_ENABLED = "style_learning:hipaa_distill_enabled"
 
 #: Re-distill cadence: rebuild the HIPAA descriptor at most this often.
 #: Operator-tunable later via /config; this is the constant default. One
-#: week = same target as the punch-list phase-3 spec ("weekly cadence:
+#: week = same target as the backlog phase-3 spec ("weekly cadence:
 #: descriptor is rebuilt weekly so stale descriptor doesn't accumulate
 #: PHI risk over time").
 HIPAA_STYLE_DESCRIPTOR_REBUILD_INTERVAL_HOURS = 168  # 7 days
 
 
-def is_hipaa_style_distill_enabled(conn: sqlite3.Connection) -> bool:
-    """Install-wide gate on the phase-3 distill pipeline.
-
-    Default OFF. The pipeline scaffold lives in
-    :mod:`email_triage.actions.hipaa_style_distill` but is not wired into
-    any production caller until the operator both (a) flips this flag and
-    (b) signs off on the LLM-backend posture (Ollama-local-only per the
-    current default).
-    """
-    return get_bool_setting(
-        conn, STYLE_LEARNING_HIPAA_DISTILL_ENABLED, default=False,
-    )
 
 
-def set_hipaa_style_distill_enabled(
-    conn: sqlite3.Connection, enabled: bool,
-) -> None:
-    """Flip the install-wide HIPAA-distill enabled flag."""
-    set_bool_setting(
-        conn, STYLE_LEARNING_HIPAA_DISTILL_ENABLED, enabled,
-    )
 
 
-def get_hipaa_style_descriptor(
-    conn: sqlite3.Connection, account_id: int,
-) -> dict | None:
-    """Return the persisted HIPAA descriptor row, or None.
-
-    Shape::
-
-        {
-            "descriptor": <dict>,        # parsed descriptor_json
-            "version": <int>,            # descriptor_version
-            "rebuilt_at": <iso8601 str>,
-            "message_count": <int>,
-            "scrubber_outcome": <str>,
-        }
-
-    Returns ``None`` when no row exists (descriptor never built).
-    Tolerant of corrupt JSON: a parse failure also returns ``None`` so
-    the caller falls back to "no descriptor available; either re-distill
-    or render empty".
-    """
-    import json as _json
-    row = conn.execute(
-        "SELECT descriptor_json, descriptor_version, rebuilt_at, "
-        "       message_count, scrubber_outcome "
-        "FROM hipaa_style_descriptors WHERE account_id = ?",
-        (int(account_id),),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        descriptor = _json.loads(
-            row["descriptor_json"] if hasattr(row, "keys") else row[0]
-        )
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(descriptor, dict):
-        return None
-    return {
-        "descriptor": descriptor,
-        "version": int(
-            row["descriptor_version"] if hasattr(row, "keys") else row[1]
-        ),
-        "rebuilt_at": (
-            row["rebuilt_at"] if hasattr(row, "keys") else row[2]
-        ),
-        "message_count": int(
-            row["message_count"] if hasattr(row, "keys") else row[3]
-        ),
-        "scrubber_outcome": (
-            row["scrubber_outcome"] if hasattr(row, "keys") else row[4]
-        ),
-    }
 
 
-def set_hipaa_style_descriptor(
-    conn: sqlite3.Connection,
-    account_id: int,
-    *,
-    descriptor: dict,
-    version: int,
-    message_count: int,
-    scrubber_outcome: str = "clean",
-) -> None:
-    """Persist a scrubbed HIPAA descriptor (upsert).
-
-    Callers should only invoke this AFTER the scrubber pass returns
-    clean. A 'dropped' outcome is an error path — the action should
-    delete any existing row rather than writing a fresh one with
-    ``scrubber_outcome='dropped'`` so a future read can't see a
-    partial / poisoned descriptor.
-    """
-    import json as _json
-    from datetime import datetime, timezone
-    if not isinstance(descriptor, dict):
-        raise ValueError("descriptor must be a dict")
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO hipaa_style_descriptors "
-        "(account_id, descriptor_json, descriptor_version, rebuilt_at, "
-        " message_count, scrubber_outcome) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(account_id) DO UPDATE SET "
-        "  descriptor_json    = excluded.descriptor_json, "
-        "  descriptor_version = excluded.descriptor_version, "
-        "  rebuilt_at         = excluded.rebuilt_at, "
-        "  message_count      = excluded.message_count, "
-        "  scrubber_outcome   = excluded.scrubber_outcome",
-        (
-            int(account_id),
-            _json.dumps(descriptor),
-            int(version),
-            now,
-            int(message_count),
-            str(scrubber_outcome or "clean"),
-        ),
-    )
-    conn.commit()
 
 
-def delete_hipaa_style_descriptor(
-    conn: sqlite3.Connection, account_id: int,
-) -> None:
-    """Remove the HIPAA descriptor row for ``account_id`` (idempotent).
-
-    Called by the distill action when the scrubber drops the descriptor
-    (a clean descriptor never landed; remove any stale one too).
-    """
-    conn.execute(
-        "DELETE FROM hipaa_style_descriptors WHERE account_id = ?",
-        (int(account_id),),
-    )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
 # style_distill_events — audit-row split for the HIPAA distill pipeline
-# (#152 phases 3-4 S4). Sibling to ``hipaa_access_events`` but the shape
+#. Sibling to ``hipaa_access_events`` but the shape
 # is wrong for the existing table; see ``_v27_create_style_distill_audit
 # _and_queue`` for the rationale.
 # ---------------------------------------------------------------------------
 
-def record_style_distill_event(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    actor_user_id: int | None,
-    backend_id: int | None,
-    backend_type: str,
-    was_cloud: bool,
-    outcome: str,
-    latency_ms: int = 0,
-    layer1_drops: int = 0,
-    layer2_matches: int = 0,
-    layer3_entities: int = 0,
-    scrubber_degraded: bool = False,
-    error_class: str | None = None,
-    kind: str = "account_m3",
-    recipient_hash: str | None = None,
-) -> int:
-    """Insert one ``style_distill_events`` row + return the id.
-
-    The PHI-safety contract: callers pass COUNTS only, never the
-    matched text or raw error message. ``error_class`` is the type-
-    name of the exception (``"HTTPError"`` / ``"TimeoutError"``) —
-    never ``str(exc)`` since some providers embed the request body in
-    the message string.
-
-    ``kind`` discriminates the audit row's pipeline (``'account_m3'``
-    for the v27 M-3 path; ``'per_contact'`` for the v28 M-7 HIPAA path).
-    ``recipient_hash`` is the 64-hex SHA-256 digest of the recipient
-    address for ``kind='per_contact'`` rows — NEVER the plaintext
-    address. NULL for ``kind='account_m3'`` rows.
-    """
-    from datetime import datetime, timezone
-    # Defensive: reject anything that looks like a plaintext email.
-    # The hash is exactly 64 hex chars, lower-cased; plaintext would
-    # carry an ``@`` or be the wrong length.
-    if recipient_hash is not None:
-        h = str(recipient_hash).lower()
-        if "@" in h:
-            raise ValueError(
-                "recipient_hash carries '@' — caller passed plaintext"
-            )
-        if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
-            raise ValueError(
-                "recipient_hash must be a 64-char SHA-256 hex digest"
-            )
-        recipient_hash = h
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO style_distill_events "
-        "(ts, account_id, actor_user_id, backend_id, backend_type, "
-        " was_cloud, outcome, latency_ms, layer1_drops, layer2_matches, "
-        " layer3_entities, scrubber_degraded, error_class, kind, "
-        " recipient_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            now,
-            int(account_id),
-            actor_user_id if actor_user_id is None else int(actor_user_id),
-            backend_id if backend_id is None else int(backend_id),
-            str(backend_type or ""),
-            1 if was_cloud else 0,
-            str(outcome),
-            int(latency_ms or 0),
-            int(layer1_drops or 0),
-            int(layer2_matches or 0),
-            int(layer3_entities) if layer3_entities is not None else 0,
-            1 if scrubber_degraded else 0,
-            (str(error_class) if error_class else None),
-            str(kind or "account_m3"),
-            recipient_hash,
-        ),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
 
 
-def style_distill_event_counts(
-    conn: sqlite3.Connection,
-    *,
-    since_iso: str | None = None,
-) -> dict:
-    """Return per-bucket counters for the /health/detail summary.
-
-    Shape::
-
-        {
-            "local_24h":            <int>,  # was_cloud=0 successes
-            "cloud_24h":            <int>,  # was_cloud=1 successes
-            "failures_24h":         <int>,  # outcome=backend_fail
-            "scrubber_rejects_24h": <int>,  # outcome=scrubber_fail
-            "total_24h":            <int>,  # any outcome in the window
-        }
-
-    ``since_iso`` defaults to ``now - 24h`` (UTC). Caller may pass an
-    explicit cutoff to inspect a different window.
-    """
-    from datetime import datetime, timezone, timedelta
-    if since_iso is None:
-        since_iso = (
-            datetime.now(timezone.utc) - timedelta(hours=24)
-        ).isoformat()
-    out = {
-        "local_24h": 0,
-        "cloud_24h": 0,
-        "failures_24h": 0,
-        "scrubber_rejects_24h": 0,
-        "total_24h": 0,
-    }
-    rows = conn.execute(
-        "SELECT outcome, was_cloud, COUNT(*) AS cnt "
-        "FROM style_distill_events "
-        "WHERE ts >= ? "
-        "GROUP BY outcome, was_cloud",
-        (since_iso,),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] if hasattr(row, "keys") else row[0]
-        was_cloud = int(row["was_cloud"] if hasattr(row, "keys") else row[1])
-        cnt = int(row["cnt"] if hasattr(row, "keys") else row[2])
-        out["total_24h"] += cnt
-        if outcome == "success":
-            if was_cloud:
-                out["cloud_24h"] += cnt
-            else:
-                out["local_24h"] += cnt
-        elif outcome == "backend_fail":
-            out["failures_24h"] += cnt
-        elif outcome == "scrubber_fail":
-            out["scrubber_rejects_24h"] += cnt
-    return out
 
 
-def list_style_distill_events(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int | None = None,
-    limit: int = 100,
-) -> list[dict]:
-    """List events newest-first with optional per-account filter."""
-    where = ""
-    params: list = []
-    if account_id is not None:
-        where = "WHERE account_id = ?"
-        params.append(int(account_id))
-    params.append(int(limit))
-    rows = conn.execute(
-        f"SELECT * FROM style_distill_events {where} "
-        f"ORDER BY ts DESC LIMIT ?",
-        params,
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
 # style_distill_queue — exponential-backoff retry queue for the HIPAA
-# distill pipeline (#152 phases 3-4 S3). One row per account; the worker
+# distill pipeline. One row per account; the worker
 # polls for the oldest ready row.
 # ---------------------------------------------------------------------------
 
@@ -5908,7 +3134,7 @@ def list_style_distill_events(
 #: surface for operator review after attempt 8.
 #:
 #: Derived from :data:`email_triage.retry_backoff.STYLE_DISTILL_SCHEDULE`
-#: (#175 R-A) so the schedule lives in one place across both queues.
+#: so the schedule lives in one place across both queues.
 #: The seconds-tuple is preserved here for backward compatibility with
 #: tests + call sites that pin the exact integer values.
 from email_triage.retry_backoff import (
@@ -5925,221 +3151,24 @@ STYLE_DISTILL_BACKOFF_SECONDS: tuple[int, ...] = tuple(
 STYLE_DISTILL_MAX_ATTEMPTS = len(STYLE_DISTILL_BACKOFF_SECONDS)
 
 
-def _style_distill_compute_next_retry(
-    attempt_count: int, *, now: "datetime | None" = None,
-) -> "str | None":
-    """Compute the ISO timestamp for the next retry, or None when
-    ``attempt_count`` exceeds the schedule (final attempt landed).
-
-    Note on indexing
-    ----------------
-    The style-distill queue uses 1-based attempt numbering ("attempt 1
-    just landed; compute wait for attempt 2"); the shared
-    :func:`email_triage.retry_backoff.compute_next_attempt_at` uses
-    0-based ("0 failures so far; compute wait for the first retry").
-    We bridge the off-by-one here: ``attempt_count=1`` → index 0 in
-    the shared helper. This preserves the public contract that
-    :data:`STYLE_DISTILL_BACKOFF_SECONDS[0]` is the wait after attempt
-    1, used by the pinned tests in ``test_style_distill_queue.py``.
-    """
-    if attempt_count <= 0:
-        attempt_count = 1
-    next_dt = _compute_next_attempt_at(
-        attempt_count - 1,  # 1-based → 0-based bridge
-        _STYLE_DISTILL_SCHEDULE,
-        now=now,
-    )
-    if next_dt is None:
-        return None
-    return next_dt.isoformat()
 
 
-def enqueue_style_distill_retry(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    last_error: str | None,
-) -> dict:
-    """Schedule a HIPAA-distill retry after a ``backend_fail``.
-
-    Upsert by ``account_id``: increments ``attempt_count`` on an existing
-    row, inserts a fresh row at attempt 1 when none exists. ``last_error``
-    is the short class-name of the failure (NEVER raw error text). Returns
-    the row shape post-update.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    existing = conn.execute(
-        "SELECT attempt_count, paused FROM style_distill_queue "
-        "WHERE account_id = ?",
-        (int(account_id),),
-    ).fetchone()
-    if existing is None:
-        attempt = 1
-    else:
-        if int(existing["paused"]):
-            # Paused rows don't auto-retry; operator must unpause.
-            return {
-                "account_id": int(account_id),
-                "attempt_count": int(existing["attempt_count"]),
-                "next_retry_at": None,
-                "last_error": last_error,
-                "paused": True,
-            }
-        attempt = int(existing["attempt_count"]) + 1
-    next_retry = _style_distill_compute_next_retry(attempt)
-    if existing is None:
-        conn.execute(
-            "INSERT INTO style_distill_queue "
-            "(account_id, attempt_count, next_retry_at, last_error, "
-            " last_attempt_at, paused, created_at) "
-            "VALUES (?, ?, ?, ?, ?, 0, ?)",
-            (
-                int(account_id), attempt, next_retry,
-                last_error, now, now,
-            ),
-        )
-    else:
-        conn.execute(
-            "UPDATE style_distill_queue SET "
-            "  attempt_count = ?, "
-            "  next_retry_at = ?, "
-            "  last_error = ?, "
-            "  last_attempt_at = ? "
-            "WHERE account_id = ?",
-            (attempt, next_retry, last_error, now, int(account_id)),
-        )
-    conn.commit()
-    return {
-        "account_id": int(account_id),
-        "attempt_count": attempt,
-        "next_retry_at": next_retry,
-        "last_error": last_error,
-        "paused": False,
-    }
 
 
-def pause_style_distill_account(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    last_error: str,
-) -> None:
-    """Mark a queue row paused after ``scrubber_fail``.
-
-    Retrying a leaky LLM does not help; the account stays out of the
-    auto-retry loop until operator intervention. Admin UI surfaces
-    paused accounts in a banner.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    existing = conn.execute(
-        "SELECT account_id FROM style_distill_queue WHERE account_id = ?",
-        (int(account_id),),
-    ).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO style_distill_queue "
-            "(account_id, attempt_count, next_retry_at, last_error, "
-            " last_attempt_at, paused, created_at) "
-            "VALUES (?, 1, NULL, ?, ?, 1, ?)",
-            (int(account_id), last_error, now, now),
-        )
-    else:
-        conn.execute(
-            "UPDATE style_distill_queue SET "
-            "  paused = 1, next_retry_at = NULL, "
-            "  last_error = ?, last_attempt_at = ? "
-            "WHERE account_id = ?",
-            (last_error, now, int(account_id)),
-        )
-    conn.commit()
 
 
-def unpause_style_distill_account(
-    conn: sqlite3.Connection, *, account_id: int,
-) -> None:
-    """Operator action: clear the paused flag + reset attempt_count.
-
-    Used when an operator has investigated a scrubber-paused account
-    + wants it back in the retry loop (e.g. swapped backends).
-    """
-    conn.execute(
-        "UPDATE style_distill_queue SET "
-        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
-        "  last_error = NULL "
-        "WHERE account_id = ?",
-        (int(account_id),),
-    )
-    conn.commit()
 
 
-def clear_style_distill_queue_entry(
-    conn: sqlite3.Connection, *, account_id: int,
-) -> None:
-    """Remove a queue row after a successful distill.
-
-    Idempotent — second call on the same account is a no-op.
-    """
-    conn.execute(
-        "DELETE FROM style_distill_queue WHERE account_id = ?",
-        (int(account_id),),
-    )
-    conn.commit()
 
 
-def get_style_distill_queue_entry(
-    conn: sqlite3.Connection, *, account_id: int,
-) -> dict | None:
-    """Return the queue row for an account, or None."""
-    row = conn.execute(
-        "SELECT * FROM style_distill_queue WHERE account_id = ?",
-        (int(account_id),),
-    ).fetchone()
-    return dict(row) if row else None
 
 
-def list_paused_style_distill_accounts(
-    conn: sqlite3.Connection,
-) -> list[dict]:
-    """Return all paused queue rows, joined with account name.
-
-    Used by the admin banner that warns "the following accounts have
-    paused style learning (scrubber rejected the descriptor)".
-    """
-    rows = conn.execute(
-        "SELECT q.*, ea.name AS account_name "
-        "FROM style_distill_queue q "
-        "LEFT JOIN email_accounts ea ON ea.id = q.account_id "
-        "WHERE q.paused = 1 "
-        "ORDER BY q.last_attempt_at DESC"
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
-def claim_next_style_distill_queue_entry(
-    conn: sqlite3.Connection,
-) -> dict | None:
-    """Pick the oldest queue row whose ``next_retry_at`` is in the past.
-
-    Returns None when no row is ready. The worker calls this on a
-    short polling loop; SQLite's single-writer guarantee makes the
-    poll-and-update sequence safe.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    row = conn.execute(
-        "SELECT * FROM style_distill_queue "
-        "WHERE paused = 0 AND next_retry_at IS NOT NULL "
-        "  AND next_retry_at <= ? "
-        "ORDER BY next_retry_at ASC LIMIT 1",
-        (now,),
-    ).fetchone()
-    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
-# Per-contact HIPAA style descriptors (#152 phase 4 / M-7 — Wave 3)
+# Per-contact HIPAA style descriptors
 #
 # Same describe-and-discard pipeline shape as M-3, but keyed on a salted
 # hash of the recipient address rather than the plaintext address. The
@@ -6156,10 +3185,6 @@ def claim_next_style_distill_queue_entry(
 #: level descriptor only. Operator-tunable later if needed.
 HIPAA_PER_CONTACT_FRESHNESS_DAYS = 30
 
-#: Per-contact GC cut-off. Rows older than this with no re-distill
-#: trigger get deleted by the daily sweep. Matches the punch spec
-#: ("operator may have stopped emailing that contact").
-HIPAA_PER_CONTACT_GC_DAYS = 90
 
 #: Minimum sent-message count to a single recipient before a per-contact
 #: distill fires. Caller responsibility — the trigger logic lives in
@@ -6168,208 +3193,16 @@ HIPAA_PER_CONTACT_GC_DAYS = 90
 HIPAA_PER_CONTACT_TRIGGER_MIN_MESSAGES = 20
 
 
-def get_per_contact_style_hipaa(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-) -> dict | None:
-    """Return the per-contact descriptor row, or None.
-
-    Shape::
-
-        {
-            "descriptor": <dict>,        # parsed descriptor_json
-            "version": <int>,
-            "message_count": <int>,
-            "last_distilled_at": <iso8601 str>,
-            "last_updated": <iso8601 str>,
-            "scrubber_outcome": <str>,
-        }
-
-    Tolerant of corrupt JSON (returns None) so a hand-edit / legacy
-    shape doesn't crash the draft-time look-up.
-    """
-    import json as _json
-    if not recipient_hash:
-        return None
-    row = conn.execute(
-        "SELECT descriptor_json, descriptor_version, message_count, "
-        "       last_distilled_at, last_updated, scrubber_outcome "
-        "FROM per_contact_style_hipaa "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), str(recipient_hash)),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        descriptor = _json.loads(
-            row["descriptor_json"] if hasattr(row, "keys") else row[0]
-        )
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(descriptor, dict):
-        return None
-    return {
-        "descriptor": descriptor,
-        "version": int(
-            row["descriptor_version"] if hasattr(row, "keys") else row[1]
-        ),
-        "message_count": int(
-            row["message_count"] if hasattr(row, "keys") else row[2]
-        ),
-        "last_distilled_at": (
-            row["last_distilled_at"] if hasattr(row, "keys") else row[3]
-        ),
-        "last_updated": (
-            row["last_updated"] if hasattr(row, "keys") else row[4]
-        ),
-        "scrubber_outcome": (
-            row["scrubber_outcome"] if hasattr(row, "keys") else row[5]
-        ),
-    }
 
 
-def set_per_contact_style_hipaa(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-    descriptor: dict,
-    version: int,
-    message_count: int,
-    scrubber_outcome: str = "clean",
-) -> None:
-    """Persist (UPSERT) a scrubbed per-contact descriptor.
-
-    Callers MUST hash the recipient via
-    :func:`email_triage.style_learning.hash_recipient_for_install`
-    before calling — this helper does NOT accept a plaintext address.
-    The ``recipient_hash`` parameter is enforced to look like a 64-hex
-    SHA-256 digest; anything else raises ``ValueError`` to catch the
-    "accidentally passed the plaintext address" mistake.
-    """
-    import json as _json
-    from datetime import datetime, timezone
-    if not isinstance(descriptor, dict):
-        raise ValueError("descriptor must be a dict")
-    if not isinstance(recipient_hash, str):
-        raise ValueError("recipient_hash must be a string")
-    h = recipient_hash.lower()
-    if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
-        raise ValueError(
-            "recipient_hash must be a 64-char lowercase SHA-256 hex digest"
-        )
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO per_contact_style_hipaa "
-        "(account_id, recipient_hash, descriptor_json, "
-        " descriptor_version, message_count, "
-        " last_distilled_at, last_updated, scrubber_outcome) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(account_id, recipient_hash) DO UPDATE SET "
-        "  descriptor_json    = excluded.descriptor_json, "
-        "  descriptor_version = excluded.descriptor_version, "
-        "  message_count      = excluded.message_count, "
-        "  last_distilled_at  = excluded.last_distilled_at, "
-        "  last_updated       = excluded.last_updated, "
-        "  scrubber_outcome   = excluded.scrubber_outcome",
-        (
-            int(account_id),
-            h,
-            _json.dumps(descriptor),
-            int(version),
-            int(message_count),
-            now,
-            now,
-            str(scrubber_outcome or "clean"),
-        ),
-    )
-    conn.commit()
 
 
-def delete_per_contact_style_hipaa(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-) -> None:
-    """Remove a single per-contact descriptor row (idempotent)."""
-    conn.execute(
-        "DELETE FROM per_contact_style_hipaa "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), str(recipient_hash).lower()),
-    )
-    conn.commit()
 
 
-def delete_all_per_contact_style_hipaa(
-    conn: sqlite3.Connection, *, account_id: int,
-) -> int:
-    """Clear every per-contact descriptor for an account.
-
-    Used by the operator "Clear style data" surface (when one exists)
-    and during account deletion paths that want belt-and-braces over
-    the ON DELETE CASCADE. Returns the rowcount.
-    """
-    cur = conn.execute(
-        "DELETE FROM per_contact_style_hipaa WHERE account_id = ?",
-        (int(account_id),),
-    )
-    conn.commit()
-    return cur.rowcount
 
 
-def list_per_contact_style_hipaa_for_account(
-    conn: sqlite3.Connection, *, account_id: int,
-) -> list[dict]:
-    """Return per-contact rows (hashes + metadata, NOT the descriptor JSON).
-
-    Used by the operator admin surface listing "we have style data for
-    N recurring contacts on this account". The descriptor JSON is
-    intentionally omitted — caller asks for one specific hash to read
-    the full descriptor.
-    """
-    rows = conn.execute(
-        "SELECT recipient_hash, descriptor_version, message_count, "
-        "       last_distilled_at, last_updated, scrubber_outcome "
-        "FROM per_contact_style_hipaa WHERE account_id = ? "
-        "ORDER BY last_distilled_at DESC",
-        (int(account_id),),
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
-def gc_per_contact_style_hipaa(
-    conn: sqlite3.Connection,
-    *,
-    gc_days: int | None = None,
-    now: "datetime | None" = None,
-) -> int:
-    """Delete per-contact descriptors older than ``gc_days`` since
-    last distill. Returns the count of removed rows.
-
-    Daily sweep — sibling to :func:`baa_expiry_daily_sweep`. The
-    cut-off defaults to :data:`HIPAA_PER_CONTACT_GC_DAYS` (90 days);
-    callers may override for tests. Idempotent — a re-run on a clean
-    DB returns 0.
-
-    Per the punch spec: "operator may have stopped emailing that
-    contact". A row with no re-distill in 90 days means no new mail
-    has crossed the trigger threshold; the overlay is stale + the
-    hash storage is no longer earning its keep.
-    """
-    from datetime import datetime, timezone, timedelta
-    days = HIPAA_PER_CONTACT_GC_DAYS if gc_days is None else int(gc_days)
-    base = now or datetime.now(timezone.utc)
-    cutoff = (base - timedelta(days=days)).isoformat()
-    cur = conn.execute(
-        "DELETE FROM per_contact_style_hipaa "
-        "WHERE last_distilled_at < ?",
-        (cutoff,),
-    )
-    conn.commit()
-    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -6381,209 +3214,23 @@ def gc_per_contact_style_hipaa(
 # per account) don't grow conditional args.
 # ---------------------------------------------------------------------------
 
-def enqueue_style_distill_contact_retry(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-    last_error: str | None,
-) -> dict:
-    """Schedule a per-contact distill retry after a ``backend_fail``.
-
-    Same exponential-backoff schedule as the account-level queue
-    (:data:`STYLE_DISTILL_BACKOFF_SECONDS`). Upsert by ``(account_id,
-    recipient_hash)``.
-    """
-    from datetime import datetime, timezone
-    if not recipient_hash:
-        raise ValueError("recipient_hash required")
-    h = str(recipient_hash).lower()
-    if len(h) != 64:
-        raise ValueError(
-            "recipient_hash must be a 64-char SHA-256 hex digest"
-        )
-    now = datetime.now(timezone.utc).isoformat()
-    existing = conn.execute(
-        "SELECT attempt_count, paused FROM style_distill_queue_contacts "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), h),
-    ).fetchone()
-    if existing is None:
-        attempt = 1
-    else:
-        if int(existing["paused"]):
-            return {
-                "account_id": int(account_id),
-                "recipient_hash": h,
-                "attempt_count": int(existing["attempt_count"]),
-                "next_retry_at": None,
-                "last_error": last_error,
-                "paused": True,
-            }
-        attempt = int(existing["attempt_count"]) + 1
-    next_retry = _style_distill_compute_next_retry(attempt)
-    if existing is None:
-        conn.execute(
-            "INSERT INTO style_distill_queue_contacts "
-            "(account_id, recipient_hash, attempt_count, next_retry_at, "
-            " last_error, last_attempt_at, paused, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-            (
-                int(account_id), h, attempt, next_retry,
-                last_error, now, now,
-            ),
-        )
-    else:
-        conn.execute(
-            "UPDATE style_distill_queue_contacts SET "
-            "  attempt_count = ?, "
-            "  next_retry_at = ?, "
-            "  last_error = ?, "
-            "  last_attempt_at = ? "
-            "WHERE account_id = ? AND recipient_hash = ?",
-            (attempt, next_retry, last_error, now, int(account_id), h),
-        )
-    conn.commit()
-    return {
-        "account_id": int(account_id),
-        "recipient_hash": h,
-        "attempt_count": attempt,
-        "next_retry_at": next_retry,
-        "last_error": last_error,
-        "paused": False,
-    }
 
 
-def pause_style_distill_contact(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-    last_error: str,
-) -> None:
-    """Pause a per-contact queue row after ``scrubber_fail``.
-
-    The account-level row stays active; only THIS contact pauses.
-    Operator clears via :func:`unpause_style_distill_contact`.
-    """
-    from datetime import datetime, timezone
-    h = str(recipient_hash).lower()
-    now = datetime.now(timezone.utc).isoformat()
-    existing = conn.execute(
-        "SELECT 1 FROM style_distill_queue_contacts "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), h),
-    ).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO style_distill_queue_contacts "
-            "(account_id, recipient_hash, attempt_count, next_retry_at, "
-            " last_error, last_attempt_at, paused, created_at) "
-            "VALUES (?, ?, 1, NULL, ?, ?, 1, ?)",
-            (int(account_id), h, last_error, now, now),
-        )
-    else:
-        conn.execute(
-            "UPDATE style_distill_queue_contacts SET "
-            "  paused = 1, next_retry_at = NULL, "
-            "  last_error = ?, last_attempt_at = ? "
-            "WHERE account_id = ? AND recipient_hash = ?",
-            (last_error, now, int(account_id), h),
-        )
-    conn.commit()
 
 
-def unpause_style_distill_contact(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-) -> None:
-    """Operator action: clear paused flag for a specific contact row."""
-    conn.execute(
-        "UPDATE style_distill_queue_contacts SET "
-        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
-        "  last_error = NULL "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), str(recipient_hash).lower()),
-    )
-    conn.commit()
 
 
-def clear_style_distill_contact_queue_entry(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-) -> None:
-    """Remove a per-contact queue row after a successful distill.
-
-    Idempotent — second call on the same key is a no-op.
-    """
-    conn.execute(
-        "DELETE FROM style_distill_queue_contacts "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), str(recipient_hash).lower()),
-    )
-    conn.commit()
 
 
-def get_style_distill_contact_queue_entry(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    recipient_hash: str,
-) -> dict | None:
-    """Return the per-contact queue row for ``(account, contact)``, or None."""
-    row = conn.execute(
-        "SELECT * FROM style_distill_queue_contacts "
-        "WHERE account_id = ? AND recipient_hash = ?",
-        (int(account_id), str(recipient_hash).lower()),
-    ).fetchone()
-    return dict(row) if row else None
 
 
-def list_paused_style_distill_contacts(
-    conn: sqlite3.Connection,
-) -> list[dict]:
-    """Return all paused per-contact queue rows joined with account name.
-
-    Sibling to :func:`list_paused_style_distill_accounts`. Plaintext
-    recipient is NEVER joined in — the row stores only the hash.
-    """
-    rows = conn.execute(
-        "SELECT q.*, ea.name AS account_name "
-        "FROM style_distill_queue_contacts q "
-        "LEFT JOIN email_accounts ea ON ea.id = q.account_id "
-        "WHERE q.paused = 1 "
-        "ORDER BY q.last_attempt_at DESC"
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
-def claim_next_style_distill_contact_queue_entry(
-    conn: sqlite3.Connection,
-) -> dict | None:
-    """Pick the oldest per-contact queue row whose ``next_retry_at`` is past.
-
-    Sibling to :func:`claim_next_style_distill_queue_entry`. Worker
-    polls both queues on each tick.
-    """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    row = conn.execute(
-        "SELECT * FROM style_distill_queue_contacts "
-        "WHERE paused = 0 AND next_retry_at IS NOT NULL "
-        "  AND next_retry_at <= ? "
-        "ORDER BY next_retry_at ASC LIMIT 1",
-        (now,),
-    ).fetchone()
-    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------
 # hipaa_send_counters — HIPAA outbound-message counters for the M-3 + M-7
-# trigger watchers (#171-B / v29).
+# trigger watchers.
 #
 # Counter rows are keyed on (account_id, recipient_hash). The empty string
 # in recipient_hash is the ACCOUNT-AGGREGATE row that drives the M-3
@@ -6624,33 +3271,20 @@ def _validate_recipient_hash_or_aggregate(recipient_hash: str) -> str:
     return h
 
 
-def record_hipaa_sent_message(
+def _bump_hipaa_send_counters(
     conn: sqlite3.Connection,
     *,
     account_id: int,
     recipient_hash: str,
 ) -> None:
-    """Increment the HIPAA send counter for ``(account_id, recipient_hash)``.
+    """Bump the HIPAA send-counter rows for ``(account_id, recipient_hash)``
+    WITHOUT committing.
 
-    Bumps two rows in a single call:
-
-      1. The per-recipient row keyed on the non-empty hash.
-      2. The account-aggregate row keyed on the empty-string sentinel.
-
-    Both rows' ``count`` columns increment by 1 + ``last_seen_at`` is
-    refreshed to ``now``. ``first_seen_at`` is set on the row's first
-    increment after a reset and left untouched on subsequent bumps.
-
-    Idempotency: this helper is NOT idempotent across calls — it's
-    designed to be called exactly once per logical outbound message.
-    The upstream caller (a future HIPAA-aware sent-stream observer)
-    is responsible for dedup against re-delivered IMAP UIDs / Graph
-    delta messages. We treat each invocation as a real send.
-
-    Privacy: the helper rejects ``recipient_hash`` containing ``@`` or
-    of the wrong length — defensive guard against a caller that
-    accidentally passes plaintext. The aggregate-row sentinel is the
-    only exception (empty string).
+    Shared core of :func:`record_hipaa_sent_message` and
+    :func:`record_hipaa_sent_message_if_new`. Issuing the bumps without a
+    ``commit()`` lets the caller fold them into a wider transaction — the
+    ``if_new`` wrapper needs the dedup INSERT and these counter bumps to
+    commit as ONE unit, so the commit point belongs to the caller.
     """
     from datetime import datetime, timezone
     h = _validate_recipient_hash_or_aggregate(recipient_hash)
@@ -6685,7 +3319,171 @@ def record_hipaa_sent_message(
                 "WHERE account_id = ? AND recipient_hash = ?",
                 (now, int(account_id), target_h),
             )
+
+
+@db_write
+def record_hipaa_sent_message(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int,
+    recipient_hash: str,
+) -> None:
+    """Increment the HIPAA send counter for ``(account_id, recipient_hash)``.
+
+    Bumps two rows in a single call:
+
+      1. The per-recipient row keyed on the non-empty hash.
+      2. The account-aggregate row keyed on the empty-string sentinel.
+
+    Both rows' ``count`` columns increment by 1 + ``last_seen_at`` is
+    refreshed to ``now``. ``first_seen_at`` is set on the row's first
+    increment after a reset and left untouched on subsequent bumps.
+
+    Idempotency: this helper is NOT idempotent across calls — it's
+    designed to be called exactly once per logical outbound message.
+    The upstream caller (a future HIPAA-aware sent-stream observer)
+    is responsible for dedup against re-delivered IMAP UIDs / Graph
+    delta messages. We treat each invocation as a real send.
+
+    Privacy: the helper rejects ``recipient_hash`` containing ``@`` or
+    of the wrong length — defensive guard against a caller that
+    accidentally passes plaintext. The aggregate-row sentinel is the
+    only exception (empty string).
+    """
+    _bump_hipaa_send_counters(
+        conn, account_id=account_id, recipient_hash=recipient_hash,
+    )
     conn.commit()
+
+
+@db_write
+def record_hipaa_sent_message_if_new(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int,
+    msgid_hash: str,
+    recipient_hashes: list[str] | tuple[str, ...],
+) -> bool:
+    """Dedup-aware wrapper around :func:`record_hipaa_sent_message`.
+
+    Idempotently records ONE outbound message's contribution to the
+    M-3 + M-7 threshold counters. Designed to be called from the
+    HIPAA Sent-folder scanner where the same Sent-folder snapshot
+    may be re-walked across cron ticks; this helper ensures each
+    unique RFC Message-ID counts exactly once across the install's
+    lifetime.
+
+    Steps
+    -----
+    1. Validate ``msgid_hash`` (must be 64-char hex; defensive guard
+       against accidental plaintext-Message-ID at the call site).
+    2. Try to INSERT a row into ``hipaa_sent_dedup`` with
+       ``(account_id, msgid_hash, now)``. If the primary key already
+       exists, return ``False`` (already counted on a prior scan).
+    3. For each recipient hash, bump the per-recipient row and the
+       account aggregate.
+    4. Commit the dedup INSERT and every counter bump as ONE
+       transaction, then return ``True``.
+
+    Atomicity
+    ----------------
+    The dedup INSERT and the counter bumps share a single ``commit()``.
+    A crash between recording the message as "seen" and incrementing
+    the M-3/M-7 counters used to leave the dedup row claiming the
+    message was counted while the counters had never moved — silently
+    under-counting the install forever. Folding both into one
+    transaction makes the record atomic: either the message is deduped
+    AND counted, or neither happened. The ``@db_write`` decorator holds
+    the process-wide write lock for the whole call, so no foreign
+    writer can flush this half-built transaction.
+
+    Privacy posture
+    ---------------
+    The dedup table stores only ``(account_id, salted-msgid-hash,
+    recorded_at)`` — no plaintext Message-IDs, no recipient
+    addresses, no subject/body bytes. The hash uses the same salt
+    as the per-contact M-7 path (one rotation invalidates both
+    surfaces consistently — see
+    :func:`email_triage.style_learning.per_contact_hipaa.hash_message_id_for_install`).
+
+    Returns
+    -------
+    ``True`` when this call recorded a NEW message (counters bumped);
+    ``False`` when the message was already in the dedup table (no-op
+    on counters).
+    """
+    from datetime import datetime, timezone
+
+    if not msgid_hash or not isinstance(msgid_hash, str):
+        raise ValueError("msgid_hash must be a non-empty string")
+    h = msgid_hash.strip().lower()
+    if len(h) != 64 or not all(c in "0123456789abcdef" for c in h):
+        raise ValueError(
+            f"msgid_hash must be 64-char lowercase hex "
+            f"(got len={len(h)!r})"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO hipaa_sent_dedup "
+        "  (account_id, msgid_hash, recorded_at) "
+        "VALUES (?, ?, ?)",
+        (int(account_id), h, now),
+    )
+    if cur.rowcount == 0:
+        # Already in dedup; counters were bumped on the prior scan.
+        # No-op on the counters — but the INSERT OR IGNORE still opened
+        # an implicit sqlite3 transaction even though it inserted zero
+        # rows. Returning without a commit/rollback leaves
+        # ``conn.in_transaction`` True, so the NEXT helper that issues
+        # an explicit ``BEGIN`` / ``BEGIN IMMEDIATE`` raises
+        # ``OperationalError: cannot start a transaction within a
+        # transaction``. Roll the (empty) transaction back so the
+        # next lock holder starts clean.
+        conn.rollback()
+        return False
+
+    # New message — bump per-recipient + aggregate, then commit the
+    # dedup INSERT and every counter bump together. A single commit
+    # makes "deduped" and "counted" atomic: a crash before this
+    # point rolls back both; a crash after it has persisted both.
+    for rh in recipient_hashes or ():
+        _bump_hipaa_send_counters(
+            conn, account_id=account_id, recipient_hash=rh,
+        )
+    conn.commit()
+    return True
+
+
+@db_write
+def prune_hipaa_sent_dedup(
+    conn: sqlite3.Connection,
+    *,
+    older_than_days: int = 90,
+) -> int:
+    """Drop dedup rows older than ``older_than_days``. Returns row count.
+
+    Bounds table growth on long-running installs. 90 days is a sensible
+    default: the cron loop scans the Sent folder every 6h with a
+    50-message window, so the table holds at most ~360 rows per active
+    HIPAA account per day; pruning at 90 days caps each account around
+    32k rows worst case. In practice the cron's ``limit=50`` ceiling
+    means an active HIPAA account contributes ~5-15 unique messages
+    per scan tick, so steady-state is much smaller.
+
+    Called from the cron sweep alongside the HIPAA counter scan; safe
+    to invoke from CLI / tests as well.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=int(older_than_days))
+    ).isoformat()
+    cur = conn.execute(
+        "DELETE FROM hipaa_sent_dedup WHERE recorded_at < ?",
+        (cutoff,),
+    )
+    conn.commit()
+    return int(cur.rowcount)
 
 
 def get_hipaa_send_counter(
@@ -6719,11 +3517,13 @@ def get_hipaa_send_counter(
     }
 
 
+@db_write
 def reset_hipaa_send_counter(
     conn: sqlite3.Connection,
     *,
     account_id: int,
     recipient_hash: str = HIPAA_SEND_COUNTER_AGGREGATE_HASH,
+    commit: bool = True,
 ) -> None:
     """Reset a counter row to 0 + clear its timestamps.
 
@@ -6738,7 +3538,8 @@ def reset_hipaa_send_counter(
         "WHERE account_id = ? AND recipient_hash = ?",
         (int(account_id), h),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def list_hipaa_per_contact_counters(
@@ -6777,54 +3578,6 @@ def list_hipaa_per_contact_counters(
     ]
 
 
-def last_successful_style_distill_at(
-    conn: sqlite3.Connection,
-    *,
-    account_id: int,
-    kind: str = "account_m3",
-    recipient_hash: str | None = None,
-) -> str | None:
-    """Return the ISO timestamp of the most-recent successful distill, or None.
-
-    Reads ``style_distill_events``. ``outcome='success'`` AND
-    (when applicable) the matching ``recipient_hash`` filter:
-
-      * ``kind='account_m3'``:  recipient_hash IS NULL filter.
-      * ``kind='per_contact'``: recipient_hash = <hash> filter.
-
-    Returns None when no qualifying row exists (first-time trigger
-    fires on this).
-    """
-    where_parts = [
-        "account_id = ?",
-        "kind = ?",
-        "outcome = 'success'",
-    ]
-    params: list = [int(account_id), str(kind)]
-    if kind == "per_contact":
-        if recipient_hash is None:
-            raise ValueError(
-                "recipient_hash required for kind='per_contact'"
-            )
-        h = _validate_recipient_hash_or_aggregate(recipient_hash)
-        if h == HIPAA_SEND_COUNTER_AGGREGATE_HASH:
-            raise ValueError(
-                "recipient_hash sentinel '' not valid for "
-                "kind='per_contact' lookup"
-            )
-        where_parts.append("recipient_hash = ?")
-        params.append(h)
-    else:
-        where_parts.append("recipient_hash IS NULL")
-    sql = (
-        "SELECT ts FROM style_distill_events "
-        "WHERE " + " AND ".join(where_parts) + " "
-        "ORDER BY ts DESC LIMIT 1"
-    )
-    row = conn.execute(sql, params).fetchone()
-    if row is None:
-        return None
-    return row["ts"] if hasattr(row, "keys") else row[0]
 
 
 # ---------------------------------------------------------------------------
@@ -6861,89 +3614,12 @@ def last_successful_style_distill_at(
 ANTI_AI_STYLE_GUIDE_MAX_LEN = 4000
 
 
-def get_global_anti_ai_style_guide(conn: sqlite3.Connection) -> str:
-    """Return the install-wide anti-AI style guide string.
-
-    Returns the empty string when the row is missing or the stored
-    value isn't a plain string (defensive: a hand-edit / legacy dict
-    shape will not crash the prompt build).
-    """
-    from email_triage.web.settings_keys import ANTI_AI_STYLE_GUIDE_GLOBAL
-    raw = get_setting(conn, ANTI_AI_STYLE_GUIDE_GLOBAL)
-    if raw is None:
-        return ""
-    if isinstance(raw, str):
-        return raw
-    # Defensive: settings table can hold any JSON shape. A dict written
-    # by an older code path collapses to empty rather than leaking
-    # ``{"value": "..."}``-style ugliness into the LLM prompt.
-    return ""
 
 
-def set_global_anti_ai_style_guide(
-    conn: sqlite3.Connection, text: str,
-) -> None:
-    """Persist the install-wide anti-AI style guide (upsert).
-
-    Stores a plain JSON string (no dict wrapper). Empty / whitespace-only
-    input is normalised to the empty string so a "clear the field"
-    operator action takes effect immediately.
-    """
-    from email_triage.web.settings_keys import ANTI_AI_STYLE_GUIDE_GLOBAL
-    cleaned = (text or "").strip()
-    set_setting(conn, ANTI_AI_STYLE_GUIDE_GLOBAL, cleaned)
 
 
-def get_user_anti_ai_style_guide(
-    conn: sqlite3.Connection, user_id: int | None,
-) -> tuple[str, bool]:
-    """Return ``(user_text, disable_global)`` for the user.
-
-    Returns ``("", False)`` when ``user_id`` is missing or the columns
-    haven't been added yet (pre-v20 DB). The disable flag is forced to
-    False on a None user so an anonymous prompt-build path doesn't
-    accidentally suppress the install-wide guide.
-    """
-    if not user_id:
-        return ("", False)
-    try:
-        row = conn.execute(
-            "SELECT anti_ai_style_guide_user, "
-            "       anti_ai_style_guide_disable_global "
-            "FROM users WHERE id = ?",
-            (int(user_id),),
-        ).fetchone()
-    except sqlite3.OperationalError:
-        # Pre-v20 DB — columns don't exist yet.
-        return ("", False)
-    if row is None:
-        return ("", False)
-    text = ""
-    disable = False
-    try:
-        text = str(row["anti_ai_style_guide_user"] or "")
-        disable = bool(row["anti_ai_style_guide_disable_global"])
-    except (KeyError, IndexError, TypeError):
-        # Defensive: row factory may not return mapping-style rows in
-        # some test fixtures; fall back to the empty defaults.
-        return ("", False)
-    return (text, disable)
 
 
-def set_user_anti_ai_style_guide(
-    conn: sqlite3.Connection, user_id: int, *,
-    text: str, disable_global: bool,
-) -> None:
-    """Persist the per-user anti-AI guide + disable-global flag."""
-    cleaned = (text or "").strip()
-    conn.execute(
-        "UPDATE users SET "
-        "  anti_ai_style_guide_user = ?, "
-        "  anti_ai_style_guide_disable_global = ? "
-        "WHERE id = ?",
-        (cleaned, 1 if disable_global else 0, int(user_id)),
-    )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -6956,158 +3632,14 @@ def set_user_anti_ai_style_guide(
 # directory) so the page renders the empty state instead of crashing.
 # ---------------------------------------------------------------------------
 
-def _has_table(conn: sqlite3.Connection, table_name: str) -> bool:
-    """True when ``table_name`` exists in the SQLite schema."""
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
 
 
-def _has_column(
-    conn: sqlite3.Connection, table_name: str, column_name: str,
-) -> bool:
-    """True when ``column_name`` exists on ``table_name``."""
-    if not _has_table(conn, table_name):
-        return False
-    rows = conn.execute(
-        f"PRAGMA table_info({table_name})"
-    ).fetchall()
-    for r in rows:
-        # PRAGMA returns (cid, name, type, notnull, dflt_value, pk)
-        name = r[1] if not hasattr(r, "keys") else r["name"]
-        if name == column_name:
-            return True
-    return False
 
 
-def get_sent_mail_index_summary(
-    conn: sqlite3.Connection, account_id: int,
-) -> dict:
-    """Summarise the sent-mail-index rows for ``account_id``.
-
-    Returns a dict shaped for the /profile/style-data page:
-
-    * ``count``: total indexed rows (0 if table absent or no rows).
-    * ``oldest``: ISO timestamp of the oldest sent_at, or None.
-    * ``newest``: ISO timestamp of the newest sent_at, or None.
-    * ``embedding_model``: most-recently-used embedding model name,
-      or empty string.
-    * ``sample_subjects``: up to 3 subjects (caller redacts under
-      HIPAA; this helper does NOT redact — gating is at the route).
-    * ``available``: True when the M-4 table exists. False is the
-      "feature not installed yet" signal the template uses to hide
-      the section entirely.
-    """
-    out: dict = {
-        "count": 0,
-        "oldest": None,
-        "newest": None,
-        "embedding_model": "",
-        "sample_subjects": [],
-        "available": False,
-    }
-    if not _has_table(conn, "sent_mail_index"):
-        return out
-    out["available"] = True
-
-    row = conn.execute(
-        "SELECT COUNT(*) AS n, MIN(sent_at) AS oldest, "
-        "       MAX(sent_at) AS newest "
-        "FROM sent_mail_index WHERE account_id = ?",
-        (account_id,),
-    ).fetchone()
-    if row is not None:
-        out["count"] = int(
-            row["n"] if hasattr(row, "keys") else row[0],
-        )
-        out["oldest"] = (
-            row["oldest"] if hasattr(row, "keys") else row[1]
-        )
-        out["newest"] = (
-            row["newest"] if hasattr(row, "keys") else row[2]
-        )
-
-    if out["count"] == 0:
-        return out
-
-    # Most-recent embedding model name (an account could have rows from
-    # multiple models if the operator swapped backends; we surface the
-    # newest). One row is plenty.
-    model_row = conn.execute(
-        "SELECT embedding_model FROM sent_mail_index "
-        "WHERE account_id = ? "
-        "ORDER BY indexed_at DESC LIMIT 1",
-        (account_id,),
-    ).fetchone()
-    if model_row is not None:
-        out["embedding_model"] = (
-            (model_row["embedding_model"]
-             if hasattr(model_row, "keys")
-             else model_row[0]) or ""
-        )
-
-    sample_rows = conn.execute(
-        "SELECT subject FROM sent_mail_index "
-        "WHERE account_id = ? "
-        "ORDER BY sent_at DESC LIMIT 3",
-        (account_id,),
-    ).fetchall()
-    out["sample_subjects"] = [
-        (r["subject"] if hasattr(r, "keys") else r[0]) or "(no subject)"
-        for r in sample_rows
-    ]
-    return out
 
 
-def get_captured_pair_count(
-    conn: sqlite3.Connection, account_id: int,
-) -> int:
-    """Count rows where ``is_captured_pair = 1`` for ``account_id``.
-
-    M-6 (the capture loop) ships this column in a parallel branch.
-    Until that lands, the column is absent and this helper returns 0.
-    Defence-in-depth: even when the column exists, missing-row counts
-    return 0 instead of raising.
-    """
-    if not _has_column(conn, "sent_mail_index", "is_captured_pair"):
-        return 0
-    try:
-        row = conn.execute(
-            "SELECT COUNT(*) AS n FROM sent_mail_index "
-            "WHERE account_id = ? AND is_captured_pair = 1",
-            (account_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        return 0
-    if row is None:
-        return 0
-    return int(row["n"] if hasattr(row, "keys") else row[0])
 
 
-def delete_sent_mail_index_for_account(
-    conn: sqlite3.Connection, account_id: int,
-) -> int:
-    """Drop every sent_mail_index row for ``account_id``.
-
-    Mirrors :meth:`SentMailIndex.delete_account_index` but stays
-    DB-only so the /profile/style-data delete path doesn't need to
-    instantiate the M-4 helper (which requires an embedding backend).
-    Returns the number of rows deleted (0 when the table is absent).
-    """
-    if not _has_table(conn, "sent_mail_index"):
-        return 0
-    cur = conn.execute(
-        "DELETE FROM sent_mail_index WHERE account_id = ?",
-        (account_id,),
-    )
-    conn.commit()
-    try:
-        return int(cur.rowcount or 0)
-    except Exception:
-        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -7125,28 +3657,10 @@ def delete_sent_mail_index_for_account(
 # M-4 keep working without touching this flag).
 # ---------------------------------------------------------------------------
 
-def is_style_learning_per_contact_enabled(account: dict | None) -> bool:
-    """Return the per-account "match by recipient" sub-toggle.
-
-    Read from ``account.config["style_learning_per_contact_enabled"]``.
-    Default is True (on) -- the privacy-neutral refinement of an
-    already-opted-in M-4 surface. The HIPAA gate at
-    :class:`SentMailIndex` short-circuits regardless of this value;
-    this flag is the operator UX surface only.
-    """
-    if account is None:
-        return False
-    cfg = account.get("config") if isinstance(account, dict) else None
-    if not isinstance(cfg, dict):
-        return True
-    val = cfg.get("style_learning_per_contact_enabled")
-    if val is None:
-        return True
-    return bool(val)
 
 
 # ---------------------------------------------------------------------------
-# Dashboard helpers (#12)
+# Dashboard helpers
 # ---------------------------------------------------------------------------
 
 def get_dashboard_dismissed_steps(
@@ -7420,7 +3934,7 @@ def triage_error_rate(
 
 
 # ---------------------------------------------------------------------------
-# Multi-label per message (#129)
+# Multi-label per message
 # ---------------------------------------------------------------------------
 #
 # Labels are install-wide tags decorating messages independently of
@@ -7436,7 +3950,7 @@ def list_labels(conn: sqlite3.Connection) -> list[dict]:
         "       created_at, updated_at "
         "FROM labels ORDER BY slug"
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def get_label(conn: sqlite3.Connection, slug: str) -> dict | None:
@@ -7447,9 +3961,10 @@ def get_label(conn: sqlite3.Connection, slug: str) -> dict | None:
         "FROM labels WHERE slug = ?",
         (slug,),
     ).fetchone()
-    return dict(row) if row else None
+    return _row(row)
 
 
+@db_write
 def create_label(
     conn: sqlite3.Connection,
     slug: str,
@@ -7478,6 +3993,7 @@ def create_label(
     return slug
 
 
+@db_write
 def update_label(
     conn: sqlite3.Connection,
     slug: str,
@@ -7498,6 +4014,7 @@ def update_label(
     return cursor.rowcount > 0
 
 
+@db_write
 def delete_label(conn: sqlite3.Connection, slug: str) -> bool:
     """Delete a label + every message_labels row referencing it.
 
@@ -7517,6 +4034,7 @@ def delete_label(conn: sqlite3.Connection, slug: str) -> bool:
     return cursor.rowcount > 0
 
 
+@db_write
 def apply_labels_to_message(
     conn: sqlite3.Connection,
     message_id: str,
@@ -7567,7 +4085,7 @@ def get_rule_provider_labels(
     corrupt JSON value doesn't crash the page render.
 
     Sibling of the install-internal ``adds_labels`` reader on the
-    rules-page snapshot (#129). Kept here so non-template consumers
+    rules-page snapshot. Kept here so non-template consumers
     (apply phase, tests) can pull the same shape without re-parsing.
     """
     import json as _json
@@ -7600,6 +4118,7 @@ def get_rule_provider_labels(
     return out
 
 
+@db_write
 def set_rule_provider_labels(
     conn: sqlite3.Connection,
     rule_id: int,
@@ -7642,6 +4161,7 @@ def set_rule_provider_labels(
     conn.commit()
 
 
+@db_write
 def remove_label_from_message(
     conn: sqlite3.Connection,
     message_id: str,
@@ -7677,7 +4197,7 @@ def list_labels_on_message(
         "ORDER BY ml.label_slug",
         (message_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def list_messages_with_label(
@@ -7709,11 +4229,11 @@ def list_messages_with_label(
             "ORDER BY applied_at DESC LIMIT ?",
             (label_slug, limit),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 # ---------------------------------------------------------------------------
-# AI backends catalog (migration v26 — #169 Wave 2-α I3 + I6)
+# AI backends catalog (migration v26 —  Wave 2-α I3 + I6)
 # ---------------------------------------------------------------------------
 #
 # Single source of truth helpers for the admin-curated ``ai_backends``
@@ -7759,7 +4279,7 @@ def list_ai_backends(
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY name"
     rows = conn.execute(sql).fetchall()
-    return [dict(r) for r in rows]
+    return _rows(rows)
 
 
 def get_ai_backend(
@@ -7773,9 +4293,10 @@ def get_ai_backend(
         "FROM ai_backends WHERE id = ?",
         (int(backend_id),),
     ).fetchone()
-    return dict(row) if row is not None else None
+    return _row(row)
 
 
+@db_write
 def create_ai_backend(
     conn: sqlite3.Connection,
     *,
@@ -7818,6 +4339,7 @@ def create_ai_backend(
     return int(cur.lastrowid)
 
 
+@db_write
 def update_ai_backend(
     conn: sqlite3.Connection,
     backend_id: int,
@@ -7866,6 +4388,7 @@ def update_ai_backend(
     return cur.rowcount > 0
 
 
+@db_write
 def delete_ai_backend(conn: sqlite3.Connection, backend_id: int) -> bool:
     """Delete a backend row. FK on ``email_accounts`` is ``ON DELETE
     SET NULL`` so any account selecting this backend falls back to the
@@ -7895,6 +4418,7 @@ def count_accounts_using_ai_backend(
     return int(row["n"] if hasattr(row, "keys") else row[0])
 
 
+@db_write
 def set_account_style_learning_backend(
     conn: sqlite3.Connection,
     account_id: int,
@@ -7940,22 +4464,25 @@ def get_account_style_learning_backend(
         "WHERE ea.id = ?",
         (int(account_id),),
     ).fetchone()
-    return dict(row) if row is not None else None
+    return _row(row)
 
 
 # ---------------------------------------------------------------------------
-# watcher_retry_queue — per-message retry queue (#175 R-A, v30)
+# watcher_retry_queue — the single consolidated retry queue
 # ---------------------------------------------------------------------------
 #
-# Per-message exception handler for the watcher / push consumer / poll
-# loop. Where ``triage_retry_queue`` (v16) parks messages whose CLASSIFY
-# step failed because the LLM backend was offline, this queue parks
-# messages whose per-message FETCH / PROCESS step raised an exception
-# (IMAP fetch timeout, transient provider 5xx, network blip, etc.).
+# Every per-message ingestion failure — IMAP IDLE watcher, unified poll,
+# Gmail push, O365 push — parks here. The retry-subsystem rebuild
+# collapsed the two legacy queues onto this one table; the
+# ``failure_kind`` column (v35) is the only per-row distinction:
+# ``'llm_unreachable'`` rows are skipped by the drainer while the LLM
+# breaker is open, NULL rows (ordinary fetch/process failures) drain
+# every tick.
 #
-# Schema lives in migration v30. Addressing is provider-specific
-# (mailbox+uid+uidvalidity for IMAP, gmail_msg_id for Gmail,
-# o365_msg_id for O365). The state machine is pending → done / dead.
+# Schema lives in migration v30 (+ failure_kind in v35). Addressing is
+# provider-specific (mailbox+uid+uidvalidity for IMAP, gmail_msg_id for
+# Gmail, o365_msg_id for O365). The state machine is pending → done /
+# dead.
 #
 # Privacy
 # -------
@@ -8050,6 +4577,7 @@ def _scrub_watcher_retry_error_msg(msg: str | None) -> str | None:
     return out
 
 
+@db_write
 def enqueue_retry(
     conn: sqlite3.Connection,
     *,
@@ -8062,6 +4590,7 @@ def enqueue_retry(
     o365_msg_id: str | None = None,
     error_class: str,
     error_msg: str | None = None,
+    failure_kind: str | None = None,
 ) -> int:
     """Insert (or bump) a row in ``watcher_retry_queue``.
 
@@ -8069,10 +4598,31 @@ def enqueue_retry(
     --------------------
     Exactly one provider-specific addressing tuple must be populated:
 
-    * ``provider_type='imap'`` → ``mailbox``, ``uid``, ``uidvalidity``
-      all required.
+    * ``provider_type='imap'`` → ``mailbox`` and ``uid`` required;
+      ``uidvalidity`` is required *non-null* only on servers that expose
+      it. A server whose ``SELECT`` carries no ``UIDVALIDITY`` line
+      legitimately yields ``uidvalidity=None`` (RFC 3501 §2.3.1.1 makes
+      the response code OPTIONAL); #239c — rather than rejecting that
+      row (which raised ``ValueError``, was swallowed, and froze the
+       IMAP-poll high-water mark forever, re-walking + re-failing
+      the same message every tick), ``None`` is stored as the sentinel
+      ``0``. The drainer already treats ``uidvalidity=0`` as a sentinel:
+      a live mailbox never reports 0, so a server that *does* expose
+      UIDVALIDITY will mismatch and the row marks dead, while a server
+      that exposes none reads ``None`` live and the mismatch check is
+      skipped so recovery proceeds.
     * ``provider_type='gmail'`` → ``gmail_msg_id`` required.
     * ``provider_type='office365'`` → ``o365_msg_id`` required.
+
+    ``failure_kind``
+    ----------------
+    Optional classifier for the failure. ``'llm_unreachable'`` marks a
+    row the drainer must skip while the LLM circuit breaker is open
+    (re-running classify against a dead backend just burns latency);
+    NULL means an ordinary per-message fetch/process failure, drained on
+    every tick. On the bump branch the value is refreshed only when a
+    non-None argument is given, so re-enqueuing without a kind keeps the
+    original classification.
 
     The UNIQUE partial indexes (see migration v30) on each addressing
     tuple guarantee that re-enqueuing the same logical message hits
@@ -8095,7 +4645,7 @@ def enqueue_retry(
     Returns
     -------
     int
-        The row id (``triage_retry_queue.id``).
+        The row id (``watcher_retry_queue.id``).
     """
     from datetime import datetime, timezone
     from email_triage.retry_backoff import (
@@ -8105,11 +4655,18 @@ def enqueue_retry(
     # Validate provider_type addressing.
     pt = (provider_type or "").lower().strip()
     if pt == "imap":
-        if mailbox is None or uid is None or uidvalidity is None:
+        if mailbox is None or uid is None:
             raise ValueError(
-                "enqueue_retry: provider_type='imap' requires mailbox, "
-                "uid, uidvalidity"
+                "enqueue_retry: provider_type='imap' requires mailbox, uid"
             )
+        # #239c — a server with no UIDVALIDITY response code yields
+        # None here legitimately. Store the sentinel 0 instead of
+        # raising: rejecting froze the IMAP-poll HWM forever (the
+        # ValueError was swallowed → uid_safe=False →  HWM cap →
+        # endless re-walk of the same message). 0 is safe — a live
+        # mailbox never reports UIDVALIDITY 0.
+        if uidvalidity is None:
+            uidvalidity = 0
     elif pt == "gmail":
         if not gmail_msg_id:
             raise ValueError(
@@ -8170,14 +4727,19 @@ def enqueue_retry(
                 next_dt = datetime.now(timezone.utc) + (
                     WATCHER_RETRY_SCHEDULE[-1]
                 )
+            # failure_kind: refresh only when a non-None value was
+            # passed (a bare re-enqueue keeps the original kind via
+            # COALESCE(?, failure_kind)).
             conn.execute(
                 "UPDATE watcher_retry_queue SET "
                 "  attempt_count=?, next_attempt_at=?, "
-                "  last_error_class=?, last_error_msg=?, last_error_at=? "
+                "  last_error_class=?, last_error_msg=?, last_error_at=?, "
+                "  failure_kind=COALESCE(?, failure_kind) "
                 "WHERE id=?",
                 (
                     new_count, next_dt.isoformat(),
                     str(error_class), scrubbed_msg, now_iso,
+                    failure_kind,
                     existing_id,
                 ),
             )
@@ -8192,11 +4754,13 @@ def enqueue_retry(
             "UPDATE watcher_retry_queue SET "
             "  state='pending', attempt_count=0, "
             "  next_attempt_at=?, last_error_class=?, last_error_msg=?, "
-            "  last_error_at=?, resolved_at=NULL, dead_reason=NULL "
+            "  last_error_at=?, resolved_at=NULL, dead_reason=NULL, "
+            "  failure_kind=COALESCE(?, failure_kind) "
             "WHERE id=?",
             (
                 next_dt.isoformat(),
                 str(error_class), scrubbed_msg, now_iso,
+                failure_kind,
                 existing_id,
             ),
         )
@@ -8211,15 +4775,16 @@ def enqueue_retry(
         "  account_id, provider_type, "
         "  mailbox, uid, uidvalidity, "
         "  gmail_msg_id, o365_msg_id, "
-        "  state, attempt_count, "
+        "  state, attempt_count, failure_kind, "
         "  next_attempt_at, "
         "  last_error_class, last_error_msg, last_error_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)",
         (
             int(account_id), pt,
             mailbox, (int(uid) if uid is not None else None),
             (int(uidvalidity) if uidvalidity is not None else None),
             gmail_msg_id, o365_msg_id,
+            failure_kind,
             next_dt.isoformat(),
             str(error_class), scrubbed_msg, now_iso,
         ),
@@ -8260,6 +4825,7 @@ def list_due_retries(
     return list(rows)
 
 
+@db_write
 def mark_retry_done(conn: sqlite3.Connection, retry_id: int) -> None:
     """Transition a row to ``state='done'``.
 
@@ -8277,6 +4843,7 @@ def mark_retry_done(conn: sqlite3.Connection, retry_id: int) -> None:
     conn.commit()
 
 
+@db_write
 def mark_retry_dead(
     conn: sqlite3.Connection, retry_id: int, *, reason: str,
 ) -> None:
@@ -8375,3 +4942,224 @@ def count_recent_deads(
     if row is None:
         return 0
     return int(row["c"] if hasattr(row, "keys") else row[0])
+
+
+def count_pending_retries(
+    conn: sqlite3.Connection,
+    *,
+    failure_kind: str | None = None,
+) -> int:
+    """Count rows in ``state='pending'``, optionally by ``failure_kind``.
+
+    With ``failure_kind='llm_unreachable'`` this is the "messages queued
+    while the LLM backend is down" depth surfaced on the /config + page
+    banners — the consolidated replacement for the retired
+    ``triage_retry_queue.queue_depth``.
+    """
+    clauses = ["state='pending'"]
+    params: list[Any] = []
+    if failure_kind is not None:
+        clauses.append("failure_kind = ?")
+        params.append(str(failure_kind))
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM watcher_retry_queue "
+        "WHERE " + " AND ".join(clauses),
+        tuple(params),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row["c"] if hasattr(row, "keys") else row[0])
+
+
+# ---------------------------------------------------------------------------
+# #277a back-compat shim — audit cluster moved to email_triage.db.audit
+# (2026-05-23). Explicit re-exports (NOT ``import *``) so every existing
+# ``from email_triage.web.db import <name>`` import string keeps working
+# unchanged for the 554 known call sites across 76 files at extraction
+# time. The ``triage_logging.py`` deliberate-late-import pattern depends on
+# this shim preserving the import string verbatim.
+#
+# When adding more #277b/c/d cluster extractions, mirror this block at the
+# bottom of web/db.py rather than scattering shim imports through the file.
+# ---------------------------------------------------------------------------
+
+from email_triage.db.audit import (  # noqa: E402, F401
+    _AUDIT_CHAIN_ANCHOR_KEY,
+    _capture_chain_anchor,
+    _get_current_hmac_version,
+    _set_hmac_key_for_test,
+    bump_session_epoch,
+    compute_log_row_hash,
+    get_last_log_row_hash,
+    insert_log_entry,
+    latest_hipaa_boundaries_for_accounts,
+    latest_hipaa_boundary,
+    list_access_events,
+    list_api_key_events,
+    list_auth_events,
+    list_discover_runs,
+    list_hipaa_access_events,
+    list_hipaa_boundary_events,
+    list_log_entries,
+    list_user_status_events,
+    prune_log_entries,
+    prune_log_entries_by_age_and_count,
+    record_access_event,
+    record_api_key_event,
+    record_auth_event,
+    record_discover_run,
+    record_hipaa_access_event,
+    record_hipaa_boundary,
+    record_user_status_event,
+    set_hmac_keys,
+    set_user_disabled,
+    update_hipaa_access_event,
+    verify_log_chain,
+)
+
+
+# ---------------------------------------------------------------------------
+# #277b back-compat shim — account cluster moved to email_triage.db.accounts
+# (2026-05-29). Explicit re-exports (NOT ``import *``) so every existing
+# ``from email_triage.web.db import <name>`` import string keeps working
+# unchanged for the public-name surface (336-name baseline; zero names lost).
+# Widely late-imported by web/dependencies.py (can_manage_account,
+# get_email_account), web/app.py (list_email_accounts), actions/*, etc. —
+# this shim preserves every one of those import strings verbatim.
+#
+# Mirrors the #277a audit.py shim block above. When #277c lands db/style.py,
+# add a sibling block here rather than scattering shim imports.
+# ---------------------------------------------------------------------------
+
+from email_triage.db.accounts import (  # noqa: E402, F401
+    INGESTION_POLL_MIN,
+    INGESTION_POLL_MAX,
+    INGESTION_POLL_STEP,
+    INGESTION_POLL_DEFAULT,
+    AliasValidationError,
+    _looks_like_email,
+    normalize_aliases,
+    normalise_from_address,
+    account_email,
+    account_aliases,
+    account_addresses,
+    clamp_poll_interval_minutes,
+    _account_mailboxes,
+    _apply_account_config_back_compat,
+    apply_ingestion_back_compat,
+    list_email_accounts,
+    get_email_account,
+    create_email_account,
+    set_account_active,
+    set_account_hipaa,
+    update_email_account,
+    update_email_account_config,
+    update_account_config_keys,
+    update_email_account_aliases,
+    delete_email_account,
+    add_account_delegate,
+    remove_account_delegate,
+    list_account_delegates,
+    is_account_delegate,
+    can_manage_account,
+    list_account_routes,
+    get_account_route,
+    upsert_account_route,
+    delete_account_route,
+    effective_routes_by_cat,
+    get_mailbox_route_overrides,
+    set_mailbox_route_overrides,
+    get_folder_prefs,
+    save_folder_prefs,
+    get_visible_folders,
+    is_alias_mode_enabled_for_account,
+    set_alias_mode_enabled_for_account,
+)
+
+# ---------------------------------------------------------------------------
+# #277c back-compat shim — style cluster moved to email_triage.db.style
+# (2026-05-29). Explicit re-exports (NOT ``import *``) so every existing
+# ``from email_triage.web.db import <name>`` import string keeps working
+# unchanged. _has_table/_has_column were promoted to db/_helpers (db-sme
+# SUB-1); re-exported here so profile.py's web.db import keeps resolving.
+# Mirrors the #277a audit.py + #277b accounts.py shim blocks above.
+# ---------------------------------------------------------------------------
+
+from email_triage.db._helpers import (  # noqa: E402, F401
+    _has_column,
+    _has_table,
+)
+
+from email_triage.db.style import (  # noqa: E402, F401
+    _style_profile_key,
+    get_style_profile,
+    set_style_profile,
+    delete_style_profile,
+    get_account_style_per_alias,
+    set_account_style_per_alias,
+    list_account_style_per_alias,
+    delete_account_style_per_alias,
+    get_user_style_knobs,
+    set_user_style_knobs,
+    is_style_learning_master_enabled,
+    set_style_learning_master_enabled,
+    get_style_learning_capture_interval_hours,
+    set_style_learning_capture_interval_hours,
+    get_style_learning_mine_limit_default,
+    set_style_learning_mine_limit_default,
+    resolve_account_mine_limit,
+    is_style_learning_account_enabled,
+    _rag_sent_index_key,
+    is_rag_sent_index_enabled,
+    set_rag_sent_index_enabled,
+    _style_knobs_hipaa_allow_key,
+    is_style_knobs_hipaa_allow,
+    set_style_knobs_hipaa_allow,
+    is_hipaa_style_distill_enabled,
+    set_hipaa_style_distill_enabled,
+    get_hipaa_style_descriptor,
+    set_hipaa_style_descriptor,
+    delete_hipaa_style_descriptor,
+    record_style_distill_event,
+    style_distill_event_counts,
+    list_style_distill_events,
+    _style_distill_compute_next_retry,
+    enqueue_style_distill_retry,
+    pause_style_distill_account,
+    unpause_style_distill_account,
+    clear_style_distill_queue_entry,
+    get_style_distill_queue_entry,
+    list_paused_style_distill_accounts,
+    claim_next_style_distill_queue_entry,
+    get_per_contact_style_hipaa,
+    set_per_contact_style_hipaa,
+    delete_per_contact_style_hipaa,
+    delete_all_per_contact_style_hipaa,
+    list_per_contact_style_hipaa_for_account,
+    gc_per_contact_style_hipaa,
+    enqueue_style_distill_contact_retry,
+    pause_style_distill_contact,
+    unpause_style_distill_contact,
+    clear_style_distill_contact_queue_entry,
+    get_style_distill_contact_queue_entry,
+    list_paused_style_distill_contacts,
+    claim_next_style_distill_contact_queue_entry,
+    last_successful_style_distill_at,
+    get_global_anti_ai_style_guide,
+    set_global_anti_ai_style_guide,
+    get_user_anti_ai_style_guide,
+    set_user_anti_ai_style_guide,
+    get_sent_mail_index_summary,
+    get_captured_pair_count,
+    delete_sent_mail_index_for_account,
+    is_style_learning_per_contact_enabled,
+    STYLE_KNOB_DEFAULTS,
+    STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS,
+    STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS,
+    STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS,
+    STYLE_LEARNING_MINE_LIMIT_MIN,
+    STYLE_LEARNING_MINE_LIMIT_MAX,
+    STYLE_LEARNING_MINE_LIMIT_DEFAULT,
+    STYLE_LEARNING_HIPAA_DISTILL_ENABLED,
+    HIPAA_PER_CONTACT_GC_DAYS,
+)

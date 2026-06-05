@@ -147,7 +147,7 @@ class TestSenderDomainMatching:
 
 class TestSubjectMatching:
     def test_substring_match(self):
-        msg = _make_email(subject="RE: Invoice #1234 attached")
+        msg = _make_email(subject="RE: Invoice  attached")
         cl = _make_list(1, "Invoices", "invoices")
         rules = {1: [_make_rule(1, 1, RuleType.SUBJECT, "invoice")]}
         hints = collect_hints(msg, [cl], rules)

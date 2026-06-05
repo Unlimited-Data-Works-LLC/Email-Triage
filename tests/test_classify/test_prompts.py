@@ -104,13 +104,13 @@ class TestHintsBlock:
 class TestEmailBlock:
     def test_contains_headers_and_body(self):
         msg = _make_email(
-            sender="Alex@example.com",
+            sender="bob@example.com",
             recipients=["team@example.com"],
             subject="Meeting notes",
             body_text="Here are the notes.",
         )
         block = build_email_block(msg)
-        assert "From: Alex@example.com" in block
+        assert "From: bob@example.com" in block
         assert "To: team@example.com" in block
         assert "Subject: Meeting notes" in block
         assert "Here are the notes." in block

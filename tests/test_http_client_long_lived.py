@@ -1,6 +1,6 @@
-"""Bundle J / #139 — long-lived ``httpx.AsyncClient`` invariants.
+"""Bundle J /  — long-lived ``httpx.AsyncClient`` invariants.
 
-Each module that #139 refactored to a long-lived client must hit
+Each module that  refactored to a long-lived client must hit
 ``httpx.AsyncClient(...)`` AT MOST ONCE across N requests in the same
 process. The shared :class:`email_triage._http_client.LazyHttpClient`
 holder also needs its own contract test (lock-protected lazy init +
@@ -42,7 +42,7 @@ class TestLazyHttpClient:
     async def test_concurrent_get_constructs_once(self):
         """Two concurrent ``get()`` calls cold-start once, not twice.
 
-        Mirrors the lock contract from Bundle G #142 on the OAuth
+        Mirrors the lock contract from Bundle G  on the OAuth
         refresh path -- two cold-path callers must not each build
         their own httpx client.
         """
@@ -357,7 +357,7 @@ class TestGoogleCalendarProviderLockOnGetClient:
     async def test_concurrent_get_client_constructs_once(self):
         """Two concurrent ``_get_client`` callers cold-start one client.
 
-        Bundle G #142 added this guard to GmailApiProvider; #139
+        Bundle G  added this guard to GmailApiProvider; 
         propagates it to GoogleCalendarProvider so cross-account
         triage that opens calendar + gmail in parallel doesn't orphan
         a connection pool.

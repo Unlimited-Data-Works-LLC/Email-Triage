@@ -15,7 +15,7 @@ Sibling: ``tests/test_log_no_token_leak.py`` (Gmail / O365 OAuth
 refresh paths, sentinel-based capture). The M-9 module focuses on
 the M-series style-learning ladder specifically.
 
-See ``docs/privacy-audit-runbook.md`` for the full operator contract.
+See ``internal documentation`` for the full operator contract.
 """
 
 from __future__ import annotations

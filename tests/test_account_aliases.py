@@ -1,4 +1,4 @@
-"""Tests for #106 — multi-address-to-one-account routing.
+"""Tests for  — multi-address-to-one-account routing.
 
 Covers the JSON-array-first cut:
 
@@ -396,7 +396,7 @@ async def test_recipient_mismatch_guard_accepts_primary(
 async def test_recipient_mismatch_guard_accepts_alias(
     acct_with_aliases, dcfg_custom,
 ):
-    """The whole point of #106 — an alias-addressed digest delivery
+    """The whole point of  — an alias-addressed digest delivery
     must round-trip without tripping the guard."""
     from email_triage.web.app import _fire_one_digest
 
@@ -628,7 +628,7 @@ async def test_run_triage_threads_alias_set_into_state_bag(
         return_value=[{"slug": "invoice", "description": ""}],
     )
     mock_collect_hints = MagicMock(return_value=[])
-    # #134.1 — _load_all_list_hints now returns (lists, rules_by_list).
+    # .1 — _load_all_list_hints now returns (lists, rules_by_list).
     # The old "warms cache, returns None" contract was replaced by the
     # explicit pre-fetch pair that callers thread through.
     mock_load_hints = MagicMock(return_value=([], {}))

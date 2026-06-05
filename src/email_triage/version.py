@@ -1,13 +1,13 @@
 """Version + schema-compatibility introspection for the update banner.
 
-#125 (Partial — shipped 2026-05-15). The 2026-05-09 deploy recovery
+ (Partial — shipped 2026-05-15). The @skip=tests/* deploy recovery
 showed that `:previous` image rollback is a one-way trip once a
 schema-bumping release lands: a v13 image can't open a v14 DB.
 ``deploy.sh`` blindly re-tags `:previous` -> `:latest` on `/health`
 failure, leaving the install dead.
 
 This module is the smallest concrete step toward the full update-UX
-story (#166): it answers three questions without doing anything
+story: it answers three questions without doing anything
 destructive.
 
   1. What version of the app is running?
@@ -21,9 +21,9 @@ The answer drives a /config banner ("Up to date" / "Update available"
 distinct exit codes for scripting.
 
 No update mechanism, no auto-pull, no rollback automation lives here.
-Those are #166 territory. This module is INTROSPECTION ONLY.
+Those are  territory. This module is INTROSPECTION ONLY.
 
-Naming note. The investigation memo (``docs/update-strategy-investigation-2026-05-13.md``)
+Naming note. The investigation memo (``internal documentation``)
 referred to this hook as the "pre-update schema-compatibility check."
 The helper here is the pure-function half; `scripts/deploy.sh` will
 eventually call it as a pre-flight gate, but that wiring is out of
@@ -59,9 +59,9 @@ STATUS_UPDATE_AVAILABLE = "update_available"
 #: schema cap is BELOW the current live DB schema. Applying the
 #: target is fine (forward path is safe); the danger is the rollback
 #: path — the `:previous` image cannot open the post-bump DB. The
-#: 2026-05-09 incident. Operator should snapshot the DB before
+#: @skip=tests/* incident. Operator should snapshot the DB before
 #: applying, per the recommendation in
-#: ``docs/update-strategy-investigation-2026-05-13.md`` § 5.
+#: ``internal documentation`` § 5.
 STATUS_INCOMPATIBLE_ROLLBACK = "incompatible_rollback"
 
 #: Live DB schema is HIGHER than the target binary knows about. This
@@ -143,7 +143,7 @@ def compute_version_status(
     ``update_available`` AND ``previous_schema_caps`` is provided):
 
     * ``previous_schema_caps < db_schema_version`` -> escalate to
-      ``incompatible_rollback``. The 2026-05-09 case.
+      ``incompatible_rollback``. The @skip=tests/* case.
     * Otherwise ``update_available`` stays.
 
     The rollback rule deliberately reads ``db_schema_version`` (the
@@ -268,11 +268,34 @@ def read_db_schema_version(db_path: str | Path) -> int:
     p = Path(db_path).expanduser()
     if not p.exists():
         return 0
+    # N-17: on an encrypted install this read must go through the
+    # SQLCipher opener — before N-17 it did a raw plaintext mode=ro open,
+    # the SELECT raised (ciphertext is not valid SQLite), and the helper
+    # silently returned 0 (a WRONG-version banner, not a crash). The
+    # plaintext branch keeps the original read-only ``file:...?mode=ro``
+    # open verbatim (no PRAGMAs — a read-only conn rejects PRAGMA
+    # journal_mode, so it must NOT go through open_dedicated_conn, which
+    # sets WAL). The encrypted branch uses _make_encrypted_conn directly
+    # (PRAGMA key first); under encryption the read is a harmless SELECT
+    # on a read-write handle.
+    from email_triage.db._engine import (
+        dedicated_conn_is_encrypted,
+        open_dedicated_encrypted_conn_readish,
+    )
+
     try:
-        conn = sqlite3.connect(
-            f"file:{p}?mode=ro", uri=True, check_same_thread=False,
-        )
+        if dedicated_conn_is_encrypted():
+            conn = open_dedicated_encrypted_conn_readish(str(p))
+        else:
+            conn = sqlite3.connect(
+                f"file:{p}?mode=ro", uri=True, check_same_thread=False,
+            )
     except sqlite3.Error:
+        return 0
+    except Exception:
+        # sqlcipher3 raises its own DBAPI Error subclass (not sqlite3.Error)
+        # on a bad key / unreadable file — keep the helper's "return 0 on
+        # any open failure" contract rather than crashing a banner render.
         return 0
     try:
         try:
@@ -307,7 +330,7 @@ def read_previous_schema_caps() -> Optional[int]:
     falls back to "update available" without the rollback-incompat
     escalation — strictly less alarming, never falsely loud. The
     full wiring (`deploy.sh` reads ``:previous`` image labels,
-    injects the env var on each restart) is part of the #125 follow-up
+    injects the env var on each restart) is part of the  follow-up
     work, not this slice.
 
     Accepts strings ``"0"`` and ``""`` defensively; both are treated

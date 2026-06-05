@@ -1,4 +1,4 @@
-"""Tests for #126 — easier O365 config flow / UX.
+"""Tests for  — easier O365 config flow / UX.
 
 Covers three sub-items shipped in the same commit:
 
@@ -391,7 +391,7 @@ class TestSharedPartialIncluded:
             "Shared O365 field-block partial must live at "
             "templates/accounts/_o365_fields.html so both the wizard "
             "step2-o365 form and the edit-page Integrations tab can "
-            "include it. (#126)"
+            "include it."
         )
 
     def test_edit_page_field_wrapper_includes_shared_partial(self):

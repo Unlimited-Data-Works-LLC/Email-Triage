@@ -1,4 +1,4 @@
-"""Tests for per-user personal categories (#62 + #87)."""
+"""Tests for per-user personal categories."""
 
 import pytest
 
@@ -198,7 +198,7 @@ class TestProfileUI:
 
 
 class TestDemote:
-    """#87 second half: move a system category to personal scope for one user."""
+    """ second half: move a system category to personal scope for one user."""
 
     def test_demote_system_to_user(self, db, regular_user):
         cat_id = create_category(db, "infrequent", "Niche category")
@@ -245,7 +245,7 @@ class TestDemote:
 
 
 class TestPromoteDemoteAudit:
-    """#87 audit-trail requirement: scope flips write to auth_events."""
+    """ audit-trail requirement: scope flips write to auth_events."""
 
     def test_promote_writes_audit_event(
         self, client, admin_cookies, db, regular_user,
@@ -311,7 +311,7 @@ class TestPromoteDemoteAudit:
 
 
 class TestDemoteRouteAuth:
-    """#87 admin-only gate on the demote routes."""
+    """ admin-only gate on the demote routes."""
 
     def test_demote_form_requires_admin(
         self, client, user_cookies, db,

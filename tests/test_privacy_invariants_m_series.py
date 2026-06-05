@@ -12,7 +12,7 @@ Sibling modules:
   * tests/test_privacy_invariants_dep_review.py -- dep-list guard
   * tests/test_privacy_invariants_log_scrub.py  -- log scrub keys
 
-See ``docs/privacy-audit-runbook.md`` for the full operator contract.
+See ``internal documentation`` for the full operator contract.
 """
 
 from __future__ import annotations
@@ -678,7 +678,7 @@ class TestEmbeddingBackendFactoryAllowlist:
 
 
 # ---------------------------------------------------------------------------
-# Invariants 10 + 11 — #152 Phase 2 M-1+M-2 HIPAA opt-in
+# Invariants 10 + 11 —  Phase 2 M-1+M-2 HIPAA opt-in
 #
 # The lift: M-1 (free-text style guide) + M-2 (tone / length / greeting /
 # signature radios) take operator-typed strings as input. Per §164.502(a)
@@ -692,8 +692,8 @@ class TestEmbeddingBackendFactoryAllowlist:
 #     / M-7 — they stay hard-off (the opt-in is scoped to operator self-
 #     disclosure, not derivative-of-PHI surfaces).
 #
-# Companion drawer: docs/m-series-hipaa-audit.md walks the per-layer
-# audit; docs/privacy-audit-runbook.md carries the sign-off log entry.
+# Companion drawer: internal documentation walks the per-layer
+# audit; internal documentation carries the sign-off log entry.
 # ---------------------------------------------------------------------------
 
 class TestM1M2HipaaOptIn:
@@ -941,7 +941,7 @@ class TestM1M2OptInEndToEnd:
 
 
 # ---------------------------------------------------------------------------
-# Invariant: auto-scan default is HIPAA-aware (#157, 2026-05-11)
+# Invariant: auto-scan default is HIPAA-aware
 #
 # Sent-mail auto-scan (the per-account ``rag_sent_index_enabled`` toggle)
 # must default OFF for HIPAA-flagged accounts and ON for non-HIPAA. Today
@@ -1100,7 +1100,7 @@ class TestAntiAiStyleGuideHipaaGate:
 
 
 # ---------------------------------------------------------------------------
-# Invariant 13 — #152 Phase 3 HIPAA-safe M-3 scrubber
+# Invariant 13 —  Phase 3 HIPAA-safe M-3 scrubber
 #
 # The phase-3 "describe-and-discard" architecture builds a structured
 # style descriptor from sent-mail bodies on HIPAA-opted-in accounts,

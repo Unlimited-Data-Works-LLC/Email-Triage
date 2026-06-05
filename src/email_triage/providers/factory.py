@@ -1,6 +1,6 @@
 """Provider factory — build EmailProvider instances from DB account records.
 
-Lifted from ``web/routers/ui.py`` (#138.1) so non-UI consumers
+Lifted from ``web/routers/ui.py`` so non-UI consumers
 (``cli.py``, ``web/app.py``, ``web/triage_runner.py``,
 ``web/triage_runner_bulk.py``, ``web/o365_renewer.py``) don't have to
 reach into the UI router for what is fundamentally a domain-level
@@ -179,9 +179,18 @@ def build_provider(
         client_secret = install.client_secret if install else ""
         is_personal = bool(cfg.get("is_personal_msa", False))
         tenant_id = "common" if is_personal else (install.tenant_id if install else "")
+        #  — give every O365 account its OWN MSAL token-cache file.
+        # The provider's default is a single shared ``msal_cache.json``;
+        # with two O365 accounts the second account's silent-acquire
+        # would pick up the first's cached tokens. Key the cache file by
+        # account id, and pass the mailbox address so the provider
+        # selects the right cached MSAL account by username.
+        token_cache_path = f"./data/msal_cache_{acct['id']}.json"
         return Office365Provider(
             client_id=client_id,
             tenant_id=tenant_id or "common",
             client_secret=client_secret or "",
+            token_cache_path=token_cache_path,
+            username=cfg.get("account", ""),
         )
     raise ValueError(f"Unknown provider type: {ptype}")

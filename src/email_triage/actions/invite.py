@@ -13,7 +13,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from email_triage.actions.base import Action
+from email_triage.actions.base import (
+    Action,
+    check_idempotent_already_done,
+    record_idempotent_done,
+)
 from email_triage.engine.ics import build_imip_reply
 from email_triage.engine.models import (
     ActionOutput,
@@ -53,7 +57,11 @@ async def _respond_via_calendar(
     if event is None:
         return False, "event_not_found"
     try:
-        await cal.respond_to_invite(event.event_id, response)
+        #  — answer the invite on the calendar the event was
+        # actually found on, not the provider's default calendar.
+        await cal.respond_to_invite(
+            event.event_id, response, calendar_id=event.calendar_id,
+        )
     except Exception as e:
         return False, f"respond_error: {e}"
     return True, event.event_id
@@ -120,6 +128,27 @@ class _InviteResponseBase(Action):
         provider: EmailProvider,
         config: dict[str, Any] | None = None,
     ) -> ActionOutput:
+        #  — guard the side effects. Both branches below mutate
+        # external state: the calendar-API path RSVPs on the user's
+        # calendar, the fallback path creates an iMIP-reply draft. The
+        # retry-queue drainer re-runs the whole triage path, so without
+        # this guard a re-run double-RSVPs or creates a second draft.
+        # The skip path leaves the prior calendar response / draft
+        # intact.
+        prior = await check_idempotent_already_done(flow, message, self.name)
+        if prior is not None:
+            log.info(
+                "Invite reply already applied for this message; skipping",
+                extra={
+                    "flow_id": flow.flow_id,
+                    "response": self.response,
+                    "previous_external_id": prior.data.get(
+                        "previous_external_id",
+                    ),
+                },
+            )
+            return prior
+
         att = _find_invite_attachment(message)
         if att is None or not att.parsed:
             return ActionOutput(
@@ -146,6 +175,12 @@ class _InviteResponseBase(Action):
                 cal, parsed.get("uid", ""), self.response,
             )
             if success:
+                #  — record the calendar event id so a retry-queue
+                # re-run skips instead of double-RSVPing.
+                await record_idempotent_done(
+                    flow, message, self.name,
+                    external_id=str(detail) if detail else None,
+                )
                 return ActionOutput(
                     result=ActionResult.COMPLETED,
                     data={"path": "calendar_api", "event_id": detail,
@@ -172,6 +207,12 @@ class _InviteResponseBase(Action):
                 error=f"imip_draft_error: {e}",
             )
 
+        #  — record the draft id so a retry-queue re-run skips
+        # instead of drafting a duplicate iMIP reply.
+        await record_idempotent_done(
+            flow, message, self.name,
+            external_id=str(draft_id) if draft_id is not None else None,
+        )
         return ActionOutput(
             result=ActionResult.COMPLETED,
             data={"path": "imip_draft", "draft_id": draft_id,

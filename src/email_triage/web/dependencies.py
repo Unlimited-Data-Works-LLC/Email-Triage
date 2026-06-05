@@ -4,13 +4,13 @@ Provides:
     - ``get_current_user`` — extracts session from cookie or Bearer token
     - ``require_role(*roles)`` — factory that builds a dependency requiring
       the current user to have one of the specified roles
-    - ``OwnedAccount`` (#137) — Annotated tuple dep that combines the
+    - ``OwnedAccount`` — Annotated tuple dep that combines the
       ``get_current_user → get_db → get_secrets → get_email_account →
       can_manage_account`` preamble repeated 80+ times in
       ``routers/ui.py``. Raises HTTPException 401 / 404 / 403 with
       a consistent JSON body; the global error handler renders the
       operator-facing HTML or JSON wrapper depending on Accept.
-    - ``OwnedAccountOrLogin`` (#137 phase 2) — sibling that returns a
+    - ``OwnedAccountOrLogin`` — sibling that returns a
       303 ``RedirectResponse`` to ``/login`` for anonymous users
       instead of raising 401. Use this for full-page navigation
       targets (GET pages + redirect-style POSTs) where the operator
@@ -146,6 +146,21 @@ def get_current_user(request: Request) -> dict[str, Any] | None:
     # takes effect immediately.
     if user.get("disabled"):
         return None
+    #  — per-user session-epoch revocation. The token carries the
+    # epoch it was minted under; the user's current epoch is bumped by
+    # disable-user + the "sign out all sessions" control. A stale epoch
+    # means this session was revoked — reject it even though the
+    # signature + TTL are still valid. A pre-#205 token decodes as
+    # epoch 0 and matches a never-revoked user (also epoch 0).
+    if int(session_data.get("epoch", 0)) != int(user.get("session_epoch", 0)):
+        return None
+    # H-05 (Cycle 7) — surface the session's mfa_verified_at claim so
+    # `require_auth` (below) can route a pre-cutover session through
+    # the hard-cutover MFA step-up flow. Attach to the returned dict
+    # rather than fetching it elsewhere; keeps the middleware lookup
+    # cheap (one session-data parse per request, not two).
+    user = dict(user)
+    user["_session_mfa_verified_at"] = session_data.get("mfa_verified_at")
     return user
 
 
@@ -153,6 +168,18 @@ def require_auth(request: Request) -> dict[str, Any]:
     """Dependency that requires an authenticated user.
 
     Raises HTTP 401 for API requests, redirects to /login for UI requests.
+
+    H-05 (Cycle 7): in HIPAA mode, a session lacking the
+    ``mfa_verified_at`` claim is treated as un-MFA'd — the user
+    is redirected to /login/webauthn (UI) or 401'd with a
+    ``mfa_required`` error (API). Hard cutover per Q6: pre-cutover
+    sessions (minted before HIPAA was flipped on) are NOT
+    grandfathered.
+
+    Bearer-token (API key) auth is exempt from the MFA gate because
+    API keys are already a §164.312(d)-class second factor that the
+    operator explicitly issued; their threat model is the same
+    "out-of-band-provisioned credential" the WebAuthn surface uses.
     """
     user = get_current_user(request)
     if user is None:
@@ -163,6 +190,26 @@ def require_auth(request: Request) -> dict[str, Any]:
             status_code=303,
             headers={"Location": "/login"},
         )
+    # H-05 (Cycle 7) — hard-cutover MFA step-up gate. The Bearer
+    # token path stamps `email` from the api_keys row but not the
+    # session claim, so detect Bearer-auth by the absence of the
+    # `_session_mfa_verified_at` key (only present when
+    # `get_current_user` resolved via the cookie path).
+    if "_session_mfa_verified_at" in user:
+        from email_triage.web.mfa import session_needs_mfa_step_up
+        session_view = {
+            "mfa_verified_at": user.get("_session_mfa_verified_at"),
+        }
+        if session_needs_mfa_step_up(session_view):
+            if request.url.path.startswith("/api/"):
+                raise HTTPException(
+                    status_code=401,
+                    detail="mfa_required",
+                )
+            raise HTTPException(
+                status_code=303,
+                headers={"Location": "/login/webauthn"},
+            )
     return user
 
 
@@ -178,16 +225,75 @@ def require_role(*roles: str):
     def _dependency(request: Request) -> dict[str, Any]:
         user = require_auth(request)
         if user["role"] not in roles:
-            if request.url.path.startswith("/api/"):
-                raise HTTPException(status_code=403, detail="Insufficient permissions")
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
+            # 403 is correct for both API and UI callers — the user IS
+            # authenticated (require_auth passed), just not authorised,
+            # so a /login redirect would not help. The former
+            # api-vs-ui branch raised an identical 403 on both arms.
+            raise HTTPException(
+                status_code=403, detail="Insufficient permissions",
+            )
         return user
 
     return _dependency
 
 
 # ---------------------------------------------------------------------------
-# #137 — OwnedAccount dependency.
+#  — RequireUser dependency.
+#
+# The auth-gate triad — ``get_current_user(request)`` + ``if user is
+# None`` + a redirect-or-401 return — was copy-pasted ~84× across the
+# UI routers. Two shapes:
+#
+#   RequireUser          anon → 303 redirect to /login. Full-page nav
+#                        targets (GET pages, redirect-style POSTs).
+#                        Reuses ``require_auth``, which already raises
+#                        ``HTTPException(303, Location=/login)`` for
+#                        non-``/api`` paths.
+#   RequireUserFragment  anon → ``HTTPException`` 401. HTMX-fragment
+#                        endpoints, where a 303 would swap a partial
+#                        for a whole login page.
+#
+# Both yield the user dict on the happy path, so the handler
+# signature is ``user: RequireUser`` with no isinstance check — the
+# anon case is a raised exception the global handler renders.
+#
+# Sibling to ``OwnedAccount``: that dep additionally resolves +
+# authz-checks an ``account_id``; ``RequireUser`` is the bare
+# "just need a logged-in user" gate.
+# ---------------------------------------------------------------------------
+
+
+def _require_user_fragment(request: Request) -> dict[str, Any]:
+    """Return the current user, or raise ``HTTPException`` 401.
+
+    The HTMX-fragment sibling of ``RequireUser``: a fragment endpoint
+    that 303-redirected an anonymous request would swap a small
+    partial for a whole login page. The global 401 handler renders
+    the right surface instead.
+    """
+    user = get_current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
+
+# Annotated aliases for handler signatures.
+#
+# Usage::
+#
+#     async def settings_page(request: Request, user: RequireUser):
+#         ...                       # full-page: anon → 303 /login
+#
+#     async def stats_fragment(request: Request, user: RequireUserFragment):
+#         ...                       # HTMX partial: anon → 401
+RequireUser = Annotated[dict[str, Any], Depends(require_auth)]
+RequireUserFragment = Annotated[
+    dict[str, Any], Depends(_require_user_fragment),
+]
+
+
+# ---------------------------------------------------------------------------
+#  — OwnedAccount dependency.
 #
 # Replaces the 7-line preamble repeated across 80+ handlers in
 # ``routers/ui.py``::
@@ -323,7 +429,7 @@ OwnedGmailApiAccount = Annotated[
 
 
 # ---------------------------------------------------------------------------
-# #137 phase 2 — OwnedAccountOrLogin sibling.
+#  phase 2 — OwnedAccountOrLogin sibling.
 #
 # The base ``OwnedAccount`` dep raises HTTPException 401 on missing auth,
 # which is correct for HTMX-fragment endpoints (the global handler renders

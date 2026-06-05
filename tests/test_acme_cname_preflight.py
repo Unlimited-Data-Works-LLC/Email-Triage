@@ -1,4 +1,4 @@
-"""Tests for the DNS-01 CNAME pre-flight (#76).
+"""Tests for the DNS-01 CNAME pre-flight.
 
 Mocks dnspython at the function level so the tests don't need a live
 DNS resolver. The pre-flight queries CNAME records at

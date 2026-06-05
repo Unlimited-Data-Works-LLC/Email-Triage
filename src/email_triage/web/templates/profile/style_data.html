@@ -79,7 +79,7 @@
 
 <h3>Style data{{ m.help("Everything Email Triage has learned about your writing voice — for example, your typical greeting (Hi Sam,) and sign-off (Thanks, Alex). This page lets you see, export, or delete it for each of your accounts.") }}</h3>
 
-{# ── Cadence banner (#161 item 1) ───────────────────────────────────
+{# ── Cadence banner ───────────────────────────────────
    Top-of-page banner that surfaces the install-wide auto-scan
    cadence so the user knows how fresh the AI's view of their voice
    is + where the manual "Mine Now" button fits in. Reads the live
@@ -91,7 +91,7 @@
     Use Mine the Sent Items Now to refresh on demand.{{ m.help("Example: at 6 hour cadence, every opted-in account is scanned 4 times a day. The Mine the Sent Items Now button on each account triggers an immediate refresh.") }}
 </article>
 
-{# ── Embedding-runtime gate banner (#180 F) ─────────────────────
+{# ── Embedding-runtime gate banner ─────────────────────
    End-user audience: this page's actions need the AI's similarity
    engine to be live. When it isn't, we show a banner explaining
    that style-learning needs admin setup before features will work.
@@ -270,7 +270,7 @@
         </label>
     </form>
 
-    {# ── Auto-scan toggle (#161 item 2) ────────────────────────────
+    {# ── Auto-scan toggle ────────────────────────────
        AUDIENCE: end-user. Operator opts the account out of the
        background capture loop while keeping the on-demand "Mine
        Now" button. HIPAA accounts without the M-1+M-2 opt-in render
@@ -327,7 +327,7 @@
         </div>
     </form>
 
-    {# ── Messages to mine (#161 item 4) ────────────────────────────
+    {# ── Messages to mine ────────────────────────────
        AUDIENCE: end-user. Per-account override for the inline mine
        size. Placeholder shows the install-wide default so the
        operator can see what an empty submit falls back to. Values
@@ -428,7 +428,7 @@
         </label>
     </form>
 
-    {# ── Auto-scan toggle (#161 item 2) — mirror ───────────────── #}
+    {# ── Auto-scan toggle — mirror ───────────────── #}
     {% set _auto_on = entry.auto_scan_enabled_resolved %}
     {% set _auto_disabled_ui = entry.auto_scan_toggle_disabled %}
     <form method="post"
@@ -475,7 +475,7 @@
         </div>
     </form>
 
-    {# ── Messages to mine (#161 item 4) — mirror ───────────────── #}
+    {# ── Messages to mine — mirror ───────────────── #}
     <form method="post"
           action="/profile/style-data/mine-limit-override?account_id={{ entry.account.id }}"
           style="margin:0.4rem 0 0 0;display:flex;align-items:flex-end;gap:0.4rem;flex-wrap:wrap;">

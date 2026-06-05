@@ -20,6 +20,7 @@ from email_triage.web.db import (
     update_category as update_category_db,
     delete_category as delete_category_db,
 )
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.auth import (
     delete_api_key,
     generate_api_key,
@@ -62,6 +63,9 @@ def _require_auth(request: Request) -> dict:
 
 
 def _require_admin(request: Request) -> dict:
+    # Sync-to-sync call: _require_admin is itself dispatched via
+    # db_call by its async callers, so this inner _require_auth runs
+    # off-loop under the write lock already — no db_call hop here.
     user = _require_auth(request)
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -85,7 +89,7 @@ async def api_metrics(request: Request):
     (everything else). Returns the text format directly with the
     standard ``text/plain; version=0.0.4`` content type.
     """
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     if user["role"] != "admin":
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse("forbidden", status_code=403)
@@ -168,29 +172,33 @@ async def api_csrf_token(request: Request):
 
 @router.get("/status")
 async def api_status(request: Request):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
     config = get_config(request)
 
-    stats = {}
-    try:
-        rows = db.execute(
-            "SELECT status, COUNT(*) as cnt FROM flows GROUP BY status"
-        ).fetchall()
-        stats = {row["status"]: row["cnt"] for row in rows}
-    except Exception:
-        pass
-
-    return {
-        "user": {"email": user["email"], "role": user["role"]},
-        "flows": stats,
+    def _status_snapshot(db, user_id):
+        # ASYNC-DB: flow-status rollup + category read off-loop.
+        stats = {}
+        try:
+            rows = db.execute(
+                "SELECT status, COUNT(*) as cnt FROM flows GROUP BY status"
+            ).fetchall()
+            stats = {row["status"]: row["cnt"] for row in rows}
+        except Exception:
+            pass
         # 2026-05-17 fix: user-scoped so personal categories appear
         # alongside the system set. Pre-fix this returned system-only
         # (``user_id IS NULL``) which hid the caller's own categories
         # from /api/status responses.
-        "categories": list(
-            get_categories_dict(db, user_id=user["id"]).keys()
-        ),
+        cats = list(get_categories_dict(db, user_id=user_id).keys())
+        return stats, cats
+
+    stats, cats = await db_call(_status_snapshot, db, user["id"])
+
+    return {
+        "user": {"email": user["email"], "role": user["role"]},
+        "flows": stats,
+        "categories": cats,
     }
 
 
@@ -200,35 +208,51 @@ async def api_status(request: Request):
 
 @router.get("/users")
 async def api_list_users(request: Request):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
-    rows = db.execute(
-        "SELECT id, email, name, role, notify_email, created_at, last_login FROM users ORDER BY id"
-    ).fetchall()
+
+    def _list_users(db):
+        # ASYNC-DB: user listing off-loop.
+        return db.execute(
+            "SELECT id, email, name, role, notify_email, created_at, last_login FROM users ORDER BY id"
+        ).fetchall()
+
+    rows = await db_call(_list_users, db)
     return {"users": [dict(r) for r in rows]}
 
 
 @router.post("/users", status_code=201)
 async def api_create_user(request: Request, body: UserCreate):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
 
     if body.role not in {r.value for r in UserRole}:
         raise HTTPException(status_code=422, detail=f"Invalid role: {body.role}")
 
-    existing = get_user_by_email(db, body.email)
-    if existing is not None:
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _create_user(db, email, name, role, notify_email, now):
+        # ASYNC-DB: dup-check + insert + commit, one off-loop hop
+        # (db_call serialises via the / lock — replaces the
+        # explicit get_write_lock() that  added).
+        if get_user_by_email(db, email) is not None:
+            return None
+        cursor = db.execute(
+            "INSERT INTO users (email, name, role, notify_email, created_at) VALUES (?, ?, ?, ?, ?)",
+            (email, name, role, notify_email, now),
+        )
+        db.commit()
+        return cursor.lastrowid
+
+    new_id = await db_call(
+        _create_user, db, body.email, body.name, body.role,
+        body.notify_email, now,
+    )
+    if new_id is None:
         raise HTTPException(status_code=409, detail="User already exists")
 
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = db.execute(
-        "INSERT INTO users (email, name, role, notify_email, created_at) VALUES (?, ?, ?, ?, ?)",
-        (body.email, body.name, body.role, body.notify_email, now),
-    )
-    db.commit()
-
     return {
-        "id": cursor.lastrowid,
+        "id": new_id,
         "email": body.email,
         "name": body.name,
         "role": body.role,
@@ -237,14 +261,19 @@ async def api_create_user(request: Request, body: UserCreate):
     }
 
 
-@router.get("/users/{user_id}")
-async def api_get_user(request: Request, user_id: int):
-    _require_admin(request)
-    db = get_db(request)
-    row = db.execute(
+def _get_user_row(db, user_id):
+    # ASYNC-DB: single-user read off-loop (shared sync helper).
+    return db.execute(
         "SELECT id, email, name, role, notify_email, created_at, last_login FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
+
+
+@router.get("/users/{user_id}")
+async def api_get_user(request: Request, user_id: int):
+    await db_call(_require_admin, request)
+    db = get_db(request)
+    row = await db_call(_get_user_row, db, user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
@@ -252,48 +281,74 @@ async def api_get_user(request: Request, user_id: int):
 
 @router.patch("/users/{user_id}")
 async def api_update_user(request: Request, user_id: int, body: UserUpdate):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
 
-    row = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-    if row is None:
+    if body.role is not None and body.role not in {r.value for r in UserRole}:
+        raise HTTPException(status_code=422, detail=f"Invalid role: {body.role}")
+
+    def _update_user(db, user_id, body):
+        # ASYNC-DB: existence check + conditional update + commit,
+        # one off-loop hop (replaces 's get_write_lock()).
+        row = db.execute(
+            "SELECT id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        updates = []
+        params: list = []
+        if body.name is not None:
+            updates.append("name = ?")
+            params.append(body.name)
+        if body.role is not None:
+            updates.append("role = ?")
+            params.append(body.role)
+        if body.notify_email is not None:
+            updates.append("notify_email = ?")
+            params.append(body.notify_email or None)
+        if updates:
+            params.append(user_id)
+            db.execute(
+                f"UPDATE users SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            db.commit()
+        return True
+
+    found = await db_call(_update_user, db, user_id, body)
+    if not found:
         raise HTTPException(status_code=404, detail="User not found")
 
-    updates = []
-    params = []
-    if body.name is not None:
-        updates.append("name = ?")
-        params.append(body.name)
-    if body.role is not None:
-        if body.role not in {r.value for r in UserRole}:
-            raise HTTPException(status_code=422, detail=f"Invalid role: {body.role}")
-        updates.append("role = ?")
-        params.append(body.role)
-    if body.notify_email is not None:
-        updates.append("notify_email = ?")
-        params.append(body.notify_email or None)
-
-    if updates:
-        params.append(user_id)
-        db.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
-        db.commit()
-
-    return await api_get_user(request, user_id)
+    row = await db_call(_get_user_row, db, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return dict(row)
 
 
 @router.delete("/users/{user_id}", status_code=204)
 async def api_delete_user(request: Request, user_id: int):
-    admin = _require_admin(request)
+    admin = await db_call(_require_admin, request)
     db = get_db(request)
 
-    target = db.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()
-    if target is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    if target["email"] == admin["email"]:
-        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    def _delete_user(db, user_id, admin_email):
+        # ASYNC-DB: existence + self-delete guard + delete + commit,
+        # one off-loop hop (replaces 's get_write_lock()).
+        target = db.execute(
+            "SELECT email FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if target is None:
+            return "not_found"
+        if target["email"] == admin_email:
+            return "self"
+        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        db.commit()
+        return "ok"
 
-    db.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    db.commit()
+    outcome = await db_call(_delete_user, db, user_id, admin["email"])
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="User not found")
+    if outcome == "self":
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +363,11 @@ async def api_list_categories(request: Request):
     # personal categories were silently filtered out, contradicting
     # the same caller's expectation from the /categories UI page
     # which DOES return system ∪ personal.
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
-    return {"categories": get_categories_dict(db, user_id=user["id"])}
+    # ASYNC-DB: category read off-loop.
+    cats = await db_call(get_categories_dict, db, user_id=user["id"])
+    return {"categories": cats}
 
 
 class CategoryCreate(BaseModel):
@@ -325,37 +382,58 @@ class CategoryUpdate(BaseModel):
 
 @router.post("/categories", status_code=201)
 async def api_create_category(request: Request, body: CategoryCreate):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
 
     slug = body.slug.strip().lower()
-    try:
-        cat_id = create_category_db(db, slug, body.description.strip())
-    except Exception:
+    desc = body.description.strip()
+
+    def _create(db, slug, desc):
+        # ASYNC-DB: category insert off-loop (helper is @db_write).
+        try:
+            return create_category_db(db, slug, desc)
+        except Exception:
+            return None
+
+    cat_id = await db_call(_create, db, slug, desc)
+    if cat_id is None:
         raise HTTPException(status_code=409, detail=f"Category '{slug}' already exists")
     return {"id": cat_id, "slug": slug, "description": body.description}
 
 
 @router.put("/categories/{cat_id}")
 async def api_update_category(request: Request, cat_id: int, body: CategoryUpdate):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
 
-    existing = get_category_db(db, cat_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Category not found")
+    def _update(db, cat_id, body):
+        # ASYNC-DB: existence read + update + commit, one off-loop
+        # hop (update_category_db is @db_write — reentrant under db_call).
+        existing = get_category_db(db, cat_id)
+        if existing is None:
+            return None
+        slug_ = (body.slug or existing["slug"]).strip().lower()
+        desc_ = (
+            body.description if body.description is not None
+            else existing["description"]
+        )
+        update_category_db(db, cat_id, slug_, desc_.strip())
+        return slug_, desc_
 
-    slug = (body.slug or existing["slug"]).strip().lower()
-    desc = body.description if body.description is not None else existing["description"]
-    update_category_db(db, cat_id, slug, desc.strip())
+    result = await db_call(_update, db, cat_id, body)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Category not found")
+    slug, desc = result
     return {"id": cat_id, "slug": slug, "description": desc}
 
 
 @router.delete("/categories/{cat_id}", status_code=204)
 async def api_delete_category(request: Request, cat_id: int):
-    _require_admin(request)
+    await db_call(_require_admin, request)
     db = get_db(request)
-    if not delete_category_db(db, cat_id):
+    # ASYNC-DB: category delete off-loop (helper is @db_write).
+    deleted = await db_call(delete_category_db, db, cat_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail="Category not found")
     return Response(status_code=204)
 
@@ -387,129 +465,191 @@ def _enrich_list(db, row) -> dict:
 
 @router.get("/lists")
 async def api_list_lists(request: Request):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
-    personal = db.execute(
-        "SELECT * FROM classification_lists WHERE owner_id = ? ORDER BY id",
-        (user["id"],),
-    ).fetchall()
-    global_lists = db.execute(
-        "SELECT * FROM classification_lists WHERE is_global = 1 ORDER BY id",
-    ).fetchall()
+    def _list_lists(db, user_id):
+        # ASYNC-DB: list reads + per-list rule enrichment off-loop.
+        personal = db.execute(
+            "SELECT * FROM classification_lists WHERE owner_id = ? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+        global_lists = db.execute(
+            "SELECT * FROM classification_lists WHERE is_global = 1 ORDER BY id",
+        ).fetchall()
+        return (
+            [_enrich_list(db, r) for r in personal],
+            [_enrich_list(db, r) for r in global_lists],
+        )
 
-    return {
-        "personal": [_enrich_list(db, r) for r in personal],
-        "global": [_enrich_list(db, r) for r in global_lists],
-    }
+    personal, global_lists = await db_call(_list_lists, db, user["id"])
+    return {"personal": personal, "global": global_lists}
 
 
 @router.post("/lists", status_code=201)
 async def api_create_list(request: Request, body: ListCreate):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
     if body.is_global and user["role"] not in ("admin", "power_user"):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     now = datetime.now(timezone.utc).isoformat()
-    cursor = db.execute(
-        "INSERT INTO classification_lists (name, category, owner_id, is_global, created_at) VALUES (?, ?, ?, ?, ?)",
-        (body.name, body.category, user["id"], int(body.is_global), now),
-    )
-    db.commit()
 
-    return {"id": cursor.lastrowid, "name": body.name, "category": body.category,
+    def _create_list(db, name, category, owner_id, is_global, now):
+        # ASYNC-DB: insert + commit off-loop (db_call serialises via
+        # the / lock — replaces 's get_write_lock()).
+        cursor = db.execute(
+            "INSERT INTO classification_lists (name, category, owner_id, is_global, created_at) VALUES (?, ?, ?, ?, ?)",
+            (name, category, owner_id, int(is_global), now),
+        )
+        db.commit()
+        return cursor.lastrowid
+
+    new_id = await db_call(
+        _create_list, db, body.name, body.category, user["id"],
+        body.is_global, now,
+    )
+    return {"id": new_id, "name": body.name, "category": body.category,
             "is_global": body.is_global, "created_at": now}
 
 
 @router.get("/lists/{list_id}")
 async def api_get_list(request: Request, list_id: int):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
-    row = db.execute(
-        "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
-    ).fetchone()
-    if row is None:
+    def _get_list(db, list_id):
+        # ASYNC-DB: list read + rule enrichment off-loop.
+        row = db.execute(
+            "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row, _enrich_list(db, row)
+
+    result = await db_call(_get_list, db, list_id)
+    if result is None:
         raise HTTPException(status_code=404, detail="List not found")
+    row, enriched = result
 
     # Only owner, admin, or if global.
     if row["owner_id"] != user["id"] and not row["is_global"] and user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    return _enrich_list(db, row)
+    return enriched
 
 
 @router.delete("/lists/{list_id}", status_code=204)
 async def api_delete_list(request: Request, list_id: int):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
-    row = db.execute(
-        "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
-    ).fetchone()
-    if row is None:
+    def _delete_list(db, list_id, user_id, is_admin):
+        # ASYNC-DB: ownership read + delete + commit, one off-loop
+        # hop (replaces 's get_write_lock()).
+        row = db.execute(
+            "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        if row["owner_id"] != user_id and not is_admin:
+            return "forbidden"
+        db.execute("DELETE FROM classification_lists WHERE id = ?", (list_id,))
+        db.commit()
+        return "ok"
+
+    outcome = await db_call(
+        _delete_list, db, list_id, user["id"], user["role"] == "admin",
+    )
+    if outcome == "not_found":
         raise HTTPException(status_code=404, detail="List not found")
-
-    if row["owner_id"] != user["id"] and user["role"] != "admin":
+    if outcome == "forbidden":
         raise HTTPException(status_code=403, detail="Forbidden")
-
-    db.execute("DELETE FROM classification_lists WHERE id = ?", (list_id,))
-    db.commit()
 
 
 @router.post("/lists/{list_id}/rules", status_code=201)
 async def api_add_rule(request: Request, list_id: int, body: RuleCreate):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
-
-    row = db.execute(
-        "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="List not found")
-
-    if row["owner_id"] != user["id"] and user["role"] not in ("admin", "power_user"):
-        raise HTTPException(status_code=403, detail="Forbidden")
 
     valid_types = {"sender", "sender_domain", "subject"}
     if body.rule_type not in valid_types:
         raise HTTPException(status_code=422, detail=f"Invalid rule_type: {body.rule_type}")
 
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = db.execute(
-        "INSERT INTO list_rules (list_id, rule_type, pattern, skip_ai, created_at) VALUES (?, ?, ?, ?, ?)",
-        (list_id, body.rule_type, body.pattern, int(body.skip_ai), now),
-    )
-    db.commit()
+    #  preventative: empty / whitespace-only patterns would silently
+    # match every email through the substring branch in _rule_matches.
+    # Reject at the boundary alongside the rule_type 422.
+    if not body.pattern or not body.pattern.strip():
+        raise HTTPException(status_code=422, detail="pattern must not be empty")
 
-    return {"id": cursor.lastrowid, "list_id": list_id, "rule_type": body.rule_type,
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _add_rule(db, list_id, body, user_id, can_global, now):
+        # ASYNC-DB: ownership read + insert + commit, one off-loop
+        # hop (replaces 's get_write_lock()).
+        row = db.execute(
+            "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found", None
+        if row["owner_id"] != user_id and not can_global:
+            return "forbidden", None
+        cursor = db.execute(
+            "INSERT INTO list_rules (list_id, rule_type, pattern, skip_ai, created_at) VALUES (?, ?, ?, ?, ?)",
+            (list_id, body.rule_type, body.pattern, int(body.skip_ai), now),
+        )
+        db.commit()
+        return "ok", cursor.lastrowid
+
+    outcome, new_id = await db_call(
+        _add_rule, db, list_id, body, user["id"],
+        user["role"] in ("admin", "power_user"), now,
+    )
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="List not found")
+    if outcome == "forbidden":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    return {"id": new_id, "list_id": list_id, "rule_type": body.rule_type,
             "pattern": body.pattern, "skip_ai": body.skip_ai}
 
 
 @router.delete("/lists/{list_id}/rules/{rule_id}", status_code=204)
 async def api_delete_rule(request: Request, list_id: int, rule_id: int):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
-    row = db.execute(
-        "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
-    ).fetchone()
-    if row is None:
+    def _delete_rule(db, list_id, rule_id, user_id, can_global):
+        # ASYNC-DB: ownership read + rule existence + delete + commit,
+        # one off-loop hop (replaces 's get_write_lock()).
+        row = db.execute(
+            "SELECT * FROM classification_lists WHERE id = ?", (list_id,)
+        ).fetchone()
+        if row is None:
+            return "list_not_found"
+        if row["owner_id"] != user_id and not can_global:
+            return "forbidden"
+        rule = db.execute(
+            "SELECT id FROM list_rules WHERE id = ? AND list_id = ?",
+            (rule_id, list_id),
+        ).fetchone()
+        if rule is None:
+            return "rule_not_found"
+        db.execute("DELETE FROM list_rules WHERE id = ?", (rule_id,))
+        db.commit()
+        return "ok"
+
+    outcome = await db_call(
+        _delete_rule, db, list_id, rule_id, user["id"],
+        user["role"] in ("admin", "power_user"),
+    )
+    if outcome == "list_not_found":
         raise HTTPException(status_code=404, detail="List not found")
-
-    if row["owner_id"] != user["id"] and user["role"] not in ("admin", "power_user"):
+    if outcome == "forbidden":
         raise HTTPException(status_code=403, detail="Forbidden")
-
-    rule = db.execute(
-        "SELECT id FROM list_rules WHERE id = ? AND list_id = ?", (rule_id, list_id)
-    ).fetchone()
-    if rule is None:
+    if outcome == "rule_not_found":
         raise HTTPException(status_code=404, detail="Rule not found")
-
-    db.execute("DELETE FROM list_rules WHERE id = ?", (rule_id,))
-    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -524,39 +664,53 @@ class ApiKeyCreate(BaseModel):
 
 @router.get("/keys")
 async def api_list_keys(request: Request):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
+    # ASYNC-DB: API-key listing off-loop.
     if user["role"] == "admin":
-        keys = list_api_keys(db)
+        keys = await db_call(list_api_keys, db)
     else:
-        keys = list_api_keys(db, user_id=user["id"])
+        keys = await db_call(list_api_keys, db, user_id=user["id"])
     return {"keys": keys}
 
 
 @router.post("/keys", status_code=201)
 async def api_create_key(request: Request, body: ApiKeyCreate):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
     # Determine target user.
-    target_user_id = user["id"]
-    if body.user_email and body.user_email != user["email"]:
-        if user["role"] != "admin":
-            raise HTTPException(status_code=403, detail="Only admins can create keys for other users")
-        target = get_user_by_email(db, body.user_email)
-        if target is None:
-            raise HTTPException(status_code=404, detail=f"User not found: {body.user_email}")
-        target_user_id = target["id"]
+    cross_user = bool(body.user_email and body.user_email != user["email"])
+    if cross_user and user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can create keys for other users")
 
     raw_key = generate_api_key()
     key_hash = hash_api_key(raw_key)
-    key_id = store_api_key(
-        db, key_hash, body.name, target_user_id, body.expires_at,
-        actor_user_id=user["id"],
-        actor_email=user["email"],
-        source="api",
+
+    def _create_key(db, key_hash, body, cross_user, actor_id, actor_email):
+        # ASYNC-DB: target-user lookup + key store + commit, one
+        # off-loop hop.
+        target_user_id = actor_id
+        if cross_user:
+            target = get_user_by_email(db, body.user_email)
+            if target is None:
+                return "no_user", None, None
+            target_user_id = target["id"]
+        key_id_ = store_api_key(
+            db, key_hash, body.name, target_user_id, body.expires_at,
+            actor_user_id=actor_id,
+            actor_email=actor_email,
+            source="api",
+        )
+        return "ok", key_id_, target_user_id
+
+    outcome, key_id, target_user_id = await db_call(
+        _create_key, db, key_hash, body, cross_user, user["id"],
+        user["email"],
     )
+    if outcome == "no_user":
+        raise HTTPException(status_code=404, detail=f"User not found: {body.user_email}")
 
     return {
         "id": key_id,
@@ -569,21 +723,31 @@ async def api_create_key(request: Request, body: ApiKeyCreate):
 
 @router.delete("/keys/{key_id}", status_code=204)
 async def api_delete_key(request: Request, key_id: int):
-    user = _require_auth(request)
+    user = await db_call(_require_auth, request)
     db = get_db(request)
 
-    # Verify ownership or admin.
-    row = db.execute(
-        "SELECT user_id FROM api_keys WHERE id = ?", (key_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="API key not found")
-    if row["user_id"] != user["id"] and user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden")
+    def _delete_key(db, key_id, user_id, is_admin, actor_email):
+        # ASYNC-DB: ownership read + key delete, one off-loop hop.
+        row = db.execute(
+            "SELECT user_id FROM api_keys WHERE id = ?", (key_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        if row["user_id"] != user_id and not is_admin:
+            return "forbidden"
+        delete_api_key(
+            db, key_id,
+            actor_user_id=user_id,
+            actor_email=actor_email,
+            source="api",
+        )
+        return "ok"
 
-    delete_api_key(
-        db, key_id,
-        actor_user_id=user["id"],
-        actor_email=user["email"],
-        source="api",
+    outcome = await db_call(
+        _delete_key, db, key_id, user["id"], user["role"] == "admin",
+        user["email"],
     )
+    if outcome == "not_found":
+        raise HTTPException(status_code=404, detail="API key not found")
+    if outcome == "forbidden":
+        raise HTTPException(status_code=403, detail="Forbidden")

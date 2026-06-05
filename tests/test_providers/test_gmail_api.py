@@ -274,7 +274,7 @@ class TestHttpApi:
         ))
         await provider.create_folder("newlabel")
         # After a successful mint the cache must be nulled so the next
-        # _resolve_label_id() refetches from Gmail (regression for #38).
+        # _resolve_label_id() refetches from Gmail (regression for ).
         assert provider._label_cache is None
 
     async def test_resolve_after_create_refetches(self, provider):

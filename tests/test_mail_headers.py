@@ -44,13 +44,13 @@ class TestBuildTriageHeader:
         value = build_triage_header(
             "digest",
             category="newsletters",
-            account="alice@home",
+            account="alice@example.com",
             version="sha1",
             generated="now",
         )
         assert value.startswith("digest")
         assert "category=newsletters" in value
-        assert "account=alice@home" in value
+        assert "account=alice@example.com" in value
 
     def test_hipaa_drops_account(self):
         value = build_triage_header(

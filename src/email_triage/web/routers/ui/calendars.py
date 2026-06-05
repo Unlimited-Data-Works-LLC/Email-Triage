@@ -1,6 +1,6 @@
 """Routes for the calendars concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,6 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +49,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.calendars")
 
 router = APIRouter()
@@ -58,7 +58,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -103,17 +103,21 @@ async def calendar_disable(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Clear the calendar_enabled flag. Refresh token retains its scope."""
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
-    # #145.7 — set_bool_setting is the canonical {"enabled": bool} write.
+    #  phase 2 — OwnedAccount dep collapses preamble.
+    # .7 — set_bool_setting is the canonical {"enabled": bool} write.
     user, acct, db, secrets = owned
 
-    from email_triage.web.db import set_bool_setting
-    set_bool_setting(db, _S.calendar_enabled(account_id), False)
-    return HTMLResponse(_render_calendar_chip(db, acct))
+    def _disable_db_work() -> str:
+        """/ — flag write + chip re-render in one threadpool hop."""
+        from email_triage.web.db import set_bool_setting
+        set_bool_setting(db, _S.calendar_enabled(account_id), False)
+        return _render_calendar_chip(db, acct)
+
+    return HTMLResponse(await db_call(_disable_db_work))
 
 
 # ---------------------------------------------------------------------------
-# Calendar discovery + role-assignment table (#105)
+# Calendar discovery + role-assignment table
 # ---------------------------------------------------------------------------
 
 # ─── AUDIENCE — calendar-section render helpers ─────────────
@@ -145,14 +149,16 @@ async def calendars_discover(
     swap-in. No persistence — the table's Save button writes."""
     from email_triage.web.calendars import normalize_calendars
 
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
 
     config = get_config(request)
     google_oauth = getattr(config, "google_oauth", None)
     # db kwarg lets IMAP accounts with a configured surrogate fall
-    # through to the surrogate's provider (#105 phase 1A++).
-    provider = _create_calendar_provider_from_account(
+    # through to the surrogate's provider.
+    # / — surrogate resolution does a SQLite read; off the loop.
+    provider = await db_call(
+        _create_calendar_provider_from_account,
         acct, secrets, google_oauth=google_oauth, db=db,
     )
     if provider is None:
@@ -205,7 +211,7 @@ async def calendars_save(
     from email_triage.web.calendars import parse_calendars_form
     from email_triage.web.db import update_account_config_keys
 
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
 
     form = await request.form()
@@ -252,7 +258,9 @@ async def calendars_save(
     # ``calendars`` key. Other config keys are preserved by
     # ``update_account_config_keys`` (atomic read-modify-write,
     # adjacent-keys-untouched).
-    update_account_config_keys(db, account_id, calendars=calendars)
+    await db_call(
+        update_account_config_keys, db, account_id, calendars=calendars,
+    )
 
     n_enabled = sum(1 for c in calendars if c.get("enabled"))
     return HTMLResponse(
@@ -286,7 +294,7 @@ async def calendar_surrogate_save(
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.web.db import update_account_config_keys
 
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
 
     form = await request.form()
@@ -299,24 +307,28 @@ async def calendar_surrogate_save(
     # trace of the attempt.
     from email_triage.triage_logging import is_account_hipaa
     if raw and is_account_hipaa(acct):
-        try:
-            from email_triage.web.db import record_access_event
-            record_access_event(
-                db,
-                actor_user_id=user.get("id"),
-                method="POST",
-                route="/accounts/{id}/calendar/surrogate",
-                account_id=account_id,
-                message_id=None,
-                status_code=403,
-                outcome="surrogate_hipaa_refused",
-                detail=(
-                    f"hipaa_account=yes attempted_surrogate={raw} "
-                    "reason=hipaa_self_only"
-                ),
-            )
-        except Exception:
-            pass
+        def _hipaa_refusal_audit() -> None:
+            """/ — best-effort refusal audit row off the loop."""
+            try:
+                from email_triage.web.db import record_access_event
+                record_access_event(
+                    db,
+                    actor_user_id=user.get("id"),
+                    method="POST",
+                    route="/accounts/{id}/calendar/surrogate",
+                    account_id=account_id,
+                    message_id=None,
+                    status_code=403,
+                    outcome="surrogate_hipaa_refused",
+                    detail=(
+                        f"hipaa_account=yes attempted_surrogate={raw} "
+                        "reason=hipaa_self_only"
+                    ),
+                )
+            except Exception:
+                pass
+
+        await db_call(_hipaa_refusal_audit)
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
             "HIPAA-flagged accounts are locked to their own "
@@ -329,7 +341,8 @@ async def calendar_surrogate_save(
         # stay put — operator may want them back if they re-pick
         # the same surrogate later. ``None`` patch tells
         # ``update_account_config_keys`` to delete the key.
-        update_account_config_keys(
+        await db_call(
+            update_account_config_keys,
             db, account_id, calendar_surrogate_account_id=None,
         )
         return HTMLResponse(
@@ -354,7 +367,22 @@ async def calendar_surrogate_save(
         **(acct.get("config") or {}),
         "calendar_surrogate_account_id": sid,
     }
-    surrogate = resolve_surrogate_account(db, candidate_acct)
+
+    def _surrogate_save_db_work() -> dict | None:
+        """/ — surrogate resolution + (on success) the
+        config-key write in one threadpool hop. Returns the resolved
+        surrogate dict, or ``None`` when it failed validation (no
+        write performed in that case).
+        """
+        surrogate_ = resolve_surrogate_account(db, candidate_acct)
+        if surrogate_ is None:
+            return None
+        update_account_config_keys(
+            db, account_id, calendar_surrogate_account_id=sid,
+        )
+        return surrogate_
+
+    surrogate = await db_call(_surrogate_save_db_work)
     if surrogate is None:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -362,10 +390,6 @@ async def calendar_surrogate_save(
             "Surrogates must be Gmail or Office 365 accounts "
             "owned by you.</small>"
         )
-
-    update_account_config_keys(
-        db, account_id, calendar_surrogate_account_id=sid,
-    )
     import html as _h
     return HTMLResponse(
         "<small style='color:var(--pico-ins-color);'>"

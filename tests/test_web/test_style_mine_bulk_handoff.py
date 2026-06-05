@@ -1,4 +1,4 @@
-"""#161 item 5 — bulk-worker handoff when resolved limit > 50.
+""" item 5 — bulk-worker handoff when resolved limit > 50.
 
 Covers:
 

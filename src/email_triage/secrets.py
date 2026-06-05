@@ -34,6 +34,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+#  — DbSecrets shares the one process-wide sqlite3.Connection; every
+# touch of it is serialised on the same write lock @db_write / db_call
+# use. db_writelock imports only stdlib, so this is cycle-free.
+from email_triage.web.db_writelock import get_write_lock
+
 logger = logging.getLogger("email_triage.secrets")
 
 _SERVICE_NAME = "email-triage"
@@ -76,6 +81,22 @@ class SecretNotFound(Exception):
         super().__init__(msg)
 
 
+class SecretsDecryptError(Exception):
+    """A stored secret row exists but cannot be decrypted — a corrupt
+    ciphertext or (more likely, since it affects every secret) a
+    master-key mismatch. Distinct from SecretNotFound: the row is
+    present but unreadable. A typed error so callers can tell
+    'unreadable' apart from 'missing' instead of catching an opaque
+    cryptography exception."""
+
+    def __init__(self, key: str):
+        self.key = key
+        super().__init__(
+            f"Could not decrypt secret '{key}' — corrupt ciphertext "
+            f"or master-key mismatch"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Container backend  (/run/secrets/<key>)
 # ---------------------------------------------------------------------------
@@ -105,11 +126,78 @@ class ContainerSecrets(SecretsProvider):
 
 
 # ---------------------------------------------------------------------------
-# Environment variable backend  (legacy / migration)
+# Environment variable backend  (DEPRECATED — dev / CI carve-out only)
 # ---------------------------------------------------------------------------
+#
+# H-07 (Cycle 6, 2026-05-24): the env backend is DEPRECATED for production
+# use and carved out as **dev / CI only**.
+#
+# Threat-model gaps that drive the deprecation:
+#
+#   * The Fernet master key sits in the process environment, visible via
+#     ``/proc/<pid>/environ``, ``podman inspect``, ``ps eww``, container
+#     orchestration logs, etc. Any local-system reader gets the key.
+#   * No rotation discipline: the env-var pattern encourages
+#     stop-and-restart with a new value, which orphans the previous
+#     ciphertext + (post-H-02a) the HMAC audit chain.
+#   * No at-rest protection guarantee: the env source (shell rc, systemd
+#     unit, container yaml, k8s secret) is operator-discretion, not a
+#     project-enforced posture.
+#   * **§164.308(a)(4)(ii)(C) Access Establishment and Modification
+#     implication**: the env-backend posture is single-master-key-per-
+#     process — every process under the same UID reading
+#     ``/proc/<pid>/environ`` sees the same master, with no per-actor
+#     differentiation. Per hipaa-sme-3 R-2 cross-reference (2026-05-24):
+#     the alternative backends (container tmpfs / OS keyring / external:* /
+#     keyfile-0600) each support per-actor access-control posture (file
+#     permissions, keyring user-scope, HSM/Vault role-based access);
+#     env-backend has no equivalent. This is a defense-in-depth gap
+#     beyond §164.312(a)(2)(iv) — it's also why the env-backend's "any
+#     local-system reader gets the key" framing maps to an access-
+#     management failure mode, not just an at-rest-encryption failure.
+#
+# Acceptable use cases (the carve-out):
+#
+#   * Local dev (``scripts/dev_preview.py`` and equivalents)
+#   * CI runners (test secrets are ephemeral; runner config is throwaway)
+#   * Test fixtures that exercise the env-bootstrap code path (the H-02a
+#     G1' enforcement test, the bootstrap roundtrip test)
+#
+# Sunset trajectory (subject to hipaa-sme-2 acceleration):
+#
+#   * v0.1.x (today): runtime ``log.warning`` at selection-time when env
+#     backend is chosen AND HIPAA mode is off AND the carve-out env var
+#     ``EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY`` is not set to a truthy value
+#     (``1``/``true``/``yes``, case-insensitive). HIPAA mode + env →
+#     RuntimeError (G1' enforcement landed in H-02a). The legacy per-
+#     instance ``_warned`` (get-time) latch is preserved for back-compat
+#     and fires once per process on the first ``.get()`` call.
+#   * v0.2.0: warning becomes a RuntimeError in non-HIPAA mode UNLESS
+#     the carve-out env var is set. Dev/CI workflows continue
+#     unchanged by setting the var; production deploys that quietly used
+#     env backend will hard-stop at boot until they migrate.
+#   * v0.3.0: env backend removed entirely. ``backend='env'`` raises a
+#     ``ValueError`` from ``create_secrets_provider``. Carve-out env var
+#     removed from the codebase.
+#
+# Companion to H-02a G1' (HIPAA-mode + env → RuntimeError, landed in
+# d23f208). H-02a closes the HIPAA-mode case immediately; H-07 carves
+# out + sunsets the non-HIPAA-mode case across the v0.2/v0.3 cycle.
+
 
 class EnvSecrets(SecretsProvider):
-    """Reads secrets from environment variables.  Logs a warning on use."""
+    """DEPRECATED. Reads secrets from environment variables.
+
+    See the section docstring above for the H-07 deprecation rationale,
+    the dev/CI-only carve-out, the
+    ``EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY`` opt-in env var, and the
+    v0.2.0 / v0.3.0 sunset trajectory.
+
+    A get-time once-per-process ``_warned`` latch is preserved for back-
+    compat. The selection-time deprecation warning fires from
+    :func:`_warn_env_backend_deprecation`, called by
+    :func:`create_secrets_provider` and :func:`_resolve_auto_backend`.
+    """
 
     _warned = False
 
@@ -275,39 +363,71 @@ class DbSecrets(SecretsProvider):
         self._fernet = Fernet(master_key)
 
     def get(self, key: str) -> str | None:
-        row = self._conn.execute(
-            f"SELECT ciphertext FROM {self._table} WHERE key = ?",
-            (key,),
-        ).fetchone()
+        #  — the shared sqlite3.Connection cannot be used by two
+        # threads at once (the driver raises InterfaceError). DbSecrets
+        # is a process-wide singleton called from ~23 async handlers;
+        # serialise every connection touch on the process-wide write
+        # lock — the same RLock @db_write / db_call take — so a secrets
+        # read never collides with a request-surface db_call worker.
+        # Only the DB read is inside the lock; the Fernet decrypt below
+        # is pure CPU and is deliberately left outside it.
+        with get_write_lock():
+            row = self._conn.execute(
+                f"SELECT ciphertext FROM {self._table} WHERE key = ?",
+                (key,),
+            ).fetchone()
         if row is None:
             return None
         ciphertext = row["ciphertext"] if hasattr(row, "keys") else row[0]
-        return self._fernet.decrypt(ciphertext.encode()).decode()
+        from cryptography.fernet import InvalidToken
+        try:
+            return self._fernet.decrypt(ciphertext.encode()).decode()
+        except InvalidToken as e:
+            # The row exists but won't decrypt — corrupt ciphertext or
+            # a master-key mismatch. Surface a typed, logged error
+            # instead of letting an opaque cryptography exception
+            # escape into callers (OTP send, lifespan startup) — .
+            logger.error(
+                "DbSecrets: could not decrypt secret %r — corrupt row "
+                "or master-key mismatch", key,
+            )
+            raise SecretsDecryptError(key) from e
 
     def set(self, key: str, value: str) -> None:
+        # Encrypt before taking the lock — pure CPU, no need to hold the
+        # write lock for it. The INSERT/UPSERT + commit run under the
+        # process-wide write lock so the shared connection is
+        # never touched by two threads at once.
         ciphertext = self._fernet.encrypt(value.encode()).decode()
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            f"INSERT INTO {self._table} (key, ciphertext, created_at, updated_at) "
-            f"VALUES (?, ?, ?, ?) "
-            f"ON CONFLICT(key) DO UPDATE SET ciphertext = excluded.ciphertext, "
-            f"updated_at = excluded.updated_at",
-            (key, ciphertext, now, now),
-        )
-        self._conn.commit()
+        with get_write_lock():
+            self._conn.execute(
+                f"INSERT INTO {self._table} (key, ciphertext, created_at, updated_at) "
+                f"VALUES (?, ?, ?, ?) "
+                f"ON CONFLICT(key) DO UPDATE SET ciphertext = excluded.ciphertext, "
+                f"updated_at = excluded.updated_at",
+                (key, ciphertext, now, now),
+            )
+            self._conn.commit()
 
     def delete(self, key: str) -> bool:
         """Remove a secret. Returns True if something was deleted."""
-        cur = self._conn.execute(
-            f"DELETE FROM {self._table} WHERE key = ?", (key,),
-        )
-        self._conn.commit()
-        return cur.rowcount > 0
+        # DELETE + commit under the process-wide write lock.
+        with get_write_lock():
+            cur = self._conn.execute(
+                f"DELETE FROM {self._table} WHERE key = ?", (key,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def list_keys(self) -> list[str]:
-        rows = self._conn.execute(
-            f"SELECT key FROM {self._table} ORDER BY key"
-        ).fetchall()
+        # SELECT under the process-wide write lock — a read on
+        # the shared connection still collides with a concurrent
+        # writer, so every touch is serialised, reads included.
+        with get_write_lock():
+            rows = self._conn.execute(
+                f"SELECT key FROM {self._table} ORDER BY key"
+            ).fetchall()
         return [r["key"] if hasattr(r, "keys") else r[0] for r in rows]
 
     @staticmethod
@@ -315,6 +435,105 @@ class DbSecrets(SecretsProvider):
         """Generate a fresh Fernet key. Returns base64 string."""
         from cryptography.fernet import Fernet
         return Fernet.generate_key().decode()
+
+    # ------------------------------------------------------------------
+    # H-02a master-key version registry (Cycle 6, 2026-05-23)
+    # ------------------------------------------------------------------
+    #
+    # The audit log_entries hash chain HMACs each row under a key HKDF-
+    # derived from the master key (see
+    # ``derive_audit_chain_hmac_key`` below). Rotating the master key
+    # changes the derived HMAC subkey, which would orphan every legacy
+    # HMAC-signed log_entries row written under the old master.
+    #
+    # Per hipaa-sme-2 + DA-3 verdicts 2026-05-23 (R1-plumbing-IN), the
+    # rotation ceremony PRESERVES old masters in the secrets_store via
+    # the key-encrypting-key (KEK) pattern (NIST SP 800-57 §6.2.2): the
+    # outgoing master is encrypted under the NEW master's Fernet and
+    # stored as ``master_key_history:v{N}`` where N is the version that
+    # was active BEFORE the rotation. The next NEW row written to
+    # log_entries stamps ``master_key_version = N + 1`` (the new
+    # current version) so the verifier can pick the right HMAC subkey
+    # for each chain-aware row.
+    #
+    # Version derivation is deliberately schema-light: the master-key-
+    # version state lives in the secrets_store as ``master_key_history:v*``
+    # rows. ``current_master_version()`` returns ``max(N for v{N} rows) + 1``
+    # (or 0 if no history rows exist — initial deployment). No separate
+    # settings-table row + no separate version column on
+    # ``secrets_store``; the history rows themselves ARE the registry.
+
+    _MASTER_KEY_HISTORY_PREFIX = "master_key_history:v"
+
+    def _list_master_key_history_versions(self) -> list[int]:
+        """Return sorted list of historical master-key version numbers.
+
+        Reads ``master_key_history:v{N}`` rows from ``secrets_store`` and
+        returns ``[N1, N2, ...]`` sorted ascending. Empty list on fresh
+        installs (no rotations yet).
+
+        Used by :meth:`current_master_version` and by audit-chain
+        startup (lifespan loads all historical keys into the version
+        map for verifier dispatch).
+        """
+        with get_write_lock():
+            rows = self._conn.execute(
+                f"SELECT key FROM {self._table} "
+                f"WHERE key LIKE ? ORDER BY key",
+                (self._MASTER_KEY_HISTORY_PREFIX + "%",),
+            ).fetchall()
+        versions = []
+        for r in rows:
+            k = r["key"] if hasattr(r, "keys") else r[0]
+            try:
+                n = int(k[len(self._MASTER_KEY_HISTORY_PREFIX):])
+                versions.append(n)
+            except (ValueError, IndexError):
+                # Malformed history key — skip silently; not load-bearing
+                # for verification (only versions referenced by actual
+                # log_entries rows matter).
+                continue
+        return sorted(versions)
+
+    def current_master_version(self) -> int:
+        """Return the version number of the *current* master key.
+
+        Initial deployment (no rotations) → 0.
+        After N rotations → N.
+        """
+        versions = self._list_master_key_history_versions()
+        return (max(versions) + 1) if versions else 0
+
+    def get_historical_master_key(self, version: int) -> bytes | None:
+        """Return the decrypted historical master key for ``version``, or None.
+
+        ``version`` of 0 means "the initial master key" (no rotations have
+        occurred for it). If 0 is requested AND no rotations have ever
+        happened, returns ``self._fernet``'s key — but the live master
+        key is not directly exposed by Fernet, so this helper instead
+        returns None in that case; callers (audit-chain startup) should
+        treat the live master separately (it's already in
+        ``self._fernet``; HKDF-derive the chain key directly from it).
+
+        For rotated installs: the v{0}..v{N-1} rows in secrets_store
+        contain prior-master ciphertexts encrypted under the
+        *current* master (per KEK pattern in rotate_master_key). Decrypt
+        with self._fernet and return the bytes.
+
+        Returns the decoded historical master key as bytes, or None if
+        no history row exists for that version.
+        """
+        if version >= self.current_master_version():
+            # Caller wants the live master — they should not need this
+            # function; the live key sits in ``self._fernet`` already.
+            # Return None to surface the API misuse (lifespan caller
+            # filters out the current version before calling).
+            return None
+        key_name = f"{self._MASTER_KEY_HISTORY_PREFIX}{version}"
+        ciphertext = self.get(key_name)  # decrypts under current master
+        if ciphertext is None:
+            return None
+        return ciphertext.encode()
 
     def rotate_master_key(self, new_master_key: str) -> int:
         """Re-encrypt every row with a new master key, atomically.
@@ -324,20 +543,49 @@ class DbSecrets(SecretsProvider):
         anything fails, the transaction rolls back and the old master
         key remains valid.
 
+        **H-02a (Cycle 6, 2026-05-23)**: also preserves the outgoing
+        master key as a ``master_key_history:v{N}`` row encrypted under
+        the NEW master (key-encrypting-key pattern per NIST SP 800-57
+        §6.2.2). This is REQUIRED for §164.312(c)(1) integrity of the
+        ``log_entries`` HMAC chain across the rotation boundary:
+        without preserved old masters, every legacy HMAC-signed audit
+        row becomes unverifiable at the next rotation, breaking
+        §164.316(b)(2)(i) 6-year retention. The new HMAC key is HKDF-
+        derived from the new master at startup (see
+        :func:`derive_audit_chain_hmac_key` + audit-chain lifespan
+        wiring in web/app.py).
+
         The caller is responsible for:
           - Stopping the running app before rotation (running app
             processes cache the old Fernet instance in memory)
           - Storing the new key in the bootstrap backend after this
             returns successfully
 
-        Returns the number of rows re-encrypted.
+        Returns the number of rows re-encrypted (excluding the new
+        history row added in this call — that row is internal
+        bookkeeping, not a user secret).
         """
         from cryptography.fernet import Fernet
         if isinstance(new_master_key, str):
             new_master_key = new_master_key.encode()
         new_fernet = Fernet(new_master_key)
 
-        # #145.3 — close the SELECT-before-BEGIN TOCTOU window. If we
+        # Determine the version number we are rotating FROM. The new
+        # ``master_key_history:v{N}`` row uses this N — the version that
+        # was current before the rotation.
+        rotating_from_version = self.current_master_version()
+
+        # Wrap the outgoing master key under the NEW key's Fernet
+        # BEFORE entering the transaction. KEK pattern: the historical
+        # master sits at-rest encrypted under the current master, the
+        # same protection-tier as every other secrets_store row.
+        old_master_bytes = self._fernet_master_key_bytes()
+        wrapped_old_master = new_fernet.encrypt(old_master_bytes).decode()
+        history_key = (
+            f"{self._MASTER_KEY_HISTORY_PREFIX}{rotating_from_version}"
+        )
+
+        # .3 — close the SELECT-before-BEGIN TOCTOU window. If we
         # SELECT first and a concurrent ``set()`` lands a new row (or
         # overwrites an existing row's ciphertext) BEFORE the BEGIN,
         # that row escapes the rotation pass: it stays encrypted with
@@ -350,32 +598,83 @@ class DbSecrets(SecretsProvider):
         # we COMMIT/ROLLBACK; the SELECT, the UPDATE loop, and the
         # in-memory key swap all observe the same row set atomically.
         now = datetime.now(timezone.utc).isoformat()
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            rows = self._conn.execute(
-                f"SELECT key, ciphertext FROM {self._table}"
-            ).fetchall()
-            for row in rows:
-                k = row["key"] if hasattr(row, "keys") else row[0]
-                old_ct = row["ciphertext"] if hasattr(row, "keys") else row[1]
-                # Decrypt with the *old* key (our _fernet) and re-encrypt
-                # with new.  Any failure here aborts the whole rotation.
-                plaintext = self._fernet.decrypt(old_ct.encode())
-                new_ct = new_fernet.encrypt(plaintext).decode()
+        #  — the whole BEGIN IMMEDIATE … COMMIT/ROLLBACK transaction
+        # runs under the process-wide write lock so the shared
+        # connection is never touched by another thread mid-rotation.
+        # The lock spans the ROLLBACK in the except branch too — that
+        # ROLLBACK is itself a connection touch. The Fernet
+        # decrypt/encrypt inside the loop necessarily runs under the
+        # lock here: it is interleaved with the per-row UPDATEs of one
+        # atomic transaction and cannot be hoisted out.
+        with get_write_lock():
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                rows = self._conn.execute(
+                    f"SELECT key, ciphertext FROM {self._table}"
+                ).fetchall()
+                for row in rows:
+                    k = row["key"] if hasattr(row, "keys") else row[0]
+                    old_ct = (
+                        row["ciphertext"] if hasattr(row, "keys")
+                        else row[1]
+                    )
+                    # Decrypt with the *old* key (our _fernet) and
+                    # re-encrypt with new. Any failure here aborts the
+                    # whole rotation.
+                    plaintext = self._fernet.decrypt(old_ct.encode())
+                    new_ct = new_fernet.encrypt(plaintext).decode()
+                    self._conn.execute(
+                        f"UPDATE {self._table} SET ciphertext = ?, "
+                        f"updated_at = ? WHERE key = ?",
+                        (new_ct, now, k),
+                    )
+                # H-02a: insert the wrapped outgoing master as a history
+                # row. UPSERT shape protects against re-running rotation
+                # against a partially-rotated DB (idempotent on the
+                # version slot — though such a re-run is itself a bug,
+                # the row already encrypted under the new key would
+                # still decrypt cleanly).
                 self._conn.execute(
-                    f"UPDATE {self._table} SET ciphertext = ?, updated_at = ? "
-                    f"WHERE key = ?",
-                    (new_ct, now, k),
+                    f"INSERT INTO {self._table} "
+                    f"(key, ciphertext, created_at, updated_at) "
+                    f"VALUES (?, ?, ?, ?) "
+                    f"ON CONFLICT(key) DO UPDATE SET "
+                    f"ciphertext = excluded.ciphertext, "
+                    f"updated_at = excluded.updated_at",
+                    (history_key, wrapped_old_master, now, now),
                 )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
         # Swap the in-memory key so subsequent get/set calls use the new
         # one immediately — matches what the app would see after restart.
         self._fernet = new_fernet
         return len(rows)
+
+    def _fernet_master_key_bytes(self) -> bytes:
+        """Return the bytes of the current Fernet master key.
+
+        Used by :meth:`rotate_master_key` to wrap the outgoing master
+        under the new master (KEK pattern). Fernet does not expose its
+        key directly via a public attribute; this helper reads the
+        underlying signing+encryption key bytes from the
+        :class:`cryptography.fernet.Fernet` instance.
+
+        Implementation: a Fernet key is the urlsafe-base64 encoding of
+        16 bytes signing key + 16 bytes encryption key. The Fernet
+        instance keeps these on private attributes ``_signing_key``
+        and ``_encryption_key``. We reconstruct the original key
+        bytes by base64-encoding their concatenation.
+
+        This helper is internal — callers outside ``rotate_master_key``
+        should not need it.
+        """
+        import base64
+        return base64.urlsafe_b64encode(
+            self._fernet._signing_key + self._fernet._encryption_key
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -423,20 +722,175 @@ def list_external_providers() -> list[str]:
 # Factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# H-07 env-backend deprecation surface (Cycle 6, 2026-05-24)
+# ---------------------------------------------------------------------------
+#
+# Per the EnvSecrets section docstring above. The selection-time
+# deprecation warning fires from this helper at every factory call site
+# that resolves to the env backend, gated by:
+#
+#   - HIPAA mode: silent (the G1' RuntimeError in
+#     :func:`enforce_master_key_at_rest_for_hipaa` fires earlier in
+#     lifespan / CLI bootstrap; a second warning here would be noise on
+#     top of an already-fatal boot)
+#   - Carve-out env var ``EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY`` set to a
+#     truthy value (``1`` / ``true`` / ``yes``, case-insensitive): silent.
+#     This is the documented dev/CI opt-in.
+#
+# A module-level once-per-process latch prevents repeated emission when
+# the factory is called from multiple lifespan / CLI paths within one
+# process (web app + CLI subcommand sharing the same interpreter).
+# The latch + log.warning are not thread-safe by construction — at
+# worst, two threads racing through the gate both emit the warning,
+# which is the operator-detection-friendly degradation (two warnings
+# vs zero). Per db-sme-2 cross-route Q1: no behavior change beyond the
+# log.warning side-effect; no shared mutable state touched outside the
+# latch flag itself.
+
+_ENV_BACKEND_CARVE_OUT_VAR = "EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY"
+_env_backend_selection_warned = False
+
+
+def _env_backend_carve_out_active() -> bool:
+    """Return True when the operator has opted into the dev/CI carve-out.
+
+    Truthy values: ``1``, ``true``, ``yes`` (case-insensitive). Anything
+    else — including unset, empty string, ``0``, ``false``, ``no``,
+    ``off``, garbage — is treated as the carve-out NOT being active,
+    which means the deprecation warning fires.
+    """
+    val = os.environ.get(_ENV_BACKEND_CARVE_OUT_VAR, "")
+    return val.strip().lower() in {"1", "true", "yes"}
+
+
+def _warn_env_backend_deprecation() -> None:
+    """Emit the H-07 selection-time deprecation warning for env backend.
+
+    No-op if:
+      - already warned once in this process (once-per-process latch), OR
+      - HIPAA mode is enabled (G1' RuntimeError handles HIPAA case), OR
+      - the carve-out env var is set to a truthy value (dev/CI opt-in).
+
+    Called from :func:`create_secrets_provider` and
+    :func:`_resolve_auto_backend` at every site that lands on the env
+    backend.
+    """
+    global _env_backend_selection_warned
+    if _env_backend_selection_warned:
+        return
+    # Late-bind the HIPAA-mode check to avoid an import cycle: this
+    # module is imported very early during config parsing, before
+    # triage_logging is necessarily settled. The late import inside the
+    # function matches the pattern in
+    # :func:`enforce_master_key_at_rest_for_hipaa`.
+    try:
+        from email_triage.triage_logging import is_hipaa_mode
+        if is_hipaa_mode():
+            # G1' enforce_master_key_at_rest_for_hipaa() will RuntimeError
+            # later in lifespan / CLI bootstrap; don't pile a warning on
+            # top of an already-fatal boot.
+            return
+    except Exception:
+        # If the HIPAA-mode probe fails for any reason (cycle, import
+        # error during test fixture setup), default to emitting the
+        # warning — operator-detectable surfacing is the safer default.
+        pass
+    if _env_backend_carve_out_active():
+        return
+    logger.warning(
+        "secrets.backend='env' is DEPRECATED (H-07). The Fernet master "
+        "key is visible via /proc/<pid>/environ and `podman inspect`. "
+        "Migrate to 'container' (podman/docker secret), 'keyfile' "
+        "(mode 0600 on disk), 'keyring' (OS credential store), or "
+        "'external:<name>' (Vault / KeePass / AWS Secrets Manager / "
+        "etc.). For dev / CI use cases, set %s=1 to suppress this "
+        "warning. Sunset: v0.2.0 turns this warning into a "
+        "RuntimeError unless the env var is set; v0.3.0 removes the "
+        "env backend entirely.",
+        _ENV_BACKEND_CARVE_OUT_VAR,
+    )
+    _env_backend_selection_warned = True
+
+
+def _reset_env_backend_warn_latch_for_tests() -> None:
+    """Test-only: reset the once-per-process latch.
+
+    Exposed for unit tests that need to exercise multiple selection
+    paths in one pytest process. NOT public API; not for use outside
+    ``tests/``.
+    """
+    global _env_backend_selection_warned
+    _env_backend_selection_warned = False
+
+
+def _resolve_auto_backend(container_path: str, master_key_name: str) -> str:
+    """Resolve the deployment-aware ``auto`` backend.
+
+    Prefers ``container`` when the master key is present as a container
+    secret (``<container_path>/<master_key_name>``) — that keeps the
+    Fernet master key out of the process environment. Falls back to
+    ``env`` otherwise, with a loud WARNING: the env backend exposes the
+    key via ``/proc/<pid>/environ`` and ``podman inspect``.
+    """
+    import logging
+    import os
+
+    log = logging.getLogger("email_triage.secrets")
+    candidate = os.path.join(container_path, master_key_name)
+    if os.path.isfile(candidate):
+        log.info(
+            "secrets backend 'auto' resolved to 'container' "
+            "(master key found at %s)", candidate,
+        )
+        return "container"
+    log.warning(
+        "secrets backend 'auto' resolved to 'env' — no container "
+        "secret at %s. The Fernet master key will be read from the "
+        "process environment, where it is visible via "
+        "/proc/<pid>/environ and `podman inspect`. For a hardened "
+        "deployment, provide the key as a podman/docker secret named "
+        "%r, or set secrets.backend explicitly to 'keyfile'.",
+        candidate, master_key_name,
+    )
+    # H-07 (Cycle 6): distinct from the auto-fell-back warning above —
+    # this one is the env-backend deprecation warning gated by HIPAA
+    # mode + carve-out env var. The auto-fell-back warning explains
+    # WHY we landed on env; the deprecation warning says env is going
+    # away.
+    _warn_env_backend_deprecation()
+    return "env"
+
+
 def create_secrets_provider(
     backend: str,
     keyfile_path: str = "~/.config/email-triage/key",
     container_path: str = "/run/secrets",
     external_config: dict[str, Any] | None = None,
+    master_key_name: str = "ET_MASTER_KEY",
 ) -> SecretsProvider:
     """Create a *bootstrap* secrets provider from a backend name.
 
     This returns the provider that supplies the master key.  For the
     runtime secret store (user-managed secrets) see ``DbSecrets``.
+
+    ``backend="auto"`` is deployment-aware — it resolves to
+    ``container`` when the master key is present as a container secret
+    (``<container_path>/<master_key_name>``), else to ``env`` with a
+    loud WARNING. ``master_key_name`` is only consulted for that
+    ``auto`` resolution.
     """
+    if backend == "auto":
+        backend = _resolve_auto_backend(container_path, master_key_name)
     if backend == "container":
         return ContainerSecrets(container_path)
     elif backend == "env":
+        # H-07 (Cycle 6): emit selection-time deprecation warning unless
+        # HIPAA mode (G1' RuntimeError fires) or carve-out env var set.
+        # The _resolve_auto_backend path above already emitted via its
+        # own call to this helper; the latch makes the second call a
+        # no-op so the warning only fires once per process.
+        _warn_env_backend_deprecation()
         return EnvSecrets()
     elif backend == "keyfile":
         return KeyfileSecrets(keyfile_path)
@@ -455,12 +909,43 @@ def create_secrets_provider(
     else:
         raise ValueError(
             f"Unknown secrets backend: '{backend}'. "
-            "Expected one of: container, env, keyfile, keyring, "
+            "Expected one of: auto, container, env, keyfile, keyring, "
             "external:<name>"
         )
 
 
-def bootstrap_secrets_from_config(conn: Any, cfg: Any) -> SecretsProvider:
+def read_bootstrap_master_key(cfg: Any) -> str:
+    """Read the Fernet master key from the bootstrap backend — NO DB needed.
+
+    Steps 1-2 of :func:`bootstrap_secrets_from_config`, factored out for
+    the v0.1.2 single-file encryption encrypted-boot ordering: the
+    SQLCipher storage key is HKDF-derived from this master key, so the
+    key MUST be read BEFORE the (encrypted) DB connection is opened —
+    whereas :func:`bootstrap_secrets_from_config` needs the open
+    connection to construct ``DbSecrets``.
+
+    The master key lives in the *bootstrap backend* (env / keyfile /
+    container secret / keyring / external), NOT in the DB itself, so this
+    read has no chicken-and-egg dependency on the database. The
+    encrypted ``secrets_store`` *table* (which DbSecrets reads later) is a
+    separate surface that only becomes readable AFTER the encrypted
+    connection is open.
+
+    Raises ``SecretNotFound`` if the master key is missing — a hard
+    failure; the app cannot start (encrypted OR plaintext) without it.
+    """
+    bootstrap = create_secrets_provider(
+        cfg.secrets.backend,
+        keyfile_path=cfg.secrets.keyfile_path,
+        external_config=cfg.secrets.external,
+        master_key_name=cfg.secrets.master_key_name,
+    )
+    return bootstrap.require(cfg.secrets.master_key_name)
+
+
+def bootstrap_secrets_from_config(
+    conn: Any, cfg: Any, *, master_key: str | None = None
+) -> SecretsProvider:
     """Build the runtime ``DbSecrets`` provider from a ``TriageConfig``.
 
     1. Build the bootstrap provider from ``cfg.secrets.backend``.
@@ -470,11 +955,271 @@ def bootstrap_secrets_from_config(conn: Any, cfg: Any) -> SecretsProvider:
     Raises ``SecretNotFound`` if the master key is missing from the
     bootstrap store — this is a hard failure; the app cannot start
     without a master key.
+
+    ``master_key`` (optional,  Phase 4): when the caller has ALREADY
+    read the master key via :func:`read_bootstrap_master_key` (the
+    encrypted-boot path reads it before opening the DB), pass it here to
+    skip a redundant second bootstrap-backend read. When ``None`` (the
+    plaintext path + every existing caller), steps 1-2 run as before.
     """
-    bootstrap = create_secrets_provider(
-        cfg.secrets.backend,
-        keyfile_path=cfg.secrets.keyfile_path,
-        external_config=cfg.secrets.external,
-    )
-    master_key = bootstrap.require(cfg.secrets.master_key_name)
+    if master_key is None:
+        master_key = read_bootstrap_master_key(cfg)
     return DbSecrets(conn, master_key)
+
+
+# ---------------------------------------------------------------------------
+# H-02a audit-chain HMAC key derivation (Cycle 6, 2026-05-23)
+# ---------------------------------------------------------------------------
+
+# The ``log_entries`` hash chain HMACs each row under a key derived from the
+# master key via HKDF-SHA256 per RFC 5869. The derived subkey narrows the
+# blast radius of any single-purpose key compromise:
+#
+#   - An attacker who reads the HMAC chain subkey can forge audit rows but
+#     cannot decrypt secrets_store ciphertexts (those use the master Fernet
+#     key directly, not the derived HMAC subkey).
+#   - An attacker who reads the master key has both surfaces, but that
+#     attacker has already won — they can decrypt every secret and forge
+#     the audit chain regardless of how the chain key is derived.
+#
+# Why HKDF and not raw master key:
+#
+#   1. NIST SP 800-108 / RFC 5869 standard construction for per-purpose
+#      subkey derivation.
+#   2. ``cryptography`` library already a dep (see DbSecrets Fernet import).
+#   3. Versioned ``info`` string reserves space for future cryptographic
+#      upgrades (e.g., HKDF-SHA512 or post-quantum) without ambiguity about
+#      which row was hashed under which derivation.
+#
+# The ``info`` field is the per-purpose label per RFC 5869 §3.2; using a
+# project-namespaced + purpose-qualified + version-tagged string makes the
+# derivation deterministic AND distinct from any other HKDF call site
+# (current or future) under the same master.
+#
+# Per medical-scope drawer §2.6: this docstring + the ``info`` constant
+# together name the regulatory framework (§164.312(c)(1) Required-spec
+# integrity), the standard (RFC 5869), and the version suffix (v1) so a
+# future auditor can trace the derivation without cross-referencing.
+
+_AUDIT_CHAIN_HMAC_HKDF_INFO_V1 = b"email_triage/audit/log_chain/hmac/v1"
+
+
+def derive_audit_chain_hmac_key(master_key: str | bytes) -> bytes:
+    """Derive the audit-chain HMAC-SHA256 subkey via HKDF-SHA256.
+
+    Implements RFC 5869 HKDF-Extract-and-Expand with:
+        algorithm = SHA256
+        length    = 32 bytes (HMAC-SHA256 block size)
+        salt      = None (HKDF treats absent salt as a zero-block; the
+                    master key itself provides the entropy)
+        info      = ``_AUDIT_CHAIN_HMAC_HKDF_INFO_V1`` (versioned per-
+                    purpose label)
+
+    Closes H-02a §164.312(c)(1) Required-spec integrity gap by giving
+    ``compute_log_row_hash`` a secret it can HMAC under — defeating the
+    insider-with-DB-write threat model the prior SHA-256-secretless
+    chain admitted (per hipaa-sme-2 Cycle-5 second-pass verdict).
+
+    Args:
+        master_key: the Fernet master key (str or bytes). Either form
+            is accepted; bytes is encoded internally.
+
+    Returns:
+        32 raw bytes suitable for use as an HMAC-SHA256 key. NOT the
+        Fernet representation; this is the OUTPUT of HKDF, not a key
+        for any other cryptographic primitive.
+
+    References:
+        - RFC 5869 (HKDF) §3.1, retrieved 2026-05-23 from
+          https://www.rfc-editor.org/rfc/rfc5869
+        - NIST SP 800-108 Rev. 1 (Key Derivation Using PRFs), §6.3
+          (HKDF as an instantiation), retrieved 2026-05-23 from
+          https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-108r1.pdf
+        - NIST SP 800-66 Rev. 2 §4.4 (HIPAA Security Rule integrity-
+          control implementations), retrieved 2026-05-23 from
+          https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-66r2.pdf
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if isinstance(master_key, str):
+        master_key_bytes = master_key.encode("utf-8")
+    else:
+        master_key_bytes = master_key
+
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=_AUDIT_CHAIN_HMAC_HKDF_INFO_V1,
+    )
+    return hkdf.derive(master_key_bytes)
+
+
+def enforce_master_key_at_rest_for_hipaa(cfg: Any) -> None:
+    """G1' boot-time enforcement of master-key at-rest protection.
+
+    Per H-02a + G1' verdict (hipaa-sme-2 + DA-3 2026-05-23): when HIPAA
+    mode is enabled, the HKDF-derived audit-chain HMAC subkey is
+    structurally meaningful ONLY if the master key itself meets
+    §164.312(a)(2)(iv) at-rest protection. This helper enforces that
+    requirement at boot time — fail-closed if the deploy is misconfigured.
+
+    Rules:
+
+    - HIPAA mode + ``secrets.backend == 'env'`` → RuntimeError. The env
+      backend exposes the Fernet master key via ``/proc/<pid>/environ``
+      and ``podman inspect``, which renders the HMAC subkey forgeable
+      by the same insider-with-DB-write attacker H-02a is designed to
+      stop.
+    - HIPAA mode + ``secrets.backend == 'keyfile'`` + non-0600 file
+      permissions → RuntimeError. Group/world-readable keyfile = same
+      attacker class.
+    - All other backends (``container``, ``keyring``, ``external:*``)
+      are accepted: each delegates at-rest protection to a system with
+      a credible security model (container runtime / OS keyring /
+      purpose-built secrets backend).
+
+    Outside HIPAA mode this helper is a no-op — the env backend is
+    still operational for dev/CI surfaces. Per medical-scope drawer
+    §2 principle 1: H-02a's threat model is HIPAA-scoped, not
+    universal.
+
+    The companion finding H-07 (deprecate env-backend entirely) tracks
+    the broader carve-out cleanup as Cycle 6 must-land separately (or
+    operator-routed defer with concrete reason) per the consolidated
+    GO 2026-05-23.
+
+    Args:
+        cfg: a ``TriageConfig``-shaped object whose ``.secrets``
+            attribute exposes ``.backend`` and ``.keyfile_path``.
+
+    Raises:
+        RuntimeError: if HIPAA mode is on AND the master-key backend
+            is one of the forbidden shapes above.
+    """
+    # Late-bind the HIPAA-mode check to avoid a cycle: triage_logging
+    # already imports from secrets indirectly via web.db's shim chain.
+    from email_triage.triage_logging import is_hipaa_mode
+    if not is_hipaa_mode():
+        return
+    backend = getattr(cfg.secrets, "backend", None)
+    if backend == "env":
+        raise RuntimeError(
+            "H-02a (§164.312(c)(1) + §164.312(a)(2)(iv)): HIPAA mode is "
+            "enabled but secrets.backend='env'. The env backend exposes "
+            "the Fernet master key via /proc/<pid>/environ and `podman "
+            "inspect`, which renders the HKDF-derived audit-chain HMAC "
+            "subkey structurally meaningless against the insider-with-"
+            "DB-write threat model H-02a closes. Use "
+            "secrets.backend='container' / 'keyring' / 'external:<name>' "
+            "/ 'keyfile' (mode 0600) instead. Per hipaa-sme-2 + DA-3 G1' "
+            "boot-enforcement verdict 2026-05-23."
+        )
+    if backend == "keyfile":
+        kpath = getattr(cfg.secrets, "keyfile_path", None)
+        if kpath:
+            expanded = os.path.expanduser(str(kpath))
+            try:
+                mode = os.stat(expanded).st_mode
+            except FileNotFoundError:
+                # The bootstrap path would already have raised
+                # SecretNotFound if the keyfile was actually missing;
+                # reaching here means the path resolves differently
+                # between bootstrap and this stat (rare; misconfig).
+                raise RuntimeError(
+                    f"H-02a: keyfile {expanded} not stat-able during "
+                    f"boot-enforcement check. Per G1' verdict, HIPAA "
+                    f"mode requires the keyfile to exist at mode 0600."
+                )
+            if mode & 0o077:
+                raise RuntimeError(
+                    f"H-02a (§164.312(c)(1) + §164.312(a)(2)(iv)): "
+                    f"HIPAA mode is enabled and secrets.backend="
+                    f"'keyfile' but {expanded} has mode "
+                    f"{oct(mode & 0o777)} (group/world bits set). "
+                    f"Fernet master key must be 0600 (owner-only). "
+                    f"Run: chmod 600 {expanded}. Per hipaa-sme-2 + "
+                    f"DA-3 G1' boot-enforcement verdict 2026-05-23."
+                )
+
+
+def wire_audit_chain_hmac_keys(
+    provider: SecretsProvider,
+    cfg: Any,
+) -> None:
+    """Derive + register HMAC subkeys for every known master-key version.
+
+    Called once at app startup (web/app.py lifespan + every CLI bootstrap
+    that opens a DbSecrets provider) AFTER the provider is populated and
+    AFTER :func:`enforce_master_key_at_rest_for_hipaa` has gated the
+    deploy. Registers the resulting version → key map with
+    :func:`email_triage.db.audit.set_hmac_keys` so subsequent
+    ``compute_log_row_hash`` / ``verify_log_chain`` calls find the keys
+    they need.
+
+    Per H-02a R1-plumbing-IN verdict (hipaa-sme-2 + DA-3 2026-05-23):
+    legacy HMAC chain rows must remain verifiable across master-key
+    rotations per §164.316(b)(2)(i) 6-year retention. The
+    ``DbSecrets.rotate_master_key`` ceremony preserves outgoing master
+    keys under ``secrets_store:master_key_history:v{N}`` via the KEK
+    pattern; this helper loads each preserved version, decrypts it
+    (chain-of-trust via the current master), HKDF-derives a chain
+    subkey from each, and registers them all.
+
+    For non-DbSecrets providers (e.g., a future read-only external
+    backend), only the current master is reachable (no history surface).
+    Such deploys register HMAC key version 0 only; rotation requires
+    custom plumbing per that backend's contract.
+
+    Args:
+        provider: the runtime secrets provider returned by
+            :func:`bootstrap_secrets_from_config`.
+        cfg: a ``TriageConfig``-shaped object whose ``.secrets``
+            attribute exposes ``.master_key_name``.
+
+    Side effects:
+        Populates the module-level HMAC registry in
+        ``email_triage.db.audit`` via ``set_hmac_keys``.
+    """
+    # Late-bind to avoid an import cycle (db.audit doesn't import
+    # secrets at module load; the import here lives inside a function).
+    from email_triage.db.audit import set_hmac_keys
+
+    if isinstance(provider, DbSecrets):
+        current_version = provider.current_master_version()
+        current_master_bytes = provider._fernet_master_key_bytes()
+        hmac_keys: dict[int, bytes] = {
+            current_version: derive_audit_chain_hmac_key(current_master_bytes),
+        }
+        for v in provider._list_master_key_history_versions():
+            if v >= current_version:
+                continue
+            historical = provider.get_historical_master_key(v)
+            if historical is None:
+                # Operator-visible: a history row is missing or
+                # undecryptable. The verifier will raise a chain
+                # break on any row referencing this version. Log at
+                # WARNING so this surfaces in the operator's /logs
+                # viewer immediately.
+                logger.warning(
+                    "H-02a: master_key_history:v%d missing or "
+                    "undecryptable; legacy chain rows under that "
+                    "version will fail verification with "
+                    "operator-detectable error. Restore the row "
+                    "before continuing if any log_entries reference "
+                    "this version.",
+                    v,
+                )
+                continue
+            hmac_keys[v] = derive_audit_chain_hmac_key(historical)
+        set_hmac_keys(hmac_keys, current_version=current_version)
+        return
+
+    # Non-DbSecrets provider — only the current master is exposed.
+    current_master_str = provider.get(cfg.secrets.master_key_name) or ""
+    if current_master_str:
+        set_hmac_keys(
+            {0: derive_audit_chain_hmac_key(current_master_str)},
+            current_version=0,
+        )

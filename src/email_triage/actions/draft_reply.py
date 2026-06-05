@@ -11,7 +11,7 @@ draft-reply LLM call is assembled in this canonical order:
 
     1. M-1+M-2: user-stated style knobs (explicit operator preference)
     2. M-3:     system-derived profile (general voice from past sent mail)
-    3. M-7:     HIPAA-safe per-contact overlay (#171-C; merges the
+    3. M-7:     HIPAA-safe per-contact overlay (-C; merges the
                 per-recipient descriptor on top of the account-level
                 direction for HIPAA-flagged accounts only)
     4. M-4:     retrieved few-shot examples (specific examples for THIS draft)
@@ -218,13 +218,17 @@ async def build_prompt_messages(
         is_style_learning_account_enabled,
         is_style_learning_master_enabled,
     )
+    from email_triage.web.db_threadpool import db_call
     from email_triage.triage_logging import is_account_hipaa
 
+    #  — build_prompt_messages is awaited from DraftReplyAction.
+    # execute, which runs on the event-loop thread. Every shared-
+    # connection read below hops to the threadpool via db_call.
     hipaa = bool(getattr(message, "hipaa", False)) or (
         account is not None and is_account_hipaa(account)
     )
     try:
-        master_enabled = is_style_learning_master_enabled(db)
+        master_enabled = await db_call(is_style_learning_master_enabled, db)
     except Exception:
         master_enabled = False
     try:
@@ -242,15 +246,21 @@ async def build_prompt_messages(
         except (TypeError, ValueError):
             account_id = None
     try:
-        knobs = get_user_style_knobs(db, user_id) if user_id else None
+        knobs = (
+            await db_call(get_user_style_knobs, db, user_id)
+            if user_id else None
+        )
     except Exception:
         knobs = None
     try:
-        profile = get_style_profile(db, account_id) if account_id else None
+        profile = (
+            await db_call(get_style_profile, db, account_id)
+            if account_id else None
+        )
     except Exception:
         profile = None
 
-    # Punch list #162 — when alias-aware learning is on for this
+    # Punch list  — when alias-aware learning is on for this
     # account, swap the account-wide descriptor for the one matching
     # the From-address the reply will use. Fallback chain:
     # alias-specific → primary → account-wide → no prefix.
@@ -262,12 +272,14 @@ async def build_prompt_messages(
                 list_account_style_per_alias,
                 normalise_from_address,
             )
-            if is_alias_mode_enabled_for_account(db, account_id):
+            if await db_call(is_alias_mode_enabled_for_account, db, account_id):
                 from email_triage.actions.style_profile import (
                     StyleProfile as _SP,
                     resolve_alias_profile,
                 )
-                rows = list_account_style_per_alias(db, account_id)
+                rows = await db_call(
+                    list_account_style_per_alias, db, account_id,
+                )
                 alias_profiles: dict[str, _SP] = {}
                 for r in rows:
                     try:
@@ -296,7 +308,7 @@ async def build_prompt_messages(
             # alias feature is additive and must never break drafting.
             pass
 
-    # #152 Phase 2: per-account opt-in to render M-1+M-2 (operator-
+    #  Phase 2: per-account opt-in to render M-1+M-2 (operator-
     # typed style knobs) on HIPAA-flagged accounts. Default False —
     # operator must explicitly tick the "Allow my own writing-style
     # preferences for this HIPAA-flagged account" checkbox on
@@ -304,10 +316,12 @@ async def build_prompt_messages(
     m1m2_hipaa_allow = False
     if hipaa and account_id is not None:
         try:
-            m1m2_hipaa_allow = is_style_knobs_hipaa_allow(db, account_id)
+            m1m2_hipaa_allow = await db_call(
+                is_style_knobs_hipaa_allow, db, account_id,
+            )
         except Exception:
             # Read failure = fall back to hard-off; the privacy bias is
-            # "more redaction, never less" per docs/privacy-audit-runbook.md.
+            # "more redaction, never less" per internal documentation.
             m1m2_hipaa_allow = False
 
     # Anti-AI style guide (install-wide + per-user). Same shape as the
@@ -320,17 +334,17 @@ async def build_prompt_messages(
     anti_ai_user = ""
     anti_ai_disable_global = False
     try:
-        anti_ai_global = get_global_anti_ai_style_guide(db)
+        anti_ai_global = await db_call(get_global_anti_ai_style_guide, db)
     except Exception:
         anti_ai_global = ""
     try:
-        anti_ai_user, anti_ai_disable_global = get_user_anti_ai_style_guide(
-            db, user_id,
+        anti_ai_user, anti_ai_disable_global = await db_call(
+            get_user_anti_ai_style_guide, db, user_id,
         )
     except Exception:
         anti_ai_user, anti_ai_disable_global = ("", False)
 
-    # ---- M-7 per-contact HIPAA overlay (#171-C) -----------------------
+    # ---- M-7 per-contact HIPAA overlay -----------------------
     # The M-7 draft-time consumer merges per-recipient HIPAA-safe
     # overlay descriptors on top of the account-level direction. Gate:
     # only fire for HIPAA-flagged accounts AND when the style-learning
@@ -363,8 +377,13 @@ async def build_prompt_messages(
             if sender_bare:
                 recipient_addrs.append(sender_bare)
             if secrets_provider is not None and recipient_addrs:
+                #  — merge_overlays_for_recipients reads the shared
+                # connection; dispatch it off the event loop via
+                # db_call (consistent with every other DB read in this
+                # async builder).
                 merged_overlay, recipient_hashes = (
-                    merge_overlays_for_recipients(
+                    await db_call(
+                        merge_overlays_for_recipients,
                         db, account_id, recipient_addrs,
                         secrets=secrets_provider,
                     )
@@ -420,7 +439,10 @@ async def build_prompt_messages(
     # The gate inside ``_should_use_rag`` re-checks HIPAA + the master
     # + per-account toggle + the presence of an embedding backend on
     # app.state. A False here means we cleanly skip the layer.
-    if _should_use_rag(db, account, app):
+    #  — _should_use_rag reads the shared connection (the toggle
+    # gates); dispatch it through db_call so the read runs off the
+    # event loop under the process-wide DB lock.
+    if await db_call(_should_use_rag, db, account, app):
         try:
             from email_triage.actions.sent_mail_index import SentMailIndex
         except Exception:
@@ -539,7 +561,7 @@ class DraftReplyAction(Action):
         from email_triage.actions.base import (
             check_idempotent_already_done, record_idempotent_done,
         )
-        prior = check_idempotent_already_done(
+        prior = await check_idempotent_already_done(
             flow, message, self.name,
         )
         if prior is not None:
@@ -561,6 +583,17 @@ class DraftReplyAction(Action):
                 build_triage_header,
                 encode_draft_body_header,
             )
+            # N-01.c (Cycle 7 2026-05-24 per hipaa-sme-3 Cycle 5 second-pass
+            # preventative warning): the draft_body below is a STATIC
+            # template — only `classification.category` (non-PHI metadata)
+            # is interpolated. N-01 REFUTED at HEAD c7462cc on this basis.
+            # **FUTURE LLM-LANDERS: do NOT introduce PHI interpolation
+            # here without (a) cross-routing to hipaa-sme for §164.502(b)
+            # minimum-necessary review AND (b) walking the actor!=owner
+            # gate from `feedback_hipaa_actor_owner_gate.md` AND (c) the
+            # N-01-forward pre-landing gate per docs/hipaa-findings-
+            # register.md §4.2.** If LLM-draft generation lands here, this
+            # comment becomes load-bearing — re-walk N-01 disposition.
             draft_body = (
                 f"[Auto-drafted reply for {classification.category} email]\n\n"
                 f"This is a draft reply. Please review and edit before sending."
@@ -624,7 +657,7 @@ class DraftReplyAction(Action):
                 "Draft created",
                 extra={"flow_id": flow.flow_id, "draft_id": draft_id},
             )
-            record_idempotent_done(
+            await record_idempotent_done(
                 flow, message, self.name,
                 external_id=str(draft_id) if draft_id is not None else None,
             )

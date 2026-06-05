@@ -1,4 +1,4 @@
-"""Tests for the provider-native label picker on the rule editor (#163).
+"""Tests for the provider-native label picker on the rule editor.
 
 Covers:
 

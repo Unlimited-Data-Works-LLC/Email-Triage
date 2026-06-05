@@ -1,4 +1,4 @@
-"""Tests for whole-mailbox triage feature (#101).
+"""Tests for whole-mailbox triage feature.
 
 Covers:
 - triage_jobs schema + helpers
@@ -173,7 +173,7 @@ class TestTriageJobsHelpers:
 
 
 # ---------------------------------------------------------------------------
-# Dedup: triage_job_messages table + helpers (#101 step 8)
+# Dedup: triage_job_messages table + helpers
 # ---------------------------------------------------------------------------
 
 class TestTriageJobMessagesDedup:
@@ -247,7 +247,7 @@ class TestTriageJobMessagesDedup:
 
 
 # ---------------------------------------------------------------------------
-# High-water-mark cursor (#101 step 9)
+# High-water-mark cursor
 # ---------------------------------------------------------------------------
 
 class TestTriageJobCursor:
@@ -411,7 +411,7 @@ class TestTokenBucket:
         assert 0.20 < elapsed < 0.6, f"unexpected timing: {elapsed:.2f}"
 
     def test_burst_5_allows_5_immediate_then_throttles(self):
-        """#145.2 — operator-tunable burst depth. burst=5 must let
+        """.2 — operator-tunable burst depth. burst=5 must let
         five acquires fire immediately at any rate (the bucket starts
         full at burst capacity), then the 6th waits for the configured
         per-second cadence. Validates the burst knob is honoured."""
@@ -491,6 +491,103 @@ class TestBulkTriageRunner:
 
         final = get_triage_job(db, job_id)
         assert final["status"] == "done"
+
+    def test_setup_window_failure_closes_hipaa_audit_row(
+        self, db, admin_user, regular_user, monkeypatch,
+    ):
+        """ — a failure in the job-setup window (after the
+        ``in_progress`` HIPAA audit row is written, before the batch
+        loop) must NOT leave the audit row stuck ``in_progress``. The
+        outer try/finally now spans the whole post-write region, so the
+        row is closed as ``error`` on any setup-window exception.
+
+        Setup: a NON-owner actor (admin) triages a HIPAA account owned
+        by regular_user — that triggers the ``in_progress`` audit-row
+        write. ``build_default_registry`` is then patched to raise,
+        simulating a setup-window failure between the row open and the
+        batch loop. Pre-#240 that exception escaped every try block and
+        the audit row stayed ``in_progress`` forever.
+        """
+        import json
+        import types
+        from email_triage.web import triage_runner_bulk as bulk
+        from email_triage.config import TriageConfig
+
+        # HIPAA account owned by regular_user.
+        cur = db.execute(
+            "INSERT INTO email_accounts "
+            "(name, provider_type, config_json, is_active, "
+            " created_at, updated_at, user_id, hipaa) "
+            "VALUES (?, 'imap', ?, 1, ?, ?, ?, 1)",
+            (
+                "hipaa-box",
+                json.dumps({"username": "u@x.com", "host": "h", "port": 993}),
+                "2026-01-01T00:00:00", "2026-01-01T00:00:00",
+                regular_user["id"],
+            ),
+        )
+        db.commit()
+        acct_id = cur.lastrowid
+
+        # Job initiated by admin (a NON-owner) — third-party PHI access,
+        # so the in_progress audit row is written.
+        job_id = create_triage_job(
+            db, account_id=acct_id, actor_user_id=admin_user["id"],
+            query="is:unread", rate_msg_per_min=1, concurrency=1,
+        )
+        job = get_triage_job(db, job_id)
+
+        # Stub the provider/classifier builders (called before the
+        # audit-row write) so the test needs no real backends.
+        class _StubProvider:
+            async def close(self):
+                pass
+
+        class _StubClassifier:
+            async def close(self):
+                pass
+
+        from email_triage.web.routers import ui as _ui_mod
+        monkeypatch.setattr(
+            _ui_mod, "_create_provider_from_account",
+            lambda acct, secrets: _StubProvider(),
+        )
+        monkeypatch.setattr(
+            _ui_mod, "_build_classifier_from_config",
+            lambda config: _StubClassifier(),
+        )
+
+        # Inject the setup-window failure: build_default_registry runs
+        # at the top of the protected region, after the in_progress row.
+        from email_triage.web import triage_one as _triage_one
+        def _boom(*a, **kw):
+            raise RuntimeError("setup-window boom")
+        monkeypatch.setattr(
+            _triage_one, "build_default_registry", _boom,
+        )
+
+        app_obj = types.SimpleNamespace()
+        app_obj.state = types.SimpleNamespace(
+            db=db, secrets=None, config=TriageConfig(),
+        )
+
+        # run_triage_all re-raises the setup-window failure (behaviour
+        # preserved); the audit-row close happens in the outer finally.
+        with pytest.raises(RuntimeError, match="setup-window boom"):
+            asyncio.run(bulk.run_triage_all(app_obj, db, job))
+
+        # The HIPAA audit row exists and is NOT stuck in_progress.
+        rows = db.execute(
+            "SELECT outcome FROM hipaa_access_events "
+            "WHERE account_id = ? AND actor_user_id = ? "
+            "AND operation = 'bulk_triage'",
+            (acct_id, admin_user["id"]),
+        ).fetchall()
+        assert len(rows) == 1, "expected exactly one bulk_triage audit row"
+        assert rows[0]["outcome"] == "error", (
+            f"audit row outcome is {rows[0]['outcome']!r} — a setup-"
+            f"window failure left it un-closed (orphaned in_progress)"
+        )
 
     def test_run_triage_all_calls_build_classifier_with_one_arg(self):
         """Regression: ``triage_runner_bulk.run_triage_all`` had a

@@ -1,6 +1,6 @@
 """Discover the Sent / Sent Items folder name for a given provider.
 
-#157 — needed by the on-demand "Mine the Sent Items Now" button on
+ — needed by the on-demand "Mine the Sent Items Now" button on
 ``/profile/style-data``. Discovery rules per provider:
 
   IMAP — RFC 6154 SPECIAL-USE (`\\Sent` flag) via LIST response, then
@@ -21,7 +21,7 @@ We deliberately mirror the Drafts-folder discovery logic in
 ``providers/imap.py`` (same RFC 6154 LIST probe, same fallback order)
 rather than refactor — the Drafts path lives inside ``send_draft``
 where it's intertwined with APPEND retry, and lifting it cleanly is
-out of scope for #157. Keeping the two helpers separate also lets a
+out of scope for . Keeping the two helpers separate also lets a
 future change to one (e.g. Drafts gets a different fallback order)
 land without coupling the other.
 """

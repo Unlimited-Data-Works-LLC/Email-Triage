@@ -1,4 +1,4 @@
-"""Async wrapper for sync DB helpers (#135 — async DB conversion).
+"""Async wrapper for sync DB helpers.
 
 Background
 ----------
@@ -30,34 +30,56 @@ site. This was a deliberate choice — see ``feedback_root_cause_scope.md``
 for the partial-conversion rationale: this commit converts the highest-
 traffic handlers (``/health``, ``/health/detail``, ``/dashboard``) plus
 the access-audit middleware. Other handlers are flagged with
-``# TODO #135 async-DB migration`` so future passes know what's left.
+``# TODO  async-DB migration`` so future passes know what's left.
 
 Concurrency note
 ----------------
 ``asyncio.to_thread`` schedules the work on the default loop executor
 (stdlib ``ThreadPoolExecutor``). The pool's max-workers default is
-``min(32, os.cpu_count() + 4)`` which is plenty for our workload. Each
-thread takes the GIL while it runs SQLite C code, so two threads can't
-truly execute in parallel — but they CAN overlap I/O (the SQLite
-journal flush, page-cache misses) and they don't block the event loop,
-which is the actual win. A handler that previously serialized every
-30s ``/health`` poll behind the slowest query can now interleave.
+``min(32, os.cpu_count() + 4)``. The win is NOT parallel DB execution
+— since  every dispatched call (read AND write) is serialised
+through the one process-wide write lock (see the next section), so two
+``db_call`` invocations never run their SQLite work concurrently. The
+win is that the SQLite work happens OFF the event loop: a slow query
+(large folder count, long ``MAX(created_at)`` scan) no longer freezes
+the loop, so unrelated request handling — timers, other coroutines —
+keeps making progress while the DB call waits its turn for the lock.
+DB calls themselves queue; everything else on the loop does not.
 
 SQLite + threading
 ------------------
 The ``sqlite3`` connection objects we hand around were created with
-``check_same_thread=False`` (see ``init_db``). That's safe because
-SQLite itself is thread-safe (compiled with ``--enable-threadsafe``)
-and we never share a cursor across threads — every helper opens its
-own cursor inside the wrapped call. WAL mode (``PRAGMA journal_mode=
-WAL``) lets readers proceed while a writer holds the lock, so the
-threadpool helps reads scale linearly.
+``check_same_thread=False`` (see ``init_db``). SQLite the *engine* is
+thread-safe, but the Python ``sqlite3`` **driver** is not: it rejects
+two threads using one ``Connection`` object CONCURRENTLY — even for
+two reads — with ``InterfaceError: bad parameter or other API
+misuse``. ``check_same_thread=False`` only lifts the *same-thread*
+assertion; it does not make concurrent use safe.
+
+Concurrent-access serialisation
+--------------------------------------
+``#211`` added a process-wide write lock (``db_writelock``) but it is
+writer-only by design — two concurrent *readers*, or a reader racing
+a writer outside the lock, still collide on the shared connection.
+The app keeps ONE shared ``sqlite3.Connection`` and SQLite is
+single-writer anyway, so there is nothing to lose by serialising
+*every* dispatched DB call through that same lock. ``db_call`` now
+acquires ``db_writelock``'s RLock for the whole duration of each
+dispatched call (read or write). Using the *same* ``RLock`` as
+``@db_write`` is load-bearing: a ``@db_write``-decorated helper
+invoked inside a ``db_call`` re-acquires the lock on the same thread
+instead of self-deadlocking.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, TypeVar
+import logging
+from typing import Any, Callable, TypeVar
+
+from email_triage.web.db_writelock import get_write_lock
+
+_log = logging.getLogger("email_triage.web.db_threadpool")
 
 T = TypeVar("T")
 
@@ -88,8 +110,141 @@ async def db_call(
     -------
     Whatever ``sync_fn`` returns. Exceptions propagate normally —
     ``asyncio.to_thread`` re-raises in the awaiting coroutine.
+
+    Concurrency
+    -----------
+    The dispatched call runs under the process-wide DB lock:
+    the shared ``sqlite3.Connection`` cannot be used by two threads at
+    once, so every read/write is serialised through that one RLock.
+    The lock is acquired *inside* the worker thread (not on the event
+    loop) so awaiting ``db_call`` never blocks the loop — it only
+    queues behind other in-flight DB work.
     """
-    return await asyncio.to_thread(sync_fn, *args, **kwargs)
+    # v0.1.2 single-file encryption  Phase 3 — auto-route write helpers through the
+    # single-writer thread when the writer backend is enabled. Detection
+    # is the ``_et_is_db_write`` tag the ``@db_write`` decorator stamps,
+    # so NO call site changes: writes (tagged) go to the writer; reads
+    # (untagged) stay on the threadpool, freeing it from lock contention.
+    # @db_write helpers route through the single-writer thread whenever one is
+    # installed. Post-N-13 (Phase-3 cutover) the writer is started unconditionally
+    # at boot (web/app.py), so this is the production path. When NO writer is
+    # installed (e.g. unit tests that don't start one), fall through to the legacy
+    #  RLock-via-threadpool path unchanged.
+    if getattr(sync_fn, "_et_is_db_write", False):
+        from email_triage.db._writer import (
+            get_writer,
+            WriterQueueFull,
+        )
+
+        writer = get_writer()
+        if writer is not None:
+            try:
+                return await writer.submit_write(sync_fn, *args, **kwargs)
+            except WriterQueueFull:
+                #  DEFECT-B (§164.312(b)) — a shed write never runs
+                # ``sync_fn``, so the ``@db_write`` gap-event sentinel
+                # (which fires only when the body RAISES) never fires.
+                # For an audit-emitter that is a §164.312(b) Audit
+                # Controls VISIBILITY HOLE: the audit row silently
+                # never lands and nothing records that it was shed.
+                # Make the shed VISIBLE before re-raising (the 503
+                # mapping in web/app.py turns the re-raise into a
+                # fast-loud 503 for the caller).
+                if getattr(sync_fn, "_is_audit_emitter", False):
+                    await _record_shed_audit_write(sync_fn, args, kwargs)
+                raise
+
+    _lock = get_write_lock()
+
+    def _run() -> T:
+        with _lock:
+            return sync_fn(*args, **kwargs)
+
+    return await asyncio.to_thread(_run)
+
+
+async def _record_shed_audit_write(
+    sync_fn: Callable[..., Any], args: tuple, kwargs: dict,
+) -> None:
+    """Make a queue-shed audit-emitter write VISIBLE.
+
+    Closes the §164.312(b) Audit Controls visibility hole: when the
+    writer queue sheds an ``@audit_emitter`` write, ``sync_fn`` never
+    runs, so the ``@db_write`` gap-event sentinel (body-raises path)
+    cannot fire. Without this, an audit row silently fails to land AND
+    nothing records the shed.
+
+    Two-layer, defense-in-depth:
+
+      1. **Best-effort gap-event row.** Attempt
+         :func:`email_triage.db.audit._write_audit_gap_event` against the
+         shared connection (``args[0]`` for a ``@db_write`` helper —
+         conn-first by contract). It runs UNDER the  write lock in a
+         worker thread (NOT on the event loop) so it cannot race the
+         writer thread on the shared ``sqlite3.Connection`` — the same
+         serialization every other dispatched write uses. The gap-event
+         write does NOT itself go back through the (saturated) writer
+         queue, so it cannot recursively shed. If it raises (e.g. the
+         connection itself is also unhealthy) it is swallowed — layer 2
+         still fires.
+      2. **Always-on loud structured ERROR.** Emitted unconditionally so
+         the shed is visible to the §164.312(b) gap-monitor even if the
+         row write in layer 1 fails. Helper + exception names are baked
+         into the message string so the signal survives
+         ``logging.lastResort`` (which strips ``extra`` fields), mirroring
+         the  HOTFIX-4 convention in ``db_writelock``.
+    """
+    from email_triage.db._writer import WriterQueueFull
+
+    helper_name = getattr(sync_fn, "__name__", "<unknown>")
+    conn = args[0] if args else None
+
+    # Layer 1 — best-effort gap-event row, serialized under the write lock.
+    if conn is not None:
+        def _write_gap() -> None:
+            from email_triage.db.audit import _write_audit_gap_event
+            lock = get_write_lock()
+            with lock:
+                # Pass the FULL args tuple (conn included) — matching the
+                # @db_write recovery-path sentinel in db_writelock. The
+                # redaction layer binds args to the emitter's real
+                # signature (conn-first), so stripping conn would
+                # mis-align every positional field.
+                _write_audit_gap_event(
+                    conn,
+                    helper_name=helper_name,
+                    args=args,
+                    kwargs=kwargs,
+                    exc=WriterQueueFull(
+                        "audit-emitter write shed at writer-queue boundary "
+                        "(queue saturated; body never ran)"
+                    ),
+                )
+        try:
+            await asyncio.to_thread(_write_gap)
+        except Exception as gap_exc:  # noqa: BLE001 — must never bury the shed
+            _log.error(
+                "db_call shed audit-emitter write AND the gap-event row "
+                "write failed (gap-on-gap): helper=%s gap_exc=%s. "
+                "§164.312(b) audit row did not land and could not be "
+                "recorded in audit_gap_events.",
+                helper_name,
+                type(gap_exc).__name__,
+                exc_info=gap_exc,
+            )
+
+    # Layer 2 — always-on loud ERROR (guaranteed-visible signal).
+    _log.error(
+        "db_call SHED an audit-emitter write at the writer-queue boundary "
+        "(queue saturated): helper=%s. The §164.312(b) audit row was NOT "
+        "written; a gap-event row was attempted. Backpressure surfaces to "
+        "the caller as HTTP 503.",
+        helper_name,
+        extra={"_extra": {
+            "shed_audit_emitter": helper_name,
+            "audit_gap_reason": "writer_queue_full",
+        }},
+    )
 
 
 __all__ = ["db_call"]

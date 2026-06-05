@@ -1,4 +1,4 @@
-"""Tests for #102 — "Test Now" button on /profile?tab=notifications.
+"""Tests for  — "Test Now" button on /profile?tab=notifications.
 
 The handler fires a single fixed-text message through the same SMTP
 helper the live escalation uses (``send_simple_smtp_email``), so the

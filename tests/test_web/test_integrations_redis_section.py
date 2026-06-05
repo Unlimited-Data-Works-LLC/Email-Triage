@@ -1,4 +1,4 @@
-"""Tests for the /admin/integrations Classification cache section (#151).
+"""Tests for the /admin/integrations Classification cache section.
 
 Covers the GET render (form fields present) + the POST save handler
 (persists URL + TTL onto ``config.redis_cache`` and round-trips through

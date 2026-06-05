@@ -242,7 +242,7 @@ class TestConfigSave:
         resp = client.post(
             "/config/save",
             data={"dry_run": "1", "log_level": "INFO", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_port": "587", "logging_format": "text"},
             cookies=admin_cookies,
         )
@@ -259,7 +259,7 @@ class TestConfigSave:
         resp = client.post(
             "/config/save",
             data={"log_level": "INFO", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_port": "587", "logging_format": "text"},
             cookies=admin_cookies,
         )
@@ -272,7 +272,7 @@ class TestConfigSave:
         resp = client.post(
             "/config/save",
             data={"log_level": "DEBUG", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_port": "587", "logging_format": "text"},
             cookies=admin_cookies,
         )
@@ -297,7 +297,7 @@ class TestConfigSave:
         resp = client.post(
             "/config/save",
             data={"log_level": "INFO", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_host": "mail.example.com", "smtp_port": "465",
                   "smtp_username": "user@example.com", "smtp_from_addr": "noreply@example.com",
                   "smtp_use_tls": "1",
@@ -314,7 +314,7 @@ class TestConfigSave:
         resp = client.post(
             "/config/save",
             data={"log_level": "WARNING", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_port": "587", "logging_format": "text"},
             cookies=admin_cookies,
         )
@@ -326,7 +326,7 @@ class TestConfigSave:
         client.post(
             "/config/save",
             data={"log_level": "DEBUG", "classifier_backend": "ollama",
-                  "classifier_model": "[local-llm-model] "classifier_ollama_url": "http://localhost:11434",
+                  "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
                   "smtp_port": "587", "logging_format": "text"},
             cookies=admin_cookies,
         )
@@ -464,7 +464,7 @@ class TestProfileSave:
         assert resp.status_code == 200
         assert "no notify address" in resp.text
 
-    # #73 — carrier dropdown path -------------------------------------
+    #  — carrier dropdown path -------------------------------------
 
     def test_save_with_carrier_dropdown_computes_address(
         self, client, db, admin_user, admin_cookies,

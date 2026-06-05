@@ -29,8 +29,8 @@ class TestPerUserAntiAiGuideRender:
         # customer names. None should appear in the rendered tooltip /
         # placeholder copy.
         for name in (
-            "user", "claforest", "alice",
-            "family-member", "friend",
+            "exampleuser", "exampleuser", "alice",
+            "exampleuser", "exampleuser",
         ):
             assert name not in body, (
                 f"Generic-placeholder rule: real name {name!r} leaked"

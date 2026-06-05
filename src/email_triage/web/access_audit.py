@@ -1,4 +1,4 @@
-"""Access-audit middleware (#41, HIPAA §164.312(b)).
+"""Access-audit middleware).
 
 Records every authenticated request that hits a PHI-touch route prefix
 into the ``access_log`` table. Captures route + method + status +
@@ -27,7 +27,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from email_triage.triage_logging import request_id_var
-# #135.2: cache the record helper + db_call wrapper at module load. The
+# .2: cache the record helper + db_call wrapper at module load. The
 # previous middleware lazy-imported on every PHI request, which is both
 # a lookup tax (~1.5µs * thousands of requests) and a foot-gun (the
 # audit write happened to share an import path with anything that
@@ -171,7 +171,7 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
             if not _is_phi_path(path):
                 return response
 
-            # #135.2: prefer the auth-dependency-resolved user that the
+            # .2: prefer the auth-dependency-resolved user that the
             # route handler already populated on ``request.state.user``
             # (auth dependency on the route ran upstream of us in the
             # ASGI flow). Fall back to the same ``get_current_user``
@@ -185,8 +185,17 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
                 actor_user_id = cached_user.get("id")
             else:
                 try:
+                    #  — ``get_current_user`` touches the shared
+                    # ``app.state.db`` connection (``verify_api_key`` is
+                    # @db_write, ``get_user_by_email`` is an undecorated
+                    # reader). Running it inline here did the SQLite work
+                    # ON the event-loop thread, which both freezes the
+                    # loop for the query duration AND can collide with a
+                    # concurrent ``db_call`` worker on the one shared
+                    # connection. Dispatch it through ``db_call`` so the
+                    # work runs off-loop under the process-wide DB lock.
                     from email_triage.web.dependencies import get_current_user
-                    user = get_current_user(request)
+                    user = await _db_call(get_current_user, request)
                     if user is not None:
                         actor_user_id = user.get("id")
                 except Exception:
@@ -199,7 +208,7 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
             request_id = getattr(request.state, "request_id", "") or None
             app_state = request.app.state
 
-            # #135.2: fire-and-forget the audit write. The write MUST
+            # .2: fire-and-forget the audit write. The write MUST
             # still happen — we just don't make the client wait on it.
             # ``asyncio.create_task`` schedules the write on the loop;
             # ``db_call`` puts the actual SQLite work on the threadpool.
@@ -287,7 +296,7 @@ async def _audit_write(
 ) -> None:
     """Background coroutine that performs the access_log write.
 
-    #135.2: split out from ``dispatch`` so failure handling lives
+    .2: split out from ``dispatch`` so failure handling lives
     inside the task — without this, a threadpool exception would land
     in asyncio's default task-exception handler (silent log + drop)
     instead of bumping ``audit_failures`` so /health can flip degraded.

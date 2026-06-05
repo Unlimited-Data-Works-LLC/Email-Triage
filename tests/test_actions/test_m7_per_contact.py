@@ -42,7 +42,7 @@ def _make_db() -> sqlite3.Connection:
     ``init_db`` -- just the v12 migration body so we keep tests fast
     + scoped to the layer under test.
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -54,7 +54,7 @@ def _make_db() -> sqlite3.Connection:
     """)
     from email_triage.web.migrations import MIGRATIONS
     # Run v12 (sent_mail_index create) AND v14 (M-6 is_captured_pair
-    # column add) AND v15 (#136 embedding_norm column for the numpy
+    # column add) AND v15 ( embedding_norm column for the numpy
     # cosine fast path). M-7 was authored before M-6 landed on main;
     # the SELECT path now references is_captured_pair AND
     # embedding_norm, so the fixture has to mirror the merged schema.
@@ -144,7 +144,7 @@ def _seed_row(
         digest = hashlib.sha256(body.encode("utf-8")).digest()
         vec = [digest[i] / 255.0 for i in range(8)]
     blob = struct.pack(f"<{len(vec)}f", *vec)
-    # #136: precomputed L2 norm matches what index_message would write.
+    # : precomputed L2 norm matches what index_message would write.
     # Tests that bypass the public method via this helper still need to
     # populate the column or retrieve_similar will skip the row.
     import math as _math
@@ -523,7 +523,7 @@ class TestSenderAddressExtraction:
     def test_display_name_stripped(self):
         """``"Alice" <alice@example.com>`` -> ``alice@example.com``.
 
-        Relies on the existing _extract_addr helper from #117; pinned
+        Relies on the existing _extract_addr helper from ; pinned
         here so the M-7 wiring in build_prompt_messages doesn't depend
         on a future regression in that helper without a test fail.
         """

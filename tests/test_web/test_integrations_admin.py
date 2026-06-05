@@ -142,10 +142,10 @@ class TestAdminIntegrationsSave:
     def _form(
         self,
         *,
-        public_url: str = "https://deployhost.example.ts.net",
+        public_url: str = "https://the deploy host.example.ts.net",
         topic: str = "projects/proj-a/topics/gmail-push",
         sa_email: str = "pusher@proj-a.iam.gserviceaccount.com",
-        audience: str = "https://deployhost.example.ts.net",
+        audience: str = "https://the deploy host.example.ts.net",
     ):
         return {
             "public_url": public_url,
@@ -163,13 +163,13 @@ class TestAdminIntegrationsSave:
         ) as mock_write:
             resp = client.post(
                 "/admin/integrations/save",
-                data=self._form(public_url="https://deployhost.example.ts.net/"),
+                data=self._form(public_url="https://the deploy host.example.ts.net/"),
                 follow_redirects=False,
             )
         assert resp.status_code == 303
         # Trailing slash stripped from public_url; in-memory config
         # mutated to the cleaned value.
-        assert app.state.config.push.public_url == "https://deployhost.example.ts.net"
+        assert app.state.config.push.public_url == "https://the deploy host.example.ts.net"
         # _write_config_yaml called with the same config object so the
         # YAML emit picks up the cleaned values.
         mock_write.assert_called_once()

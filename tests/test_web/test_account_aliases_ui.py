@@ -1,4 +1,4 @@
-"""HTTP-level tests for the additional-addresses UI (#106).
+"""HTTP-level tests for the additional-addresses UI.
 
 Covers the round-trip of POST /accounts/{id}/aliases/add and POST
 /accounts/{id}/aliases/remove. The handlers re-render the

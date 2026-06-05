@@ -1,4 +1,4 @@
-"""Re-embed an account's ``sent_mail_index`` rows (#180 C).
+"""Re-embed an account's ``sent_mail_index`` rows.
 
 When the operator switches embedding backends or models, the
 existing per-row vectors are computed against the OLD backend —
@@ -184,12 +184,20 @@ async def run_embedding_reindex_job(
     job_id = job_row["job_id"]
     account_id = int(job_row["account_id"])
 
+    #  — run_embedding_reindex_job is awaited from the bulk
+    # dispatcher loop on the event-loop thread. Every shared-connection
+    # touch below (the @db_write finish/bump helpers, get_email_account,
+    # the raw COUNT / cursor / batch-SELECT / per-row UPDATE statements)
+    # hops to the threadpool via db_call.
+    from email_triage.web.db_threadpool import db_call
+
     # 1. Belt-and-braces: refuse to run if the embedding stack
     #    isn't installed yet. The admin button also gates this but
     #    a future code path that enqueues from elsewhere shouldn't
     #    be able to spin a doomed job.
     if not is_runtime_ready():
-        finish_triage_job(
+        await db_call(
+            finish_triage_job,
             conn, job_id, status="failed",
             error_text=(
                 "Embedding runtime is not installed yet — install via "
@@ -202,7 +210,8 @@ async def run_embedding_reindex_job(
     #    hasn't configured one — there's nothing to reindex against.
     embedding_backend = getattr(app.state, "embedding_backend", None)
     if embedding_backend is None:
-        finish_triage_job(
+        await db_call(
+            finish_triage_job,
             conn, job_id, status="failed",
             error_text=(
                 "No embedding backend configured — reindex needs a "
@@ -220,9 +229,10 @@ async def run_embedding_reindex_job(
     #    entry), so the reindex is structurally a no-op. We finish
     #    'done' rather than 'failed' — the operator's intent was
     #    served, just trivially.
-    acct = get_email_account(conn, account_id)
+    acct = await db_call(get_email_account, conn, account_id)
     if acct is None:
-        finish_triage_job(
+        await db_call(
+            finish_triage_job,
             conn, job_id, status="failed",
             error_text="account not found",
         )
@@ -232,7 +242,7 @@ async def run_embedding_reindex_job(
             "embedding_reindex: HIPAA account; trivially done",
             extra={"_extra": {"account_id": account_id}},
         )
-        finish_triage_job(conn, job_id, status="done")
+        await db_call(finish_triage_job, conn, job_id, status="done")
         return
 
     # 4. Count total rows up-front for progress display. The worker
@@ -243,27 +253,33 @@ async def run_embedding_reindex_job(
     #    free reuse). The dedup table (triage_job_messages) is NOT
     #    used — message-id idempotence isn't the right shape for
     #    "skip rows already at target model".
-    total_row = conn.execute(
-        "SELECT COUNT(*) AS n FROM sent_mail_index WHERE account_id = ?",
-        (account_id,),
-    ).fetchone()
-    total = int(total_row["n"] if total_row else 0)
+    def _count_total() -> int:
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM sent_mail_index WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+        return int(total_row["n"] if total_row else 0)
+
+    total = await db_call(_count_total)
 
     if total == 0:
         log.info(
             "embedding_reindex: account has no sent_mail_index rows",
             extra={"_extra": {"account_id": account_id}},
         )
-        finish_triage_job(conn, job_id, status="done")
+        await db_call(finish_triage_job, conn, job_id, status="done")
         return
 
     # Persist the total via the cursor field so the UI can show
     # "X of Y" without an extra COUNT(*) on every poll.
-    conn.execute(
-        "UPDATE triage_jobs SET cursor = ? WHERE job_id = ?",
-        (str(total), job_id),
-    )
-    conn.commit()
+    def _persist_total_cursor() -> None:
+        conn.execute(
+            "UPDATE triage_jobs SET cursor = ? WHERE job_id = ?",
+            (str(total), job_id),
+        )
+        conn.commit()
+
+    await db_call(_persist_total_cursor)
 
     # 5. Walk rows in batches. Using id as the cursor (autoincrement,
     #    monotonic) gives a stable resume order regardless of
@@ -274,11 +290,26 @@ async def run_embedding_reindex_job(
     skipped = 0
 
     while True:
-        # Cancel check — operator cancels via the bulk-runs cancel
-        # endpoint; the job status flips to 'cancelled' and we exit
-        # at the next batch boundary.
-        latest = get_triage_job(conn, job_id)
-        if latest and latest.get("status") == "cancelled":
+        # Cancel check + batch fetch in one threadpool hop. Operator
+        # cancels via the bulk-runs cancel endpoint; the job status
+        # flips to 'cancelled' and we exit at the next batch boundary.
+        def _cancel_check_and_fetch(_last_id: int):
+            latest = get_triage_job(conn, job_id)
+            cancelled = bool(latest and latest.get("status") == "cancelled")
+            if cancelled:
+                return True, []
+            rows = conn.execute(
+                "SELECT id, message_id, subject, body_excerpt, "
+                "       embedding_model, embedding_dimension "
+                "FROM sent_mail_index "
+                "WHERE account_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (account_id, _last_id, BATCH_SIZE),
+            ).fetchall()
+            return False, rows
+
+        cancelled, batch = await db_call(_cancel_check_and_fetch, last_id)
+        if cancelled:
             log.info(
                 "embedding_reindex: cancellation observed",
                 extra={"_extra": {
@@ -288,17 +319,22 @@ async def run_embedding_reindex_job(
             # finish_triage_job is idempotent under the request_triage_
             # job_cancel set; bulk runner's wrapper will tag the row.
             return
-
-        batch = conn.execute(
-            "SELECT id, message_id, subject, body_excerpt, "
-            "       embedding_model, embedding_dimension "
-            "FROM sent_mail_index "
-            "WHERE account_id = ? AND id > ? "
-            "ORDER BY id ASC LIMIT ?",
-            (account_id, last_id, BATCH_SIZE),
-        ).fetchall()
         if not batch:
             break
+
+        # Snapshot the cumulative counters so the per-batch bump below
+        # uses this batch's genuine delta. The old code bumped
+        # processed by len(batch) and skipped/errors by a literal 0 —
+        # so the job's UI counters always showed every row processed.
+        _batch_start_processed = processed
+        _batch_start_skipped = skipped
+        _batch_start_errors = errors
+
+        #  — the embed call is awaited per-row; the SQLite UPDATE
+        # is NOT. Collect the per-row updates here and apply them in a
+        # single db_call hop at the batch boundary so no row write
+        # runs on the event-loop thread.
+        pending_updates: list[tuple] = []
 
         for row in batch:
             row_id = int(row["id"])
@@ -329,7 +365,7 @@ async def run_embedding_reindex_job(
                 # finishes 'done' with an error count; operator can
                 # re-enqueue if errors are high. We don't retry per-row
                 # here: the retry_backoff schedules are tuned for
-                # message-level retry (#175), not embedding probes that
+                # message-level retry, not embedding probes that
                 # are typically deterministic-fail when wrong.
                 errors += 1
                 log.warning(
@@ -350,45 +386,57 @@ async def run_embedding_reindex_job(
             packed = _pack_vec([float(x) for x in vec])
             dimension = len(vec)
             now = _now_iso()
-            try:
-                conn.execute(
-                    "UPDATE sent_mail_index SET "
-                    "  embedding_vec = ?, "
-                    "  embedding_norm = ?, "
-                    "  embedding_model = ?, "
-                    "  embedding_dimension = ?, "
-                    "  indexed_at = ? "
-                    "WHERE id = ?",
-                    (
-                        packed, float(norm), target_model,
-                        dimension, now, row_id,
-                    ),
-                )
-            except sqlite3.Error as exc:
-                errors += 1
-                log.warning(
-                    "embedding_reindex: row write failed",
-                    extra={"_extra": {
-                        "account_id": account_id, "row_id": row_id,
-                        "error_type": type(exc).__name__,
-                    }},
-                )
-                continue
+            pending_updates.append(
+                (packed, float(norm), target_model, dimension, now, row_id),
+            )
 
-            processed += 1
+        # Apply the batch's row updates + commit in one threadpool hop.
+        # Per-row write failures are counted but don't abort the batch
+        # — matches the pre-#241 per-row try/except behaviour.
+        def _apply_batch_updates(updates: list[tuple]) -> int:
+            ok = 0
+            for params in updates:
+                try:
+                    conn.execute(
+                        "UPDATE sent_mail_index SET "
+                        "  embedding_vec = ?, "
+                        "  embedding_norm = ?, "
+                        "  embedding_model = ?, "
+                        "  embedding_dimension = ?, "
+                        "  indexed_at = ? "
+                        "WHERE id = ?",
+                        params,
+                    )
+                    ok += 1
+                except sqlite3.Error as exc:
+                    log.warning(
+                        "embedding_reindex: row write failed",
+                        extra={"_extra": {
+                            "account_id": account_id,
+                            "row_id": params[5],
+                            "error_type": type(exc).__name__,
+                        }},
+                    )
+            conn.commit()
+            return ok
 
-        # Commit the batch + bump the UI counter.
-        conn.commit()
-        bump_triage_job_counters(
+        batch_ok = await db_call(_apply_batch_updates, pending_updates)
+        processed += batch_ok
+        errors += len(pending_updates) - batch_ok
+
+        # Bump the UI counter.
+        await db_call(
+            bump_triage_job_counters,
             conn, job_id,
             seen=len(batch),
-            processed=sum(1 for r in batch if int(r["id"]) <= last_id),
-            skipped=0,
-            errors=0,
+            processed=processed - _batch_start_processed,
+            skipped=skipped - _batch_start_skipped,
+            errors=errors - _batch_start_errors,
         )
-        # Direct counter set rather than continuous deltas — bump_*
-        # adds, so to avoid drift on resume we just absorb the batch
-        # cleanly. The cancellation poll already happened above.
+        # bump_* ADDS — so each batch contributes only its own delta
+        # (cumulative-now minus cumulative-at-batch-start). Over the
+        # run the job counters sum to the true processed / skipped /
+        # errors totals. The cancellation poll already happened above.
         if INTER_BATCH_SLEEP_SECS > 0:
             await asyncio.sleep(INTER_BATCH_SLEEP_SECS)
 
@@ -404,9 +452,14 @@ async def run_embedding_reindex_job(
             "target_backend": target_backend_type,
         }},
     )
-    finish_triage_job(
+    await db_call(
+        finish_triage_job,
         conn, job_id,
-        status="done" if errors == 0 else "done",
+        # A run where every row errored and none succeeded is a
+        # failure, not a success — otherwise the operator never knows
+        # to re-enqueue. A partial run (some rows succeeded)
+        # stays "done"; error_text carries the partial-failure detail.
+        status="failed" if (errors and not processed) else "done",
         error_text=(
             f"{errors} row(s) failed to re-embed; "
             f"{processed} succeeded, {skipped} skipped"

@@ -1,4 +1,4 @@
-"""Tests for #95 sub-A — auto-chained wizard flow.
+"""Tests for  sub-A — auto-chained wizard flow.
 
 The first wave of tests in test_account_wizard.py verified each
 step's basic CRUD shape. This file covers the auto-chain

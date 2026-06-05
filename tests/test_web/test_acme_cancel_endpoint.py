@@ -1,4 +1,4 @@
-"""Tests for ``POST /admin/acme-status/cancel`` (#103).
+"""Tests for ``POST /admin/acme-status/cancel``.
 
 The cancel endpoint flips the ``cancel_requested`` flag on the
 in-flight ACME job; the worker thread reads the flag at retry-loop

@@ -1,4 +1,4 @@
-"""Tests for the watcher per-message retry queue (#175 R-A).
+"""Tests for the watcher per-message retry queue.
 
 Covers:
 * Migration v30 round-trip — table + indexes + CHECK constraints.
@@ -191,7 +191,8 @@ class TestMigrationV30:
 # ---------------------------------------------------------------------------
 
 class TestEnqueueValidation:
-    def test_imap_requires_mailbox_uid_uidvalidity(self, conn, account_id):
+    def test_imap_requires_mailbox_and_uid(self, conn, account_id):
+        # mailbox + uid are still hard-required for IMAP rows.
         with pytest.raises(ValueError):
             enqueue_retry(
                 conn, account_id=account_id, provider_type="imap",
@@ -200,9 +201,25 @@ class TestEnqueueValidation:
         with pytest.raises(ValueError):
             enqueue_retry(
                 conn, account_id=account_id, provider_type="imap",
-                mailbox="INBOX", uid=1,
+                mailbox="INBOX",  # uid missing
                 error_class="X",
             )
+
+    def test_imap_accepts_none_uidvalidity_storing_sentinel(
+        self, conn, account_id,
+    ):
+        """#239c — an IMAP server with no UIDVALIDITY response code
+        yields ``uidvalidity=None``. ``enqueue_retry`` must NOT raise:
+        it stores the sentinel 0 so the row enqueues and the 
+        IMAP-poll HWM can advance past the failed message."""
+        rid = enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=1, uidvalidity=None,
+            error_class="X",
+        )
+        row = get_retry(conn, rid)
+        assert row is not None
+        assert row["uidvalidity"] == 0
 
     def test_gmail_requires_gmail_msg_id(self, conn, account_id):
         with pytest.raises(ValueError):
@@ -688,3 +705,92 @@ class TestScheduleExhaustion:
             "WHERE gmail_msg_id='exhaust'"
         ).fetchone()
         assert row["attempt_count"] == 6
+
+
+# ---------------------------------------------------------------------------
+#  — gmail_api provider_type normalisation (end to end)
+# ---------------------------------------------------------------------------
+
+class TestGmailApiProviderTypeEnqueue:
+    def test_gmail_api_account_produces_a_real_row(self, conn):
+        """A Gmail account carries provider_type='gmail_api'. The
+        enqueue_watcher_retry shim must normalise that to the queue
+        slug 'gmail' so a real retry row lands — before  the
+        unnormalised slug raised ValueError inside enqueue_retry, the
+        watcher swallowed it, and NO row was ever created."""
+        from email_triage.web.watcher_retry import enqueue_watcher_retry
+
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            "INSERT INTO users (email, name, role, created_at) "
+            "VALUES ('g@x.com','G','user',?)", (now,),
+        )
+        uid = int(cur.lastrowid)
+        cur = conn.execute(
+            "INSERT INTO email_accounts "
+            "(user_id, name, provider_type, config_json, "
+            " created_at, updated_at) VALUES (?,?,?,?,?,?)",
+            (uid, "Gmail", "gmail_api", "{}", now, now),
+        )
+        acct_id = int(cur.lastrowid)
+        conn.commit()
+
+        retry_id = enqueue_watcher_retry(
+            conn,
+            account_id=acct_id,
+            provider_type="gmail_api",       # account's native slug
+            gmail_msg_id="msg_real_001",
+            error=RuntimeError("connection reset"),
+        )
+        assert retry_id is not None
+        row = conn.execute(
+            "SELECT provider_type, gmail_msg_id, state "
+            "FROM watcher_retry_queue WHERE id=?", (retry_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["provider_type"] == "gmail"   # normalised
+        assert row["gmail_msg_id"] == "msg_real_001"
+        assert row["state"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# failure_kind column
+# ---------------------------------------------------------------------------
+
+class TestFailureKind:
+    def test_enqueue_persists_failure_kind(self, conn, account_id):
+        rid = enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=7, uidvalidity=1,
+            error_class="LLMBackendUnreachableError", error_msg="down",
+            failure_kind="llm_unreachable",
+        )
+        row = get_retry(conn, rid)
+        assert row["failure_kind"] == "llm_unreachable"
+
+    def test_enqueue_default_failure_kind_is_null(self, conn, account_id):
+        rid = enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=8, uidvalidity=1,
+            error_class="TimeoutError", error_msg="x",
+        )
+        row = get_retry(conn, rid)
+        assert row["failure_kind"] is None
+
+    def test_reenqueue_without_kind_keeps_original(self, conn, account_id):
+        """A bare re-enqueue (the drainer's transient-failure path)
+        must not wipe the original failure_kind."""
+        enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=9, uidvalidity=1,
+            error_class="LLMBackendUnreachableError", error_msg="down",
+            failure_kind="llm_unreachable",
+        )
+        rid = enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=9, uidvalidity=1,
+            error_class="TimeoutError", error_msg="x",
+            # no failure_kind — bump branch.
+        )
+        row = get_retry(conn, rid)
+        assert row["failure_kind"] == "llm_unreachable"

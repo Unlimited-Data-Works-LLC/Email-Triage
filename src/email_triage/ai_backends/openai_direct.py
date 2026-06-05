@@ -1,4 +1,4 @@
-"""OpenAI direct + OpenAI-compatible adapter (#171-A).
+"""OpenAI direct + OpenAI-compatible adapter.
 
 Sibling to :class:`email_triage.ai_backends.azure_openai.AzureOpenAIAdapter`.
 Wraps the same OpenAI ``/v1/chat/completions`` API surface that the
@@ -24,8 +24,7 @@ This module mirrors the canonical pattern set by
   :class:`OpenAIAdapter`, so the existing classifier path can use it
   without waiting for :func:`load_backend` migration.
 * :class:`OpenAIError` + :class:`OpenAIAuthError` — error classes with
-  the defensive ``_TOKEN_KEYS`` body-scrub at construction time
-  (#168 hardening, identical pattern to :class:`AzureOpenAIError`).
+  the defensive ``_TOKEN_KEYS`` body-scrub at construction time.
 
 File name
 ---------
@@ -55,7 +54,7 @@ Privacy
 -------
 The adapter never logs the api_key, never round-trips it through
 templates, and scrubs token-shape keys out of any error body before
-incorporating it into the exception message (#168 hardening pattern,
+incorporating it into the exception message ( hardening pattern,
 mirroring :class:`GmailApiError` + :class:`AzureOpenAIError`).
 """
 
@@ -65,7 +64,8 @@ import logging
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
+from email_triage._http_client import LazyHttpClient
+from email_triage.classify.base import JsonChatClassifier
 
 logger = logging.getLogger("email_triage.ai_backends.openai_direct")
 
@@ -91,7 +91,7 @@ class OpenAIError(Exception):
 
     Defensive token-shape scrub at construction time (mirrors the
     :class:`AzureOpenAIError` pattern, which mirrors :class:`GmailApiError`
-    from commit ``2de45ea`` / #168). The fallback ``str(body)`` path is
+    from commit ``2de45ea`` / ). The fallback ``str(body)`` path is
     reachable when an upstream proxy injects a non-OpenAI response or
     when a future refactor returns the wrong dict shape — in either
     case, if a token-bearing field ever lands in the response dict,
@@ -246,6 +246,11 @@ class OpenAIAdapter(BackendAdapter):
         self._default_temperature = default_temperature
         self._default_max_tokens = default_max_tokens
         self._timeout = timeout
+        #  — one long-lived pooled httpx client per adapter
+        # instance, reused across every chat_complete() call instead of
+        # a fresh AsyncClient (TLS handshake) per call. Mirrors the
+        # classify/* cloud classifiers and OllamaClassifier.
+        self._http = LazyHttpClient(timeout=timeout)
 
         # HIPAA gate posture mirrors classify.openai_compat — local
         # endpoints (localhost / RFC1918 / .local / operator-defined
@@ -255,6 +260,10 @@ class OpenAIAdapter(BackendAdapter):
             self._endpoint,
             extra_suffixes=tuple(local_url_suffixes or ()),
         )
+
+    async def close(self) -> None:
+        """Drain the pooled HTTP client (BackendAdapter.close override)."""
+        await self._http.aclose()
 
     # ------------------------------------------------------------------
     # Canonical W1-A method
@@ -350,7 +359,22 @@ class OpenAIAdapter(BackendAdapter):
                 continue
             body[k] = v
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        #  — wrap the POST in the shared circuit-breaker helper, the
+        # same translation  added to classify/openai_compat.py. A
+        # dead OpenAI-compatible endpoint (connection refused / network
+        # blip) now trips the breaker and re-raises a typed
+        # LLMBackendUnreachableError instead of a raw httpx.ConnectError.
+        # Keyed "openai" to match the configured classifier.backend the
+        # is_healthy gate resolves ("ollama"/"openai"/"gemini") — a key
+        # the gate never sees can never gate. A 4xx/5xx is NOT a connect
+        # failure, so the raise_for_status-equivalent status check below
+        # stays OUTSIDE the wrapper: those mean the backend is up but
+        # misbehaving and must not flip the breaker.
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "openai", self._endpoint, default_port=443,
+        ):
+            client = await self._http.get()
             resp = await client.post(url, headers=headers, json=body)
 
         if resp.status_code >= 400:
@@ -426,42 +450,23 @@ class OpenAIAdapter(BackendAdapter):
 # ---------------------------------------------------------------------------
 
 
-def _build_openai_classifier_imports():
-    """Local import helper.
-
-    The classify package depends on the engine.models module, which in
-    turn pulls in a sizeable bit of the SQLite layer. Defer those
-    imports to first-use so ``import email_triage.ai_backends`` stays
-    cheap (e.g. for an admin UI that lists backends without ever
-    calling them).
-    """
-    from email_triage.classify.base import Classifier
-    from email_triage.classify.ollama import _parse_llm_json
-    from email_triage.classify.prompts import (
-        build_system_prompt, build_user_prompt,
-    )
-    from email_triage.engine.models import (
-        Classification, EmailMessage, ListHint,
-    )
-    return (
-        Classifier, _parse_llm_json, build_system_prompt,
-        build_user_prompt, Classification, EmailMessage, ListHint,
-    )
-
-
-class OpenAIClassifier:
-    """:class:`Classifier`-ABC-compatible wrapper around :class:`OpenAIAdapter`.
+class OpenAIClassifier(JsonChatClassifier):
+    """:class:`JsonChatClassifier` subclass wrapping :class:`OpenAIAdapter`.
 
     The existing flow engine calls ``classifier.classify(message, ...)``;
-    this shim adapts to that surface while delegating the HTTP work to
-    the canonical adapter. Same prompt builders + same response parser
-    as the existing :class:`OpenAICompatClassifier` — diverges only at
-    the HTTP-call seam, which now routes through the W1-A adapter.
+    that whole body — prompt build, two-level classification-cache
+    lookup, sender-history hint, JSON parse, out-of-taxonomy
+    :class:`ValueError`, cache store — lives once on
+    :class:`JsonChatClassifier`. This shim implements only the two
+    per-backend hooks:
 
-    The class is built without inheriting from :class:`Classifier`
-    because the ABC + prompt helpers are imported lazily (see
-    :func:`_build_openai_classifier_imports`). This costs one extra
-    method call but keeps ``import email_triage.ai_backends`` cheap.
+    * :meth:`_resolve_model` — the cache key + request model name.
+    * :meth:`_chat` — issue one chat request via the W1-A adapter.
+
+    Subclassing the shared base (rather than re-implementing
+    ``classify``) means the out-of-taxonomy guard fires here too: a
+    model returning a category no route matches raises instead of
+    silently producing a no-op :class:`Classification`.
     """
 
     def __init__(
@@ -484,86 +489,39 @@ class OpenAIClassifier:
             timeout=timeout,
             local_url_suffixes=local_url_suffixes,
         )
+        # ``_model`` is the classification-cache key the shared base
+        # passes to the cache + to :meth:`_chat`. Non-empty fallback
+        # mirrors the pre-refactor ``model_key = self._adapter.model or
+        # "openai"`` behaviour so an empty configured model still keys
+        # the cache stably.
+        self._model = self._adapter.model or "openai"
         # Surface :attr:`is_local` on the shim so the HIPAA gate sees
         # the same answer regardless of which surface it inspects.
         self.is_local = self._adapter.is_local
 
-    async def classify(self, message, categories, list_hints=None):
-        # Lazy import — keeps cold-import path light.
-        (
-            _Classifier, _parse_llm_json, build_system_prompt,
-            build_user_prompt, Classification, _EmailMessage, _ListHint,
-        ) = _build_openai_classifier_imports()
+    async def _chat(
+        self, system_prompt: str, user_prompt: str, model: str,
+    ) -> str:
+        """Issue one chat request via the W1-A adapter; return raw text.
 
-        system_prompt = build_system_prompt(categories, list_hints)
-        user_prompt = build_user_prompt(message)
-
-        # 2026-05-13 two-level cache lookup — same pattern as the
-        # OpenAI-compat / Gemini / Ollama / Azure classifiers. Best-
-        # effort; any cache failure falls through to a live call.
-        outer_key: str | None = None
-        inner_field: str | None = None
-        hint_text: str | None = None
-        try:
-            from email_triage.cache.classification import (
-                cache_lookup_for_message,
-            )
-            model_key = self._adapter.model or "openai"
-            outer_key, inner_field, cache_entry, hint_text = (
-                cache_lookup_for_message(message, model_key, categories)
-            )
-            if cache_entry is not None:
-                logger.info("Classification cache hit (cache_hit=True)")
-                return cache_entry
-        except Exception as e:
-            logger.debug("Classification cache lookup error: %s", e)
-
-        if hint_text:
-            system_prompt = (
-                f"[SENDER HISTORY HINT] {hint_text}\n\n{system_prompt}"
-            )
-
-        raw = await self._adapter.chat_complete(
+        ``model`` is the cache key from :meth:`_resolve_model`; the
+        adapter uses its own configured model for the request payload,
+        so the placeholder cache key never reaches the endpoint.
+        """
+        return await self._adapter.chat_complete(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
         )
-        parsed = _parse_llm_json(raw)
-
-        category = parsed.get("category", "")
-        if category not in categories:
-            logger.warning(
-                "LLM returned unknown category '%s', treating as low confidence",
-                category,
-            )
-        confidence = float(parsed.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-        reason = parsed.get("reason", "")
-        result = Classification(
-            category=category,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
-        )
-
-        try:
-            from email_triage.cache.classification import (
-                cache_store_for_message,
-            )
-            model_key = self._adapter.model or "openai"
-            cache_store_for_message(
-                outer_key, inner_field, model_key, result, categories,
-                is_hipaa=bool(getattr(message, "hipaa", False)),
-            )
-        except Exception as e:
-            logger.debug("Classification cache store error: %s", e)
-
-        return result
 
     async def complete(self, prompt: str) -> str:
         """Raw completion via the underlying adapter."""
         return await self._adapter.complete(
             prompt, max_tokens=2048,
         )
+
+    async def close(self) -> None:
+        """Drain the adapter's pooled HTTP client. Idempotent."""
+        await self._adapter.close()

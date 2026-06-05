@@ -39,6 +39,22 @@
 </article>
 {% endif %}
 
+{# #205 — session revocation. Standalone form: it POSTs to its own
+   action and must sit OUTSIDE the profile-save form below. #}
+<form method="post" action="/profile/sign-out-all"
+      style="margin-bottom:1.25rem;"
+      onsubmit="return confirm('Sign out of every device, including this one? You will be returned to the login page.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="secondary outline" style="width:auto;">
+        Sign out all sessions
+    </button>
+    <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
+        Revokes every active session for your account — including this
+        one. Use it if you suspect a device or a copied session is
+        compromised; ordinary log-out only clears the current device.
+    </small>
+</form>
+
 <form method="post" action="/profile/save">
     {{ csrf_input(request) }}
 <input type="hidden" name="active_tab" value="{{ active }}">
@@ -111,7 +127,7 @@
         </small>
     </p>
 
-    {# ── Test Now (#102) ──────────────────────────────────────────
+    {# ── Test Now ──────────────────────────────────────────
        Verify the wiring (cell + carrier or free-text address) by
        firing one fixed-text message through the live escalation
        send path. Button only renders when an address is configured;

@@ -1,4 +1,4 @@
-"""Tests for the WebAuthn / FIDO2 module + DB helpers (#67).
+"""Tests for the WebAuthn / FIDO2 module + DB helpers.
 
 The full ceremony (browser-side ``navigator.credentials.create/get``)
 needs a real authenticator and is covered by manual smoke tests in
@@ -424,13 +424,13 @@ class TestFinishRegistrationIntegration:
         user = {"id": user_id, "email": "u@e.com", "name": "U", "role": "user"}
         finish_registration(
             db, user=user, rp_id="example.com",
-            origin=["https://example.com", "https://example.com:8081"],
+            origin=["https://example.com", "https://example.com:8080"],
             response_json={"id": "x", "rawId": "x", "type": "public-key",
                            "response": {"transports": []}},
             nickname="k",
         )
         assert captured["expected_origin"] == [
-            "https://example.com", "https://example.com:8081",
+            "https://example.com", "https://example.com:8080",
         ]
 
     def test_no_pending_challenge_raises(self, db, user_id, monkeypatch):

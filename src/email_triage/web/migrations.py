@@ -40,15 +40,38 @@ and check column presence before ``ALTER TABLE ADD COLUMN``.
 checksum must match the current code on subsequent runs. If a
 shipped migration is later edited, the runner refuses to start —
 catches the worst-case "I edited migration 12 in place after it
-already ran on prod" mistake.
+already ran on prod" mistake. The hash is taken over the
+*normalized* body (comments + docstrings stripped, whitespace
+collapsed — see ``_normalize_body``) so a purely cosmetic edit
+(fixing a typo in a comment, reflowing a long line) does not trip
+the guard and refuse to boot; only a change to the executable
+tokens counts.
+
+**Backward-compat: pre-#228 raw-source checksums.** Before
+ the checksum was a SHA-256 over ``inspect.getsource(body)``
+(no AST normalization). DBs deployed against that older code carry
+raw-source SHAs in ``schema_migrations.checksum``. A naive
+algorithm swap would fail *every* already-applied row on first
+boot of the new image — exactly what tripped the deploy host's
+pre-validation gate when we tried to deploy c163d4b past 0de1999. The compare
+branch in ``run_migrations`` therefore does a *dual* check: if the
+current normalized checksum doesn't match the recorded value, we
+also recompute the legacy raw-source SHA; if that matches, the row
+is silently rewritten to the normalized form (one-time
+transparent transition, logged at INFO) and the runner continues.
+Only when neither shape matches do we raise — that's the real
+"someone edited a shipped migration" case the guard exists for.
 """
 
 from __future__ import annotations
 
+import ast
+import functools
 import hashlib
 import inspect
 import logging
 import sqlite3
+import textwrap
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -88,12 +111,112 @@ class Migration:
     body: Callable[[sqlite3.Connection], None]
 
     def checksum(self) -> str:
-        # Hash the source of body() so a future edit-after-ship
-        # mistake surfaces. inspect.getsource may include indentation
-        # whitespace — that's fine; hashing the literal string keeps
-        # the comparison strict.
-        src = inspect.getsource(self.body)
-        return hashlib.sha256(src.encode("utf-8")).hexdigest()
+        # Hash the *normalized* source of body() so a future
+        # edit-after-ship mistake surfaces — but a purely cosmetic
+        # edit (docstring tweak, comment, reflow whitespace) does not
+        # trip the guard and refuse to boot. ``_normalize_body``
+        # strips comments + docstrings and collapses whitespace, so
+        # only a change to the *executable* tokens of the body changes
+        # the checksum.
+        #
+        # Delegates to the module-level ``_checksum_for`` so the
+        # getsource + AST parse/unparse work runs once per body
+        # function, not once per call: ``run_migrations`` re-checksums
+        # every already-applied migration on every run. A free
+        # function with ``lru_cache`` — NOT ``functools.cached_property``
+        # — because ``Migration`` is a frozen dataclass; adding
+        # ``slots=True`` later would silently break a cached_property.
+        return _checksum_for(self.body)
+
+
+@functools.lru_cache(maxsize=None)
+def _checksum_for(body: Callable[[sqlite3.Connection], None]) -> str:
+    """Normalized-source SHA-256 of a migration body, memoized.
+
+    Keyed on the body function object — stable for the process
+    lifetime and hashable by identity. Migration bodies are
+    module-level functions registered append-only, so the cache is
+    bounded and never needs eviction (``maxsize=None``).
+    """
+    src = inspect.getsource(body)
+    return hashlib.sha256(
+        _normalize_body(src).encode("utf-8")
+    ).hexdigest()
+
+
+@functools.lru_cache(maxsize=None)
+def _legacy_raw_checksum(body: Callable[[sqlite3.Connection], None]) -> str:
+    """Pre-#228 raw-source SHA-256 of a migration body.
+
+    Used ONLY by the backward-compat dual-check in ``run_migrations``. Reproduces the exact algorithm that shipped before
+    c163d4b (commit "fix"): SHA-256 over the raw
+    ``inspect.getsource(body)`` bytes, with no AST normalization.
+
+    Any pre-c163d4b deployed install has rows in
+    ``schema_migrations.checksum`` computed by this algorithm.
+    Booting the post-c163d4b code against that DB would otherwise
+    raise ``MigrationError`` on every row, refusing to start. The
+    runner's compare branch invokes this helper *only* when the
+    primary normalized checksum fails to match, treats a match as
+    "this row was written by pre-#228 code", rewrites the row to
+    the new normalized shape, and continues.
+
+    This is the *only* call site for this helper outside tests. The
+    production checksum path is ``_checksum_for`` (above) — see the
+    AST pin in ``tests/test_migrations_checksum_pin.py``.
+    """
+    return hashlib.sha256(
+        inspect.getsource(body).encode("utf-8")
+    ).hexdigest()
+
+
+def _normalize_body(src: str) -> str:
+    """Reduce a migration function's source to its executable shape.
+
+    The source is parsed to an AST and the function *body* is
+    re-emitted with :func:`ast.unparse`. This drops comments, drops a
+    leading docstring, and canonicalizes whitespace / line breaks —
+    so a cosmetic edit (comment, docstring, reflowed long line, added
+    blank line) does not change the result. The function's *name* and
+    decorator list are deliberately excluded: only the statements that
+    actually run against the database matter for "was this migration
+    edited after it shipped."
+
+    Falls back to the raw source if parsing fails — better a
+    too-strict checksum than a crash in the migration runner.
+    """
+    try:
+        # ``inspect.getsource`` keeps the original indentation; a
+        # nested function body is indented and would not parse on its
+        # own. ``textwrap.dedent`` puts the ``def`` at column 0.
+        tree = ast.parse(textwrap.dedent(src))
+    except (SyntaxError, ValueError, IndentationError):
+        return src
+
+    func: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func = node
+            break
+    if func is None:
+        return src
+
+    body = list(func.body)
+    # Drop a leading docstring statement if present.
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body:
+        return ""
+
+    try:
+        return "\n".join(ast.unparse(stmt) for stmt in body)
+    except Exception:
+        return src
 
 
 # Module-level list of registered migrations. Append-only; numbers
@@ -197,18 +320,74 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
     applied = applied_versions(conn)
 
     # Guard 1: checksum verification on every already-applied row.
+    #
+    # Dual-check: the primary check is the current
+    # normalized-AST SHA. If it doesn't match the recorded value, the
+    # row MIGHT be a real edited-after-ship case OR it might just be a
+    # row written by pre-#228 code (raw-source SHA shape — see
+    # ``_legacy_raw_checksum`` docstring for the c163d4b history). We
+    # recompute the legacy raw-source SHA as a fallback; if THAT
+    # matches, the row is silently rewritten to the new normalized
+    # shape and we continue. Only when neither shape matches do we
+    # raise — that's the real "someone edited a shipped migration"
+    # case the guard exists for.
+    rewrites: list[tuple[int, str, str, str]] = []
     for m in MIGRATIONS:
         if m.version in applied:
             current = m.checksum()
             recorded = applied[m.version]["checksum"]
-            if current != recorded:
-                raise MigrationError(
-                    f"migration {m.version} ({m.name!r}) was edited "
-                    f"after it was applied to this database. Recorded "
-                    f"checksum {recorded[:16]}..., current "
-                    f"{current[:16]}.... Refusing to run further "
-                    f"migrations until this is reconciled."
+            if current == recorded:
+                continue
+            legacy = _legacy_raw_checksum(m.body)
+            if legacy == recorded:
+                # Pre-#228 row. Queue a one-time transparent rewrite
+                # to the normalized shape. We collect them first and
+                # commit them in one transaction below so we don't
+                # half-rewrite when something later in this loop
+                # raises.
+                rewrites.append((m.version, m.name, recorded, current))
+                continue
+            raise MigrationError(
+                f"migration {m.version} ({m.name!r}) was edited "
+                f"after it was applied to this database. Recorded "
+                f"checksum {recorded[:16]}..., current "
+                f"{current[:16]}.... Refusing to run further "
+                f"migrations until this is reconciled."
+            )
+
+    if rewrites:
+        # One-time transition: pre-#228 raw-source checksums get
+        # rewritten to the post-#228 normalized shape. All in one
+        # transaction so a power-cut during the rewrite either
+        # finishes the whole transition or none of it (the next boot
+        # would just re-detect the legacy shape and retry).
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for version, name, _old, new in rewrites:
+                conn.execute(
+                    "UPDATE schema_migrations SET checksum = ? "
+                    "WHERE version = ?",
+                    (new, version),
                 )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        for version, name, old, new in rewrites:
+            _log.info(
+                "migration checksum rewritten from pre-#228 raw-source "
+                "shape to post-#228 normalized-AST shape ( one-time "
+                "transition; no migration body changed)",
+                extra={"_extra": {
+                    "version": version,
+                    "name": name,
+                    "old_checksum": old[:16],
+                    "new_checksum": new[:16],
+                }},
+            )
 
     # Guard 2: DB at a version newer than this code knows about.
     max_registered = max((m.version for m in MIGRATIONS), default=0)
@@ -493,18 +672,18 @@ def _v5_flip_digest_preview_off(conn: sqlite3.Connection) -> None:
 def _v6_backfill_account_tz_default(conn: sqlite3.Connection) -> None:
     """Default per-account timezone for calendar render enrichment.
 
-    Punch-list #109 adds pre-rendered local-tz strings to the
+    the backlog  adds pre-rendered local-tz strings to the
     calendar API response so LLM-agent consumers don't have to
     do timezone arithmetic. The local strings are computed against
     a per-account ``tz`` field stored under ``email_accounts.config_json``.
 
-    This migration backfills the default (``America/Detroit``) for
+    This migration backfills the default (``America/New_York``) for
     every existing account row whose config_json does NOT already
     have a ``tz`` key. Future accounts get the default at create-
     time via the account form (the dropdown defaults to
-    ``America/Detroit`` when no value is supplied).
+    ``America/New_York`` when no value is supplied).
 
-    Why ``America/Detroit`` and not UTC: the install was originally
+    Why ``America/New_York`` and not UTC: the install was originally
     seeded for a single Eastern US household. Defaulting to UTC
     would cause the API to render UTC times to humans, which is
     explicitly disallowed in the handover spec. Operators in
@@ -529,7 +708,7 @@ def _v6_backfill_account_tz_default(conn: sqlite3.Connection) -> None:
             continue
         if "tz" in cfg:
             continue
-        cfg["tz"] = "America/Detroit"
+        cfg["tz"] = "America/New_York"
         conn.execute(
             "UPDATE email_accounts SET config_json = ? WHERE id = ?",
             (json.dumps(cfg), rid),
@@ -540,7 +719,7 @@ def _v6_backfill_account_tz_default(conn: sqlite3.Connection) -> None:
 def _v7_create_acme_jobs(conn: sqlite3.Connection) -> None:
     """ACME issuance job table -- restart-recovery for the renewer.
 
-    Punch-list #104. The previous shape lived in process memory only
+    the backlog . The previous shape lived in process memory only
     (``acme_job_state._STATE`` singleton); a process kill mid-issuance
     abandoned both the operator-visible state AND the in-flight LE
     order context. If LE finalised the order before the kill, the
@@ -548,7 +727,7 @@ def _v7_create_acme_jobs(conn: sqlite3.Connection) -> None:
     was to re-trigger -- which could collide with the LE prod
     duplicate-cert rate limit (5 per exact-cert-FQDNs per week).
 
-    Schema mirrors triage_jobs (#101) so the operator-surfacing
+    Schema mirrors triage_jobs so the operator-surfacing
     code can stay symmetric across both job types:
 
       job_id            TEXT PK   ``acme_<12-hex>`` UUID-style handle
@@ -561,8 +740,8 @@ def _v7_create_acme_jobs(conn: sqlite3.Connection) -> None:
       max_attempts      INTEGER   from config
       visibility_json   TEXT      per-domain DNS visibility map
       last_error        TEXT      nullable
-      last_error_kind   TEXT      nullable; 'cancelled' for #103
-      cancel_requested  INTEGER   BOOL flag (#103)
+      last_error_kind   TEXT      nullable; 'cancelled' for 
+      cancel_requested  INTEGER   BOOL flag
       started_at        TEXT      ISO 8601 (set when phase=starting)
       last_progress_at  TEXT      ISO 8601 (UI staleness signal)
       ended_at          TEXT      ISO 8601 (terminal phase only)
@@ -660,7 +839,7 @@ def _v8_create_office365_subscriptions(conn: sqlite3.Connection) -> None:
 def _v9_create_email_watches(conn: sqlite3.Connection) -> None:
     """Email watches — operator-defined match-and-fire on classified mail.
 
-    Punch-list #100. Each row is one watch: a filter, an action set
+    the backlog . Each row is one watch: a filter, an action set
     (escalate / webhook / both), and a scope (single account or all
     accounts when ``account_id IS NULL``). The webhook signing secret
     is held in the secrets store under ``watch_<id>_hmac`` — never on
@@ -711,7 +890,7 @@ def _v9_create_email_watches(conn: sqlite3.Connection) -> None:
 
 @register(10, "add_email_account_aliases")
 def _v10_add_email_account_aliases(conn: sqlite3.Connection) -> None:
-    """Per-account additional-address list (#106).
+    """Per-account additional-address list.
 
     One physical mailbox can be reachable at several addresses (the
     same inbox receives mail at ``user@example.com`` AND at
@@ -959,7 +1138,7 @@ def _v14_add_sent_mail_index_captured_pair(conn: sqlite3.Connection) -> None:
 
 @register(15, "add_sent_mail_index_embedding_norm")
 def _v15_add_sent_mail_index_embedding_norm(conn: sqlite3.Connection) -> None:
-    """Precomputed L2 norm column on ``sent_mail_index`` (#136 RAG perf).
+    """Precomputed L2 norm column on ``sent_mail_index``.
 
     The M-4 retrieval hot path used to walk every indexed row and
     recompute the candidate vector's L2 norm in pure Python on every
@@ -1030,8 +1209,7 @@ def _v15_add_sent_mail_index_embedding_norm(conn: sqlite3.Connection) -> None:
 
 @register(16, "create_triage_retry_queue")
 def _v16_create_triage_retry_queue(conn: sqlite3.Connection) -> None:
-    """Durable retry queue for triage attempts that the LLM rejected
-    (#149 Bundle A — LLM offline handling).
+    """Durable retry queue for triage attempts that the LLM rejected.
 
     When the classify path fires :class:`LLMBackendUnreachableError`
     (Ollama down, network blip, etc.), the watcher / push consumer /
@@ -1103,7 +1281,7 @@ def _v16_create_triage_retry_queue(conn: sqlite3.Connection) -> None:
 
 @register(17, "watches_per_account_fanout")
 def _v17_watches_per_account_fanout(conn: sqlite3.Connection) -> None:
-    """Punch-list #154 + #155 — move watches off the implicit
+    """the backlog  +  — move watches off the implicit
     "all accounts" NULL row onto an explicit multi-account fan-out.
 
     Pre-v17 the ``email_watches`` table allowed ``account_id IS NULL``
@@ -1251,7 +1429,7 @@ def _v17_watches_per_account_fanout(conn: sqlite3.Connection) -> None:
 
 @register(18, "create_labels")
 def _v18_create_labels(conn: sqlite3.Connection) -> None:
-    """Multi-LABEL per message (#129) — operator-curated tags that
+    """Multi-LABEL per message — operator-curated tags that
     decorate messages independently of LLM classification.
 
     Gmail-style labels. Today every message gets exactly ONE category
@@ -1470,7 +1648,7 @@ def _v21_add_triage_jobs_kind(conn: sqlite3.Connection) -> None:
 
 @register(22, "add_list_rules_provider_labels")
 def _v22_add_list_rules_provider_labels(conn: sqlite3.Connection) -> None:
-    """Provider-native label picker on rule editor (#163).
+    """Provider-native label picker on rule editor.
 
     Today every list rule can carry ``adds_labels`` — a JSON array of
     install-internal label slugs from the v18 ``labels`` catalog. That
@@ -1511,7 +1689,7 @@ def _v22_add_list_rules_provider_labels(conn: sqlite3.Connection) -> None:
 
 @register(23, "add_account_style_per_alias")
 def _v23_add_account_style_per_alias(conn: sqlite3.Connection) -> None:
-    """Per-alias writing-style descriptors (punch list #162).
+    """Per-alias writing-style descriptors (punch list ).
 
     Today the system stores ONE M-3 writing-style descriptor per
     account (under settings key ``style_profile:<id>``). Operators
@@ -1569,7 +1747,7 @@ def _v23_add_account_style_per_alias(conn: sqlite3.Connection) -> None:
 
 @register(24, "create_push_deliveries")
 def _v24_create_push_deliveries(conn: sqlite3.Connection) -> None:
-    """Per-day push-delivery counter table (#166).
+    """Per-day push-delivery counter table.
 
     Today the Gmail Pub/Sub webhook + the Office365 Graph webhook
     bump an in-memory ``app.state.metrics`` counter on every
@@ -1624,7 +1802,7 @@ def _v24_create_push_deliveries(conn: sqlite3.Connection) -> None:
 
 @register(25, "add_hipaa_style_descriptor")
 def _v25_add_hipaa_style_descriptor(conn: sqlite3.Connection) -> None:
-    """HIPAA-safe describe-and-discard descriptor storage (#152 phase 3).
+    """HIPAA-safe describe-and-discard descriptor storage.
 
     Phase 3 of the M-3 HIPAA lift wants a structured, post-scrubbed
     writing-style descriptor for HIPAA-flagged accounts that have the
@@ -1699,7 +1877,7 @@ def _v25_add_hipaa_style_descriptor(conn: sqlite3.Connection) -> None:
 
 @register(26, "create_ai_backends")
 def _v26_create_ai_backends(conn: sqlite3.Connection) -> None:
-    """Admin-curated AI backend registry + per-account selector FK (#169 Wave 1 I1).
+    """Admin-curated AI backend registry + per-account selector FK.
 
     Pre-#169 the install picks ONE classifier backend from YAML config
     (``config.classifier.backend``: ``ollama`` / ``openai`` / ``gemini``).
@@ -1797,11 +1975,11 @@ def _v26_create_ai_backends(conn: sqlite3.Connection) -> None:
     accounts (the account falls back to install default + Wave 2
     raises a warning banner).
 
-    Classifier backend FK NOT added in this migration. Per the #169
+    Classifier backend FK NOT added in this migration. Per the 
     punch entry, the per-account classifier override is deferred —
     today's classifier is install-wide, reshaping it is a separate
     bundle. Only the style-learning selector lands here so phase 3-4
-    of #152 can unblock.
+    of  can unblock.
 
     Idempotent
     ----------
@@ -1850,7 +2028,7 @@ def _v26_create_ai_backends(conn: sqlite3.Connection) -> None:
 
 @register(27, "create_style_distill_audit_and_queue")
 def _v27_create_style_distill_audit_and_queue(conn: sqlite3.Connection) -> None:
-    """Style-distill audit-row split + retry queue (#152 phases 3-4 S3+S4).
+    """Style-distill audit-row split + retry queue.
 
     Two new tables for the HIPAA describe-and-discard pipeline:
 
@@ -2032,7 +2210,7 @@ def _v27_create_style_distill_audit_and_queue(conn: sqlite3.Connection) -> None:
 
 @register(28, "create_per_contact_style_hipaa")
 def _v28_create_per_contact_style_hipaa(conn: sqlite3.Connection) -> None:
-    """HIPAA-safe per-contact style descriptor (#152 phase 4 / M-7 — Wave 3).
+    """HIPAA-safe per-contact style descriptor.
 
     Wave 3 of the M-7 lift: a per-recipient style overlay for HIPAA-
     flagged accounts that have opted in to style learning. The non-HIPAA
@@ -2221,7 +2399,7 @@ hash_recipient_for_install`). Length 64 hex chars.
 
 @register(29, "create_hipaa_send_counters")
 def _v29_create_hipaa_send_counters(conn: sqlite3.Connection) -> None:
-    """HIPAA outbound-message counter table (#171-B trigger watcher).
+    """HIPAA outbound-message counter table.
 
     Drives the threshold gate on the M-3 + M-7 trigger watchers. A
     HIPAA-flagged account cannot reuse :class:`SentMailIndex` (the
@@ -2261,7 +2439,7 @@ hash_recipient_for_install`). NEVER the plaintext.
     ----------------------------------------------------------
     ``sent_mail_index`` short-circuits HIPAA accounts at every public
     method (``SentMailIndex.__init__`` + ``index_message``); the
-    feature is hard-off on HIPAA by design (#152 W2-β). The HIPAA
+    feature is hard-off on HIPAA by design. The HIPAA
     pipeline therefore has zero rows there. A dedicated counter table
     avoids re-deriving HIPAA-safe accounting from a table that is
     intentionally empty on HIPAA accounts. The counter rows hold ONLY
@@ -2307,7 +2485,7 @@ sent_message`` helper rejects values containing ``@`` defensively —
 
 @register(30, "create_watcher_retry_queue")
 def _v30_create_watcher_retry_queue(conn: sqlite3.Connection) -> None:
-    """Watcher per-message retry queue (#175 R-A).
+    """Watcher per-message retry queue.
 
     Sibling to the v16 ``triage_retry_queue`` (LLM-backend-unreachable
     retries) but with a different shape + purpose. Where v16 parks
@@ -2321,7 +2499,7 @@ def _v30_create_watcher_retry_queue(conn: sqlite3.Connection) -> None:
 
     Why a separate table from ``triage_retry_queue``
     ------------------------------------------------
-    The spec for #175 named the new table ``triage_retry_queue``; the
+    The spec for  named the new table ``triage_retry_queue``; the
     name was already taken by v16. Renaming v16 would force a destructive
     schema migration on a table that is in production use (sweeper +
     UI banner depend on it). Two tables, two sweepers — both small,
@@ -2436,8 +2614,7 @@ def _v30_create_watcher_retry_queue(conn: sqlite3.Connection) -> None:
 
 @register(31, "create_embedding_bits_install_state")
 def _v31_create_embedding_bits_install_state(conn: sqlite3.Connection) -> None:
-    """Singleton install-state row for the slim-image lazy embedding stack
-    (#180).
+    """Singleton install-state row for the slim-image lazy embedding stack.
 
     The v0.1.1+ container ships at ~250 MB (vs the v0.1.0 ~2 GiB) by
     lifting torch + sentence-transformers + the all-MiniLM-L6-v2 model
@@ -2598,7 +2775,7 @@ def _v31_create_embedding_bits_install_state(conn: sqlite3.Connection) -> None:
 def _v32_add_sent_mail_index_embedding_dimension(
     conn: sqlite3.Connection,
 ) -> None:
-    """Add ``embedding_dimension`` column to ``sent_mail_index`` (#180 C).
+    """Add ``embedding_dimension`` column to ``sent_mail_index``.
 
     The lazy-install embedding-bits feature lets the operator switch
     backends/models after the install is running. When the dimension
@@ -2610,7 +2787,7 @@ def _v32_add_sent_mail_index_embedding_dimension(
     model mismatch as "stale, ignore", but it lacks an explicit
     dimension column. Adding it lets:
 
-      * The reindex job (#180 C) detect dimension changes cheaply
+      * The reindex job detect dimension changes cheaply
         without re-loading the backend at scan time.
       * The retrieval helper short-circuit on dim mismatch even
         when the operator renamed the model but kept the same
@@ -2631,3 +2808,466 @@ def _v32_add_sent_mail_index_embedding_dimension(
             "ALTER TABLE sent_mail_index "
             "ADD COLUMN embedding_dimension INTEGER"
         )
+
+
+@register(33, "create_hipaa_sent_dedup")
+def _v33_create_hipaa_sent_dedup(conn: sqlite3.Connection) -> None:
+    """Dedup table for the HIPAA Sent-folder counter loop.
+
+    The :class:`email_triage.actions.hipaa_sent_counter.HipaaSentCounterLoop`
+    scans the Sent folder on each cron tick. Without dedup, every tick
+    would re-count every message in the operator's chosen scan window,
+    inflating the M-3 + M-7 threshold counters until they fire every
+    tick. With dedup, each unique outbound message increments the
+    counters exactly once across the install's lifetime.
+
+    Why a separate dedup table instead of reusing ``sent_mail_index``
+    -----------------------------------------------------------------
+    ``sent_mail_index`` stores message bodies (encrypted + embedded for
+    M-4 RAG retrieval). It is HARD-OFF for HIPAA-flagged accounts by
+    design — the sister gates on :class:`SentMailIndex` and
+    :class:`SentMailCaptureLoop` refuse to write rows for HIPAA
+    accounts. Reusing it for HIPAA dedup would either (a) require
+    relaxing the HIPAA gate, or (b) require a parallel "HIPAA-only,
+    no-body" row shape that splits the index's contract.
+
+    Cleaner: tiny dedup-only table that holds nothing but a salted hash
+    of the RFC Message-ID + a timestamp. No PHI, no content, no
+    plaintext message IDs — the salted-HMAC-SHA-256 hash is opaque to
+    anyone without the install salt.
+
+    Schema
+    ------
+    ``account_id``  INTEGER NOT NULL FK email_accounts(id) CASCADE
+    ``msgid_hash``  TEXT NOT NULL — 64-char hex; HMAC-SHA-256 of the
+                    RFC 5322 Message-ID using the install's per-style
+                    recipient salt (same salt the M-7 per-contact path
+                    uses; one salt rotation invalidates both surfaces
+                    consistently)
+    ``recorded_at`` TEXT NOT NULL DEFAULT now() — ISO 8601 UTC of when
+                    the counter recorded the message. Used by the
+                    retention sweep (90-day prune) to bound table
+                    growth.
+    PRIMARY KEY (account_id, msgid_hash) — guarantees a second scan
+    on the same Sent-folder snapshot is a no-op.
+
+    Idempotent — ``CREATE TABLE IF NOT EXISTS`` + ``CREATE INDEX IF NOT
+    EXISTS``; re-runs are no-ops.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hipaa_sent_dedup ("
+        "  account_id  INTEGER NOT NULL"
+        "      REFERENCES email_accounts(id) ON DELETE CASCADE,"
+        "  msgid_hash  TEXT    NOT NULL,"
+        "  recorded_at TEXT    NOT NULL,"
+        "  PRIMARY KEY (account_id, msgid_hash)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hipaa_sent_dedup_recorded "
+        "ON hipaa_sent_dedup (recorded_at)"
+    )
+
+
+@register(34, "create_action_idempotency")
+def _v34_create_action_idempotency(conn: sqlite3.Connection) -> None:
+    """Durable per-action idempotency store.
+
+    Before  the action idempotency record (PR-6/C2) lived only in
+    ``flow.state_bag["action_results"]``. That works for the
+    ``FlowEngine`` path, which persists the state_bag — but the
+    watcher / runner / bulk ingestion paths build a throwaway
+    ``FlowState`` with a fresh ``flow_id`` per action, so the state_bag
+    is never persisted. On any retry-queue re-run or container restart
+    every action re-executed: duplicate draft replies, duplicate
+    escalation SMS to real recipients.
+
+    This table is the durable store. ``check_idempotent_already_done``
+    / ``record_idempotent_done`` in ``actions/base.py`` read/write it
+    keyed on the stable RFC 5322 Message-ID — NOT the per-mailbox IMAP
+    UID, which is not unique within an account. When the Message-ID or
+    the db / account_id are unavailable, those helpers fall back to the
+    legacy per-flow state_bag record.
+
+    Schema
+    ------
+    ``account_id``      INTEGER NOT NULL FK email_accounts(id) CASCADE
+    ``rfc_message_id``  TEXT NOT NULL — the RFC 5322 Message-ID header
+    ``action_name``     TEXT NOT NULL — the action's registry name
+    ``external_id``     TEXT — provider id the action created (e.g. a
+                        draft id); surfaced on a skip
+    ``completed_at``    TEXT NOT NULL — ISO 8601 UTC
+    PRIMARY KEY (account_id, rfc_message_id, action_name) — a retry of
+    the same action on the same message is a no-op.
+
+    Idempotent — CREATE TABLE / INDEX IF NOT EXISTS; re-runs no-op.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS action_idempotency ("
+        "  account_id     INTEGER NOT NULL"
+        "      REFERENCES email_accounts(id) ON DELETE CASCADE,"
+        "  rfc_message_id TEXT    NOT NULL,"
+        "  action_name    TEXT    NOT NULL,"
+        "  external_id    TEXT,"
+        "  completed_at   TEXT    NOT NULL,"
+        "  PRIMARY KEY (account_id, rfc_message_id, action_name)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_action_idempotency_completed "
+        "ON action_idempotency (completed_at)"
+    )
+
+
+@register(35, "consolidate_retry_queues")
+def _v35_consolidate_retry_queues(conn: sqlite3.Connection) -> None:
+    """Fold ``triage_retry_queue`` (v16) into ``watcher_retry_queue`` (v30).
+
+    Before -#215 the install carried TWO retry queues: ``triage_retry_queue``
+    (v16 — messages whose CLASSIFY step failed because the LLM backend was
+    offline) and ``watcher_retry_queue`` (v30 — messages whose per-message
+    FETCH/PROCESS step raised). Both were non-functional end to end (their
+    drainers never re-acted), so the rebuild collapses them onto a single
+    queue + single drainer.
+
+    ``watcher_retry_queue`` is the survivor — it already has the right shape
+    (provider addressing tuple, a pending/done/dead state machine,
+    ``dead_reason``, UNIQUE partial indexes for upsert).
+
+    This migration:
+
+    1. Adds ``failure_kind`` (nullable TEXT) to ``watcher_retry_queue``. The
+       drainer reads it to special-case ``'llm_unreachable'`` rows — those
+       are skipped while the LLM circuit breaker is open (re-running classify
+       against a dead backend just burns latency). NULL means "ordinary
+       per-message fetch/process failure" — drained on every tick.
+    2. Backfills any live ``triage_retry_queue`` rows into
+       ``watcher_retry_queue``. v16 rows are all IMAP-origin; ``message_id``
+       is the stringified UID. Each row is inserted as
+       ``provider_type='imap'``, ``failure_kind='llm_unreachable'``,
+       ``state='pending'``, carrying the original ``attempt_count`` and a
+       recomputed ``next_attempt_at`` off the watcher schedule. The backfill
+       is idempotent against the v30 UNIQUE partial index on
+       ``(account_id, mailbox, uid, uidvalidity)`` — ``INSERT OR IGNORE`` so
+       a re-run skips rows already present.
+    3. Drops ``triage_retry_queue`` + its index.
+
+    The v16 schema had no ``uidvalidity`` column. The UNIQUE partial index
+    keys on it, so a backfilled row needs a non-NULL value to be addressable
+    by :func:`email_triage.web.db.enqueue_retry`'s upsert. v16 rows carry no
+    uidvalidity, so we use ``0`` as a sentinel — the drainer's UIDVALIDITY
+    guard compares the row value against the live mailbox value and marks the
+    row dead on mismatch, which is the correct conservative outcome for a
+    backfilled row whose original epoch is unknown.
+
+    Idempotent — the ALTER is guarded by a column probe, the backfill is
+    ``INSERT OR IGNORE``, and the DROP is ``IF EXISTS``. Re-running on a DB
+    that already has v35 is a no-op.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    # 1 — add failure_kind (guarded probe so a re-run is a no-op).
+    cols = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(watcher_retry_queue)"
+        ).fetchall()
+    }
+    if "failure_kind" not in cols:
+        conn.execute(
+            "ALTER TABLE watcher_retry_queue ADD COLUMN failure_kind TEXT"
+        )
+
+    # 2 — backfill live triage_retry_queue rows. Skip cleanly if the v16
+    # table was never created (fresh install that started past v16).
+    has_v16 = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='triage_retry_queue'"
+    ).fetchone()
+    if has_v16 is not None:
+        from email_triage.retry_backoff import (
+            WATCHER_RETRY_SCHEDULE, compute_next_attempt_at,
+        )
+        now = datetime.now(timezone.utc)
+        legacy_rows = conn.execute(
+            "SELECT account_id, mailbox, uid, attempt_count, "
+            "       last_error, last_error_type, created_at "
+            "FROM triage_retry_queue"
+        ).fetchall()
+        for r in legacy_rows:
+            account_id = r[0]
+            mailbox = r[1]
+            uid_raw = r[2]
+            attempt_count = int(r[3] or 0)
+            last_error = r[4]
+            last_error_type = r[5]
+            # v16 message_id == uid (stringified IMAP UID). uid column is
+            # also populated. Coerce to int; a non-numeric uid is unusable
+            # for the IMAP addressing tuple — skip that row.
+            try:
+                uid_int = int(str(uid_raw).strip())
+            except (TypeError, ValueError):
+                continue
+            if not mailbox:
+                # IMAP addressing needs a mailbox; a NULL one cannot be
+                # re-fetched. Drop silently — the row was already dead.
+                continue
+            next_dt = compute_next_attempt_at(
+                attempt_count, WATCHER_RETRY_SCHEDULE, now=now,
+            )
+            if next_dt is None:
+                # Schedule exhausted — schedule one tick out so the
+                # drainer's cap sweep transitions it to dead promptly.
+                next_dt = now + WATCHER_RETRY_SCHEDULE[-1]
+            now_iso = now.isoformat()
+            conn.execute(
+                "INSERT OR IGNORE INTO watcher_retry_queue ("
+                "  account_id, provider_type, "
+                "  mailbox, uid, uidvalidity, "
+                "  state, attempt_count, failure_kind, "
+                "  next_attempt_at, "
+                "  last_error_class, last_error_msg, last_error_at, "
+                "  created_at"
+                ") VALUES (?, 'imap', ?, ?, 0, 'pending', ?, "
+                "          'llm_unreachable', ?, ?, ?, ?, ?)",
+                (
+                    int(account_id), mailbox, uid_int,
+                    attempt_count,
+                    next_dt.isoformat(),
+                    last_error_type, last_error, now_iso,
+                    now_iso,
+                ),
+            )
+
+    # 3 — drop the retired v16 table + its index.
+    conn.execute("DROP INDEX IF EXISTS idx_triage_retry_queue_ready")
+    conn.execute("DROP TABLE IF EXISTS triage_retry_queue")
+
+
+@register(36, "create_watch_fire_idempotency")
+def _v36_create_watch_fire_idempotency(conn: sqlite3.Connection) -> None:
+    """Durable per-(account, message, watch) watch-fire idempotency store.
+
+     suppressed watch-firing in the retry drainer
+    (``_recover_one_retry_row`` set ``fire_watches=False``) on the
+    premise "watches already fired on the original ingestion attempt."
+    That premise is FALSE for the dominant retry case: when the LLM
+    backend is down, ``classify`` raises ``LLMBackendUnreachableError``
+    BEFORE the  watch-fire stage, so watches NEVER fired on the
+    original attempt. The  LLM-down retry worker exists precisely
+    for that case — draining those rows with ``fire_watches=False``
+    means a  escalation watch (pager / SMS) on mail that arrived
+    during an LLM outage silently never fires.
+
+     restores ``fire_watches=True`` on retry recovery and makes
+    watch-firing idempotent so the restored re-runs cannot duplicate a
+    pager/SMS escalation. ``fire_watches_for_message`` in
+    ``watch_runner.py`` consults this table before firing a given watch
+    for a given message and records the fire after — so a second
+    drainer pass (or a container restart mid-drain) is a no-op for any
+    watch already fired.
+
+    NOTE: the ``message_id`` keying created here is superseded
+    by migration **v37**, which rebuilds this table keyed on the RFC
+    5322 ``rfc_message_id`` instead. v36 is left intact (un-edited) so
+    its checksum stays stable for any database that already applied it;
+    v37 does the rebuild. See ``_v37_rekey_watch_fire_idempotency``.
+
+    Why a dedicated table, not ``action_idempotency`` (v34)
+    -------------------------------------------------------
+    ``action_idempotency`` keys ``(account_id, rfc_message_id,
+    action_name)``. A watch is not an action: it has a numeric
+    ``watch_id`` that is a distinct identifier domain from an action's
+    registry name, and the watch path keys on the provider
+    ``message_id`` it is handed (not necessarily the RFC 5322
+    Message-ID). Smuggling ``watch:<id>`` into the ``action_name``
+    column would conflate the two surfaces and break the column's
+    semantics. A tiny dedicated table keeps each surface's contract
+    clean.
+
+    Schema
+    ------
+    ``account_id`` INTEGER NOT NULL FK email_accounts(id) CASCADE
+    ``message_id`` TEXT NOT NULL — the provider message id the watch
+                   stage was handed (IMAP UID string / Gmail id /
+                   O365 id), same value ``fire_watches_for_message``
+                   receives
+    ``watch_id``   TEXT NOT NULL — the watch's id
+    ``fired_at``   TEXT NOT NULL — ISO 8601 UTC of the first fire
+    PRIMARY KEY (account_id, message_id, watch_id) — a second fire of
+    the same watch on the same message is a no-op.
+
+    Idempotent — CREATE TABLE / INDEX IF NOT EXISTS; re-runs no-op.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS watch_fire_idempotency ("
+        "  account_id INTEGER NOT NULL"
+        "      REFERENCES email_accounts(id) ON DELETE CASCADE,"
+        "  message_id TEXT    NOT NULL,"
+        "  watch_id   TEXT    NOT NULL,"
+        "  fired_at   TEXT    NOT NULL,"
+        "  PRIMARY KEY (account_id, message_id, watch_id)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_fire_idempotency_fired "
+        "ON watch_fire_idempotency (fired_at)"
+    )
+
+
+@register(37, "rekey_watch_fire_idempotency")
+def _v37_rekey_watch_fire_idempotency(conn: sqlite3.Connection) -> None:
+    """Re-key ``watch_fire_idempotency`` on the RFC 5322 Message-ID.
+
+    Migration v36 created ``watch_fire_idempotency`` keyed
+    ``(account_id, message_id, watch_id)`` where ``message_id`` is the
+    *provider* message id the watch stage was handed. For an IMAP
+    account that is the mailbox-scoped UID — unique only within ONE
+    mailbox and ONE UIDVALIDITY epoch. The same numeric UID recurs in
+    a different folder, and resets low after a Dovecot index rebuild
+    bumps UIDVALIDITY; under the v36 key that collision makes
+    ``fire_watches_for_message`` treat a brand-new message as "already
+    fired" and silently SUPPRESS the watch — a dropped pager/SMS
+    escalation.
+
+    The fix re-keys on the **RFC 5322 Message-ID**: mail-global, stable
+    across folders and UIDVALIDITY epochs, and already this codebase's
+    canonical cross-folder identity — ``is_triaged()`` and the v34
+    ``action_idempotency`` table both key on it (see v34's docstring:
+    the IMAP UID "is not unique within an account").
+
+    Why a rebuild, not an in-place v36 edit
+    ---------------------------------------
+    Editing v36's body would change its checksum; ``run_migrations``
+    Guard 1 then refuses to boot on any database that already applied
+    the old v36. A separate v37 is checksum-safe regardless of whether
+    old-v36 ran. The table is DROP+CREATEd rather than column-renamed:
+    ``watch_fire_idempotency`` is brand-new on the unreleased v0.1.1
+    branch (no production database has ever held a row — the live
+    deploy runs v0.1.0, which predates v36), so there is no data to preserve and a
+    clean rebuild guarantees the exact final schema. Any rows a dev /
+    CI database accumulated under the old key are intentionally
+    discarded: a stale UID-keyed claim is exactly what  Bug 2 is
+    removing, so dropping it is correct, not lossy — at worst a watch
+    re-fires once, which the  claim-before-fire guard then makes
+    idempotent on the new key.
+
+    Schema (post-rebuild)
+    ---------------------
+    ``account_id``     INTEGER NOT NULL FK email_accounts(id) CASCADE
+    ``rfc_message_id`` TEXT NOT NULL — the RFC 5322 Message-ID of the
+                       mail (``fire_watches_for_message`` falls back to
+                       the provider message id when the header is
+                       absent — no worse than the v36 keying)
+    ``watch_id``       TEXT NOT NULL — the watch's id
+    ``fired_at``       TEXT NOT NULL — ISO 8601 UTC of the claim
+    PRIMARY KEY (account_id, rfc_message_id, watch_id) — a second fire
+    of the same watch on the same message is a no-op.
+
+    Idempotent — DROP / CREATE ... IF [NOT] EXISTS; re-runs no-op.
+    """
+    # Drop the v36 table + its index. IF EXISTS keeps the migration
+    # safe on a database that somehow never ran v36.
+    conn.execute("DROP INDEX IF EXISTS idx_watch_fire_idempotency_fired")
+    conn.execute("DROP TABLE IF EXISTS watch_fire_idempotency")
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS watch_fire_idempotency ("
+        "  account_id     INTEGER NOT NULL"
+        "      REFERENCES email_accounts(id) ON DELETE CASCADE,"
+        "  rfc_message_id TEXT    NOT NULL,"
+        "  watch_id       TEXT    NOT NULL,"
+        "  fired_at       TEXT    NOT NULL,"
+        "  PRIMARY KEY (account_id, rfc_message_id, watch_id)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_fire_idempotency_fired "
+        "ON watch_fire_idempotency (fired_at)"
+    )
+
+
+@register(38, "create_audit_gap_events")
+def _v38_create_audit_gap_events(conn: sqlite3.Connection) -> None:
+    """Create ``audit_gap_events`` for  Deliverable 3.
+
+    Background
+    ----------
+    When a ``@db_write @audit_emitter`` helper raises mid-write (the
+    cursor-corruption cascade catalogued live on the test container
+    2026-05-25), the audit row never lands and the operator has NO
+    visible trace. §164.312(b) Audit Controls requires the dropped
+    event be visible somewhere; §164.312(c)(1) Integrity Controls
+    requires the visibility-row itself be tamper-evident.
+
+    This migration creates the table the
+    ``web/db_writelock.db_write.wrapper`` writes to on the exception
+    path. The HMAC chain reuses the same key derivation as
+    ``log_entries`` (EQM-05 — no new key, no new key-rotation
+    surface).
+
+    Schema
+    ------
+    ``id``                     INTEGER PRIMARY KEY AUTOINCREMENT
+    ``ts``                     TEXT NOT NULL  — ISO-8601 UTC of failure
+    ``helper_name``            TEXT NOT NULL  — e.g. "record_user_status_event"
+    ``original_args_redacted`` TEXT NOT NULL  — JSON of IN-class fields
+                                                (typed numeric IDs + bounded-enum
+                                                strings) per the per-emitter
+                                                map in ``db/audit.py``
+    ``original_args_hash``     TEXT NOT NULL  — SHA-256 of full canonicalised
+                                                args (so an investigator can
+                                                MATCH a gap row to a PHI
+                                                payload stored elsewhere
+                                                without storing the PHI here)
+    ``exc_type``               TEXT NOT NULL  — e.g. "OperationalError"
+    ``exc_msg``                TEXT NOT NULL  — truncated to 500 chars
+    ``prev_hash``              TEXT NOT NULL DEFAULT ''  — chain link
+    ``row_hash``               TEXT NOT NULL DEFAULT ''  — HMAC-SHA256 of
+                                                          canonical row
+    ``hash_alg``               TEXT           — "hmac-sha256-v1" once HMAC
+                                                key registry is populated;
+                                                "sha256" pre-registry boot
+    ``master_key_version``     INTEGER        — which HMAC key version
+                                                signed this row
+
+    Indexes: ``ts`` (chronological scan), ``helper_name`` (by-emitter
+    triage). No UNIQUE constraint — gap-events are append-only audit
+    trail, and a repeat firing for the same failed call is acceptable
+    (better duplicate evidence than silent loss).
+
+    Retention: ships IMMUTABLE on v0.1.1 per hipaa-sme verdict
+    2026-05-25 — operator break-glass DELETE only. A Cycle 10+ pruner
+    will add chain-anchored retention (§164.316(b)(2)(i) 6-year
+    minimum) modelled on ``prune_log_entries``.
+
+    Idempotent — ``CREATE TABLE IF NOT EXISTS`` + ``CREATE INDEX IF
+    NOT EXISTS``; re-runs no-op.
+
+    §-anchors: §164.312(b) Audit Controls, §164.312(c)(1) Integrity
+    Controls, §164.502(a) Minimum Necessary, §164.514(b)(2)(i)
+    Safe-Harbor.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_gap_events ("
+        "  id                    INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  ts                    TEXT NOT NULL,"
+        "  helper_name           TEXT NOT NULL,"
+        "  original_args_redacted TEXT NOT NULL,"
+        "  original_args_hash    TEXT NOT NULL,"
+        "  exc_type              TEXT NOT NULL,"
+        "  exc_msg               TEXT NOT NULL,"
+        "  prev_hash             TEXT NOT NULL DEFAULT '',"
+        "  row_hash              TEXT NOT NULL DEFAULT '',"
+        "  hash_alg              TEXT,"
+        "  master_key_version    INTEGER"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_gap_events_ts "
+        "ON audit_gap_events (ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_gap_events_helper "
+        "ON audit_gap_events (helper_name)"
+    )

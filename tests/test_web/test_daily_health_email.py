@@ -1,4 +1,4 @@
-"""Tests for daily health email (#27), From-name (#32), signature (#33)."""
+"""Tests for daily health email, From-name, signature."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def _seed_log(db, *, level: str, message: str, ts: str | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Signature scope regression (#33 — signature belongs on newsletter digest,
+# Signature scope regression ( — signature belongs on newsletter digest,
 # NOT on the daily health email).  See tests/test_actions/test_digest.py
 # for the positive signature-rendering tests.
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ class TestSignatureScopeRegression:
 
 
 # ---------------------------------------------------------------------------
-# From-name (#32)
+# From-name
 # ---------------------------------------------------------------------------
 
 class TestFromName:
@@ -236,7 +236,7 @@ class TestDailyHealthAssembly:
         assert "log_entries" in combined
         assert "Watchers" in combined
         # Signature intentionally NOT rendered on the daily health email
-        # (item #39 scope correction — signature belongs on newsletter
+        # (item  scope correction — signature belongs on newsletter
         # digests, not admin health email).
         assert "Health Digest" not in combined
 

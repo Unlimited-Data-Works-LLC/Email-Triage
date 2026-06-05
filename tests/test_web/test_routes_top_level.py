@@ -1,4 +1,4 @@
-"""Tests for the top-level /routes page (#115).
+"""Tests for the top-level /routes page.
 
 Covers:
   * GET /routes (no params) renders picker + first-account body.

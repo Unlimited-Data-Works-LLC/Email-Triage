@@ -1,5 +1,5 @@
 """HTTP-route tests for the per-account calendar selection
-endpoints (#105 phase 1A).
+endpoints.
 
 Covers /accounts/{id}/calendars/discover (HTMX-triggered fetch +
 table render) and /accounts/{id}/calendars/save (form persistence
@@ -80,7 +80,7 @@ def test_discover_renders_table_with_provider_calendars(
     aid = _seed_gmail_account(db, admin_user["id"])
 
     fake_calendars = [
-        {"id": "primary", "summary": "claforest@gmail.com",
+        {"id": "primary", "summary": "exampleuser@gmail.com",
          "primary": True, "access_role": "owner"},
         {"id": "team@grp.calendar.google.com", "summary": "Team",
          "primary": False, "access_role": "writer"},
@@ -104,7 +104,7 @@ def test_discover_renders_table_with_provider_calendars(
         )
     assert r.status_code == 200
     body = r.text
-    assert "claforest@gmail.com" in body
+    assert "exampleuser@gmail.com" in body
     assert "Team" in body
     assert "Holidays" in body
     # Role headers in the table.
@@ -227,7 +227,7 @@ def test_save_anonymous_unauthorized(client, db, admin_user):
 
 
 # ---------------------------------------------------------------------------
-# /calendar/surrogate — IMAP calendar-surrogate selection (#105 phase 1A++)
+# /calendar/surrogate — IMAP calendar-surrogate selection
 # ---------------------------------------------------------------------------
 
 

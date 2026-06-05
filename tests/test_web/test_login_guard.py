@@ -1,5 +1,5 @@
 """Tests for the login_guard module + its wiring at the OTP / WebAuthn /
-dev-keypair / passkey login surfaces (#92)."""
+dev-keypair / passkey login surfaces."""
 
 from __future__ import annotations
 

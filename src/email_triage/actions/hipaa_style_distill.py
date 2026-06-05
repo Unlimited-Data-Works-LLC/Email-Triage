@@ -1,4 +1,4 @@
-"""HIPAA-safe M-3 describe-and-discard distillation (#152 phase 3).
+"""HIPAA-safe M-3 describe-and-discard distillation.
 
 This module is the phase-3 scaffold for the M-3 lift on HIPAA-flagged
 accounts. Today the plain M-3 path (``actions.style_profile``) reads
@@ -52,11 +52,11 @@ Activating phase 3 requires:
     the documented default; deviations from that are a separate
     operator decision).
   * Flipping the install-wide flag.
-  * A follow-up punch-list item to wire the call into the M-3 mine
+  * A follow-up the backlog item to wire the call into the M-3 mine
     surface for HIPAA accounts with opt-in.
 
-See ``docs/m-series-hipaa-audit.md`` row M-3 + the phase-3 addendum in
-``PUNCH-LIST.md`` #152 for the full activation checklist.
+See ``internal documentation`` row M-3 + the phase-3 addendum in
+``the backlog``  for the full activation checklist.
 
 Privacy contract
 ================
@@ -553,7 +553,7 @@ async def distill_hipaa_style(
     """Build + persist a HIPAA-safe writing-style descriptor.
 
     **NOT WIRED INTO PRODUCTION CALLERS** — this function is the
-    flag-gated scaffold for #152 phase 3. Callers must opt in via the
+    flag-gated scaffold for  phase 3. Callers must opt in via the
     install-wide flag :data:`STYLE_LEARNING_HIPAA_DISTILL_ENABLED` AND
     the per-account ``style_knobs_hipaa_allow`` flag. The default
     posture (both off) is "no-op + return".
@@ -607,40 +607,48 @@ async def distill_hipaa_style(
     if account_id <= 0:
         return None, "not_hipaa"
 
-    # Install-wide gate first — cheapest check.
-    if not is_hipaa_style_distill_enabled(conn):
+    #  — distill_hipaa_style is an async def touching the shared
+    # connection. Every DB touch hops to the threadpool via db_call so
+    # that, if this scaffold is wired onto an event-loop task, nothing
+    # runs SQLite work on the loop thread.
+    from email_triage.web.db_threadpool import db_call
+
+    # Install / HIPAA / opt-in / cadence gates run in one threadpool
+    # hop. Returns a short-circuit status string, or None to proceed.
+    def _hipaa_distill_gating():
+        if not is_hipaa_style_distill_enabled(conn):
+            return "disabled"
+        if not is_account_hipaa(account):
+            return "not_hipaa"
+        if not is_style_knobs_hipaa_allow(conn, account_id):
+            return "not_opted_in"
+        if not force and _is_within_cadence_window(conn, account_id):
+            return "cadence_skip"
+        return None
+
+    _gate = await db_call(_hipaa_distill_gating)
+    if _gate == "disabled":
         log.info(
             "hipaa_distill: install-wide flag off; skipping",
             extra={"_extra": {"account_id": account_id}},
         )
         return None, "disabled"
-
-    # HIPAA-flag gate. If the account isn't HIPAA, the caller should
-    # be on the non-HIPAA M-3 path. Don't auto-redirect — surface the
-    # mis-route so the dispatcher knows.
-    if not is_account_hipaa(account):
+    if _gate == "not_hipaa":
         return None, "not_hipaa"
-
-    # Per-account opt-in gate. Owner-set on /accounts/<id>/edit.
-    if not is_style_knobs_hipaa_allow(conn, account_id):
+    if _gate == "not_opted_in":
         log.info(
             "hipaa_distill: per-account opt-in off; skipping",
             extra={"_extra": {"account_id": account_id}},
         )
         return None, "not_opted_in"
-
-    # Weekly cadence gate — only if a recent row exists and force is
-    # not set. Implemented as "fetch existing row + compare rebuilt_at
-    # to now - interval". A re-distill on a row that's exactly at the
-    # threshold is allowed; only strictly-younger rows skip.
-    if not force:
-        if _is_within_cadence_window(conn, account_id):
-            return None, "cadence_skip"
+    if _gate == "cadence_skip":
+        return None, "cadence_skip"
 
     # Audit bookend — start row. Mirror of the bulk-runner pattern.
     audit_event_id: int | None = None
     try:
-        audit_event_id = record_hipaa_access_event(
+        audit_event_id = await db_call(
+            record_hipaa_access_event,
             conn, actor_user_id or 0, account_id,
             "style_distill_hipaa",
             outcome="in_progress",
@@ -715,7 +723,9 @@ async def distill_hipaa_style(
             # Delete any stale row too so a future read can't see a
             # partial / poisoned descriptor from a prior run.
             try:
-                delete_hipaa_style_descriptor(conn, account_id)
+                await db_call(
+                    delete_hipaa_style_descriptor, conn, account_id,
+                )
             except Exception:
                 log.exception(
                     "hipaa_distill: stale-row delete failed during drop",
@@ -728,7 +738,8 @@ async def distill_hipaa_style(
         clean.sample_count = message_count
         clean.model_used = candidate.model_used
 
-        set_hipaa_style_descriptor(
+        await db_call(
+            set_hipaa_style_descriptor,
             conn, account_id,
             descriptor=clean.to_dict(),
             version=STYLE_DESCRIPTOR_VERSION,
@@ -758,7 +769,8 @@ async def distill_hipaa_style(
                     "fired=" + ",".join(fired_labels[:16])
                 )
             try:
-                update_hipaa_access_event(
+                await db_call(
+                    update_hipaa_access_event,
                     conn, audit_event_id, outcome,
                     " ".join(detail_parts),
                 )

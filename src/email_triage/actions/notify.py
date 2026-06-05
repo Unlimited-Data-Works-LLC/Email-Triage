@@ -53,7 +53,7 @@ class NotifyAction(Action):
         from email_triage.actions.base import (
             check_idempotent_already_done, record_idempotent_done,
         )
-        prior = check_idempotent_already_done(
+        prior = await check_idempotent_already_done(
             flow, message, self.name,
         )
         if prior is not None:
@@ -65,7 +65,7 @@ class NotifyAction(Action):
             notification.get("summary", ""),
             extra={"flow_id": flow.flow_id},
         )
-        record_idempotent_done(flow, message, self.name)
+        await record_idempotent_done(flow, message, self.name)
         return ActionOutput(
             result=ActionResult.COMPLETED,
             data={"notification": notification},

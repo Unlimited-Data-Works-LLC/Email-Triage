@@ -258,7 +258,7 @@ class _FakeSecrets:
 
 def _state_bag_with_smtp(notify_email: str | None = None) -> dict:
     """Build a state_bag that has the SMTP context the escalate
-    action expects after the #73 wiring. Mirrors what app.py /
+    action expects after the  wiring. Mirrors what app.py /
     triage_runner.py stash."""
     bag = {
         "smtp_config": _FakeSmtpConfig(),

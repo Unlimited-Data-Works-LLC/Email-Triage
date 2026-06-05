@@ -1,4 +1,4 @@
-"""HIPAA describe-and-discard distillation (#152 S1, Wave 2-β).
+"""HIPAA describe-and-discard distillation.
 
 Pipeline
 ========
@@ -36,7 +36,7 @@ response, never the prompt text.
 No fallback-to-local on cloud failure
 =====================================
 
-Per operator directive (#152 phases 3-4 S3): when the operator picked
+Per operator directive: when the operator picked
 a cloud backend for this account and the call fails, we do NOT silently
 re-route to the install-default Ollama. That'd defeat the per-account
 backend choice. We enqueue a retry via
@@ -410,53 +410,55 @@ async def distill_hipaa_account(
     """
     result = DistillResult(status=OUTCOME_NOT_HIPAA, backend_id=None)
 
+    #  — distill_hipaa_account is an async def that touches the
+    # shared connection. If wired onto an event-loop task, every DB
+    # touch must hop to the threadpool via db_call. The gating reads,
+    # the @db_write helpers, the audit-row writes, and the backend
+    # loader (which reads the backend row) are all routed through
+    # db_call below.
+    from email_triage.web.db_threadpool import db_call
+
     # ---- Gating ---------------------------------------------------------
 
-    # Read the account row once for the HIPAA gate. We also use it to
-    # capture backend metadata for the audit row.
-    row = db_conn.execute(
-        "SELECT id, hipaa, user_id FROM email_accounts WHERE id = ?",
-        (int(account_id),),
-    ).fetchone()
-    if row is None:
-        result.status = OUTCOME_NOT_HIPAA
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
+    # Read the account row + run the install/HIPAA/opt-in/cadence gates
+    # in one threadpool hop. Returns (account_dict_or_None, status) —
+    # a non-None status is a short-circuit outcome.
+    def _distill_gating():
+        row = db_conn.execute(
+            "SELECT id, hipaa, user_id FROM email_accounts WHERE id = ?",
+            (int(account_id),),
+        ).fetchone()
+        if row is None:
+            return None, OUTCOME_NOT_HIPAA
+        acct = {
+            "id": int(row["id"]),
+            "hipaa": int(row["hipaa"] or 0),
+            "user_id": row["user_id"],
+        }
+        if not is_hipaa_style_distill_enabled(db_conn):
+            return acct, OUTCOME_DISABLED
+        if not is_account_hipaa(acct):
+            return acct, OUTCOME_NOT_HIPAA
+        if not is_style_knobs_hipaa_allow(db_conn, account_id):
+            return acct, OUTCOME_NOT_OPTED_IN
+        if not force and _is_within_cadence_window(db_conn, account_id):
+            return acct, OUTCOME_CADENCE_SKIP
+        return acct, None
+
+    account_dict, _gate_status = await db_call(_distill_gating)
+    if _gate_status is not None:
+        result.status = _gate_status
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
         return result
-
-    account_dict = {
-        "id": int(row["id"]),
-        "hipaa": int(row["hipaa"] or 0),
-        "user_id": row["user_id"],
-    }
-
-    # Install-wide flag (cheapest check first).
-    if not is_hipaa_style_distill_enabled(db_conn):
-        result.status = OUTCOME_DISABLED
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        return result
-
-    if not is_account_hipaa(account_dict):
-        result.status = OUTCOME_NOT_HIPAA
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        return result
-
-    if not is_style_knobs_hipaa_allow(db_conn, account_id):
-        result.status = OUTCOME_NOT_OPTED_IN
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        return result
-
-    # Cadence gate — defer to the existing helper.
-    if not force:
-        if _is_within_cadence_window(db_conn, account_id):
-            result.status = OUTCOME_CADENCE_SKIP
-            _audit_and_return(db_conn, account_id, actor_user_id, result)
-            return result
 
     # ---- Backend resolution --------------------------------------------
 
-    backend_id = _get_account_backend_id(db_conn, account_id)
+    backend_id = await db_call(_get_account_backend_id, db_conn, account_id)
     try:
-        adapter: BackendAdapter = load_backend(
+        adapter: BackendAdapter = await db_call(
+            load_backend,
             backend_id,
             db_conn=db_conn,
             secrets=secrets,
@@ -468,8 +470,11 @@ async def distill_hipaa_account(
         result.status = OUTCOME_BACKEND_FAIL
         result.backend_id = backend_id
         result.error_class = type(exc).__name__
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_retry(
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_retry,
             db_conn,
             account_id=account_id,
             last_error=f"backend_fail:{result.error_class}",
@@ -488,7 +493,9 @@ async def distill_hipaa_account(
 
     if message_count <= 0:
         result.status = OUTCOME_NO_MESSAGES
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
         return result
 
     prompt = _format_distill_prompt(corpus)
@@ -520,8 +527,11 @@ async def distill_hipaa_account(
         result.status = OUTCOME_BACKEND_FAIL
         result.error_class = type(exc).__name__
         result.latency_ms = int((time.monotonic() - t0) * 1000)
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_retry(
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_retry,
             db_conn,
             account_id=account_id,
             last_error=f"backend_fail:{result.error_class}",
@@ -558,8 +568,11 @@ async def distill_hipaa_account(
         # JSON; retrying may succeed).
         result.status = OUTCOME_BACKEND_FAIL
         result.error_class = "JSONDecodeError"
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
-        enqueue_style_distill_retry(
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
+        await db_call(
+            enqueue_style_distill_retry,
             db_conn,
             account_id=account_id,
             last_error="backend_fail:JSONDecodeError",
@@ -573,15 +586,20 @@ async def distill_hipaa_account(
         # Structural PHI leak — descriptor discarded. Delete any stale
         # descriptor row from a prior cleaner run.
         try:
-            delete_hipaa_style_descriptor(db_conn, account_id)
+            await db_call(
+                delete_hipaa_style_descriptor, db_conn, account_id,
+            )
         except Exception:
             log.exception(
                 "distill_hipaa: stale-descriptor delete failed during drop",
             )
         result.status = OUTCOME_SCRUBBER_FAIL
-        _audit_and_return(db_conn, account_id, actor_user_id, result)
+        await db_call(
+            _audit_and_return, db_conn, account_id, actor_user_id, result,
+        )
         # Pause the account (retrying a leaky LLM won't help).
-        pause_style_distill_account(
+        await db_call(
+            pause_style_distill_account,
             db_conn,
             account_id=account_id,
             last_error="scrubber_fail:structural_leak",
@@ -590,7 +608,8 @@ async def distill_hipaa_account(
 
     # ---- Persist + audit ------------------------------------------------
 
-    set_hipaa_style_descriptor(
+    await db_call(
+        set_hipaa_style_descriptor,
         db_conn, account_id,
         descriptor=scrub.scrubbed_descriptor,
         version=DESCRIPTOR_VERSION,
@@ -611,13 +630,17 @@ async def distill_hipaa_account(
 
     # Clear the retry queue on success — no pending work.
     try:
-        clear_style_distill_queue_entry(db_conn, account_id=account_id)
+        await db_call(
+            clear_style_distill_queue_entry, db_conn, account_id=account_id,
+        )
     except Exception:
         log.exception(
             "distill_hipaa: queue-clear failed on success path",
         )
 
-    _audit_and_return(db_conn, account_id, actor_user_id, result)
+    await db_call(
+        _audit_and_return, db_conn, account_id, actor_user_id, result,
+    )
     return result
 
 

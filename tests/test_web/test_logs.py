@@ -1,7 +1,7 @@
 """Tests for the ``/logs`` admin viewer and the account-resolution helper
 that keeps ``account_id`` log extras human-readable.
 
-Audit item #11: log lines referencing ``account_id=N`` were opaque
+Audit item : log lines referencing ``account_id=N`` were opaque
 without cross-referencing ``/accounts``. The emit side now splats a
 small helper so every log gets ``account_name`` too; the render side
 resolves the numeric id to a link pill via an ``accounts_by_id`` dict
@@ -193,7 +193,7 @@ class TestLogsSearch:
 
 
 class TestLogsDensityImprovements:
-    """Item #10 — /logs information-density pass. These regressions pin
+    """Item  — /logs information-density pass. These regressions pin
     the six template improvements so a future refactor can't silently
     drop them."""
 
@@ -348,7 +348,7 @@ class TestLegacyExtraUnpack:
     shape ``{"_extra": "<stringified Python repr of caller dict>"}``.
     The /logs page's pill renderer + Details column can't see the
     inner keys without an unpack. Backfilling the rows would invalidate
-    the audit hash chain (#131); the render-time unpack in
+    the audit hash chain; the render-time unpack in
     ``list_log_entries`` leaves storage intact + shows the operator-
     actionable fields on the page."""
 

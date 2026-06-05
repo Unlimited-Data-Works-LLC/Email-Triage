@@ -40,7 +40,7 @@ class TestEventDispatcher:
         assert dispatcher._matching_targets("flow.classified") == []
 
     def test_matching_targets(self):
-        # Non-local URLs require allow_external=True (#60 deny-by-default).
+        # Non-local URLs require allow_external=True.
         targets = [
             WebhookTarget(url="http://a", events=["flow.classified", "flow.finished"]),
             WebhookTarget(url="http://b", events=["flow.failed"]),
@@ -65,7 +65,7 @@ class TestEventDispatcher:
             assert len(matched) == 1
 
     def test_external_url_dropped_by_default(self):
-        """#60 — external URLs are filtered out unless allow_external=True.
+        """ — external URLs are filtered out unless allow_external=True.
 
         Cover three cases without depending on any operator-specific
         domain suffix:

@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -54,12 +56,204 @@ _log = logging.getLogger("email_triage.web.task_supervisor")
 DEFAULT_QUARANTINE_AFTER_CRASHES = 5
 DEFAULT_QUARANTINE_WINDOW_SECS = 600
 
+#  — a ``supervised_interval_loop`` whose per-tick body fails on
+# every tick stays ``status="running"`` forever (the supervisor only
+# records ``crashed`` when the loop *coroutine* raises, and the loop's
+# per-tick try/except deliberately never lets a tick failure through).
+# This threshold is how many *consecutive* tick failures count as
+# "this loop is broken" — surfaced via ``health_snapshot()`` so
+# /health can degrade on it. A single transient failure must not flap
+# the signal, hence "consecutive" + a threshold > 1.
+DEFAULT_TICK_FAILURE_THRESHOLD = 3
+
+#  — a tick that HANGS forever (never returns, never raises) is the
+# blind spot the failure-count signal above cannot see: ``record_tick_
+# result`` is only ever called *after* a tick completes, so a hung tick
+# leaves ``last_tick_ts`` frozen and ``failing`` stuck at False — the
+# loop reads healthy while it is in fact wedged. The fix is a staleness
+# signal: a loop is "stale" when its last tick (or its start, before
+# the first tick lands) is older than ``TICK_STALENESS_MULTIPLE`` × its
+# interval. The multiple is generous so an ordinary slow tick or a long
+# cron-anchored interval does not trip it. ``TICK_STALENESS_FLOOR_SECS``
+# is a lower bound so a short-interval loop is not flagged for a single
+# tick that ran a little long.
+DEFAULT_TICK_STALENESS_MULTIPLE = 5.0
+TICK_STALENESS_FLOOR_SECS = 120.0
+
 
 # ---------------------------------------------------------------------------
 # State records
 # ---------------------------------------------------------------------------
 
 CoroFactory = Callable[[], Awaitable[Any]]
+
+
+@dataclass
+class TickHealth:
+    """Per-loop tick-health record for a ``supervised_interval_loop``.
+
+     — the loop scaffolding swallows every per-tick exception so a
+    single bad tick never kills the loop. The cost is that a loop whose
+    *every* tick fails looks identical (``status="running"``) to a
+    healthy one. This record is the missing signal: the loop updates it
+    after each tick, and ``TaskSupervisor.health_snapshot()`` merges it
+    into the per-task payload so /health can degrade on a sustained
+    failure run.
+
+    ``failing`` is True only once ``consecutive_failures`` reaches the
+    threshold — so one transient hiccup does not flap the signal.
+
+     — ``interval_secs`` and ``started_ts`` are recorded so
+    ``stale`` can be computed: a tick that hangs forever never reaches
+    ``record_tick_result``, so ``last_tick_ts`` alone cannot reveal a
+    wedged loop. ``stale`` compares the freshness reference (the later
+    of ``last_tick_ts`` and ``started_ts``) against the interval.
+    """
+    loop_name: str
+    last_tick_ok: bool = True
+    consecutive_failures: int = 0
+    last_tick_ts: float | None = None
+    last_tick_error_type: str | None = None
+    total_ticks: int = 0
+    total_tick_failures: int = 0
+    failure_threshold: int = DEFAULT_TICK_FAILURE_THRESHOLD
+    #  — staleness inputs. ``interval_secs`` is the loop's current
+    # sleep cadence (the loop reports it; for a callable interval it is
+    # the most recent computed value). ``started_ts`` is when the loop
+    # registered — it bridges the warm-up window before the first tick.
+    interval_secs: float | None = None
+    started_ts: float | None = None
+    staleness_multiple: float = DEFAULT_TICK_STALENESS_MULTIPLE
+
+    @property
+    def failing(self) -> bool:
+        """True once consecutive failures reach the threshold."""
+        return self.consecutive_failures >= self.failure_threshold
+
+    def staleness_budget_secs(self) -> float | None:
+        """How long since the last tick is still considered healthy.
+
+        ``None`` when the interval is unknown (loop never reported one)
+        — staleness cannot be judged, so it is not flagged.
+        """
+        if self.interval_secs is None:
+            return None
+        return max(
+            self.interval_secs * self.staleness_multiple,
+            TICK_STALENESS_FLOOR_SECS,
+        )
+
+    def seconds_since_tick(self, *, now: float | None = None) -> float | None:
+        """Seconds since the freshness reference (last tick, or loop
+        start before the first tick). ``None`` if neither is known."""
+        ref = self.last_tick_ts
+        if ref is None:
+            ref = self.started_ts
+        if ref is None:
+            return None
+        return (time.time() if now is None else now) - ref
+
+    def is_stale(self, *, now: float | None = None) -> bool:
+        """True when no tick has completed within the staleness budget
+        — the signal a hung tick (which never calls
+        ``record_tick_result``) would otherwise hide."""
+        budget = self.staleness_budget_secs()
+        if budget is None:
+            return False
+        since = self.seconds_since_tick(now=now)
+        if since is None:
+            return False
+        return since > budget
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "last_tick_ok": self.last_tick_ok,
+            "consecutive_failures": self.consecutive_failures,
+            "last_tick_ts": self.last_tick_ts,
+            "last_tick_error_type": self.last_tick_error_type,
+            "total_ticks": self.total_ticks,
+            "total_tick_failures": self.total_tick_failures,
+            "failing": self.failing,
+            "interval_secs": self.interval_secs,
+            "seconds_since_tick": self.seconds_since_tick(),
+            "staleness_budget_secs": self.staleness_budget_secs(),
+            "stale": self.is_stale(),
+        }
+
+
+# Module-level registry of per-loop tick health, keyed by loop name.
+# ``supervised_interval_loop`` writes here; ``TaskSupervisor.
+# health_snapshot()`` reads here. A module global (rather than threading
+# the supervisor through every ``supervised_interval_loop`` call site)
+# keeps the ~15 existing callers untouched — the loop name is the join
+# key and it already matches the supervised-task name 1:1.
+_tick_health: dict[str, TickHealth] = {}
+
+
+def mark_loop_started(
+    loop_name: str,
+    interval_secs: float | None,
+    *,
+    staleness_multiple: float = DEFAULT_TICK_STALENESS_MULTIPLE,
+) -> TickHealth:
+    """Register a ``supervised_interval_loop`` at startup.
+
+     — records ``started_ts`` (so the staleness clock has a
+    reference before the first tick completes) and the loop's
+    ``interval_secs`` (so :meth:`TickHealth.is_stale` has a budget).
+    Idempotent: re-registering an existing loop refreshes the interval
+    but leaves the tick counters untouched.
+    """
+    th = _tick_health.get(loop_name)
+    if th is None:
+        th = TickHealth(loop_name=loop_name)
+        _tick_health[loop_name] = th
+    th.started_ts = time.time()
+    th.interval_secs = interval_secs
+    th.staleness_multiple = staleness_multiple
+    return th
+
+
+def record_tick_result(
+    loop_name: str,
+    ok: bool,
+    *,
+    error_type: str | None = None,
+    failure_threshold: int = DEFAULT_TICK_FAILURE_THRESHOLD,
+    interval_secs: float | None = None,
+) -> TickHealth:
+    """Record the outcome of one ``supervised_interval_loop`` tick.
+
+    A successful tick clears ``consecutive_failures``; a failed tick
+    increments it. Returns the live :class:`TickHealth` record so the
+    caller can inspect ``failing`` without a second lookup.
+
+     — ``interval_secs``, when supplied, refreshes the staleness
+    budget input (a callable interval changes tick-to-tick).
+    """
+    th = _tick_health.get(loop_name)
+    if th is None:
+        th = TickHealth(loop_name=loop_name, failure_threshold=failure_threshold)
+        _tick_health[loop_name] = th
+    th.failure_threshold = failure_threshold
+    if interval_secs is not None:
+        th.interval_secs = interval_secs
+    th.total_ticks += 1
+    th.last_tick_ts = time.time()
+    th.last_tick_ok = ok
+    if ok:
+        th.consecutive_failures = 0
+        th.last_tick_error_type = None
+    else:
+        th.consecutive_failures += 1
+        th.total_tick_failures += 1
+        th.last_tick_error_type = error_type
+    return th
+
+
+def get_tick_health(loop_name: str) -> TickHealth | None:
+    """Return the tick-health record for ``loop_name`` (or None)."""
+    return _tick_health.get(loop_name)
 
 
 @dataclass
@@ -252,10 +446,31 @@ class TaskSupervisor:
         """Return a JSON-safe snapshot of every supervised task.
 
         Consumed by ``/health`` to report tasks block. Counts are
-        derived (any_quarantined, any_crashed_recently, total_crashes)
-        so the endpoint doesn't have to compute them itself.
+        derived (any_quarantined, any_crashed_recently, total_crashes,
+        any_loop_tick_failing) so the endpoint doesn't have to compute
+        them itself.
+
+         — each task that runs as a ``supervised_interval_loop``
+        also carries a ``tick_health`` sub-dict (merged from the
+        module-level tick-health registry by matching loop name). The
+        derived ``any_loop_tick_failing`` flag is True when at least
+        one loop has hit its consecutive-failure threshold — a loop
+        that is nominally ``status="running"`` but whose every tick
+        fails. /health folds this into ``degraded``.
+
+         — ``any_loop_tick_stale`` is the companion signal for the
+        hung-tick blind spot: a tick that never returns never reaches
+        ``record_tick_result``, so the failure counter cannot move. A
+        loop is "stale" when its last tick (or its start, before the
+        first tick) is older than a generous multiple of its interval.
+        /health folds this into ``degraded`` too.
         """
         tasks = {n: s.to_dict() for n, s in self._states.items()}
+        # Merge per-loop tick health onto the matching task record.
+        for name, rec in tasks.items():
+            th = _tick_health.get(name)
+            if th is not None:
+                rec["tick_health"] = th.to_dict()
         any_quarantined = any(
             s.status == "quarantined" for s in self._states.values()
         )
@@ -263,11 +478,25 @@ class TaskSupervisor:
             s.status == "crashed" for s in self._states.values()
         )
         total_crashes = sum(s.crashes for s in self._states.values())
+        # A loop is "tick-failing" only once it has crossed the
+        # consecutive-failure threshold — one transient hiccup does
+        # not flip this.
+        any_loop_tick_failing = any(
+            th.failing for th in _tick_health.values()
+        )
+        # A loop is "tick-stale" when no tick has completed within its
+        # staleness budget — the only signal a wedged (hung) tick
+        # leaves, since it never records a result.
+        any_loop_tick_stale = any(
+            th.is_stale() for th in _tick_health.values()
+        )
         return {
             "tasks": tasks,
             "any_quarantined": any_quarantined,
             "any_crashed_recently": any_crashed_recently,
             "total_crashes": total_crashes,
+            "any_loop_tick_failing": any_loop_tick_failing,
+            "any_loop_tick_stale": any_loop_tick_stale,
         }
 
     def get_state(self, name: str) -> TaskState | None:
@@ -309,3 +538,200 @@ class TaskSupervisor:
                 # Cancellation is the expected path; swallow.
                 pass
             self._states[name].status = "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Interval-loop helper
+# ---------------------------------------------------------------------------
+
+
+async def _run_leased_tick(
+    loop_name: str,
+    lease_name: str,
+    conn: sqlite3.Connection,
+    ttl_secs: float,
+    tick: Callable[[], Awaitable[Any]],
+) -> None:
+    """Run ``tick`` only while holding the ``single_flight`` DB lock
+    ``lease_name``. Another instance holding it → skip this tick.
+
+    The lock is held for the tick's duration only — no renewal. That
+    is the right model for the idempotent interval sweeps this drives:
+    a crashed holder's lock auto-expires within a few ticks (the TTL),
+    and the next tick on any instance simply runs. Leadership may move
+    tick-to-tick; for an idempotent sweep that is harmless.
+    """
+    from email_triage.single_flight import (
+        DbLockBusy, acquire_db_lock_async,
+    )
+    try:
+        async with acquire_db_lock_async(
+            conn, lease_name, ttl_secs=int(ttl_secs),
+        ):
+            await tick()
+    except DbLockBusy:
+        # Another instance owns the lease this tick — expected in a
+        # multi-instance deployment, a no-op single-instance.
+        _log.debug(
+            "interval loop tick skipped — lease held elsewhere",
+            extra={"_extra": {"loop": loop_name, "lease": lease_name}},
+        )
+
+
+async def supervised_interval_loop(
+    name: str,
+    interval_secs: float | Callable[[], float],
+    tick: Callable[[], Awaitable[Any]],
+    *,
+    warmup_secs: float = 5.0,
+    startup_jitter_secs: float = 0.0,
+    lease_name: str | None = None,
+    lease_conn: sqlite3.Connection | None = None,
+    lease_ttl_secs: float | None = None,
+) -> None:
+    """Run ``tick`` every ``interval_secs`` forever, with the standard
+    background-loop guards.
+
+    ~15 background loops each hand-rolled the same skeleton — a warm-up
+    delay, a ``while True`` with a per-tick ``try/except`` (re-raising
+    ``CancelledError``, logging anything else), and a cancel-safe
+    interval sleep. This is the single home for it: a loop function
+    becomes just its per-tick body passed as ``tick``, and the result
+    is handed to :meth:`TaskSupervisor.supervise` exactly as before
+    (the supervisor still catches a crash of the loop scaffolding
+    itself).
+
+    ``interval_secs`` is normally a fixed number of seconds, but it may
+    also be a zero-arg callable returning the seconds to sleep before
+    the next tick — re-evaluated each cycle. That supports a
+    cron-anchored cadence (sleep to the next HH:00 boundary rather than
+    a fixed delay after the previous tick finished).
+
+    Lease-gating: when ``lease_name`` is set, each tick runs
+    only on the instance that can acquire the ``single_flight`` DB
+    advisory lock of that name — see :func:`_run_leased_tick`. This is
+    idempotent and a transparent no-op on a single-instance install;
+    it is forward-prep for a multi-instance deployment where exactly
+    one instance should run a given global sweep per tick. ``lease_conn``
+    (the app DB connection) is required when ``lease_name`` is set.
+    ``lease_ttl_secs`` defaults to ``max(interval_secs * 3, 60)`` for a
+    fixed interval (3600 for a callable one) so a crashed holder's lock
+    auto-expires within a few ticks.
+
+    First-tick startup jitter: when ``startup_jitter_secs``
+    is positive, the loop sleeps a uniform random interval in
+    ``[0, startup_jitter_secs)`` BEFORE the ``warmup_secs`` delay. This
+    staggers the first-tick across all loops so the ~14 background
+    interval loops don't all hit ``@db_write`` writes within the same
+    5-10s window after the warmup expires — the SQLite single-writer
+    queue depth then exceeds the 30s ``busy_timeout``, producing a
+    ``database is locked`` storm that Phase 3 closed the cursor-
+    corruption cascade but cannot close (it's the engine-level wall).
+    Each loop's jitter is drawn ONCE at process start; subsequent ticks
+    follow the regular ``interval_secs`` cadence (jitter is NOT applied
+    each cycle). Default 0.0 = backward-compatible no-op for callers
+    that don't opt in.
+
+    The ``acme_renewer`` previously used a manual ``await asyncio.sleep``
+    BEFORE calling ``supervised_interval_loop`` to stagger past the
+    o365 / gmail renewers. The ``startup_jitter_secs`` kwarg supersedes
+    that pattern uniformly across every interval loop.
+    """
+    if lease_name is not None and lease_conn is None:
+        raise ValueError(
+            f"supervised_interval_loop({name!r}): lease_name set but "
+            f"lease_conn is None"
+        )
+
+    #  Shape B — first-tick startup jitter. Applied BEFORE warmup
+    # so the warmup window's purpose (let app finish lifespan
+    # initialisation before any tick fires) is preserved; the jitter
+    # simply spreads the post-warmup wave across a window. Use
+    # ``random.uniform`` so the distribution is flat — every
+    # millisecond in ``[0, N)`` is equally likely to be chosen, which
+    # avoids the cluster-near-zero shape of an exponential or
+    # half-normal draw.
+    if startup_jitter_secs > 0:
+        await asyncio.sleep(random.uniform(0, startup_jitter_secs))
+
+    if warmup_secs > 0:
+        await asyncio.sleep(warmup_secs)
+    _log.info(
+        "interval loop started",
+        extra={"_extra": {
+            "loop": name,
+            "interval_secs": (
+                "dynamic" if callable(interval_secs) else interval_secs
+            ),
+            "lease_name": lease_name,
+        }},
+    )
+
+    if lease_ttl_secs:
+        ttl = lease_ttl_secs
+    elif callable(interval_secs):
+        ttl = 3600.0
+    else:
+        ttl = max(interval_secs * 3, 60.0)
+
+    #  — register the loop so the staleness clock has a reference
+    # (``started_ts``) and a budget (``interval_secs``) before the
+    # first tick lands. A fixed interval is recorded as-is; a callable
+    # interval is seeded with its first computed value and then
+    # refreshed each cycle via ``record_tick_result``.
+    initial_interval = (
+        interval_secs() if callable(interval_secs) else interval_secs
+    )
+    mark_loop_started(name, initial_interval)
+
+    while True:
+        #  — compute the next interval up front so it can refresh
+        # the staleness budget on every tick-result record (a callable
+        # interval changes cycle-to-cycle).
+        delay = interval_secs() if callable(interval_secs) else interval_secs
+        try:
+            if lease_name is not None:
+                await _run_leased_tick(
+                    name, lease_name, lease_conn, ttl, tick,
+                )
+            else:
+                await tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A per-tick failure must not kill the loop — log and carry
+            # on to the next interval. (The supervisor's crash handling
+            # is the safety net for a failure of the loop scaffolding,
+            # which this except deliberately does not let through.)
+            #
+            #  — but a swallowed tick failure was previously
+            # *invisible*: a loop whose every tick fails stays
+            # ``status="running"`` and /health can't tell. Record the
+            # outcome in the tick-health registry so a sustained
+            # failure run surfaces (``any_loop_tick_failing`` →
+            # /health ``degraded``). A single transient failure is
+            # cleared by the next good tick before it crosses the
+            # threshold, so the signal does not flap.
+            th = record_tick_result(
+                name, ok=False, error_type=type(exc).__name__,
+                interval_secs=delay,
+            )
+            log_fn = _log.error if th.failing else _log.warning
+            log_fn(
+                "interval loop tick failed",
+                extra={"_extra": {
+                    "loop": name,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                    "consecutive_failures": th.consecutive_failures,
+                    "tick_failing": th.failing,
+                }},
+            )
+        else:
+            # Clean tick — clear any prior consecutive-failure streak.
+            record_tick_result(name, ok=True, interval_secs=delay)
+
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise

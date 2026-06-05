@@ -1,4 +1,4 @@
-"""Tests for the backup/restore module (#65).
+"""Tests for the backup/restore module.
 
 Covers:
 

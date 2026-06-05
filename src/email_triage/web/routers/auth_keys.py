@@ -1,4 +1,4 @@
-"""Auth-surface routes (#67): dev-keypair admin + login,
+"""Auth-surface routes: dev-keypair admin + login,
 WebAuthn registration + login, and ACME diagnostic test buttons.
 
 Lives in its own router so the existing 7000-line ``ui.py`` doesn't
@@ -39,10 +39,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from email_triage.triage_logging import get_logger
 from email_triage.web.auth import (
-    SESSION_COOKIE_NAME,
     SESSION_MAX_AGE,
     create_session_token,
     get_user_by_email,
+    set_session_cookie,
 )
 from email_triage.web.dependencies import get_current_user
 from email_triage.web.db_auth_helpers import (
@@ -60,6 +60,7 @@ from email_triage.web.db_auth_helpers import (
 from email_triage.web import dev_keypair as dk
 from email_triage.web import webauthn_auth as wa
 from email_triage.web import acme_renewer as acme_mod
+from email_triage.web.db_threadpool import db_call
 from email_triage._errfmt import fmt_exc
 
 
@@ -88,12 +89,17 @@ def _get_secrets(request: Request):
     return request.app.state.secrets
 
 
-def _render(request: Request, name: str, context: dict[str, Any] | None = None):
+async def _render(request: Request, name: str, context: dict[str, Any] | None = None):
     """Wrapper matching ui.py's `_render` semantics: injects user +
     hipaa_mode template globals so base templates render
-    consistently."""
+    consistently.
+
+     / Option B — ``async`` because the shared ``_render`` it
+    delegates to is async (auto-injected admin banners read the
+    shared connection off-loop). Callers ``await`` the wrapper.
+    """
     from email_triage.web.routers.ui import _render as _render_ui
-    return _render_ui(_get_templates(request), request, name, context or {})
+    return await _render_ui(_get_templates(request), request, name, context or {})
 
 
 def _allowed_webauthn_origins(request: Request, config) -> list[str]:
@@ -103,7 +109,7 @@ def _allowed_webauthn_origins(request: Request, config) -> list[str]:
     page from in ``clientDataJSON.origin``; the verify call must accept
     that exact string. A static config field can't cover all of:
 
-      * Direct listener on a non-default port (``:8081``)
+      * Direct listener on a non-default port (``:8080``)
       * Reverse-proxy fronted on :443 (bare hostname)
       * Operator switching between the two without re-issuing keys
 
@@ -169,7 +175,7 @@ async def admin_dev_keys_legacy(request: Request):
     and non-admin users still get 403 — preserves the pre-refactor
     contract that ``follow_redirects=False`` tests pin against.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     qs = request.url.query
@@ -248,7 +254,7 @@ async def admin_dev_keys_add(
     ``ttl`` is one of '1d' / '1w' / '2w' (UI dropdown). ``email_allowlist``
     is a comma-separated list of emails the key may log in as.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = _get_db(request)
@@ -280,27 +286,41 @@ async def admin_dev_keys_add(
             'Email allowlist required (comma-separated).</small>',
             status_code=400,
         )
-    for em in emails:
-        if get_user_by_email(db, em) is None:
-            return HTMLResponse(
-                f'<small style="color:var(--pico-del-color);">'
-                f"Allowlist email {em!r} doesn't match a known user.</small>",
-                status_code=400,
-            )
 
-    try:
-        new_id = db_add_dev_key(
-            db, name=name, public_key=public_key.strip(),
-            fingerprint=fp, email_allowlist=emails,
-            created_by_user_id=user["id"], expires_at=expires_at,
+    def _validate_and_add(db, emails, name, public_key, fp, user_id, expires_at):
+        # ASYNC-DB: allowlist-email validation + dev-key insert in
+        # one off-loop hop.
+        for em in emails:
+            if get_user_by_email(db, em) is None:
+                return "bad_email", em
+        try:
+            new_id_ = db_add_dev_key(
+                db, name=name, public_key=public_key,
+                fingerprint=fp, email_allowlist=emails,
+                created_by_user_id=user_id, expires_at=expires_at,
+            )
+        except sqlite3.IntegrityError:
+            return "dup", None
+        return "ok", new_id_
+
+    outcome, payload = await db_call(
+        _validate_and_add, db, emails, name, public_key.strip(),
+        fp, user["id"], expires_at,
+    )
+    if outcome == "bad_email":
+        return HTMLResponse(
+            f'<small style="color:var(--pico-del-color);">'
+            f"Allowlist email {payload!r} doesn't match a known user.</small>",
+            status_code=400,
         )
-    except sqlite3.IntegrityError:
+    if outcome == "dup":
         return HTMLResponse(
             f'<small style="color:var(--pico-del-color);">'
             f'Fingerprint already registered: {fp}. '
             f'Revoke the existing entry first.</small>',
             status_code=409,
         )
+    new_id = payload
 
     log.info(
         "Dev key registered",
@@ -314,11 +334,12 @@ async def admin_dev_keys_add(
 
 @router.post("/admin/dev-keys/{key_id}/revoke", response_class=HTMLResponse)
 async def admin_dev_keys_revoke(request: Request, key_id: int):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = _get_db(request)
-    ok = db_revoke_dev_key(db, key_id, user["id"])
+    # ASYNC-DB: dev-key revoke off the loop.
+    ok = await db_call(db_revoke_dev_key, db, key_id, user["id"])
     if ok:
         log.info("Dev key revoked", key_id=key_id, actor_user_id=user["id"])
     return RedirectResponse("/config?tab=security", status_code=303)
@@ -334,7 +355,7 @@ async def login_dev_keypair_page(request: Request):
     cookie so the operator's CLI / paste-in client can sign it."""
     challenge = dk.generate_login_challenge()
     challenge_b64 = base64.urlsafe_b64encode(challenge).rstrip(b"=").decode("ascii")
-    response = _render(request, "login_dev_keypair.html", {
+    response = await _render(request, "login_dev_keypair.html", {
         "challenge": challenge_b64,
     })
     response.set_cookie(
@@ -371,7 +392,7 @@ async def login_dev_keypair_verify(
     row, this path is closed for that email. OTP path remains
     available regardless.
 
-    #92 — login_guard runs FIRST so a brute-force attacker can't
+     — login_guard runs FIRST so a brute-force attacker can't
     use the signature-verify side-channel for fingerprint /
     public-key oracle queries. Per-email + per-ip counters are
     shared with the OTP and WebAuthn surfaces — a sustained
@@ -383,21 +404,32 @@ async def login_dev_keypair_verify(
     client_host = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    # #92 lockout gate.
+    #  lockout gate.
     from email_triage.web.login_guard import (
         check_login_allowed, record_login_failure, record_login_lockout,
         LoginLocked,
     )
-    try:
-        check_login_allowed(
-            db, email=email, ip=client_host, config=config,
-        )
-    except LoginLocked as locked:
-        record_login_lockout(
-            db, surface="dev_keypair", email=email, ip=client_host,
-            user_agent=user_agent, scope=locked.scope,
-            threshold=locked.retry_after_secs,
-        )
+
+    def _lockout_gate(db, email, client_host, config, user_agent):
+        # ASYNC-DB: lockout-counter read + (on lock) lockout write
+        # in one off-loop hop.
+        try:
+            check_login_allowed(
+                db, email=email, ip=client_host, config=config,
+            )
+            return None
+        except LoginLocked as locked_:
+            record_login_lockout(
+                db, surface="dev_keypair", email=email, ip=client_host,
+                user_agent=user_agent, scope=locked_.scope,
+                threshold=locked_.retry_after_secs,
+            )
+            return locked_
+
+    locked = await db_call(
+        _lockout_gate, db, email, client_host, config, user_agent,
+    )
+    if locked is not None:
         retry_min = max(1, locked.retry_after_secs // 60)
         return HTMLResponse(
             f"Too many login attempts. Try again in {retry_min} "
@@ -460,126 +492,141 @@ async def login_dev_keypair_verify(
             status_code=400,
         )
 
-    # Look up the registered key.
-    row = find_dev_key_by_fingerprint(db, fingerprint)
-    if row is None:
+    # ASYNC-DB: the whole dev-keypair verify — key lookup, all
+    # validation reads, every failure-record write, the success-path
+    # mark_dev_key_used + record_auth_event — runs in ONE off-loop hop.
+    # The signature crypto (parse/verify) is short pure-CPU work and is
+    # included so the handler never bounces between loop and threadpool
+    # mid-verify.
+    email_l = email.strip().lower()
+    client_ip = request.client.host if request.client else ""
+
+    def _verify_dev_keypair(db):
+        from email_triage.web.db import record_auth_event
+        row = find_dev_key_by_fingerprint(db, fingerprint)
+        if row is None:
+            record_login_failure(
+                db, surface="dev_keypair", email=email, ip=client_host,
+                user_agent=user_agent, reason="unknown_fingerprint",
+            )
+            return ("unknown_fingerprint", None, None)
+        now_iso_ = datetime.now(timezone.utc).isoformat()
+        if not is_dev_key_active(row, now_iso_):
+            record_login_failure(
+                db, surface="dev_keypair", email=email, ip=client_host,
+                user_agent=user_agent, reason="key_inactive",
+                key_id=row["id"],
+            )
+            return ("key_inactive", row, None)
+        if email_l not in [e.lower() for e in row.get("email_allowlist", [])]:
+            record_login_failure(
+                db, surface="dev_keypair", email=email_l, ip=client_host,
+                user_agent=user_agent, reason="email_not_in_allowlist",
+                key_id=row["id"],
+            )
+            return ("email_not_in_allowlist", row, None)
+        user_ = get_user_by_email(db, email_l)
+        if user_ is None:
+            record_login_failure(
+                db, surface="dev_keypair", email=email_l, ip=client_host,
+                user_agent=user_agent, reason="account_not_found",
+            )
+            return ("account_not_found", row, None)
+        if user_.get("disabled"):
+            record_login_failure(
+                db, surface="dev_keypair", email=email_l, ip=client_host,
+                user_agent=user_agent, reason="account_disabled",
+                user_id=user_["id"],
+            )
+            return ("account_disabled", row, user_)
+        if user_has_active_hardware_key(db, user_["id"]):
+            record_login_failure(
+                db, surface="dev_keypair", email=email_l, ip=client_host,
+                user_agent=user_agent, reason="hardware_key_required",
+                user_id=user_["id"], key_id=row["id"],
+            )
+            return ("hardware_key_required", row, user_)
+        # Verify signature against challenge (pure-CPU; kept in the
+        # worker so the verify is one atomic off-loop unit).
+        try:
+            parsed_ = dk.parse_ssh_ed25519_pubkey(row["public_key"])
+        except dk.DevKeyParseError:
+            return ("parse_error", row, user_)
+        if not dk.verify_signature(parsed_, challenge, sig_bytes):
+            record_login_failure(
+                db, surface="dev_keypair", email=email_l, ip=client_host,
+                user_agent=user_agent, reason="signature_invalid",
+                user_id=user_["id"], key_id=row["id"],
+            )
+            return ("signature_invalid", row, user_)
+        # All checks pass: stamp last_used_at + append-only audit row.
+        mark_dev_key_used(db, row["id"], email=email_l, ip=client_ip)
+        try:
+            record_auth_event(
+                db,
+                event_type="login_dev_keypair",
+                email=email_l,
+                user_id=user_["id"],
+                key_id=row["id"],
+                ip=client_ip or None,
+                user_agent=user_agent,
+                outcome="success",
+            )
+        except Exception:
+            pass
+        return ("ok", row, user_)
+
+    outcome, row, user = await db_call(_verify_dev_keypair, db)
+    if outcome == "unknown_fingerprint":
         log.warning(
             "Dev-keypair login: unknown fingerprint",
             fingerprint=fingerprint, email=email,
         )
-        record_login_failure(
-            db, surface="dev_keypair", email=email, ip=client_host,
-            user_agent=user_agent, reason="unknown_fingerprint",
-        )
-        return HTMLResponse(
-            "Unknown or revoked key.", status_code=403,
-        )
-    now_iso = datetime.now(timezone.utc).isoformat()
-    if not is_dev_key_active(row, now_iso):
+        return HTMLResponse("Unknown or revoked key.", status_code=403)
+    if outcome == "key_inactive":
         log.warning(
             "Dev-keypair login: key inactive",
             key_id=row["id"], email=email,
             revoked_at=row.get("revoked_at"),
             expires_at=row.get("expires_at"),
         )
-        record_login_failure(
-            db, surface="dev_keypair", email=email, ip=client_host,
-            user_agent=user_agent, reason="key_inactive",
-            key_id=row["id"],
-        )
         return HTMLResponse("Key is revoked or expired.", status_code=403)
-
-    # Email allowlist enforcement.
-    email_l = email.strip().lower()
-    if email_l not in [e.lower() for e in row.get("email_allowlist", [])]:
+    if outcome == "email_not_in_allowlist":
         log.warning(
             "Dev-keypair login: email not in allowlist",
             key_id=row["id"], email=email_l,
-        )
-        record_login_failure(
-            db, surface="dev_keypair", email=email_l, ip=client_host,
-            user_agent=user_agent, reason="email_not_in_allowlist",
-            key_id=row["id"],
         )
         return HTMLResponse(
             "This key is not allowlisted for that email.",
             status_code=403,
         )
-
-    # User exists?
-    user = get_user_by_email(db, email_l)
-    if user is None:
-        record_login_failure(
-            db, surface="dev_keypair", email=email_l, ip=client_host,
-            user_agent=user_agent, reason="account_not_found",
-        )
+    if outcome == "account_not_found":
         return HTMLResponse("Account not found.", status_code=404)
-    if user.get("disabled"):
-        record_login_failure(
-            db, surface="dev_keypair", email=email_l, ip=client_host,
-            user_agent=user_agent, reason="account_disabled",
-            user_id=user["id"],
-        )
+    if outcome == "account_disabled":
         return HTMLResponse("Account disabled.", status_code=403)
-
-    # Hardware-key-wins rule.
-    if user_has_active_hardware_key(db, user["id"]):
+    if outcome == "hardware_key_required":
         log.info(
             "Dev-keypair login refused: hardware key registered",
             email=email_l, user_id=user["id"], key_id=row["id"],
-        )
-        record_login_failure(
-            db, surface="dev_keypair", email=email_l, ip=client_host,
-            user_agent=user_agent, reason="hardware_key_required",
-            user_id=user["id"], key_id=row["id"],
         )
         return HTMLResponse(
             "This account has a hardware key registered. Use your "
             "hardware key or OTP fallback to log in.",
             status_code=403,
         )
-
-    # Verify signature against challenge.
-    try:
-        parsed = dk.parse_ssh_ed25519_pubkey(row["public_key"])
-    except dk.DevKeyParseError:
+    if outcome == "parse_error":
         log.error(
             "Dev-keypair login: stored public_key unparseable",
             key_id=row["id"],
         )
         return HTMLResponse("Server-side key parse error.", status_code=500)
-    if not dk.verify_signature(parsed, challenge, sig_bytes):
+    if outcome == "signature_invalid":
         log.warning(
             "Dev-keypair login: signature invalid",
             key_id=row["id"], email=email_l,
         )
-        record_login_failure(
-            db, surface="dev_keypair", email=email_l, ip=client_host,
-            user_agent=user_agent, reason="signature_invalid",
-            user_id=user["id"], key_id=row["id"],
-        )
         return HTMLResponse("Invalid signature.", status_code=403)
 
-    # All checks pass: mint session, stamp last_used_at on the key.
-    client_ip = request.client.host if request.client else ""
-    mark_dev_key_used(db, row["id"], email=email_l, ip=client_ip)
-    # PR 9 / D4 — append-only audit row, parallel to the
-    # mark_dev_key_used overwrite (which feeds the admin UI's
-    # "last used" display). This row preserves history.
-    try:
-        from email_triage.web.db import record_auth_event
-        record_auth_event(
-            db,
-            event_type="login_dev_keypair",
-            email=email_l,
-            user_id=user["id"],
-            key_id=row["id"],
-            ip=client_ip or None,
-            user_agent=request.headers.get("user-agent"),
-            outcome="success",
-        )
-    except Exception:
-        pass
     # PR 10 / E — metrics counter.
     try:
         from email_triage import metrics as metrics_mod
@@ -594,6 +641,7 @@ async def login_dev_keypair_verify(
     token = create_session_token(
         secret, user["email"], user["role"],
         auth_source="dev_keypair", auth_key_id=row["id"],
+        session_epoch=int(user.get("session_epoch", 0)),
     )
     log.info(
         "Dev-keypair login successful",
@@ -601,12 +649,7 @@ async def login_dev_keypair_verify(
         client_ip=client_ip,
     )
     response = RedirectResponse("/dashboard", status_code=303)
-    from email_triage.web.auth import effective_session_ttl
-    response.set_cookie(
-        SESSION_COOKIE_NAME, token,
-        max_age=effective_session_ttl(request.app.state.config),
-        httponly=True, samesite="lax",
-    )
+    set_session_cookie(response, token, request.app.state.config)
     response.delete_cookie(_DEV_KEYPAIR_CHALLENGE_COOKIE)
     return response
 
@@ -621,39 +664,48 @@ async def login_webauthn_begin(request: Request, email: str = Form(...)):
     browser to feed into navigator.credentials.get()."""
     db = _get_db(request)
     config = _get_config(request)
-    user = get_user_by_email(db, email.strip().lower())
-    if user is None or user.get("disabled"):
+
+    def _begin(db, email, config):
+        # ASYNC-DB: user lookup + hardware-key check + challenge
+        # store in one off-loop hop.
+        user_ = get_user_by_email(db, email.strip().lower())
+        if user_ is None or user_.get("disabled"):
+            return ("no_credential", None)
+        if not user_has_active_hardware_key(db, user_["id"]):
+            return ("no_credential", None)
+        try:
+            opts_json_ = wa.begin_authentication(
+                db,
+                user_id=user_["id"],
+                email=user_["email"],
+                rp_id=config.webauthn.rp_id,
+                require_user_verification=(
+                    config.webauthn.require_user_verification_for_admin
+                    and user_.get("role") == "admin"
+                ),
+            )
+        except wa.WebAuthnConfigError as e_:
+            return ("config_error", fmt_exc(e_))
+        except wa.WebAuthnAuthError as e_:
+            return ("auth_error", fmt_exc(e_))
+        return ("ok", opts_json_)
+
+    outcome, payload = await db_call(_begin, db, email, config)
+    if outcome == "no_credential":
         # Don't leak account existence — generic error.
-        return JSONResponse(
-            {"error": "no_credential"}, status_code=404,
-        )
-    if not user_has_active_hardware_key(db, user["id"]):
-        return JSONResponse(
-            {"error": "no_credential"}, status_code=404,
-        )
-    try:
-        opts_json = wa.begin_authentication(
-            db,
-            user_id=user["id"],
-            email=user["email"],
-            rp_id=config.webauthn.rp_id,
-            require_user_verification=(
-                config.webauthn.require_user_verification_for_admin
-                and user.get("role") == "admin"
-            ),
-        )
-    except wa.WebAuthnConfigError as e:
-        return JSONResponse({"error": fmt_exc(e)}, status_code=503)
-    except wa.WebAuthnAuthError as e:
-        return JSONResponse({"error": fmt_exc(e)}, status_code=400)
-    return JSONResponse(json.loads(opts_json))
+        return JSONResponse({"error": "no_credential"}, status_code=404)
+    if outcome == "config_error":
+        return JSONResponse({"error": payload}, status_code=503)
+    if outcome == "auth_error":
+        return JSONResponse({"error": payload}, status_code=400)
+    return JSONResponse(json.loads(payload))
 
 
 @router.post("/login/webauthn/finish", response_class=JSONResponse)
 async def login_webauthn_finish(request: Request):
     """Step 2 of WebAuthn login: verify assertion + mint session.
 
-    #92 — login_guard runs before assertion verify so brute-force
+     — login_guard runs before assertion verify so brute-force
     against the assertion path is throttled identically to the
     OTP + dev-keypair surfaces.
     """
@@ -667,72 +719,85 @@ async def login_webauthn_finish(request: Request):
     client_host = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    # #92 lockout gate.
+    #  lockout gate.
     from email_triage.web.login_guard import (
         check_login_allowed, record_login_failure, record_login_lockout,
         LoginLocked,
     )
-    try:
-        check_login_allowed(
-            db, email=email, ip=client_host, config=config,
-        )
-    except LoginLocked as locked:
-        record_login_lockout(
-            db, surface="webauthn", email=email, ip=client_host,
-            user_agent=user_agent, scope=locked.scope,
-            threshold=locked.retry_after_secs,
-        )
-        return JSONResponse(
-            {"error": "rate_limited",
-             "retry_after_secs": locked.retry_after_secs},
-            status_code=429,
-            headers={"Retry-After": str(locked.retry_after_secs)},
-        )
+    # Pure (config + request headers, no DB) — compute before the hop.
+    allowed_origins = _allowed_webauthn_origins(request, config)
 
-    user = get_user_by_email(db, email)
-    if user is None or user.get("disabled"):
-        # Don't leak account state — generic error AND a failure
-        # row so the rate-limiter still counts the probe.
-        record_login_failure(
-            db, surface="webauthn", email=email, ip=client_host,
-            user_agent=user_agent,
-            reason="no_account_or_disabled",
-        )
-        return JSONResponse({"error": "no_credential"}, status_code=404)
-    try:
-        key_id = wa.finish_authentication(
-            db,
-            user_id=user["id"],
-            rp_id=config.webauthn.rp_id,
-            origin=_allowed_webauthn_origins(request, config),
-            response_json=response_data,
-        )
-    except wa.WebAuthnAuthError as e:
-        log.warning("WebAuthn login: assertion verify failed",
-                    email=email, error=fmt_exc(e))
-        record_login_failure(
-            db, surface="webauthn", email=email, ip=client_host,
-            user_agent=user_agent, reason="verify_failed",
-            user_id=user["id"],
-        )
-        return JSONResponse({"error": "verify_failed"}, status_code=403)
-    # PR 9 / D4 — append-only audit. WebAuthn finish_authentication
-    # already updates hardware_keys.last_used_at internally; this
-    # row preserves history.
-    try:
+    # ASYNC-DB: lockout gate + user lookup + assertion verify +
+    # failure/success writes, all in ONE off-loop hop.
+    def _verify_webauthn(db):
         from email_triage.web.db import record_auth_event
-        record_auth_event(
-            db,
-            event_type="login_webauthn",
-            email=email,
-            user_id=user["id"],
-            key_id=key_id,
-            ip=(request.client.host if request.client else None),
-            user_agent=request.headers.get("user-agent"),
-            outcome="success",
+        try:
+            check_login_allowed(
+                db, email=email, ip=client_host, config=config,
+            )
+        except LoginLocked as locked_:
+            record_login_lockout(
+                db, surface="webauthn", email=email, ip=client_host,
+                user_agent=user_agent, scope=locked_.scope,
+                threshold=locked_.retry_after_secs,
+            )
+            return ("locked", locked_.retry_after_secs, None, None)
+        user_ = get_user_by_email(db, email)
+        if user_ is None or user_.get("disabled"):
+            # Don't leak account state — generic error AND a failure
+            # row so the rate-limiter still counts the probe.
+            record_login_failure(
+                db, surface="webauthn", email=email, ip=client_host,
+                user_agent=user_agent,
+                reason="no_account_or_disabled",
+            )
+            return ("no_credential", None, None, None)
+        try:
+            key_id_ = wa.finish_authentication(
+                db,
+                user_id=user_["id"],
+                rp_id=config.webauthn.rp_id,
+                origin=allowed_origins,
+                response_json=response_data,
+            )
+        except wa.WebAuthnAuthError as e_:
+            record_login_failure(
+                db, surface="webauthn", email=email, ip=client_host,
+                user_agent=user_agent, reason="verify_failed",
+                user_id=user_["id"],
+            )
+            return ("verify_failed", fmt_exc(e_), user_, None)
+        # PR 9 / D4 — append-only audit. WebAuthn finish_authentication
+        # already updates hardware_keys.last_used_at internally; this
+        # row preserves history.
+        try:
+            record_auth_event(
+                db,
+                event_type="login_webauthn",
+                email=email,
+                user_id=user_["id"],
+                key_id=key_id_,
+                ip=client_host,
+                user_agent=user_agent,
+                outcome="success",
+            )
+        except Exception:
+            pass
+        return ("ok", None, user_, key_id_)
+
+    outcome, extra, user, key_id = await db_call(_verify_webauthn, db)
+    if outcome == "locked":
+        return JSONResponse(
+            {"error": "rate_limited", "retry_after_secs": extra},
+            status_code=429,
+            headers={"Retry-After": str(extra)},
         )
-    except Exception:
-        pass
+    if outcome == "no_credential":
+        return JSONResponse({"error": "no_credential"}, status_code=404)
+    if outcome == "verify_failed":
+        log.warning("WebAuthn login: assertion verify failed",
+                    email=email, error=extra)
+        return JSONResponse({"error": "verify_failed"}, status_code=403)
     # PR 10 / E — metrics counter.
     try:
         from email_triage import metrics as metrics_mod
@@ -743,18 +808,19 @@ async def login_webauthn_finish(request: Request):
     except Exception:
         pass
     from email_triage.web.dependencies import get_session_secret
+    from email_triage.web.mfa import mfa_verified_now
     secret = get_session_secret(request)
+    # H-05 (Cycle 7) — WebAuthn login stamps mfa_verified_at so the
+    # HIPAA-mode hard-cutover middleware accepts the session without
+    # forcing a step-up.
     token = create_session_token(
         secret, user["email"], user["role"],
         auth_source="webauthn", auth_key_id=key_id,
+        session_epoch=int(user.get("session_epoch", 0)),
+        mfa_verified_at=mfa_verified_now(),
     )
     response = JSONResponse({"ok": True, "redirect": "/dashboard"})
-    from email_triage.web.auth import effective_session_ttl
-    response.set_cookie(
-        SESSION_COOKIE_NAME, token,
-        max_age=effective_session_ttl(request.app.state.config),
-        httponly=True, samesite="lax",
-    )
+    set_session_cookie(response, token, request.app.state.config)
     log.info(
         "WebAuthn login successful",
         user_id=user["id"], email=email, key_id=key_id,
@@ -813,7 +879,7 @@ async def login_passkey_finish(request: Request):
     """Step 2 of passkey login: read challenge from cookie, verify
     assertion, resolve user from credential, mint session.
 
-    #92 — IP-only guard (passkey doesn't carry email upfront).
+     — IP-only guard (passkey doesn't carry email upfront).
     The per-email guard fires later if user resolution succeeds
     AND the assertion fails.
     """
@@ -826,21 +892,29 @@ async def login_passkey_finish(request: Request):
     client_host = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent")
 
-    # #92 IP-only lockout gate (no email yet at this point).
+    #  IP-only lockout gate (no email yet at this point).
     from email_triage.web.login_guard import (
         check_login_allowed, record_login_failure, record_login_lockout,
         LoginLocked,
     )
-    try:
-        check_login_allowed(
-            db, email=None, ip=client_host, config=config,
-        )
-    except LoginLocked as locked:
-        record_login_lockout(
-            db, surface="passkey", email=None, ip=client_host,
-            user_agent=user_agent, scope=locked.scope,
-            threshold=locked.retry_after_secs,
-        )
+
+    def _passkey_lockout_gate(db):
+        # ASYNC-DB: lockout-counter read + (on lock) write off-loop.
+        try:
+            check_login_allowed(
+                db, email=None, ip=client_host, config=config,
+            )
+            return None
+        except LoginLocked as locked_:
+            record_login_lockout(
+                db, surface="passkey", email=None, ip=client_host,
+                user_agent=user_agent, scope=locked_.scope,
+                threshold=locked_.retry_after_secs,
+            )
+            return locked_
+
+    locked = await db_call(_passkey_lockout_gate, db)
+    if locked is not None:
         return JSONResponse(
             {"error": "rate_limited",
              "retry_after_secs": locked.retry_after_secs},
@@ -865,57 +939,69 @@ async def login_passkey_finish(request: Request):
             {"error": "challenge_invalid"}, status_code=400,
         )
 
-    try:
-        user_id, key_id = wa.finish_passkey_authentication(
-            db,
-            rp_id=config.webauthn.rp_id,
-            origin=_allowed_webauthn_origins(request, config),
-            response_json=response_data,
-            challenge=challenge,
-        )
-    except wa.WebAuthnAuthError as e:
+    # Pure (config + request headers, no DB) — compute before the hop.
+    allowed_origins = _allowed_webauthn_origins(request, config)
+
+    # ASYNC-DB: passkey assertion verify + user resolution +
+    # failure/success writes, all in ONE off-loop hop.
+    def _verify_passkey(db):
+        from email_triage.web.db import record_auth_event
+        try:
+            user_id_, key_id_ = wa.finish_passkey_authentication(
+                db,
+                rp_id=config.webauthn.rp_id,
+                origin=allowed_origins,
+                response_json=response_data,
+                challenge=challenge,
+            )
+        except wa.WebAuthnAuthError as e_:
+            record_login_failure(
+                db, surface="passkey", email=None, ip=client_host,
+                user_agent=user_agent, reason="verify_failed",
+            )
+            return ("verify_failed", fmt_exc(e_), None, None)
+        # Look up the resolved user. No dedicated by-id helper exists;
+        # one-line query is fine.
+        row_ = db.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id_,),
+        ).fetchone()
+        user_ = dict(row_) if row_ else None
+        if user_ is None or user_.get("disabled"):
+            record_login_failure(
+                db, surface="passkey",
+                email=(row_["email"] if row_ else None),
+                ip=client_host, user_agent=user_agent,
+                reason="user_inactive",
+                user_id=user_id_, key_id=key_id_,
+            )
+            return ("user_inactive", None, user_, key_id_)
+        # Append-only audit (mirrors the existing webauthn login site).
+        try:
+            record_auth_event(
+                db,
+                event_type="login_webauthn",
+                email=user_["email"],
+                user_id=user_["id"],
+                key_id=key_id_,
+                ip=client_host,
+                user_agent=user_agent,
+                outcome="success",
+                detail="passkey",
+            )
+        except Exception:
+            pass
+        return ("ok", None, user_, key_id_)
+
+    outcome, extra, user, key_id = await db_call(_verify_passkey, db)
+    if outcome == "verify_failed":
         log.warning(
-            "Passkey login: assertion verify failed", error=fmt_exc(e),
-        )
-        record_login_failure(
-            db, surface="passkey", email=None, ip=client_host,
-            user_agent=user_agent, reason="verify_failed",
+            "Passkey login: assertion verify failed", error=extra,
         )
         return JSONResponse({"error": "verify_failed"}, status_code=403)
-
-    # Look up the resolved user. No dedicated by-id helper exists;
-    # one-line query is fine.
-    row = db.execute(
-        "SELECT * FROM users WHERE id = ?", (user_id,),
-    ).fetchone()
-    user = dict(row) if row else None
-    if user is None or user.get("disabled"):
-        record_login_failure(
-            db, surface="passkey",
-            email=(row["email"] if row else None),
-            ip=client_host, user_agent=user_agent,
-            reason="user_inactive",
-            user_id=user_id, key_id=key_id,
-        )
+    if outcome == "user_inactive":
         return JSONResponse({"error": "user_inactive"}, status_code=403)
 
-    # Append-only audit + metric counter (mirrors the existing
-    # webauthn login site).
-    try:
-        from email_triage.web.db import record_auth_event
-        record_auth_event(
-            db,
-            event_type="login_webauthn",
-            email=user["email"],
-            user_id=user["id"],
-            key_id=key_id,
-            ip=(request.client.host if request.client else None),
-            user_agent=request.headers.get("user-agent"),
-            outcome="success",
-            detail="passkey",
-        )
-    except Exception:
-        pass
+    # PR 10 / E — metric counter.
     try:
         from email_triage import metrics as metrics_mod
         metrics_mod.counter(
@@ -926,18 +1012,18 @@ async def login_passkey_finish(request: Request):
         pass
 
     from email_triage.web.dependencies import get_session_secret
+    from email_triage.web.mfa import mfa_verified_now
     sess_secret = get_session_secret(request)
+    # H-05 (Cycle 7) — passkey login stamps mfa_verified_at so the
+    # HIPAA-mode hard-cutover middleware accepts the session.
     token = create_session_token(
         sess_secret, user["email"], user["role"],
         auth_source="webauthn", auth_key_id=key_id,
+        session_epoch=int(user.get("session_epoch", 0)),
+        mfa_verified_at=mfa_verified_now(),
     )
-    from email_triage.web.auth import effective_session_ttl
     resp = JSONResponse({"ok": True, "redirect": "/dashboard"})
-    resp.set_cookie(
-        SESSION_COOKIE_NAME, token,
-        max_age=effective_session_ttl(request.app.state.config),
-        httponly=True, samesite="lax",
-    )
+    set_session_cookie(resp, token, request.app.state.config)
     resp.delete_cookie(_PASSKEY_CHALLENGE_COOKIE)
     log.info(
         "Passkey login successful",
@@ -959,7 +1045,7 @@ async def profile_hardware_keys_page(request: Request):
     dropdown (Me / each owner / All Users) so they can see any
     user's keys from one page. Same pattern as /accounts.
     """
-    user, err = _require_login(request)
+    user, err = await db_call(_require_login, request)
     if err:
         return err
     db = _get_db(request)
@@ -968,13 +1054,17 @@ async def profile_hardware_keys_page(request: Request):
     raw_filter = (request.query_params.get("owner_filter") or "").strip()
     if not is_admin:
         # Non-admins always see only their own keys; no filter.
-        keys = list_hardware_keys(
-            db, user["id"], include_revoked=True,
+        # ASYNC-DB: hardware-key listing off the loop.
+        keys = await db_call(
+            list_hardware_keys, db, user["id"], include_revoked=True,
         )
         visible_owners = []
         owner_filter_value: int | str = user["id"]
     else:
-        all_keys = list_hardware_keys(db, None, include_revoked=True)
+        # ASYNC-DB: hardware-key listing off the loop.
+        all_keys = await db_call(
+            list_hardware_keys, db, None, include_revoked=True,
+        )
         # Build owner list across all keys (admins see everyone).
         # Style matches /accounts: "name (email)" if name present,
         # else email, else "User #N". No "Me" alias.
@@ -1009,7 +1099,7 @@ async def profile_hardware_keys_page(request: Request):
                 candidate = user["id"]
             owner_filter_value = candidate
             keys = [k for k in all_keys if k.get("user_id") == candidate]
-    return _render(request, "profile/hardware_keys.html", {
+    return await _render(request, "profile/hardware_keys.html", {
         "user": user, "keys": keys,
         "is_admin": is_admin,
         "visible_owners": visible_owners,
@@ -1019,28 +1109,37 @@ async def profile_hardware_keys_page(request: Request):
 
 @router.post("/profile/hardware-keys/register/begin", response_class=JSONResponse)
 async def profile_hw_register_begin(request: Request):
-    user, err = _require_login(request)
+    user, err = await db_call(_require_login, request)
     if err:
         return err
     db = _get_db(request)
     config = _get_config(request)
-    try:
-        opts_json = wa.begin_registration(
-            db, user=user,
-            rp_id=config.webauthn.rp_id, rp_name=config.webauthn.rp_name,
-            require_user_verification=(
-                config.webauthn.require_user_verification_for_admin
-                and user.get("role") == "admin"
-            ),
-        )
-    except wa.WebAuthnConfigError as e:
-        return JSONResponse({"error": fmt_exc(e)}, status_code=503)
-    return JSONResponse(json.loads(opts_json))
+
+    def _begin_reg(db):
+        # ASYNC-DB: WebAuthn registration-begin (challenge store)
+        # off the loop.
+        try:
+            return ("ok", wa.begin_registration(
+                db, user=user,
+                rp_id=config.webauthn.rp_id,
+                rp_name=config.webauthn.rp_name,
+                require_user_verification=(
+                    config.webauthn.require_user_verification_for_admin
+                    and user.get("role") == "admin"
+                ),
+            ))
+        except wa.WebAuthnConfigError as e_:
+            return ("config_error", fmt_exc(e_))
+
+    outcome, payload = await db_call(_begin_reg, db)
+    if outcome == "config_error":
+        return JSONResponse({"error": payload}, status_code=503)
+    return JSONResponse(json.loads(payload))
 
 
 @router.post("/profile/hardware-keys/register/finish", response_class=JSONResponse)
 async def profile_hw_register_finish(request: Request):
-    user, err = _require_login(request)
+    user, err = await db_call(_require_login, request)
     if err:
         return err
     db = _get_db(request)
@@ -1050,17 +1149,27 @@ async def profile_hw_register_finish(request: Request):
     response_data = body.get("response")
     if not nickname or not response_data:
         return JSONResponse({"error": "bad_request"}, status_code=400)
-    try:
-        new_id = wa.finish_registration(
-            db, user=user,
-            rp_id=config.webauthn.rp_id,
-            origin=_allowed_webauthn_origins(request, config),
-            response_json=response_data, nickname=nickname,
-        )
-    except wa.WebAuthnAuthError as e:
+    allowed_origins = _allowed_webauthn_origins(request, config)
+
+    def _finish_reg(db):
+        # ASYNC-DB: WebAuthn registration-finish (verify + key
+        # insert) off the loop.
+        try:
+            return ("ok", wa.finish_registration(
+                db, user=user,
+                rp_id=config.webauthn.rp_id,
+                origin=allowed_origins,
+                response_json=response_data, nickname=nickname,
+            ))
+        except wa.WebAuthnAuthError as e_:
+            return ("verify_failed", fmt_exc(e_))
+
+    outcome, payload = await db_call(_finish_reg, db)
+    if outcome == "verify_failed":
         log.warning("WebAuthn register: verify failed",
-                    user_id=user["id"], error=fmt_exc(e))
+                    user_id=user["id"], error=payload)
         return JSONResponse({"error": "verify_failed"}, status_code=400)
+    new_id = payload
     log.info(
         "Hardware key registered",
         user_id=user["id"], key_id=new_id, nickname=nickname,
@@ -1070,18 +1179,285 @@ async def profile_hw_register_finish(request: Request):
 
 @router.post("/profile/hardware-keys/{key_id}/revoke", response_class=HTMLResponse)
 async def profile_hw_revoke(request: Request, key_id: int):
-    user, err = _require_login(request)
+    user, err = await db_call(_require_login, request)
     if err:
         return err
     db = _get_db(request)
-    # Verify the key belongs to this user before revoking.
-    rows = list_hardware_keys(db, user["id"], include_revoked=True)
-    if not any(r["id"] == key_id for r in rows):
+
+    def _revoke_hw_key(db, user_id, key_id):
+        # ASYNC-DB: ownership read + key revoke in one off-loop hop.
+        # Verify the key belongs to this user before revoking.
+        rows = list_hardware_keys(db, user_id, include_revoked=True)
+        if not any(r["id"] == key_id for r in rows):
+            return "not_found"
+        return "revoked" if db_revoke_hardware_key(db, key_id) else "noop"
+
+    outcome = await db_call(_revoke_hw_key, db, user["id"], key_id)
+    if outcome == "not_found":
         return HTMLResponse("Not found", status_code=404)
-    if db_revoke_hardware_key(db, key_id):
+    if outcome == "revoked":
         log.info("Hardware key revoked",
                  user_id=user["id"], key_id=key_id)
     return RedirectResponse("/profile/hardware-keys", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# /auth/mfa/recovery — H-05 (Cycle 7) recovery-code + operator-recovery
+# token consume. Sibling of /login/webauthn/passkey/finish but uses a
+# printable one-time code instead of a WebAuthn assertion.
+# ---------------------------------------------------------------------------
+#
+# Two consume modes share this endpoint by the shape of the submitted
+# payload:
+#   - {"email": "...", "code": "<12-hex>"} → recovery_codes consume
+#   - {"token": "<32-hex>"} → operator_recovery_keys consume
+#
+# Both mint a session token with `mfa_verified_at` stamped so the
+# HIPAA-mode hard-cutover middleware accepts the session.
+#
+# The operator-recovery path does NOT require email because the token
+# self-resolves the target_user_id (the issuing CLI captured it at
+# token-creation time). The recovery_codes path requires email because
+# the codes are scoped per-user and we'd otherwise have to scan every
+# user's code-hash table (worse rate-limit shape).
+
+@router.post("/auth/mfa/recovery", response_class=JSONResponse)
+async def auth_mfa_recovery(request: Request):
+    """H-05 Cycle 7 — consume a recovery code or operator-recovery token.
+
+    Per Q5 design: printable single-use codes (user-driven) + operator-
+    key recovery (last-resort, hand-delivered). Both mint a session
+    with the `mfa_verified_at` claim so the HIPAA-mode hard-cutover
+    middleware (`mfa.session_needs_mfa_step_up`) accepts the session.
+
+    Per H-03 §164.312(b) audit-trail discipline: success + denial both
+    emit a `record_auth_event` row (event_type "login_recovery_code"
+    or "login_operator_recovery") so the §164.316 trail captures the
+    fallback-flow use.
+
+    Rate-limited via the existing  `login_guard` precedent — the
+    consume path is bracketed by `check_login_allowed` / `record_login_failure`
+    on the recovery-code path. Operator-recovery tokens are NOT
+    rate-limited at the per-target-user shape because they're
+    single-use + short-TTL by construction (24h default).
+    """
+    db = _get_db(request)
+    client_host = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+    body = await request.json()
+
+    token = (body.get("token") or "").strip()
+    email = (body.get("email") or "").strip().lower()
+    code = (body.get("code") or "").strip()
+
+    if token:
+        return await _consume_operator_recovery(
+            request, db, token=token,
+            client_host=client_host, user_agent=user_agent,
+        )
+    if email and code:
+        return await _consume_recovery_code(
+            request, db, email=email, code=code,
+            client_host=client_host, user_agent=user_agent,
+        )
+    return JSONResponse({"error": "bad_request"}, status_code=400)
+
+
+async def _consume_operator_recovery(
+    request: Request,
+    db: sqlite3.Connection,
+    *,
+    token: str,
+    client_host: str | None,
+    user_agent: str | None,
+) -> JSONResponse:
+    """Operator-issued recovery-token consume path. Resolves
+    target_user from the token itself; mints session with
+    mfa_verified_at."""
+    from email_triage.web.mfa import (
+        consume_operator_recovery_token,
+        mfa_verified_now,
+    )
+    from email_triage.web.db import record_auth_event
+
+    def _consume(db) -> tuple[str, dict | None]:
+        target_user_id = consume_operator_recovery_token(db, token=token)
+        if target_user_id is None:
+            try:
+                record_auth_event(
+                    db,
+                    event_type="login_operator_recovery",
+                    email="(token)",
+                    user_id=None,
+                    key_id=None,
+                    ip=client_host,
+                    user_agent=user_agent,
+                    outcome="denied:token_invalid_or_expired",
+                )
+            except Exception:
+                pass
+            return ("invalid", None)
+        # Resolve the user row for session minting.
+        row = db.execute(
+            "SELECT id, email, role, session_epoch, disabled "
+            "FROM users WHERE id = ?",
+            (target_user_id,),
+        ).fetchone()
+        if row is None or row["disabled"]:
+            try:
+                record_auth_event(
+                    db,
+                    event_type="login_operator_recovery",
+                    email=row["email"] if row else "(unknown)",
+                    user_id=target_user_id,
+                    key_id=None,
+                    ip=client_host,
+                    user_agent=user_agent,
+                    outcome="denied:user_disabled_or_missing",
+                )
+            except Exception:
+                pass
+            return ("user_invalid", None)
+        try:
+            record_auth_event(
+                db,
+                event_type="login_operator_recovery",
+                email=row["email"],
+                user_id=target_user_id,
+                key_id=None,
+                ip=client_host,
+                user_agent=user_agent,
+                outcome="success",
+            )
+        except Exception:
+            pass
+        return ("ok", dict(row))
+
+    outcome, user = await db_call(_consume, db)
+    if outcome == "invalid":
+        return JSONResponse({"error": "invalid_token"}, status_code=403)
+    if outcome == "user_invalid":
+        return JSONResponse(
+            {"error": "user_invalid"}, status_code=403,
+        )
+
+    from email_triage.web.dependencies import get_session_secret
+    sess_secret = get_session_secret(request)
+    sess_token = create_session_token(
+        sess_secret, user["email"], user["role"],
+        auth_source="operator_recovery",
+        auth_key_id=None,
+        session_epoch=int(user.get("session_epoch", 0)),
+        mfa_verified_at=mfa_verified_now(),
+    )
+    resp = JSONResponse({
+        "ok": True,
+        # Operator-recovery is the explicit "re-enroll your passkey"
+        # path: redirect the user to the hardware-keys profile page
+        # where they can register a fresh credential.
+        "redirect": "/profile/hardware-keys",
+    })
+    set_session_cookie(resp, sess_token, request.app.state.config)
+    log.info(
+        "Operator-recovery login successful",
+        user_id=user["id"], email=user["email"],
+    )
+    return resp
+
+
+async def _consume_recovery_code(
+    request: Request,
+    db: sqlite3.Connection,
+    *,
+    email: str,
+    code: str,
+    client_host: str | None,
+    user_agent: str | None,
+) -> JSONResponse:
+    """User-driven recovery-code consume path. Requires email +
+    plaintext code; consumes the matching unused row; mints
+    mfa_verified_at session."""
+    from email_triage.web.login_guard import (
+        check_login_allowed, record_login_failure, record_login_lockout,
+        LoginLocked,
+    )
+    from email_triage.web.mfa import (
+        consume_recovery_code,
+        mfa_verified_now,
+    )
+    from email_triage.web.db import record_auth_event
+
+    def _consume(db) -> tuple[str, dict | None, Any]:
+        config = _get_config(request)
+        try:
+            check_login_allowed(
+                db, email=email, ip=client_host, config=config,
+            )
+        except LoginLocked as locked:
+            record_login_lockout(
+                db, surface="recovery_code", email=email,
+                ip=client_host, user_agent=user_agent,
+                scope=locked.scope,
+                threshold=locked.retry_after_secs,
+            )
+            return ("locked", None, locked.retry_after_secs)
+        user_ = get_user_by_email(db, email)
+        if user_ is None or user_.get("disabled"):
+            record_login_failure(
+                db, surface="recovery_code", email=email,
+                ip=client_host, user_agent=user_agent,
+                reason="no_account_or_disabled",
+            )
+            return ("invalid", None, None)
+        if not consume_recovery_code(db, user_id=user_["id"], code=code):
+            record_login_failure(
+                db, surface="recovery_code", email=email,
+                ip=client_host, user_agent=user_agent,
+                reason="code_invalid_or_used",
+                user_id=user_["id"],
+            )
+            return ("invalid", None, None)
+        try:
+            record_auth_event(
+                db,
+                event_type="login_recovery_code",
+                email=email,
+                user_id=user_["id"],
+                key_id=None,
+                ip=client_host,
+                user_agent=user_agent,
+                outcome="success",
+            )
+        except Exception:
+            pass
+        return ("ok", user_, None)
+
+    outcome, user, locked_secs = await db_call(_consume, db)
+    if outcome == "locked":
+        return JSONResponse(
+            {"error": "rate_limited", "retry_after_secs": locked_secs},
+            status_code=429,
+            headers={"Retry-After": str(locked_secs)},
+        )
+    if outcome == "invalid":
+        return JSONResponse({"error": "invalid"}, status_code=403)
+
+    from email_triage.web.dependencies import get_session_secret
+    sess_secret = get_session_secret(request)
+    sess_token = create_session_token(
+        sess_secret, user["email"], user["role"],
+        auth_source="recovery_code",
+        auth_key_id=None,
+        session_epoch=int(user.get("session_epoch", 0)),
+        mfa_verified_at=mfa_verified_now(),
+    )
+    resp = JSONResponse({"ok": True, "redirect": "/dashboard"})
+    set_session_cookie(resp, sess_token, request.app.state.config)
+    log.info(
+        "Recovery-code login successful",
+        user_id=user["id"], email=user["email"],
+    )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -1090,7 +1466,7 @@ async def profile_hw_revoke(request: Request, key_id: int):
 
 @router.get("/admin/acme-status", response_class=HTMLResponse)
 async def admin_acme_status_page(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = _get_db(request)
@@ -1105,8 +1481,9 @@ async def admin_acme_status_page(request: Request):
         secrets_store=secrets, db=db,
     )
     cert_meta = renewer.cert_metadata()
-    log_rows = list_acme_renewal_log(db, limit=20)
-    # #81 -- listener restart pending chip. True when the operator hit
+    # ASYNC-DB: ACME renewal-log read off the loop.
+    log_rows = await db_call(list_acme_renewal_log, db, limit=20)
+    #  -- listener restart pending chip. True when the operator hit
     # Save with a new tls.enabled value but the running uvicorn
     # listener is still on the old protocol. Persists across page
     # reloads (unlike the old query-param banner which evaporated
@@ -1115,7 +1492,7 @@ async def admin_acme_status_page(request: Request):
     from email_triage.web.app import is_listener_restart_pending
     listener_restart_pending = is_listener_restart_pending(request.app)
     boot_mode = getattr(request.app.state, "tls_boot_mode", None)
-    return _render(request, "admin/acme_status.html", {
+    return await _render(request, "admin/acme_status.html", {
         "user": user,
         "config": config.tls.acme,
         "tls": config.tls,
@@ -1146,7 +1523,7 @@ def _resolve_renewer(request: Request) -> acme_mod.AcmeRenewer:
 
 @router.post("/admin/acme-status/test/dns-reach", response_class=JSONResponse)
 async def admin_acme_test_dns_reach(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1160,7 +1537,7 @@ async def admin_acme_test_dns_reach(request: Request):
 
 @router.post("/admin/acme-status/test/tsig", response_class=JSONResponse)
 async def admin_acme_test_tsig(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1176,7 +1553,7 @@ async def admin_acme_test_tsig(request: Request):
 
 @router.post("/admin/acme-status/test/publish", response_class=JSONResponse)
 async def admin_acme_test_publish(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1192,7 +1569,7 @@ async def admin_acme_test_publish(request: Request):
 
 @router.post("/admin/acme-status/test/full-cycle", response_class=JSONResponse)
 async def admin_acme_test_full_cycle(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1239,7 +1616,7 @@ async def admin_acme_save(
     next process boot reads the same values. TSIG secret is written
     to the secrets store, never YAML.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1259,7 +1636,7 @@ async def admin_acme_save(
     requested_https = (
         tls_enabled == "1" or tls_enabled == "on" or tls_enabled == "true"
     )
-    # #81 -- listener mode flip detection. uvicorn doesn't switch
+    #  -- listener mode flip detection. uvicorn doesn't switch
     # protocols mid-process; an http<->https flip writes to YAML +
     # in-memory config but the live socket is unchanged until the
     # service restarts. Capture pre-state so the redirect can surface
@@ -1371,7 +1748,7 @@ async def admin_acme_save(
              listener_flipped=listener_flipped)
 
     # Return to the status page; query string surfaces a save flash.
-    # (#81) -- the listener-flip restart prompt no longer rides the
+    # -- the listener-flip restart prompt no longer rides the
     # query string. It now lives on the page itself via the persistent
     # ``listener_restart_pending`` chip rendered from
     # ``app.state.tls_boot_mode`` vs the saved value. The chip
@@ -1395,7 +1772,7 @@ async def admin_acme_issue_now(
     explicit options so a single click can't accidentally hit prod
     and burn the LE production rate limit (5 certs / week / domain).
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     config = _get_config(request)
@@ -1433,7 +1810,7 @@ async def admin_acme_issue_now(
 async def admin_acme_cancel(request: Request):
     """Operator-driven cancel for an in-flight ACME issuance.
 
-    Punch-list #103. Flips ``cancel_requested=1`` on the
+    the backlog . Flips ``cancel_requested=1`` on the
     ``acme_jobs`` row; the worker thread checks the flag at each
     retry-loop boundary and transitions to the ``cancelled``
     terminal phase via ``finish_failure(kind="cancelled")``.
@@ -1446,7 +1823,7 @@ async def admin_acme_cancel(request: Request):
     so any admin can abort -- matching how triage_jobs cancel
     delegates to the manage-account check (admin or owner).
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     from email_triage.web import acme_job_state
@@ -1471,7 +1848,7 @@ async def admin_acme_cancel(request: Request):
 async def admin_acme_job_status(request: Request):
     """Return the current ACME issuance job state for live re-attach.
 
-    #75 -- the page polls this endpoint on load (and every few seconds
+     -- the page polls this endpoint on load (and every few seconds
     while a job is in flight) so a refresh / nav-away-and-back doesn't
     lose the live timer. State lives in process memory only; a worker-
     thread restart abandons both the cert and the view, so no stronger
@@ -1482,7 +1859,7 @@ async def admin_acme_job_status(request: Request):
     is the simple polling-stop signal -- when False, the page can
     stop polling and render the terminal state once.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     from email_triage.web import acme_job_state
@@ -1493,7 +1870,7 @@ async def admin_acme_job_status(request: Request):
 async def admin_system_restart(request: Request):
     """Exit the running process so systemd respawns the container.
 
-    #81 -- listener-mode flips don't take effect until the uvicorn
+     -- listener-mode flips don't take effect until the uvicorn
     process restarts; this endpoint gives the operator a one-click
     way to trigger that without ssh-ing to the host.
 
@@ -1506,7 +1883,7 @@ async def admin_system_restart(request: Request):
     Audit: writes an auth_events row before the timer fires so the
     intent is captured even if the restart somehow doesn't recover.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -1515,7 +1892,9 @@ async def admin_system_restart(request: Request):
     user_agent = request.headers.get("user-agent")
     try:
         from email_triage.web.db import record_auth_event
-        record_auth_event(
+        # ASYNC-DB: restart audit-event write off the loop.
+        await db_call(
+            record_auth_event,
             db, event_type="system_restart", email=user.get("email", ""),
             user_id=user["id"], ip=client_host, user_agent=user_agent,
             outcome="success",

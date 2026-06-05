@@ -12,6 +12,13 @@ import re
 from email.utils import parseaddr
 from typing import Sequence
 
+# PyPI ``regex`` package — used only at the SUBJECT-rule match site
+# below, where the pattern is operator-authored and an evil regex
+# would otherwise hang the worker thread. Stdlib ``re`` has no
+# timeout. Other ``re`` uses in this module (static developer
+# patterns) keep stdlib because they're not attacker-controlled.
+import regex as _bounded_regex
+
 from email_triage.engine.models import (
     ClassificationList,
     EmailMessage,
@@ -64,6 +71,18 @@ def _extract_domain(sender: str) -> str:
 
 def _rule_matches(rule: ListRule, message: EmailMessage) -> bool:
     """Check whether a single rule matches the given message."""
+    #  defense-in-depth: an empty / whitespace-only pattern is
+    # nonsensical for every rule type (SENDER, SENDER_DOMAIN, SUBJECT).
+    # In particular the SUBJECT branch's substring fast-path treats
+    # ``"" in any_subject`` as True, so a saved empty rule would match
+    # every email and force-skip-AI on every message in the worst case.
+    # The web/API insert + update paths reject empty patterns at the
+    # boundary now, but historic rows could still exist and any future
+    # entry point would also need to remember the rule; short-circuit
+    # here so the engine itself can never honor one.
+    if not rule.pattern or not rule.pattern.strip():
+        return False
+
     if rule.rule_type == RuleType.SENDER:
         # Operator types a bare address (e.g. ``news@ctox.com``); the
         # incoming ``message.sender`` may be the display-name form
@@ -93,9 +112,19 @@ def _rule_matches(rule: ListRule, message: EmailMessage) -> bool:
         pattern = rule.pattern
         if message.subject and pattern.lower() in message.subject.lower():
             return True
+        # Bounded ReDoS surface: operator-authored ``pattern`` against
+        # message.subject. Stdlib ``re`` has no per-call timeout, so a
+        # pathological backtracker pegs the worker. ``regex.search`` with
+        # ``timeout=1.0`` raises TimeoutError after one second — we treat
+        # that exactly like a non-match, same as a malformed pattern.
         try:
-            return bool(re.search(pattern, message.subject, re.IGNORECASE))
-        except re.error:
+            return bool(_bounded_regex.search(
+                pattern,
+                message.subject or "",
+                flags=_bounded_regex.IGNORECASE,
+                timeout=1.0,
+            ))
+        except (_bounded_regex.error, TimeoutError):
             return False
 
     return False

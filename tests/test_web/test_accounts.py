@@ -256,7 +256,7 @@ class TestGmailPushWatchEndpoints:
 
 
 class TestAccountsTestButtonFactoryWiring:
-    """#20: the Test button on gmail_api accounts must resolve OAuth
+    """: the Test button on gmail_api accounts must resolve OAuth
     client creds via the install-level GoogleOAuthConfig, not from
     per-account config (which is empty since B1).
     """
@@ -465,7 +465,7 @@ class TestConfigSystemHipaaBoundary:
 
 
 # ---------------------------------------------------------------------------
-# Item #19 — admin owner filter on /accounts
+# Item  — admin owner filter on /accounts
 # ---------------------------------------------------------------------------
 
 class TestAccountsOwnerFilter:

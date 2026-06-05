@@ -68,7 +68,9 @@ class TestCalendarApiPath:
         assert out.result == ActionResult.COMPLETED
         assert out.data["path"] == "calendar_api"
         assert out.data["event_id"] == "ev1"
-        cal.respond_to_invite.assert_awaited_once_with("ev1", "accepted")
+        cal.respond_to_invite.assert_awaited_once_with(
+            "ev1", "accepted", calendar_id="primary",
+        )
 
     async def test_decline_partstat(self):
         cal = MagicMock()
@@ -79,7 +81,9 @@ class TestCalendarApiPath:
             _flow(calendar_provider=cal, self_email="me@me.com"),
             _msg_with_invite(), _classification(), provider,
         )
-        cal.respond_to_invite.assert_awaited_once_with("ev1", "declined")
+        cal.respond_to_invite.assert_awaited_once_with(
+            "ev1", "declined", calendar_id="primary",
+        )
 
     async def test_tentative_partstat(self):
         cal = MagicMock()
@@ -90,7 +94,9 @@ class TestCalendarApiPath:
             _flow(calendar_provider=cal, self_email="me@me.com"),
             _msg_with_invite(), _classification(), provider,
         )
-        cal.respond_to_invite.assert_awaited_once_with("ev1", "tentative")
+        cal.respond_to_invite.assert_awaited_once_with(
+            "ev1", "tentative", calendar_id="primary",
+        )
 
 
 class TestFallback:

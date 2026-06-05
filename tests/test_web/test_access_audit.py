@@ -1,4 +1,6 @@
-"""Tests for #41 — access-audit log + middleware."""
+"""Tests for  — access-audit log + middleware."""
+
+import time
 
 from email_triage.web.access_audit import (
     _extract_account_id,
@@ -10,6 +12,35 @@ from email_triage.web.db import (
     list_access_events,
     record_access_event,
 )
+
+
+def _drain_audit_writes(app, timeout: float = 5.0) -> None:
+    """Block until every fire-and-forget audit-write task has finished.
+
+    .2 made the access-audit write fire-and-forget: the middleware
+    ``asyncio.create_task``s it and tracks the task on
+    ``app.state._audit_pending``. By the time ``TestClient.get()``
+    returns the response has been sent, but the write task may still be
+    pending on the TestClient portal's event loop — so a test that
+    asserts on ``access_log`` immediately after the request is racy. This helper polls the pending set until it drains: the
+    portal loop stays alive between requests, so a short sleep in the
+    test thread lets the loop advance the task to completion.
+
+    A bounded timeout keeps a genuinely stuck write from hanging the
+    suite — it raises so the failure is visible rather than silent.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pending = getattr(app.state, "_audit_pending", None)
+        # The set is created lazily on the first PHI-path request; once
+        # it exists, drained means every tracked task reports done().
+        if pending is not None and all(t.done() for t in pending):
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        "audit-write tasks did not drain within "
+        f"{timeout}s — app.state._audit_pending still has in-flight tasks"
+    )
 
 
 class TestPhiPathClassifier:
@@ -204,7 +235,7 @@ class TestAccessLogPersistence:
 
 class TestMiddlewareIntegration:
     def test_middleware_logs_authenticated_phi_request(
-        self, client, user_cookies, db, regular_user,
+        self, client, app, user_cookies, db, regular_user,
     ):
         """Hitting a PHI-touch route writes an access_log row."""
         before = len(list_access_events(db, limit=1000))
@@ -212,6 +243,10 @@ class TestMiddlewareIntegration:
         resp = client.get("/classify", cookies=user_cookies)
         # Whether the response is 200 or a redirect, the audit row should land.
         assert resp.status_code in (200, 303, 401, 403)
+        #  — the audit write is fire-and-forget; drain the pending
+        # task set before asserting the row count grew (same test-only
+        # timing flake the sibling actor-id test hit).
+        _drain_audit_writes(app)
         after = len(list_access_events(db, limit=1000))
         # The audit table grew by exactly 1.
         assert after == before + 1
@@ -231,7 +266,7 @@ class TestMiddlewareIntegration:
 
 
 class TestFireAndForgetAuditWrite:
-    """#135.2 — audit write is fire-and-forget (off the request path)
+    """.2 — audit write is fire-and-forget (off the request path)
     but MUST still complete. These tests pin the contract:
 
     1. The write lands on app.state DB after the response settles.
@@ -260,7 +295,7 @@ class TestFireAndForgetAuditWrite:
         assert all(t.done() for t in pending)
 
     def test_record_helper_is_module_cached(self):
-        """#135.2: ``record_access_event`` is imported once at module
+        """.2: ``record_access_event`` is imported once at module
         load, not lazily on every request. The previous lazy import
         was a per-request lookup tax."""
         from email_triage.web import access_audit
@@ -269,9 +304,9 @@ class TestFireAndForgetAuditWrite:
         assert access_audit._record_access_event is record_access_event
 
     def test_middleware_uses_request_state_user_when_present(
-        self, client, db, regular_user, user_cookies,
+        self, client, app, db, regular_user, user_cookies,
     ):
-        """#135.2: when the auth dependency on the route already
+        """.2: when the auth dependency on the route already
         resolved a user onto ``request.state.user``, the middleware
         reuses it instead of re-running the full auth lookup. We
         can't read ``request.state`` from outside the request scope,
@@ -280,12 +315,16 @@ class TestFireAndForgetAuditWrite:
         # This is the same path test_middleware_logs_authenticated_phi_request
         # exercises; the assertion here is just on the resolved actor.
         client.get("/classify", cookies=user_cookies)
+        #  — the audit write is fire-and-forget; drain the pending
+        # task set before reading access_log or the row may not have
+        # landed yet (test-only timing flake).
+        _drain_audit_writes(app)
         latest = list_access_events(db, limit=1)[0]
         assert latest["actor_user_id"] == regular_user["id"]
 
 
 class TestHealthHandlerAsyncConversion:
-    """#135.1 — verify /health + /health/detail conversion didn't break
+    """.1 — verify /health + /health/detail conversion didn't break
     the response shape. The existing 11 health tests in test_health.py
     cover the response-shape contract end-to-end; these add a direct
     cross-check that ``_compute_health_detail`` is now async and runs

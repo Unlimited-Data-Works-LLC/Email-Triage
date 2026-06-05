@@ -1,5 +1,5 @@
 /*
- * #124 — PWA install-prompt surface.
+ *  — PWA install-prompt surface.
  *
  * Browsers that implement the install heuristic (Chrome / Edge /
  * Brave on desktop + Android) fire a `beforeinstallprompt` event on

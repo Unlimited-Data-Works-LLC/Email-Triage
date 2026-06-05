@@ -1,4 +1,4 @@
-"""Shared exponential-backoff math for retry queues (#175 R-A).
+"""Shared exponential-backoff math for retry queues.
 
 Used by:
   * :mod:`email_triage.web.db` — ``_style_distill_compute_next_retry`` (M-3 / M-7
@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 # schedule has no entry at index N the caller transitions the row to
 # terminal-failure state ("dead") rather than scheduling another retry.
 
-#: Watcher per-message retry schedule (#175). Six attempts over ~31h:
+#: Watcher per-message retry schedule. Six attempts over ~31h:
 #: 30s / 2m / 10m / 1h / 6h / 24h. Tuned for transient timeouts on
 #: provider fetch — long enough to ride out an LLM/provider outage,
 #: short enough to clear backlog before the next nightly cycle.
@@ -43,7 +43,7 @@ WATCHER_RETRY_SCHEDULE: tuple[timedelta, ...] = (
     timedelta(hours=24),
 )
 
-#: HIPAA style-distill retry schedule (#152 phases 3-4 S3). Eight
+#: HIPAA style-distill retry schedule. Eight
 #: attempts over ~10d: 1m / 5m / 30m / 2h / 12h / 1d / 3d / 7d. Tuned
 #: for cloud-LLM transient failures where the operator may need a
 #: day to fix the backend. Per operator directive: NO fallback-to-local

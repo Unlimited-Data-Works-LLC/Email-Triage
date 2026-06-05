@@ -1,4 +1,4 @@
-"""Tests for the ACME renewer module (#67).
+"""Tests for the ACME renewer module.
 
 Network-side ACME flow + DNS-01 publish are mocked — the unit tests
 cover the pure-Python orchestration (config validation, cert
@@ -277,3 +277,133 @@ class TestPublisherValidation:
         )
         with pytest.raises(ValueError, match="acme_tsig_secret"):
             Rfc2136Publisher(rfc, "")
+
+
+# ---------------------------------------------------------------------------
+#  — supervised cert-renewer + tls_cert health block
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from email_triage.config import TLSConfig, PersistenceConfig  # noqa: E402
+from email_triage.web.acme_renewer import (  # noqa: E402
+    _build_renewer_from_app,
+    _resume_pending_acme_jobs,
+    read_tls_cert_health,
+)
+
+
+def _fake_app(cfg, secrets, db, tmp_path, *, cert_dir=None):
+    """Minimal app-state stand-in for the supervised-renewer helpers."""
+    tls = TLSConfig(
+        cert_dir=str(cert_dir) if cert_dir else "",
+        acme=cfg,
+    )
+    persistence = PersistenceConfig(db_path=str(tmp_path / "test.db"))
+    config = SimpleNamespace(
+        tls=tls, persistence=persistence, smtp=None,
+    )
+    return SimpleNamespace(
+        state=SimpleNamespace(config=config, secrets=secrets, db=db),
+    )
+
+
+class TestBuildRenewerFromApp:
+    def test_uses_explicit_cert_dir(self, cfg, secrets, db, tmp_path):
+        cd = tmp_path / "explicit_certs"
+        app = _fake_app(cfg, secrets, db, tmp_path, cert_dir=cd)
+        r = _build_renewer_from_app(app)
+        assert isinstance(r, AcmeRenewer)
+        assert r.cert_dir == cd
+
+    def test_falls_back_to_data_dir_certs(self, cfg, secrets, db, tmp_path):
+        app = _fake_app(cfg, secrets, db, tmp_path)
+        r = _build_renewer_from_app(app)
+        # No explicit cert_dir → <db_path parent>/certs.
+        assert r.cert_dir == tmp_path / "certs"
+
+
+class TestReadTlsCertHealth:
+    def test_absent_cert_reports_not_present(
+        self, cfg, secrets, db, tmp_path,
+    ):
+        app = _fake_app(cfg, secrets, db, tmp_path)
+        block = read_tls_cert_health(app)
+        assert block["present"] is False
+        assert block["not_after"] is None
+        assert block["days_remaining"] is None
+
+    def test_present_cert_reports_expiry(
+        self, cfg, secrets, db, tmp_path,
+    ):
+        cd = tmp_path / "certs"
+        cd.mkdir(parents=True, exist_ok=True)
+        cert_pem, key_pem = generate_self_signed_cert(
+            "triage.example.com", valid_days=42,
+        )
+        (cd / "server.crt").write_bytes(cert_pem)
+        (cd / "server.key").write_bytes(key_pem)
+        app = _fake_app(cfg, secrets, db, tmp_path, cert_dir=cd)
+        block = read_tls_cert_health(app)
+        assert block["present"] is True
+        assert block["not_after"] is not None
+        # 42-day cert — days_remaining lands in [40, 42] allowing for
+        # the boundary-day truncation.
+        assert 40 <= block["days_remaining"] <= 42
+
+    def test_never_raises_on_bad_config(self, secrets, db):
+        # A wholly broken app object must degrade, not raise.
+        broken = SimpleNamespace(state=SimpleNamespace())
+        block = read_tls_cert_health(broken)
+        assert block["present"] is False
+        assert "error" in block
+
+
+@pytest.mark.asyncio
+class TestResumePendingAcmeJobs:
+    async def test_no_rows_returns_zero(self, cfg, secrets, db, tmp_path):
+        app = _fake_app(cfg, secrets, db, tmp_path)
+        renewer = _build_renewer_from_app(app)
+        from email_triage.web import acme_job_state
+        acme_job_state.set_db_handle(db)
+        try:
+            resolved = await _resume_pending_acme_jobs(app, renewer)
+        finally:
+            acme_job_state.set_db_handle(None)
+        assert resolved == 0
+
+    async def test_consumes_resume_pending_row(
+        self, cfg, secrets, db, tmp_path,
+    ):
+        """A 'resume_pending'-stamped acme_jobs row is closed terminally
+        by the resume worker."""
+        from email_triage.web import acme_job_state
+        app = _fake_app(cfg, secrets, db, tmp_path)
+        renewer = _build_renewer_from_app(app)
+        acme_job_state.set_db_handle(db)
+        try:
+            # Start a job + drive it to a non-terminal phase, persist an
+            # order_url, then stamp it resume_pending the way
+            # resume_on_startup does for a recent interrupted order.
+            job_id = acme_job_state.start(
+                domains=["triage.example.com"],
+                directory_url=cfg.directory_url,
+                max_attempts=3,
+            )
+            acme_job_state.transition(
+                "publishing", order_url="https://le/order/abc",
+            )
+            resolved_startup = acme_job_state.resume_on_startup()
+            assert any(
+                r.get("_verdict") == "resume_pending"
+                for r in resolved_startup
+            )
+            # Resume worker consumes it.
+            count = await _resume_pending_acme_jobs(app, renewer)
+            assert count == 1
+            row = acme_job_state.get_persisted_row(job_id)
+            assert row["phase"] in ("failed", "cancelled")
+            assert row["last_error_kind"] == "resume_abandoned"
+        finally:
+            acme_job_state.set_db_handle(None)
+            acme_job_state.reset()

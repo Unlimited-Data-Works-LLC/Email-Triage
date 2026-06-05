@@ -1,4 +1,4 @@
-"""Tests for the listener-mode restart-pending chip (#81).
+"""Tests for the listener-mode restart-pending chip.
 
 The uvicorn listener binds either http or https at process start; it
 cannot swap mid-process. When an operator flips ``tls.enabled`` and

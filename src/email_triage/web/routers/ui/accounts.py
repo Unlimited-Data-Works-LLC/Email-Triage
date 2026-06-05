@@ -1,6 +1,6 @@
 """Routes for the accounts concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,8 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
+    RequireUser,
+    RequireUserFragment,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +51,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.accounts")
 
 router = APIRouter()
@@ -58,7 +60,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -99,7 +101,7 @@ def __getattr__(name):
 
 
 # ---------------------------------------------------------------------------
-# #169 Wave 2-α I6 — per-account style-learning backend selector helper.
+#  Wave 2-α I6 — per-account style-learning backend selector helper.
 # ---------------------------------------------------------------------------
 
 def _build_ai_backend_selector_context(
@@ -188,32 +190,26 @@ def _build_ai_backend_selector_context(
 
 
 @router.get("/accounts", response_class=HTMLResponse)
-async def accounts_page(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
+async def accounts_page(request: Request, user: RequireUser):
     templates = get_templates(request)
-    # #135 phase 2 — wrap-at-snapshot: build the entire context off the
+    #  phase 2 — wrap-at-snapshot: build the entire context off the
     # event loop so concurrent /health polls + other operator surfaces
     # don't serialise behind the per-account chip enrichment.
     ctx = await db_call(_build_accounts_page_snapshot, request, user)
-    return _render(templates, request, "accounts/manage.html", ctx)
+    return await _render(templates, request, "accounts/manage.html", ctx)
 
 
 @router.get("/accounts/form-fields", response_class=HTMLResponse)
-async def accounts_form_fields(request: Request, provider_type: str = "imap"):
+async def accounts_form_fields(
+    request: Request, user: RequireUserFragment, provider_type: str = "imap",
+):
     """Return provider-specific form fields fragment (HTMX swap)."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     if provider_type not in _PROVIDER_TYPES:
         return HTMLResponse("Unknown provider type", status_code=400)
 
     templates = get_templates(request)
     config = get_config(request)
-    return _render(templates, request, f"accounts/_fields_{provider_type}.html", {
+    return await _render(templates, request, f"accounts/_fields_{provider_type}.html", {
         "public_url": getattr(config.push, "public_url", "").rstrip("/"),
     })
 
@@ -236,7 +232,7 @@ async def accounts_auth_status(
         Otherwise we return the same waiting strip + a 200 status,
         and HTMX swaps it back over itself for the next poll cycle.
     """
-    # #137 phase 2 — OwnedAccount dep collapses the
+    #  phase 2 — OwnedAccount dep collapses the
     # get_user/get_db/get_account/can_manage preamble.
     user, acct, db, secrets = owned
 
@@ -288,11 +284,7 @@ async def accounts_auth_status(
 
 
 @router.post("/accounts/create", response_class=HTMLResponse)
-async def accounts_create(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
+async def accounts_create(request: Request, user: RequireUserFragment):
     form = await request.form()
     db = get_db(request)
     secrets = get_secrets(request)
@@ -306,7 +298,7 @@ async def accounts_create(request: Request):
 
     # Admin can assign to any user; regular users own their own accounts.
     if is_admin and form.get("user_id"):
-        owner_id = int(form["user_id"])
+        owner_id = _safe_int(form["user_id"], user["id"])
     else:
         owner_id = user["id"]
 
@@ -341,16 +333,26 @@ async def accounts_create(request: Request):
         hipaa_flag = "hipaa" in form
 
     from email_triage.web.db import create_email_account, set_bool_setting
-    account_id = create_email_account(
-        db, owner_id, name, ptype, config, hipaa=hipaa_flag,
-    )
 
-    # Calendar opt-in at create time (B2) — same wiring as edit.
-    if ptype in ("gmail_api", "office365") and config.get("calendar_opted_in"):
-        set_bool_setting(db, _S.calendar_enabled(account_id), True)
+    def _account_create_db_work() -> int:
+        """/ — account row create + calendar opt-in flag +
+        provider-secret store in one threadpool hop. Returns the new
+        account id.
+        """
+        new_id = create_email_account(
+            db, owner_id, name, ptype, config, hipaa=hipaa_flag,
+        )
+        # Calendar opt-in at create time (B2) — same wiring as edit.
+        if (
+            ptype in ("gmail_api", "office365")
+            and config.get("calendar_opted_in")
+        ):
+            set_bool_setting(db, _S.calendar_enabled(new_id), True)
+        # Save password/secret now that we have the account ID.
+        _save_provider_secret(form, ptype, new_id, secrets)
+        return new_id
 
-    # Save password/secret now that we have the account ID.
-    _save_provider_secret(form, ptype, account_id, secrets)
+    account_id = await db_call(_account_create_db_work)
 
     # Item #23a: auto-activate watcher after a successful connection
     # test. Opt-in via the "Start watching for new mail right away"
@@ -361,14 +363,14 @@ async def accounts_create(request: Request):
     flash_success = "Account added."
     flash_error = ""
     if "start_watch" in form:
-        # #138 phase 2 — table-driven dispatch. Each ptype's
+        #  phase 2 — table-driven dispatch. Each ptype's
         # post_create_start_watch returns ``(success_msg, error_msg)``;
         # exactly one is non-empty (or both empty for O365 where no
         # action runs).
         from email_triage.web.db import get_email_account
         from email_triage.providers.dispatcher import get_dispatch
         from email_triage.web.app import get_watcher_manager
-        fresh_acct = get_email_account(db, account_id)
+        fresh_acct = await db_call(get_email_account, db, account_id)
         try:
             mgr = get_watcher_manager(request)
         except Exception:
@@ -400,7 +402,7 @@ async def accounts_create(request: Request):
 async def accounts_edit_form(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    # #137 — ``OwnedAccount`` collapses the get_current_user → get_db
+    #  — ``OwnedAccount`` collapses the get_current_user → get_db
     # → get_secrets → get_email_account → can_manage_account preamble
     # into one Annotated dep. Raises HTTPException 401 / 404 / 403
     # with the same shape the inline preamble used (the global error
@@ -413,7 +415,7 @@ async def accounts_edit_form(
         is_account_hipaa, is_account_hipaa_locked,
     )
 
-    # #135 phase 2 — pre-provider DB snapshot (chips + delegates +
+    #  phase 2 — pre-provider DB snapshot (chips + delegates +
     # grantable users + digest configs + watches + wizard-resume).
     pre = await db_call(
         _accounts_edit_pre_provider, request, db, secrets, user, acct,
@@ -455,7 +457,7 @@ async def accounts_edit_form(
             drafts_folder_candidates = []
 
     # Tab selection via ?tab=<slug>; default = provider.
-    # #154 retired the per-account "watches" tab; if a legacy bookmark
+    #  retired the per-account "watches" tab; if a legacy bookmark
     # still passes ?tab=watches we silently land on the default tab so
     # the operator sees a working page rather than a 404.
     valid_tabs = {
@@ -466,7 +468,7 @@ async def accounts_edit_form(
     if tab not in valid_tabs:
         tab = "provider"
 
-    # #96 — hide the OpenClaw chip when no webhook targets are
+    #  — hide the OpenClaw chip when no webhook targets are
     # configured at the install level. The chip's controls (pause /
     # quiet hours / off) only do anything if there's a target to
     # gate, so showing them with no destination is misleading.
@@ -491,7 +493,7 @@ async def accounts_edit_form(
             wizard_resume_step, f"Step {wizard_resume_step}",
         )
 
-    # #169 Wave 2-α I6 — per-account style-learning backend selector.
+    #  Wave 2-α I6 — per-account style-learning backend selector.
     # Dropdown options filter on the account's HIPAA posture:
     #   * HIPAA account / system HIPAA mode:
     #       enabled=1 AND baa_certified=1 AND baa_expires_at > today
@@ -500,8 +502,11 @@ async def accounts_edit_form(
     # The status-chip string is rendered server-side so the template
     # can read it without a second DB round-trip.
     from email_triage.triage_logging import is_hipaa_mode
+    #  — _build_ai_backend_selector_context reads the shared
+    # connection (the ai_backends list); dispatch it off the event
+    # loop through db_call.
     ai_backend_options, ai_backend_selected_chip = (
-        _build_ai_backend_selector_context(db, acct)
+        await db_call(_build_ai_backend_selector_context, db, acct)
     )
 
     ctx = {
@@ -526,25 +531,36 @@ async def accounts_edit_form(
     # Direct browser GET (no HX-Request header) gets the full-page
     # wrapper so base.html (nav + Pico CSS + theme) renders.
     if request.headers.get("HX-Request") == "true":
-        return _render(templates, request, "accounts/_edit.html", ctx)
-    return _render(templates, request, "accounts/edit_page.html", ctx)
+        return await _render(templates, request, "accounts/_edit.html", ctx)
+    return await _render(templates, request, "accounts/edit_page.html", ctx)
 
 
 @router.get("/accounts/{account_id}/row", response_class=HTMLResponse)
-async def accounts_row(request: Request, account_id: int):
-    """Return a single row fragment (for cancel from edit mode)."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
+async def accounts_row(
+    request: Request, account_id: int, owned: OwnedAccount,
+):
+    """Return a single row fragment (for cancel from edit mode).
 
+    #239g — gated by ``OwnedAccount`` (not the bare
+    ``RequireUserFragment``): the row snapshot enriches with
+    provider, HIPAA flag, watcher state, BAA chip and
+    ``has_password``/``has_secret``. Without an ownership gate any
+    authenticated user could fetch any account's enriched metadata
+    (IDOR). ``OwnedAccount`` raises 401/404/403 before the body runs,
+    mirroring the sibling ``accounts_edit_form`` handler.
+    """
+    user, _acct, _db, _secrets = owned
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
 
+    # OwnedAccount already proved the account exists + is manageable;
+    # re-fetch through the enricher for the chip-bearing snapshot the
+    # row template needs.
     acct = await db_call(_accounts_row_snapshot, request, account_id)
     if acct is None:
         return HTMLResponse("Not found", status_code=404)
 
-    return _render(templates, request, "accounts/_row.html", {
+    return await _render(templates, request, "accounts/_row.html", {
         "acct": acct, "is_admin": is_admin,
     })
 
@@ -567,7 +583,7 @@ async def recipient_digest_send_now(
     Returns a small inline HTML fragment for HTMX swap-in next to
     the button.
     """
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     config = get_config(request)
 
@@ -598,7 +614,10 @@ async def recipient_digest_send_now(
 
     now_utc = datetime.now(timezone.utc)
     since_iso = (now_utc - timedelta(hours=24)).isoformat()
-    rows = gather_digest_rows(
+    #  — gather_digest_rows reads the shared connection; dispatch
+    # it off the event loop through db_call.
+    rows = await db_call(
+        gather_digest_rows,
         db, account_id=account_id, since_iso=since_iso,
     )
     if not rows:
@@ -627,29 +646,38 @@ async def recipient_digest_send_now(
             use_tls=smtp.use_tls,
             fallback_dt_iso=now_utc.isoformat(),
         )
-        # Stamp last_sent so the scheduler's idempotence guard
-        # picks up the manual send too — no surprise duplicate at
-        # the next HH:10 firing within 23h.
-        mark_sent(db, account_id, now_utc, len(rows))
-        # Audit row mirroring the scheduler's path.
-        try:
-            from email_triage.web.db import record_access_event
-            record_access_event(
-                db,
-                actor_user_id=user["id"],
-                method="POST",
-                route=f"/accounts/{account_id}/recipient-digest/send-now",
-                account_id=account_id,
-                message_id=None,
-                status_code=200,
-                outcome="recipient_digest_sent",
-                detail=(
-                    f"row_count={len(rows)} hipaa={hipaa} "
-                    f"to={to_addr} manual=true"
-                ),
-            )
-        except Exception:
-            pass
+        def _digest_sent_db_work() -> None:
+            """/ — last-sent stamp + audit row in one hop,
+            after the SMTP send above.
+            """
+            # Stamp last_sent so the scheduler's idempotence guard
+            # picks up the manual send too — no surprise duplicate at
+            # the next HH:10 firing within 23h.
+            mark_sent(db, account_id, now_utc, len(rows))
+            # Audit row mirroring the scheduler's path.
+            try:
+                from email_triage.web.db import record_access_event
+                record_access_event(
+                    db,
+                    actor_user_id=user["id"],
+                    method="POST",
+                    route=(
+                        f"/accounts/{account_id}"
+                        "/recipient-digest/send-now"
+                    ),
+                    account_id=account_id,
+                    message_id=None,
+                    status_code=200,
+                    outcome="recipient_digest_sent",
+                    detail=(
+                        f"row_count={len(rows)} hipaa={hipaa} "
+                        f"to={to_addr} manual=true"
+                    ),
+                )
+            except Exception:
+                pass
+
+        await db_call(_digest_sent_db_work)
         return HTMLResponse(
             "<small style='color:var(--pico-ins-color);'>"
             f"&#10003; Sent {len(rows)} row digest to "
@@ -680,7 +708,7 @@ async def digest_create_stub(
     don't persist on this route — saves a wasted row when the
     operator clicks Cancel.
     """
-    # #137 phase 2 — OwnedAccountOrLogin keeps the redirect-to-/login
+    #  phase 2 — OwnedAccountOrLogin keeps the redirect-to-/login
     # UX for full-page nav targets while collapsing the rest of the
     # preamble. Anon → 303 to /login; non-owner → HTTPException 403.
     if isinstance(ctx, RedirectResponse):
@@ -701,14 +729,14 @@ async def digest_editor_new(
 ):
     """Editor for a not-yet-saved digest. ``dcfg.id`` empty until
     first save mints one in ``upsert_digest_config``."""
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
     templates = get_templates(request)
     ctx = _digest_editor_context(db, request, account_id, dcfg=None)
     ctx["user"] = user
-    return _render(templates, request, "accounts/_digest_editor.html", ctx)
+    return await _render(templates, request, "accounts/_digest_editor.html", ctx)
 
 
 @router.get(
@@ -728,19 +756,19 @@ async def digest_editor(
     from email_triage.actions.digest_configs import (
         PRESET_ID, get_digest_config,
     )
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
     templates = get_templates(request)
 
-    dcfg = get_digest_config(db, account_id, digest_id)
+    dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse("Digest not found", status_code=404)
     ctx = _digest_editor_context(db, request, account_id, dcfg=dcfg)
     ctx["user"] = user
     ctx["is_preset"] = (dcfg.id == PRESET_ID)
-    return _render(templates, request, "accounts/_digest_editor.html", ctx)
+    return await _render(templates, request, "accounts/_digest_editor.html", ctx)
 
 
 @router.post(
@@ -764,7 +792,7 @@ async def digest_save(
     from email_triage.actions.digest_configs import (
         PRESET_ID, get_digest_config, upsert_digest_config, validate,
     )
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
@@ -783,15 +811,17 @@ async def digest_save(
 
     errors = validate(cfg)
     if errors:
-        ctx = _digest_editor_context(db, request, account_id, dcfg=cfg)
+        ctx = await db_call(
+            _digest_editor_context, db, request, account_id, dcfg=cfg,
+        )
         ctx["user"] = user
         ctx["is_preset"] = (cfg.id == PRESET_ID)
         ctx["errors"] = errors
-        return _render(
+        return await _render(
             templates, request, "accounts/_digest_editor.html", ctx,
         )
 
-    upsert_digest_config(db, account_id, cfg)
+    await db_call(upsert_digest_config, db, account_id, cfg)
     return RedirectResponse(
         f"/accounts/{account_id}/edit?tab=digests", status_code=303,
     )
@@ -809,7 +839,7 @@ async def digest_delete(
     from email_triage.actions.digest_configs import (
         PRESET_ID, delete_digest_config,
     )
-    # #137 phase 2 — OwnedAccountOrLogin: anon → 303 /login.
+    #  phase 2 — OwnedAccountOrLogin: anon → 303 /login.
     if isinstance(owned, RedirectResponse):
         return owned
     user, acct, db, secrets = owned
@@ -817,7 +847,9 @@ async def digest_delete(
         return HTMLResponse(
             "Cannot delete the preset digest.", status_code=400,
         )
-    delete_digest_config(db, account_id, digest_id)
+    #  — delete_digest_config writes the shared connection;
+    # dispatch it off the event loop through db_call.
+    await db_call(delete_digest_config, db, account_id, digest_id)
     return RedirectResponse(
         f"/accounts/{account_id}/edit?tab=digests", status_code=303,
     )
@@ -851,7 +883,7 @@ async def digest_test_send(
     )
     from email_triage.web.app import _fire_one_digest
 
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     config = get_config(request)
     smtp = config.smtp
@@ -867,7 +899,7 @@ async def digest_test_send(
             "Account has no email address. Save the account first."
             "</small>"
         )
-    dcfg = get_digest_config(db, account_id, digest_id)
+    dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -970,9 +1002,9 @@ async def digest_candidates(
     )
     from email_triage.web.app import _filter_digest_candidates
 
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
-    dcfg = get_digest_config(db, account_id, digest_id)
+    dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -981,7 +1013,11 @@ async def digest_candidates(
 
     now_utc = datetime.now(timezone.utc)
     try:
-        rows = _filter_digest_candidates(
+        #  — _filter_digest_candidates does a synchronous DB read on
+        # the shared connection; route it through db_call so it runs off
+        # the event loop under the process-wide DB lock.
+        rows = await db_call(
+            _filter_digest_candidates,
             db=db, acct=acct, dcfg=dcfg,
             now_utc=now_utc, last_sent=None,
         )
@@ -1075,10 +1111,10 @@ async def digest_preview(
     )
     from email_triage.web.app import _render_digest_payload
 
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     config = get_config(request)
-    dcfg = get_digest_config(db, account_id, digest_id)
+    dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -1158,7 +1194,7 @@ async def digest_validate_query(
     own error message so operators can fix the query without
     hunting through logs.
     """
-    # #137 phase 2 — OwnedAccount dep collapses preamble.
+    #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
 
     form = await request.form()
@@ -1234,7 +1270,7 @@ async def accounts_save_post(
 async def accounts_update(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    # #137 — preamble collapsed to ``OwnedAccount``. The save-POST
+    #  — preamble collapsed to ``OwnedAccount``. The save-POST
     # sibling forwards its own ``owned`` tuple so the dep runs once
     # per request, not twice. Local imports below stay narrow to keep
     # cherry-pick locality tight against parallel-agent edits in the
@@ -1271,16 +1307,27 @@ async def accounts_update(
         selected = list(config.get("mailboxes") or [])
         if len(selected) > cap:
             # Re-render the edit form with the error message.
-            _enrich_account(acct, secrets)
             try:
                 wm = _gwm(request)
             except Exception:
                 wm = None
-            _enrich_account_chips(acct, db, secrets, watcher_mgr=wm, config=request.app.state.config)
-            from email_triage.web.db import list_account_delegates
-            return _render(templates, request, "accounts/_edit.html", {
+
+            def _mailbox_cap_render_snapshot() -> list[dict]:
+                """/ — enrich + delegates read for the cap-error
+                re-render, in one threadpool hop.
+                """
+                from email_triage.web.db import list_account_delegates
+                _enrich_account(acct, secrets)
+                _enrich_account_chips(
+                    acct, db, secrets, watcher_mgr=wm,
+                    config=request.app.state.config,
+                )
+                return list_account_delegates(db, account_id)
+
+            delegates = await db_call(_mailbox_cap_render_snapshot)
+            return await _render(templates, request, "accounts/_edit.html", {
                 "acct": acct, "is_admin": is_admin, "user": user,
-                "delegates": list_account_delegates(db, account_id),
+                "delegates": delegates,
                 "mailbox_cap_error": (
                     f"Too many folders selected ({len(selected)} > cap of {cap}). "
                     "Most IMAP servers limit concurrent connections per user — "
@@ -1289,36 +1336,47 @@ async def accounts_update(
                 ),
             })
 
-    update_email_account(db, account_id, name, ptype, config, is_active)
+    # / — this edit-save handler is a long synchronous SQLite
+    # block with no ``await`` interleaved until the watcher-bounce far
+    # below. Each contiguous DB sub-block is wrapped via db_call so it
+    # runs off the event loop. (One giant nested helper would require
+    # re-indenting ~300 lines of branchy code — wrapping each coherent
+    # sub-block is the lower-risk, behaviour-preserving conversion.)
+    def _update_account_row_db_work() -> None:
+        update_email_account(db, account_id, name, ptype, config, is_active)
 
-    # Sync the preset digest config from the legacy form fields.
-    # Phase 4 of the multi-digest refactor moved the source of
-    # truth to ``digest_configs:<id>`` storage; we still accept
-    # the legacy ``recipient_digest_enabled`` /
-    # ``recipient_digest_send_at`` form fields (no UI churn for
-    # the operator's existing toggle) but mirror them into the
-    # preset config so the new sender path picks them up. Custom
-    # digests are managed via the Phase 6 editor; not touched here.
-    try:
-        from email_triage.actions.digest_configs import (
-            PRESET_ID, get_digest_config, upsert_digest_config,
-        )
-        preset = get_digest_config(db, account_id, PRESET_ID)
-        if preset is not None:
-            preset.enabled = bool(config.get("recipient_digest_enabled", False))
-            preset.schedule.time_local = (
-                config.get("recipient_digest_send_at") or "08:10"
+        # Sync the preset digest config from the legacy form fields.
+        # Phase 4 of the multi-digest refactor moved the source of
+        # truth to ``digest_configs:<id>`` storage; we still accept
+        # the legacy ``recipient_digest_enabled`` /
+        # ``recipient_digest_send_at`` form fields (no UI churn for
+        # the operator's existing toggle) but mirror them into the
+        # preset config so the new sender path picks them up. Custom
+        # digests are managed via the Phase 6 editor; not touched here.
+        try:
+            from email_triage.actions.digest_configs import (
+                PRESET_ID, get_digest_config, upsert_digest_config,
             )
-            upsert_digest_config(db, account_id, preset)
-    except Exception as e:
-        # Sync is best-effort — the legacy fields still drive the
-        # Phase 4 migration on first read, and the preset config
-        # is always re-derivable from them. Log + move on.
-        from email_triage._errfmt import fmt_exc
-        _log.warning(
-            "digest preset sync failed",
-            account_id=account_id, error=fmt_exc(e),
-        )
+            preset = get_digest_config(db, account_id, PRESET_ID)
+            if preset is not None:
+                preset.enabled = bool(
+                    config.get("recipient_digest_enabled", False)
+                )
+                preset.schedule.time_local = (
+                    config.get("recipient_digest_send_at") or "08:10"
+                )
+                upsert_digest_config(db, account_id, preset)
+        except Exception as e:
+            # Sync is best-effort — the legacy fields still drive the
+            # Phase 4 migration on first read, and the preset config
+            # is always re-derivable from them. Log + move on.
+            from email_triage._errfmt import fmt_exc
+            _log.warning(
+                "digest preset sync failed",
+                account_id=account_id, error=fmt_exc(e),
+            )
+
+    await db_call(_update_account_row_db_work)
 
     # Calendar opt-in wiring (B2):
     # - gmail_api: the checkbox sets ``calendar_opted_in`` in the account
@@ -1332,7 +1390,8 @@ async def accounts_update(
     #   matters. Sync it directly from the checkbox.
     from email_triage.web.db import set_bool_setting
     if ptype in ("gmail_api", "office365"):
-        set_bool_setting(
+        await db_call(
+            set_bool_setting,
             db, _S.calendar_enabled(account_id),
             bool(config.get("calendar_opted_in", False)),
         )
@@ -1349,7 +1408,7 @@ async def accounts_update(
     except Exception:
         watcher_mgr = None
 
-    # #50 — HIPAA flag flip is owner-or-admin only. Delegates
+    #  — HIPAA flag flip is owner-or-admin only. Delegates
     # explicitly can NOT change the flag (blast-radius op: toggling
     # off downgrades audit posture for an account that may carry
     # PHI). Skip the whole block when a delegate posts the form —
@@ -1364,56 +1423,81 @@ async def accounts_update(
         # when an account becomes HIPAA so future renders reflect the
         # explicit OFF state until the operator manually re-enables it.
         was_hipaa = bool(acct.get("hipaa"))
-        try:
-            from email_triage.web.db import set_account_hipaa
-            set_account_hipaa(db, account_id, desired, actor_id=user["id"])
-        except PermissionError as e:
-            # Lock violation — surface inline, don't 500.
-            acct = get_email_account(db, account_id)
-            _enrich_account(acct, secrets)
-            _enrich_account_chips(acct, db, secrets, watcher_mgr=watcher_mgr, config=request.app.state.config)
-            return _render(templates, request, "accounts/_row.html", {
-                "acct": acct, "is_admin": is_admin,
-                "hipaa_error": str(e),
-            })
-        # Auto-off on flip 0→1: when an account becomes HIPAA, force
-        # the AI-learns toggle off so future renders reflect the
-        # explicit OFF state. Operator can re-enable it manually once
-        # the M-1+M-2 opt-in is in place. Per operator: "if the
-        # account flips on hipaa, disable until checked manually
-        # again." INFO log carries account_id + actor for audit.
-        if desired and not was_hipaa:
+
+        def _hipaa_flag_db_work() -> tuple[str, dict | None]:
+            """/ — HIPAA flag set + (on 0→1 flip) the AI-learns
+            auto-off, in one hop. Returns ("permission_error", acct)
+            when the lock guard rejects, else ("ok", None).
+            """
             try:
-                from email_triage.web.db import set_rag_sent_index_enabled
-                set_rag_sent_index_enabled(
-                    db, account_id, enabled=False,
+                from email_triage.web.db import set_account_hipaa
+                set_account_hipaa(
+                    db, account_id, desired, actor_id=user["id"],
                 )
-                _log.info(
-                    "AI-learns toggle auto-disabled on HIPAA flip",
-                    account_id=account_id,
-                    actor_user_id=user["id"],
+            except PermissionError as e:
+                # Lock violation — surface inline, don't 500. Re-fetch
+                # + enrich here so the handler can render off-thread.
+                bad_acct = get_email_account(db, account_id)
+                _enrich_account(bad_acct, secrets)
+                _enrich_account_chips(
+                    bad_acct, db, secrets, watcher_mgr=watcher_mgr,
+                    config=request.app.state.config,
                 )
-            except Exception as auto_off_err:
-                # Auto-off is defence in depth — the M-4 path itself
-                # short-circuits HIPAA accounts. Log + continue rather
-                # than break the save.
-                _log.warning(
-                    "AI-learns auto-off on HIPAA flip failed",
-                    account_id=account_id,
-                    error=fmt_exc(auto_off_err),
-                )
+                bad_acct = dict(bad_acct or {})
+                bad_acct["_hipaa_error"] = str(e)
+                return "permission_error", bad_acct
+            # Auto-off on flip 0→1: when an account becomes HIPAA, force
+            # the AI-learns toggle off so future renders reflect the
+            # explicit OFF state. Operator can re-enable it manually
+            # once the M-1+M-2 opt-in is in place. Per operator: "if
+            # the account flips on hipaa, disable until checked
+            # manually again." INFO log carries account_id + actor.
+            if desired and not was_hipaa:
+                try:
+                    from email_triage.web.db import (
+                        set_rag_sent_index_enabled,
+                    )
+                    set_rag_sent_index_enabled(
+                        db, account_id, enabled=False,
+                    )
+                    _log.info(
+                        "AI-learns toggle auto-disabled on HIPAA flip",
+                        account_id=account_id,
+                        actor_user_id=user["id"],
+                    )
+                except Exception as auto_off_err:
+                    # Auto-off is defence in depth — the M-4 path
+                    # itself short-circuits HIPAA accounts. Log +
+                    # continue rather than break the save.
+                    _log.warning(
+                        "AI-learns auto-off on HIPAA flip failed",
+                        account_id=account_id,
+                        error=fmt_exc(auto_off_err),
+                    )
+            return "ok", None
+
+        _hipaa_kind, _hipaa_acct = await db_call(_hipaa_flag_db_work)
+        if _hipaa_kind == "permission_error":
+            return await _render(templates, request, "accounts/_row.html", {
+                "acct": _hipaa_acct, "is_admin": is_admin,
+                "hipaa_error": _hipaa_acct.get("_hipaa_error", ""),
+            })
 
     # Save password/secret if provided.
-    _save_provider_secret(form, ptype, account_id, secrets)
+    await db_call(_save_provider_secret, form, ptype, account_id, secrets)
 
-    # #169 Wave 2-α I6 — per-account style-learning backend FK.
+    #  Wave 2-α I6 — per-account style-learning backend FK.
     # Form field is ``style_learning_backend_id`` (HTML select);
     # empty / unset value means "fall through to install default".
     # The dropdown was filtered server-side to enforce the HIPAA gate
     # at render time, but defence-in-depth: re-check on save and
     # refuse a HIPAA account selecting a backend that doesn't meet
     # the BAA-current invariant.
-    if "style_learning_backend_id" in form:
+    def _style_backend_db_work() -> None:
+        """/ — per-account style-learning backend FK select:
+        validate + HIPAA gate + audit + write, all in one threadpool
+        hop. Only invoked when the form carries the field.
+        """
         from email_triage.web.db import (
             get_ai_backend,
             record_hipaa_access_event,
@@ -1513,7 +1597,10 @@ async def accounts_update(
                         error=fmt_exc(audit_err),
                     )
 
-    # #152 Phase 2 — M-1+M-2 HIPAA opt-in (per-account).
+    if "style_learning_backend_id" in form:
+        await db_call(_style_backend_db_work)
+
+    #  Phase 2 — M-1+M-2 HIPAA opt-in (per-account).
     # The checkbox is rendered ONLY for HIPAA-flagged accounts AND only
     # for the account owner (the ``{% if acct.hipaa and user.id ==
     # acct.user_id %}`` gate in accounts/_edit.html); for non-HIPAA
@@ -1527,7 +1614,7 @@ async def accounts_update(
     # snapshot so a flip-to-non-HIPAA in the same save doesn't leave a
     # stale opt-in row behind.
     #
-    # OWNER-ONLY: per #152 phase 2 + feedback_hipaa_actor_owner_gate.md,
+    # OWNER-ONLY: per  phase 2 + feedback_hipaa_actor_owner_gate.md,
     # the M-1+M-2 opt-in is the operator's own §164.502(a)
     # self-disclosure ack — admin / delegate cannot tick it on behalf
     # of the account owner. A non-owner POST that carries the field
@@ -1536,66 +1623,73 @@ async def accounts_update(
     # is a separate decision: admin can flip the policy bit, but only
     # the data subject can opt their own knobs in.
     _is_owner = acct["user_id"] == user["id"]
-    cur_acct = get_email_account(db, account_id)
-    if cur_acct and bool(cur_acct.get("hipaa")):
-        if _is_owner:
-            from email_triage.web.db import (
-                record_hipaa_access_event,
-                set_style_knobs_hipaa_allow,
-            )
-            desired_optin = ("style_knobs_hipaa_allow" in form)
-            set_style_knobs_hipaa_allow(
-                db, account_id,
-                enabled=desired_optin,
-            )
-            # Audit the owner-self tick (§164.502(a) carve-out
-            # doesn't waive the audit trail). Outcome key is the
-            # final state so the auditor can read "who set the flag
-            # to what + when" off a single row.
-            try:
-                record_hipaa_access_event(
-                    db,
+
+    def _m1m2_optin_db_work() -> None:
+        """/ — re-read account + (HIPAA) M-1+M-2 opt-in write +
+        audit, all in one threadpool hop.
+        """
+        cur_acct = get_email_account(db, account_id)
+        if cur_acct and bool(cur_acct.get("hipaa")):
+            if _is_owner:
+                from email_triage.web.db import (
+                    record_hipaa_access_event,
+                    set_style_knobs_hipaa_allow,
+                )
+                desired_optin = ("style_knobs_hipaa_allow" in form)
+                set_style_knobs_hipaa_allow(
+                    db, account_id,
+                    enabled=desired_optin,
+                )
+                # Audit the owner-self tick (§164.502(a) carve-out
+                # doesn't waive the audit trail). Outcome key is the
+                # final state so the auditor can read "who set the
+                # flag to what + when" off a single row.
+                try:
+                    record_hipaa_access_event(
+                        db,
+                        actor_user_id=user["id"],
+                        account_id=account_id,
+                        operation="style_knobs_hipaa_allow_set",
+                        outcome="ok",
+                        detail=(
+                            "enabled" if desired_optin else "disabled"
+                        ),
+                    )
+                except Exception as audit_err:
+                    _log.warning(
+                        "style_knobs_hipaa_allow audit row failed",
+                        account_id=account_id,
+                        error=fmt_exc(audit_err),
+                    )
+            elif "style_knobs_hipaa_allow" in form:
+                # Non-owner POSTed the opt-in field on a HIPAA account
+                # they don't own. Silently refuse (no setting write)
+                # but record the attempt — the audit row is the
+                # paper trail.
+                from email_triage.web.db import record_hipaa_access_event
+                _log.info(
+                    "style_knobs_hipaa_allow tick refused — actor != owner",
+                    account_id=account_id,
                     actor_user_id=user["id"],
-                    account_id=account_id,
-                    operation="style_knobs_hipaa_allow_set",
-                    outcome="ok",
-                    detail=(
-                        "enabled" if desired_optin else "disabled"
-                    ),
+                    owner_user_id=acct["user_id"],
                 )
-            except Exception as audit_err:
-                _log.warning(
-                    "style_knobs_hipaa_allow audit row failed",
-                    account_id=account_id,
-                    error=fmt_exc(audit_err),
-                )
-        elif "style_knobs_hipaa_allow" in form:
-            # Non-owner POSTed the opt-in field on a HIPAA account
-            # they don't own. Silently refuse (no setting write)
-            # but record the attempt — the audit row is the
-            # paper trail.
-            from email_triage.web.db import record_hipaa_access_event
-            _log.info(
-                "style_knobs_hipaa_allow tick refused — actor != owner",
-                account_id=account_id,
-                actor_user_id=user["id"],
-                owner_user_id=acct["user_id"],
-            )
-            try:
-                record_hipaa_access_event(
-                    db,
-                    actor_user_id=user["id"],
-                    account_id=account_id,
-                    operation="style_knobs_hipaa_allow_set",
-                    outcome="refused_non_owner",
-                    detail="actor != owner; owner-only opt-in",
-                )
-            except Exception as audit_err:
-                _log.warning(
-                    "style_knobs_hipaa_allow refused-audit failed",
-                    account_id=account_id,
-                    error=fmt_exc(audit_err),
-                )
+                try:
+                    record_hipaa_access_event(
+                        db,
+                        actor_user_id=user["id"],
+                        account_id=account_id,
+                        operation="style_knobs_hipaa_allow_set",
+                        outcome="refused_non_owner",
+                        detail="actor != owner; owner-only opt-in",
+                    )
+                except Exception as audit_err:
+                    _log.warning(
+                        "style_knobs_hipaa_allow refused-audit failed",
+                        account_id=account_id,
+                        error=fmt_exc(audit_err),
+                    )
+
+    await db_call(_m1m2_optin_db_work)
 
     # Watcher bounce: if either the push/poll flags, the poll cadence,
     # or (for IMAP) the mailbox list changed, tear down and re-start
@@ -1644,33 +1738,40 @@ async def accounts_update(
                     account_id=account_id, reason=reason, error=fmt_exc(e),
                 )
 
-    acct = get_email_account(db, account_id)
-    _enrich_account(acct, secrets)
-    _enrich_account_chips(acct, db, secrets, watcher_mgr=watcher_mgr, config=request.app.state.config)
-    return _render(templates, request, "accounts/_row.html", {
+    def _account_row_render_snapshot() -> dict:
+        """/ — re-fetch + enrich for the row re-render, in one
+        threadpool hop.
+        """
+        acct_ = get_email_account(db, account_id)
+        _enrich_account(acct_, secrets)
+        _enrich_account_chips(
+            acct_, db, secrets, watcher_mgr=watcher_mgr,
+            config=request.app.state.config,
+        )
+        return acct_
+
+    acct = await db_call(_account_row_render_snapshot)
+    return await _render(templates, request, "accounts/_row.html", {
         "acct": acct, "is_admin": is_admin,
     })
 
 
 @router.post("/accounts/{account_id}/delegates/add", response_class=HTMLResponse)
 async def accounts_delegate_add(
-    request: Request, account_id: int,
+    request: Request, account_id: int, user: RequireUserFragment,
 ):
     """Grant a user delegate access to this account. Owner-or-admin only.
 
     Form fields:
         user_email: email of the user to grant access to (must exist).
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     db = get_db(request)
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
     from email_triage.web.db import (
         get_email_account, add_account_delegate, list_account_delegates,
     )
-    # #135 phase 3 — DB-before-(form-parse-and-write).
+    #  phase 3 — DB-before-(form-parse-and-write).
     acct = await db_call(get_email_account, db, account_id)
     if acct is None:
         return HTMLResponse("Not found", status_code=404)
@@ -1680,75 +1781,89 @@ async def accounts_delegate_add(
     form = await request.form()
     # Hybrid grant UX: admin dropdown posts user_id; owner free-text
     # posts user_email. Honour either.
-    target = None
     target_user_id = (form.get("user_id") or "").strip()
-    if target_user_id:
-        try:
-            target = db.execute(
-                "SELECT id, email, name FROM users WHERE id = ?",
-                (int(target_user_id),),
-            ).fetchone()
-        except (ValueError, TypeError):
-            target = None
-    if target is None:
-        target_email = (form.get("user_email") or "").strip().lower()
-        if not target_email and not target_user_id:
-            return HTMLResponse("missing user_id or user_email",
-                                status_code=400)
-        if target_email:
+    target_email = (form.get("user_email") or "").strip().lower()
+    if not target_email and not target_user_id:
+        return HTMLResponse("missing user_id or user_email",
+                            status_code=400)
+
+    #  — fold every shared-connection touch (target-user lookup,
+    # the @db_write add_account_delegate helper, the post-write
+    # delegate-list + grantable-users re-render reads) into one
+    # threadpool hop so none of it runs on the event-loop thread.
+    def _delegate_add_db_work() -> dict:
+        """ — resolve target user, grant the delegate, build the
+        re-render context. Runs entirely off-loop under the DB lock.
+        """
+        # Refresh grantable_users for re-render. Inline (not a nested
+        # db_call) — it shares this closure's threadpool hop + lock.
+        def _grantable():
+            if is_admin:
+                rows = db.execute(
+                    "SELECT id, email, name FROM users WHERE id != ? "
+                    "ORDER BY COALESCE(NULLIF(name, ''), email)",
+                    (acct["user_id"],),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            return None
+
+        target = None
+        if target_user_id:
+            try:
+                target = db.execute(
+                    "SELECT id, email, name FROM users WHERE id = ?",
+                    (int(target_user_id),),
+                ).fetchone()
+            except (ValueError, TypeError):
+                target = None
+        if target is None and target_email:
             target = db.execute(
                 "SELECT id, email, name FROM users WHERE LOWER(email) = ?",
                 (target_email,),
             ).fetchone()
 
-    # Refresh grantable_users for re-render after error.
-    def _grantable():
-        if is_admin:
-            rows = db.execute(
-                "SELECT id, email, name FROM users WHERE id != ? "
-                "ORDER BY COALESCE(NULLIF(name, ''), email)",
-                (acct["user_id"],),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        return None
+        if target is None:
+            identifier = (
+                form.get("user_email") or form.get("user_id") or ""
+            ).strip()
+            return {
+                "acct": acct,
+                "delegates": list_account_delegates(db, account_id),
+                "error": f"No user found matching '{identifier}'",
+                "is_admin": is_admin,
+                "user": user,
+                "grantable_users": _grantable(),
+            }
+        try:
+            added = add_account_delegate(
+                db, account_id, target["id"], granted_by=user["id"],
+            )
+        except ValueError as e:
+            return {
+                "acct": acct,
+                "delegates": list_account_delegates(db, account_id),
+                "error": fmt_exc(e),
+                "is_admin": is_admin,
+                "user": user,
+                "grantable_users": _grantable(),
+            }
+        if added:
+            _log.info(
+                "Account delegate granted",
+                account_id=account_id, account_name=acct.get("name", ""),
+                target_user_id=target["id"], target_email=target["email"],
+                granted_by=user["id"],
+            )
+        return {
+            "acct": acct,
+            "delegates": list_account_delegates(db, account_id),
+            "is_admin": is_admin,
+            "user": user,
+            "grantable_users": _grantable(),
+        }
 
-    if target is None:
-        identifier = (form.get("user_email") or form.get("user_id") or "").strip()
-        return _render(templates, request, "accounts/_delegates.html", {
-            "acct": acct,
-            "delegates": list_account_delegates(db, account_id),
-            "error": f"No user found matching '{identifier}'",
-            "is_admin": is_admin,
-            "user": user,
-            "grantable_users": _grantable(),
-        })
-    try:
-        added = add_account_delegate(
-            db, account_id, target["id"], granted_by=user["id"],
-        )
-    except ValueError as e:
-        return _render(templates, request, "accounts/_delegates.html", {
-            "acct": acct,
-            "delegates": list_account_delegates(db, account_id),
-            "error": fmt_exc(e),
-            "is_admin": is_admin,
-            "user": user,
-            "grantable_users": _grantable(),
-        })
-    if added:
-        _log.info(
-            "Account delegate granted",
-            account_id=account_id, account_name=acct.get("name", ""),
-            target_user_id=target["id"], target_email=target["email"],
-            granted_by=user["id"],
-        )
-    return _render(templates, request, "accounts/_delegates.html", {
-        "acct": acct,
-        "delegates": list_account_delegates(db, account_id),
-        "is_admin": is_admin,
-        "user": user,
-        "grantable_users": _grantable(),
-    })
+    ctx = await db_call(_delegate_add_db_work)
+    return await _render(templates, request, "accounts/_delegates.html", ctx)
 
 
 @router.delete(
@@ -1757,58 +1872,63 @@ async def accounts_delegate_add(
 )
 async def accounts_delegate_remove(
     request: Request, account_id: int, user_id: int,
+    user: RequireUserFragment,
 ):
     """Revoke a delegate. Owner-or-admin only."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
     db = get_db(request)
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
     from email_triage.web.db import (
         get_email_account, remove_account_delegate, list_account_delegates,
     )
-    # #135 phase 3 — DB-before-write.
+    #  phase 3 — DB-before-write.
     acct = await db_call(get_email_account, db, account_id)
     if acct is None:
         return HTMLResponse("Not found", status_code=404)
     if acct["user_id"] != user["id"] and not is_admin:
         return HTMLResponse("Forbidden", status_code=403)
-    if remove_account_delegate(db, account_id, user_id):
-        _log.info(
-            "Account delegate revoked",
-            account_id=account_id, account_name=acct.get("name", ""),
-            target_user_id=user_id, revoked_by=user["id"],
-        )
-    grantable = None
-    if is_admin:
-        rows = db.execute(
-            "SELECT id, email, name FROM users WHERE id != ? "
-            "ORDER BY COALESCE(NULLIF(name, ''), email)",
-            (acct["user_id"],),
-        ).fetchall()
-        grantable = [dict(r) for r in rows]
-    return _render(templates, request, "accounts/_delegates.html", {
-        "acct": acct,
-        "delegates": list_account_delegates(db, account_id),
-        "is_admin": is_admin,
-        "user": user,
-        "grantable_users": grantable,
-    })
+    #  — fold the @db_write remove_account_delegate helper plus the
+    # post-write delegate-list + grantable-users re-render reads into a
+    # single threadpool hop; none of it runs on the event-loop thread.
+    def _delegate_remove_db_work() -> dict:
+        if remove_account_delegate(db, account_id, user_id):
+            _log.info(
+                "Account delegate revoked",
+                account_id=account_id, account_name=acct.get("name", ""),
+                target_user_id=user_id, revoked_by=user["id"],
+            )
+        grantable = None
+        if is_admin:
+            rows = db.execute(
+                "SELECT id, email, name FROM users WHERE id != ? "
+                "ORDER BY COALESCE(NULLIF(name, ''), email)",
+                (acct["user_id"],),
+            ).fetchall()
+            grantable = [dict(r) for r in rows]
+        return {
+            "acct": acct,
+            "delegates": list_account_delegates(db, account_id),
+            "is_admin": is_admin,
+            "user": user,
+            "grantable_users": grantable,
+        }
+
+    ctx = await db_call(_delegate_remove_db_work)
+    return await _render(templates, request, "accounts/_delegates.html", ctx)
 
 
 @router.post("/accounts/{account_id}/aliases/add", response_class=HTMLResponse)
 async def accounts_alias_add(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    """Add an additional address to an account (#106).
+    """Add an additional address to an account.
 
     Owner / delegate / admin can add (same gate as the main account
     save). The submitted address is validated for RFC shape and
     de-duplication before write; on validation failure the partial
     re-renders with an inline error message above the table.
     """
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
@@ -1831,12 +1951,12 @@ async def accounts_alias_add(
     try:
         cleaned = normalize_aliases(proposed, primary=primary)
     except AliasValidationError as e:
-        return _render(templates, request, "accounts/_aliases.html", {
+        return await _render(templates, request, "accounts/_aliases.html", {
             "acct": acct, "user": user, "is_admin": is_admin,
             "alias_error": str(e),
         })
 
-    # #135 phase 2 — write off the loop.
+    #  phase 2 — write off the loop.
     await db_call(update_email_account_aliases, db, account_id, cleaned)
     _log.info(
         "Account alias added",
@@ -1844,7 +1964,7 @@ async def accounts_alias_add(
         actor_user_id=user["id"],
     )
     acct = await db_call(get_email_account, db, account_id)
-    return _render(templates, request, "accounts/_aliases.html", {
+    return await _render(templates, request, "accounts/_aliases.html", {
         "acct": acct, "user": user, "is_admin": is_admin,
     })
 
@@ -1856,13 +1976,13 @@ async def accounts_alias_add(
 async def accounts_alias_remove(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
-    """Remove an additional address from an account (#106).
+    """Remove an additional address from an account.
 
     Body field: ``address`` — the alias to drop. Idempotent: a remove
     request for an address that isn't present re-renders the same
     partial with no change.
     """
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
@@ -1880,7 +2000,7 @@ async def accounts_alias_remove(
     ]
     if len(kept) != len(existing):
         def _alias_remove_snapshot(db, account_id, kept):
-            """#135 phase 2 — write + re-fetch in one threadpool hop."""
+            """ phase 2 — write + re-fetch in one threadpool hop."""
             update_email_account_aliases(db, account_id, kept)
             return get_email_account(db, account_id)
 
@@ -1890,24 +2010,22 @@ async def accounts_alias_remove(
             account_id=account_id, address=target,
             actor_user_id=user["id"],
         )
-    return _render(templates, request, "accounts/_aliases.html", {
+    return await _render(templates, request, "accounts/_aliases.html", {
         "acct": acct, "user": user, "is_admin": is_admin,
     })
 
 
 @router.delete("/accounts/{account_id}", response_class=HTMLResponse)
-async def accounts_delete(request: Request, account_id: int):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
+async def accounts_delete(
+    request: Request, account_id: int, user: RequireUserFragment,
+):
     db = get_db(request)
     is_admin = user["role"] == "admin"
 
     from email_triage.web.db import get_email_account, delete_email_account
 
     def _accounts_delete_snapshot(db, account_id, user_id, is_admin):
-        """#135 phase 2 — fetch + auth check + delete in one hop. Returns
+        """ phase 2 — fetch + auth check + delete in one hop. Returns
         ('ok' | 'not_found' | 'forbidden')."""
         acct = get_email_account(db, account_id)
         if acct is None:
@@ -1933,7 +2051,7 @@ async def accounts_test(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Test an account's connection using its saved config + secrets."""
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, secrets = owned
     is_admin = user["role"] == "admin"
 
@@ -1963,7 +2081,7 @@ async def accounts_test(
             )
         elif not watching and ptype == "gmail_api":
             from email_triage.web.db import get_gmail_watch
-            # #135 phase 3 — DB read after the network test() above; the
+            #  phase 3 — DB read after the network test() above; the
             # threadpool hop here lets a concurrent request progress while
             # the gmail_watch row is read.
             watch = await db_call(get_gmail_watch, db, account_id)
@@ -2008,7 +2126,7 @@ async def accounts_folders(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """List available folders/labels for an account (JSON fragment or HTML)."""
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, _, secrets = owned
     is_admin = user["role"] == "admin"
 
@@ -2041,7 +2159,7 @@ async def accounts_folder_create(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Create a new folder on the account's mail server."""
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, _, secrets = owned
     is_admin = user["role"] == "admin"
 
@@ -2099,7 +2217,7 @@ async def accounts_folder_prefs_page(
 ):
     """Show the folder subscription page — check/uncheck folders to show in dropdowns.
 
-    Migrated to ``OwnedAccountOrLogin`` (#137 phase 2) — full-page
+    Migrated to ``OwnedAccountOrLogin`` — full-page
     navigation target keeps redirect-to-/login UX for anonymous users.
     """
     if isinstance(owned, RedirectResponse):
@@ -2120,7 +2238,7 @@ async def accounts_folder_prefs_page(
     except Exception as e:
         error = f"Could not list folders: {e}"
 
-    # #135 phase 2 — folder-prefs read off the loop.
+    #  phase 2 — folder-prefs read off the loop.
     prefs = await db_call(get_folder_prefs, db, account_id)
     folder_included = {}
     for f in all_folders:
@@ -2128,7 +2246,7 @@ async def accounts_folder_prefs_page(
 
     tree = _build_folder_tree(all_folders)
 
-    return _render(templates, request, "accounts/folder_prefs.html", {
+    return await _render(templates, request, "accounts/folder_prefs.html", {
         "user": user,
         "acct": acct,
         "tree": tree,
@@ -2143,7 +2261,7 @@ async def accounts_folder_prefs_save(
     request: Request, account_id: int, owned: OwnedAccount,
 ):
     """Save folder include/exclude preferences."""
-    # #137 — preamble collapsed to ``OwnedAccount``.
+    #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
     is_admin = user["role"] == "admin"
 
@@ -2159,7 +2277,7 @@ async def accounts_folder_prefs_save(
     for path in all_folder_paths:
         prefs[path] = path in included_paths
 
-    # #135 phase 2 — write off the loop.
+    #  phase 2 — write off the loop.
     await db_call(save_folder_prefs, db, account_id, prefs)
 
     # Redirect back to routes page with a success flash.

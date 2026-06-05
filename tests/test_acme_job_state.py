@@ -1,4 +1,4 @@
-"""Tests for the in-process ACME issuance job-state singleton (#75)."""
+"""Tests for the in-process ACME issuance job-state singleton."""
 
 import time
 

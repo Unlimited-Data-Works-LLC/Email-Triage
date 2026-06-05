@@ -1,8 +1,11 @@
-"""Tests for the ``retry_queue`` field on /health/detail (#175 R-B).
+"""Tests for the ``retry_queue`` field on /health/detail.
 
-Same synthetic-schema strategy as the admin tests — R-A ships the
-migration in parallel, this fixture installs the expected v30
-shape so the health-field tests run against the right table.
+Installs the real v30 ``watcher_retry_queue`` schema (see
+``migrations.py`` ``_v30_create_watcher_retry_queue``) so the
+health-field tests run against the table the production code
+actually queries. : the dead-in-24h window filters on
+``resolved_at`` — the column set on the dead transition — not the
+non-existent ``updated_at`` an earlier synthetic-schema guess used.
 """
 
 from __future__ import annotations
@@ -11,8 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 
 def _install_ra_schema(db) -> None:
-    """Drop legacy v16 shape + install the v30 shape R-A is going
-    to deliver. Idempotent."""
+    """Drop any prior shape + install the real v30 schema. Idempotent."""
     try:
         db.execute("DROP TABLE IF EXISTS watcher_retry_queue")
     except Exception:
@@ -24,18 +26,20 @@ def _install_ra_schema(db) -> None:
             account_id INTEGER NOT NULL,
             provider_type TEXT NOT NULL,
             mailbox TEXT,
-            uid TEXT,
-            uidvalidity TEXT,
+            uid INTEGER,
+            uidvalidity INTEGER,
             gmail_msg_id TEXT,
             o365_msg_id TEXT,
-            error_class TEXT,
-            error_msg TEXT,
             state TEXT NOT NULL DEFAULT 'pending',
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+            next_attempt_at TEXT NOT NULL,
+            last_error_class TEXT,
+            last_error_msg TEXT,
+            last_error_at TEXT,
+            resolved_at TEXT,
             dead_reason TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
@@ -46,19 +50,27 @@ def _seed(
     db, *, state, dead_reason=None, created_hours_ago=0,
     updated_hours_ago=0,
 ):
+    """Insert one retry row.
+
+    ``updated_hours_ago`` sets ``resolved_at`` — the timestamp the
+    dead/done transition stamps, and the column the 24h dead-window
+    query filters on.
+    """
     created = (
         datetime.now(timezone.utc) - timedelta(hours=created_hours_ago)
     ).isoformat()
-    updated = (
+    resolved = (
         datetime.now(timezone.utc) - timedelta(hours=updated_hours_ago)
     ).isoformat()
+    # ``resolved_at`` is only set once a row leaves the pending state.
+    resolved_at = resolved if state in ("dead", "done") else None
     db.execute(
         "INSERT INTO watcher_retry_queue ("
-        " account_id, provider_type, error_class, error_msg, "
-        " state, attempts, next_attempt_at, dead_reason, "
-        " created_at, updated_at"
+        " account_id, provider_type, last_error_class, last_error_msg, "
+        " state, attempt_count, next_attempt_at, dead_reason, "
+        " created_at, resolved_at"
         ") VALUES (1, 'imap', 'ReadTimeout', '', ?, 0, ?, ?, ?, ?)",
-        (state, updated, dead_reason, created, updated),
+        (state, resolved, dead_reason, created, resolved_at),
     )
     db.commit()
 

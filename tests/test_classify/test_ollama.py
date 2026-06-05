@@ -62,8 +62,8 @@ class TestParseLlmJson:
         result = _parse_llm_json(text)
         assert result["category"] == "fyi"
 
-    def test_[local-llm-model]_think_tags(self):
-        """[local-llm-model] wraps reasoning in <think>...</think> before the JSON."""
+    def test_qwen3_think_tags(self):
+        """Qwen3 wraps reasoning in <think>...</think> before the JSON."""
         text = (
             '<think>\nLet me analyze this email. It appears to be an invoice '
             'based on the subject line and body content.\n</think>\n'
@@ -73,7 +73,7 @@ class TestParseLlmJson:
         assert result["category"] == "invoices"
         assert result["confidence"] == 0.95
 
-    def test_[local-llm-model]_think_tags_multiline(self):
+    def test_qwen3_think_tags_multiline(self):
         """Handle multi-line think blocks with nested content."""
         text = (
             '<think>\nFirst, I need to check the sender.\n'
@@ -84,7 +84,7 @@ class TestParseLlmJson:
         result = _parse_llm_json(text)
         assert result["category"] == "invoices"
 
-    def test_[local-llm-model]_think_tags_empty(self):
+    def test_qwen3_think_tags_empty(self):
         """Handle empty think blocks."""
         text = '<think></think>{"category": "fyi", "confidence": 0.7, "reason": "Info"}'
         result = _parse_llm_json(text)
@@ -127,7 +127,7 @@ class TestOllamaClassifier:
             mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
-            msg = _make_email(subject="Invoice #1234", body_text="Please pay invoice #1234.")
+            msg = _make_email(subject="Invoice ", body_text="Please pay invoice .")
             result = await classifier.classify(msg, _CATEGORIES)
 
         assert result.category == "invoices"

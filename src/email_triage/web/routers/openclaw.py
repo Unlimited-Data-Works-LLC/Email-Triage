@@ -29,9 +29,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from email_triage.triage_logging import get_logger, is_account_hipaa
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 from email_triage.web.ratelimit import enforce_rate_limit
 from email_triage._errfmt import fmt_exc
+from email_triage._isotime import parse_iso
 
 log = get_logger("web.routers.openclaw")
 
@@ -43,7 +45,9 @@ router = APIRouter(prefix="/api/openclaw", tags=["openclaw"])
 # ---------------------------------------------------------------------------
 
 async def _require_user(request: Request) -> dict:
-    user = get_current_user(request)
+    #  — get_current_user takes the DB write lock (verify_api_key
+    # is @db_write); dispatch it off the event-loop thread.
+    user = await db_call(get_current_user, request)
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     # Rate-limit by API-key id when present, falling back to user id.
@@ -74,11 +78,25 @@ async def _require_openclaw_account(
     db = request.app.state.db
     from email_triage.web.db import get_email_account
 
-    acct = get_email_account(db, account_id)
-    if acct is None:
+    def _fetch_and_scope(db, account_id, user):
+        # ASYNC-DB: account read + delegate-scope read in one
+        # off-loop hop (this resolver is the hot path for nearly every
+        # OpenClaw endpoint).
+        acct_ = get_email_account(db, account_id)
+        if acct_ is None:
+            return None, False
+        return acct_, _scope_to_user(db, user, acct_)
+
+    acct, scoped = await db_call(_fetch_and_scope, db, account_id, user)
+    #  — uniform 404 for BOTH "account does not exist" and "account
+    # exists but is not owned by this caller". Returning a
+    # distinguishable 403 for the not-owned case turned this endpoint
+    # into an enumeration oracle: a caller could walk account ids and
+    # read which ones exist from the 404-vs-403 split. A non-owner has
+    # no business knowing an id is live, so both cases now look
+    # identical — "not found" from the caller's point of view.
+    if acct is None or not scoped:
         raise HTTPException(status_code=404, detail="account_not_found")
-    if not _scope_to_user(db, user, acct):
-        raise HTTPException(status_code=403, detail="not_owner")
     if is_account_hipaa(acct):
         raise HTTPException(
             status_code=403,
@@ -127,7 +145,7 @@ async def openclaw_health(request: Request):
     (operator-facing detail: tasks block, ingestion counts, watchers,
     audit_failures, csrf_rejects, schema_version, version) but
     accepts a bearer token instead of a session cookie -- so an
-    agent caller, Nagios, or any other unattended client can
+    agent caller, the monitoring system, or any other unattended client can
     scrape it without going through the web-UI auth flow.
 
     Returns 503 (with the body) when degraded; same status-code
@@ -155,21 +173,28 @@ async def list_accounts(request: Request):
     db = request.app.state.db
     from email_triage.web.db import list_email_accounts
     from email_triage.web.events import get_openclaw_quiet_settings
-    # Strict per-user scope. ``list_email_accounts(user_id=...)``
-    # returns owner + delegate rows. Admin role does NOT bypass --
-    # OpenClaw token represents operator intent, not role privilege.
-    accts = list_email_accounts(db, user_id=user["id"])
-    out = []
-    for acct in accts:
-        if is_account_hipaa(acct):
-            continue
-        out.append({
-            "id": acct["id"],
-            "name": acct["name"],
-            "provider_type": acct["provider_type"],
-            "is_active": bool(acct.get("is_active", True)),
-            "quiet_hours": get_openclaw_quiet_settings(db, acct["id"]),
-        })
+
+    def _accounts_snapshot(db, user_id):
+        # ASYNC-DB: account list + per-account quiet-hours reads
+        # in one off-loop hop.
+        # Strict per-user scope. ``list_email_accounts(user_id=...)``
+        # returns owner + delegate rows. Admin role does NOT bypass --
+        # OpenClaw token represents operator intent, not role privilege.
+        accts = list_email_accounts(db, user_id=user_id)
+        out_ = []
+        for acct in accts:
+            if is_account_hipaa(acct):
+                continue
+            out_.append({
+                "id": acct["id"],
+                "name": acct["name"],
+                "provider_type": acct["provider_type"],
+                "is_active": bool(acct.get("is_active", True)),
+                "quiet_hours": get_openclaw_quiet_settings(db, acct["id"]),
+            })
+        return out_
+
+    out = await db_call(_accounts_snapshot, db, user["id"])
     return {"accounts": out}
 
 
@@ -322,6 +347,12 @@ async def archive_message(
     request: Request, account_id: int, message_id: str,
 ):
     async def _op(provider):
+        # H-06 sister-site sweep (per hipaa-sme-3 R-3 verify-don't-accept
+        # review 2026-05-24): exception from provider.archive propagates
+        # to _provider_op which surfaces it as HTTP 500 to the caller —
+        # no PHI state-divergence buried. NOT a H-06 surface — see
+        # actions/digest.py:486 for the divergence-visibility primary
+        # site (§164.308(a)(7) Contingency Plan).
         await provider.archive(message_id)
         return {"status": "ok", "message_id": message_id}
     return await _provider_op(request, account_id, message_id, _op)
@@ -355,27 +386,33 @@ async def list_runs(
     db = request.app.state.db
     from email_triage.web.db import list_triage_runs, get_email_account
 
-    rows = list_triage_runs(db, account_id=account_id, limit=limit)
-    out = []
-    for r in rows:
-        acct = get_email_account(db, r["account_id"])
-        # Hide HIPAA-flagged accounts and other users' accounts.
-        # Strict scope: admin role does NOT bypass.
-        if acct is None:
-            continue
-        if not _scope_to_user(db, user, acct):
-            continue
-        if is_account_hipaa(acct):
-            continue
-        out.append({
-            "id": r["id"],
-            "account_id": r["account_id"],
-            "account_name": r.get("account_name", ""),
-            "query": r.get("query", ""),
-            "total_messages": r.get("total_messages", 0),
-            "elapsed_secs": r.get("elapsed_secs"),
-            "started_at": r.get("started_at"),
-        })
+    def _runs_snapshot(db, account_id, limit, user):
+        # ASYNC-DB: run listing + per-row account-scope reads in
+        # one off-loop hop.
+        rows = list_triage_runs(db, account_id=account_id, limit=limit)
+        out_ = []
+        for r in rows:
+            acct = get_email_account(db, r["account_id"])
+            # Hide HIPAA-flagged accounts and other users' accounts.
+            # Strict scope: admin role does NOT bypass.
+            if acct is None:
+                continue
+            if not _scope_to_user(db, user, acct):
+                continue
+            if is_account_hipaa(acct):
+                continue
+            out_.append({
+                "id": r["id"],
+                "account_id": r["account_id"],
+                "account_name": r.get("account_name", ""),
+                "query": r.get("query", ""),
+                "total_messages": r.get("total_messages", 0),
+                "elapsed_secs": r.get("elapsed_secs"),
+                "started_at": r.get("started_at"),
+            })
+        return out_
+
+    out = await db_call(_runs_snapshot, db, account_id, limit, user)
     return {"runs": out}
 
 
@@ -392,11 +429,19 @@ async def set_quiet_hours(
     db = request.app.state.db
     from email_triage.web.db import get_setting, set_setting
     from email_triage.web.settings_keys import openclaw_quiet
-    current = get_setting(db, openclaw_quiet(account_id)) or {}
-    for key in ("enabled", "paused", "start_utc", "end_utc"):
-        if key in body:
-            current[key] = body[key]
-    set_setting(db, openclaw_quiet(account_id), current)
+
+    def _update_quiet(db, account_id, body):
+        # ASYNC-DB: read-modify-write of the quiet-hours setting
+        # in one off-loop hop.
+        key_ = openclaw_quiet(account_id)
+        current = get_setting(db, key_) or {}
+        for k in ("enabled", "paused", "start_utc", "end_utc"):
+            if k in body:
+                current[k] = body[k]
+        set_setting(db, key_, current)
+        return current
+
+    current = await db_call(_update_quiet, db, account_id, body)
     return {"status": "ok", "settings": current}
 
 
@@ -422,13 +467,13 @@ class RespondBody(BaseModel):
 # Backfill migration v6 stamps this on every existing row, but the
 # helper still falls back here for the in-memory belt-and-braces
 # case (test fixtures, partially-migrated rows).
-_DEFAULT_ACCOUNT_TZ = "America/Detroit"
+_DEFAULT_ACCOUNT_TZ = "America/New_York"
 
 
 def _resolve_account_tz(acct: dict | None) -> str:
     """Return the IANA tz string the account renders calendar
     events in. Falls back to the install default; never returns
-    UTC implicitly (per punch-list #109 — UTC times must not leak
+    UTC implicitly (per the backlog  — UTC times must not leak
     to human consumers)."""
     if not acct:
         return _DEFAULT_ACCOUNT_TZ
@@ -455,7 +500,7 @@ def _format_local_time(dt) -> str:
 
 def _local_render_fields(ev, acct: dict | None) -> dict[str, Any]:
     """Compute the per-event local-tz render fields documented in
-    punch-list #109. Returns a dict with all nine new keys; on any
+    the backlog . Returns a dict with all nine new keys; on any
     failure (missing zone, unknown IANA name, naive datetimes that
     can't be localised) returns the same keys with ``None`` values
     so consumers can still substitute without KeyErrors."""
@@ -568,12 +613,19 @@ async def _open_calendar(request: Request, acct: dict):
     from email_triage.web.db import is_calendar_enabled
     db = request.app.state.db
     secrets = request.app.state.secrets
-    # Resolve which account's enablement flag actually applies:
-    # the surrogate's if one is set + valid, otherwise the
-    # account's own.
-    surrogate = resolve_surrogate_account(db, acct)
-    flag_acct_id = (surrogate or acct)["id"]
-    if not is_calendar_enabled(db, flag_acct_id):
+
+    def _resolve_enablement(db, acct):
+        # ASYNC-DB: surrogate resolution + enablement read in one
+        # off-loop hop.
+        # Resolve which account's enablement flag actually applies:
+        # the surrogate's if one is set + valid, otherwise the
+        # account's own.
+        surrogate_ = resolve_surrogate_account(db, acct)
+        flag_acct_id = (surrogate_ or acct)["id"]
+        return surrogate_, is_calendar_enabled(db, flag_acct_id)
+
+    surrogate, enabled = await db_call(_resolve_enablement, db, acct)
+    if not enabled:
         raise HTTPException(
             status_code=400,
             detail={
@@ -589,8 +641,14 @@ async def _open_calendar(request: Request, acct: dict):
         )
     from email_triage.web.routers.ui import _create_calendar_provider_from_account
     # Pass db so the surrogate-account path resolves on IMAP
-    # accounts (#105 phase 1A++).
-    cal = _create_calendar_provider_from_account(acct, secrets, db=db)
+    # accounts.
+    # R1 HIGH-2 — the helper is sync and runs resolve_surrogate_account(db, ...)
+    # (a shared-connection read) + secrets.get(...); dispatch off the event-loop
+    # thread via db_call. The DbSecrets reads re-acquire the write lock
+    # reentrantly on the same worker — safe.
+    cal = await db_call(
+        _create_calendar_provider_from_account, acct, secrets, db=db,
+    )
     if cal is None:
         raise HTTPException(
             status_code=400,
@@ -606,7 +664,7 @@ async def _calendar_op(request: Request, account_id: int, op):
     """Helper: open calendar provider, run async closure, close cleanly.
 
     The closure receives ``(cal, acct)`` so consumers can read
-    per-account calendar role assignments (#105) — e.g. iterate
+    per-account calendar role assignments — e.g. iterate
     the calendars the operator opted into for the ``api`` role
     rather than always querying the implicit primary.
     """
@@ -645,12 +703,10 @@ async def calendar_list(
     time_max: str = Query(..., description="ISO 8601 UTC"),
     limit: int = Query(50, ge=1, le=250),
 ):
-    from datetime import datetime
-    try:
-        tmin = datetime.fromisoformat(time_min.replace("Z", "+00:00"))
-        tmax = datetime.fromisoformat(time_max.replace("Z", "+00:00"))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"bad_iso_datetime: {e}")
+    tmin = parse_iso(time_min)
+    tmax = parse_iso(time_max)
+    if tmin is None or tmax is None:
+        raise HTTPException(status_code=400, detail="bad_iso_datetime")
 
     async def _op(cal, acct):
         # Iterate the calendars the operator opted into for the
@@ -667,9 +723,10 @@ async def calendar_list(
         # Determine which account holds the canonical role +
         # display-name data: the surrogate when one is set, else
         # the consumer itself.
+        # ASYNC-DB: surrogate resolution read off the loop.
         db = request.app.state.db
         role_acct = (
-            resolve_surrogate_account(db, acct) or acct
+            await db_call(resolve_surrogate_account, db, acct) or acct
         )
 
         # Build an id -> display-name map so events can carry a
@@ -793,13 +850,11 @@ async def calendar_get(
 async def calendar_create(
     request: Request, account_id: int, body: CalendarEventBody = Body(...),
 ):
-    from datetime import datetime
     from email_triage.engine.models import CalendarEvent
-    try:
-        start = datetime.fromisoformat(body.start.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(body.end.replace("Z", "+00:00"))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"bad_iso_datetime: {e}")
+    start = parse_iso(body.start)
+    end = parse_iso(body.end)
+    if start is None or end is None:
+        raise HTTPException(status_code=400, detail="bad_iso_datetime")
     ev = CalendarEvent(
         event_id="",
         summary=body.summary,
@@ -933,7 +988,7 @@ async def mail_search(
 
 
 # ---------------------------------------------------------------------------
-# Bulk namespace migration (item #31)
+# Bulk namespace migration (item )
 #
 # Originally the bulk-write endpoints lived under ``/mail/bulk`` and
 # ``/calendar/bulk-respond`` while the bulk-read endpoints were minted
@@ -1262,7 +1317,7 @@ async def _fetch_messages_bulk(
 
     When ``include_body`` is False the per-id fetch is allowed to
     skip the body — providers that support a cheaper headers-only
-    mode (currently IMAP, to dodge upstream issue #118) will use it.
+    mode (currently IMAP, to dodge upstream issue ) will use it.
     Providers without such a mode ignore the kwarg and return the
     full message; the summary projection drops the body anyway.
 
@@ -1544,7 +1599,7 @@ def _shape_calendar_event(ev, acct: dict | None = None) -> dict[str, Any]:
     a literal without juggling CalendarEvent imports.
 
     ``acct`` carries the per-account timezone used for the local-
-    render fields (#109). Dict-shaped stubs pass through verbatim
+    render fields. Dict-shaped stubs pass through verbatim
     so they can opt into the local fields explicitly when they
     care about them; the bulk-fetch path emits a CalendarEvent so
     enrichment runs there."""
@@ -1658,24 +1713,26 @@ async def calendar_free_slots(
     user, acct = await _require_openclaw_account(request, account_id)
     db = request.app.state.db
     cal = await _open_calendar(request, acct)
-    prefs = MeetingPreferences.from_dict(get_meeting_prefs(db, acct["user_id"]))
+    # ASYNC-DB: meeting-prefs read off the loop.
+    prefs = MeetingPreferences.from_dict(
+        await db_call(get_meeting_prefs, db, acct["user_id"])
+    )
 
     now = datetime.now(timezone.utc)
-    try:
-        h_start = (
-            datetime.fromisoformat(time_min.replace("Z", "+00:00"))
-            if time_min else now + timedelta(hours=prefs.minimum_lead_time_hours)
-        )
-        h_end = (
-            datetime.fromisoformat(time_max.replace("Z", "+00:00"))
-            if time_max else now + timedelta(days=prefs.search_horizon_days)
-        )
-    except Exception as e:
+    h_start = parse_iso(time_min)
+    h_end = parse_iso(time_max)
+    # A supplied-but-unparseable bound is a client error; an absent
+    # bound falls back to the preference-derived default window.
+    if (time_min and h_start is None) or (time_max and h_end is None):
         try:
             await cal.close()
         except Exception:
             pass
-        raise HTTPException(status_code=400, detail=f"bad_iso_datetime: {e}")
+        raise HTTPException(status_code=400, detail="bad_iso_datetime")
+    if h_start is None:
+        h_start = now + timedelta(hours=prefs.minimum_lead_time_hours)
+    if h_end is None:
+        h_end = now + timedelta(days=prefs.search_horizon_days)
 
     try:
         try:
@@ -2134,7 +2191,9 @@ async def openclaw_digests_list(request: Request, account_id: int):
     """
     user, acct = await _require_openclaw_account(request, account_id)
     db = request.app.state.db
-    configs = _dc.list_digest_configs(db, account_id)
+    # ASYNC-DB: digest-config listing (may run a legacy migration)
+    # off the loop.
+    configs = await db_call(_dc.list_digest_configs, db, account_id)
     return {
         "account_id": account_id,
         "digests": [_digest_to_api(c) for c in configs],
@@ -2166,7 +2225,8 @@ async def openclaw_digests_create(request: Request, account_id: int):
         raise HTTPException(
             status_code=400, detail={"errors": errors},
         )
-    saved = _dc.upsert_digest_config(db, account_id, cfg)
+    # ASYNC-DB: digest-config write off the loop.
+    saved = await db_call(_dc.upsert_digest_config, db, account_id, cfg)
     return _digest_to_api(saved)
 
 
@@ -2189,7 +2249,10 @@ async def openclaw_digests_update(
             status_code=400, detail="body must be a JSON object",
         )
 
-    existing = _dc.get_digest_config(db, account_id, digest_id)
+    # ASYNC-DB: digest-config read off the loop.
+    existing = await db_call(
+        _dc.get_digest_config, db, account_id, digest_id,
+    )
     if existing is None:
         raise HTTPException(status_code=404, detail="digest not found")
 
@@ -2220,7 +2283,8 @@ async def openclaw_digests_update(
         raise HTTPException(
             status_code=400, detail={"errors": errors},
         )
-    saved = _dc.upsert_digest_config(db, account_id, cfg)
+    # ASYNC-DB: digest-config write off the loop.
+    saved = await db_call(_dc.upsert_digest_config, db, account_id, cfg)
     return _digest_to_api(saved)
 
 
@@ -2235,7 +2299,10 @@ async def openclaw_digests_delete(
         raise HTTPException(
             status_code=400, detail="cannot delete the preset digest",
         )
-    removed = _dc.delete_digest_config(db, account_id, digest_id)
+    # ASYNC-DB: digest-config delete off the loop.
+    removed = await db_call(
+        _dc.delete_digest_config, db, account_id, digest_id,
+    )
     if not removed:
         raise HTTPException(status_code=404, detail="digest not found")
     return {"ok": True, "deleted_id": digest_id}
@@ -2314,7 +2381,8 @@ async def openclaw_digests_test_send(
             status_code=400,
             detail="account has no email address",
         )
-    dcfg = _dc.get_digest_config(db, account_id, digest_id)
+    # ASYNC-DB: digest-config read off the loop.
+    dcfg = await db_call(_dc.get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         raise HTTPException(
             status_code=404, detail="digest not found",
@@ -2342,7 +2410,7 @@ async def openclaw_digests_test_send(
 
 
 # ---------------------------------------------------------------------------
-# Email watches CRUD (#100)
+# Email watches CRUD
 # ---------------------------------------------------------------------------
 #
 # Mirrors the digest CRUD shape: GET list / POST create / PATCH update /
@@ -2379,7 +2447,9 @@ async def openclaw_watches_list(request: Request, account_id: int):
     """
     user, acct = await _require_openclaw_account(request, account_id)
     db = request.app.state.db
-    rows = _watches.list_watches(
+    # ASYNC-DB: watch listing off the loop.
+    rows = await db_call(
+        _watches.list_watches,
         db,
         account_id=account_id,
         include_all_accounts=not is_account_hipaa(acct),
@@ -2424,7 +2494,8 @@ async def openclaw_watches_create(request: Request, account_id: int):
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
 
-    saved = _watches.upsert_watch(db, w)
+    # ASYNC-DB: watch write off the loop.
+    saved = await db_call(_watches.upsert_watch, db, w)
 
     # Mint HMAC secret if absent.
     try:
@@ -2461,7 +2532,8 @@ async def openclaw_watches_update(
         raise HTTPException(
             status_code=400, detail="body must be a JSON object",
         )
-    existing = _watches.get_watch(db, watch_id)
+    # ASYNC-DB: watch read off the loop.
+    existing = await db_call(_watches.get_watch, db, watch_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="watch not found")
 
@@ -2476,7 +2548,8 @@ async def openclaw_watches_update(
     if errors:
         raise HTTPException(status_code=400, detail={"errors": errors})
 
-    saved = _watches.upsert_watch(db, w)
+    # ASYNC-DB: watch write off the loop.
+    saved = await db_call(_watches.upsert_watch, db, w)
     return _watch_to_api(saved)
 
 
@@ -2488,10 +2561,15 @@ async def openclaw_watches_delete(
     user, acct = await _require_openclaw_account(request, account_id)
     db = request.app.state.db
     secrets = request.app.state.secrets
-    existing = _watches.get_watch(db, watch_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="watch not found")
-    removed = _watches.delete_watch(db, watch_id)
+
+    def _delete_watch(db, watch_id):
+        # ASYNC-DB: watch existence read + delete in one off-loop
+        # hop.
+        if _watches.get_watch(db, watch_id) is None:
+            return False
+        return _watches.delete_watch(db, watch_id)
+
+    removed = await db_call(_delete_watch, db, watch_id)
     if not removed:
         raise HTTPException(status_code=404, detail="watch not found")
     try:
@@ -2527,7 +2605,8 @@ async def openclaw_watches_test_fire(
     secrets = request.app.state.secrets
     config = request.app.state.config
 
-    existing = _watches.get_watch(db, watch_id)
+    # ASYNC-DB: watch read off the loop.
+    existing = await db_call(_watches.get_watch, db, watch_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="watch not found")
 

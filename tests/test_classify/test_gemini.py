@@ -2,7 +2,8 @@
 
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -53,6 +54,24 @@ def _gemini_response(category: str, confidence: float, reason: str) -> dict:
     }
 
 
+def _mock_http(classifier, mock_resp):
+    """Swap the classifier's pooled ``LazyHttpClient`` for a stub.
+
+     — the classifier now reuses one long-lived client per
+    instance (``self._http.get()``) instead of ``async with
+    httpx.AsyncClient(...)`` per call. The stub returns ``mock_resp``
+    from ``.post()``; the returned mock client lets a test assert on
+    ``.post.call_args``.
+    """
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    classifier._http = SimpleNamespace(
+        get=AsyncMock(return_value=mock_client),
+        aclose=AsyncMock(),
+    )
+    return mock_client
+
+
 class TestGeminiClassifier:
     @pytest.fixture
     def classifier(self):
@@ -65,15 +84,9 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("to-respond", 0.92, "Needs reply.")
         mock_resp.raise_for_status = lambda: None
+        _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            result = await classifier.classify(_make_email(), _CATEGORIES)
+        result = await classifier.classify(_make_email(), _CATEGORIES)
 
         assert result.category == "to-respond"
         assert result.confidence == 0.92
@@ -84,15 +97,9 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("fyi", 0.7, "Info.")
         mock_resp.raise_for_status = lambda: None
+        mock_client = _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            await classifier.classify(_make_email(), _CATEGORIES)
+        await classifier.classify(_make_email(), _CATEGORIES)
 
         call_args = mock_client.post.call_args
         url = call_args[0][0]
@@ -103,15 +110,9 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("fyi", 0.6, "FYI.")
         mock_resp.raise_for_status = lambda: None
+        mock_client = _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            await classifier.classify(_make_email(), _CATEGORIES)
+        await classifier.classify(_make_email(), _CATEGORIES)
 
         call_args = mock_client.post.call_args
         params = call_args.kwargs.get("params", {})
@@ -121,15 +122,9 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("invoices", 0.85, "Bill.")
         mock_resp.raise_for_status = lambda: None
+        mock_client = _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            await classifier.classify(_make_email(), _CATEGORIES)
+        await classifier.classify(_make_email(), _CATEGORIES)
 
         call_args = mock_client.post.call_args
         payload = call_args.kwargs.get("json", {})
@@ -142,15 +137,9 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("fyi", 1.5, "Very confident.")
         mock_resp.raise_for_status = lambda: None
+        _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            result = await classifier.classify(_make_email(), _CATEGORIES)
+        result = await classifier.classify(_make_email(), _CATEGORIES)
 
         assert result.confidence == 1.0
 
@@ -164,19 +153,13 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("invoices", 0.95, "Billing email.")
         mock_resp.raise_for_status = lambda: None
+        _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            result = await classifier.classify(
-                _make_email(sender="billing@company.com"),
-                _CATEGORIES,
-                list_hints=hints,
-            )
+        result = await classifier.classify(
+            _make_email(sender="billing@company.com"),
+            _CATEGORIES,
+            list_hints=hints,
+        )
 
         assert result.category == "invoices"
 
@@ -187,35 +170,32 @@ class TestGeminiClassifier:
         mock_resp = Mock()
         mock_resp.json.return_value = _gemini_response("fyi", 0.7, "Info.")
         mock_resp.raise_for_status = lambda: None
+        mock_client = _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
-
-            await classifier.classify(_make_email(), _CATEGORIES)
+        await classifier.classify(_make_email(), _CATEGORIES)
 
         call_args = mock_client.post.call_args
         params = call_args.kwargs.get("params", {})
         assert "key" not in params
 
     async def test_empty_response(self, classifier):
-        """Empty candidate list raises ValueError from _parse_llm_json."""
+        """Empty candidate list raises a typed GeminiResponseError."""
+        from email_triage.classify.gemini import GeminiResponseError
+
         mock_resp = Mock()
         mock_resp.json.return_value = {"candidates": []}
         mock_resp.raise_for_status = lambda: None
+        _mock_http(classifier, mock_resp)
 
-        with patch("email_triage.classify.gemini.httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client.post.return_value = mock_resp
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client_cls.return_value = mock_client
+        with pytest.raises(GeminiResponseError, match="no usable text"):
+            await classifier.classify(_make_email(), _CATEGORIES)
 
-            with pytest.raises(ValueError, match="No JSON object"):
-                await classifier.classify(_make_email(), _CATEGORIES)
+    async def test_close_drains_pooled_client(self, classifier):
+        """close() forwards to the pooled client's aclose()."""
+        stub = SimpleNamespace(get=AsyncMock(), aclose=AsyncMock())
+        classifier._http = stub
+        await classifier.close()
+        stub.aclose.assert_awaited_once()
 
 
 class TestExtractText:
@@ -231,14 +211,34 @@ class TestExtractText:
         assert GeminiClassifier._extract_text(body) == "Hello!"
 
     def test_empty_candidates(self):
-        assert GeminiClassifier._extract_text({"candidates": []}) == ""
+        """No candidates → typed GeminiResponseError, not a bare ""."""
+        from email_triage.classify.gemini import GeminiResponseError
+
+        with pytest.raises(GeminiResponseError, match="no usable text"):
+            GeminiClassifier._extract_text({"candidates": []})
 
     def test_no_candidates_key(self):
-        assert GeminiClassifier._extract_text({}) == ""
+        from email_triage.classify.gemini import GeminiResponseError
+
+        with pytest.raises(GeminiResponseError, match="no usable text"):
+            GeminiClassifier._extract_text({})
+
+    def test_safety_block_reports_reason(self):
+        """A prompt-level safety block surfaces its blockReason."""
+        from email_triage.classify.gemini import GeminiResponseError
+
+        body = {"promptFeedback": {"blockReason": "SAFETY"}}
+        with pytest.raises(GeminiResponseError, match="SAFETY"):
+            GeminiClassifier._extract_text(body)
 
     def test_empty_parts(self):
-        body = {"candidates": [{"content": {"parts": []}}]}
-        assert GeminiClassifier._extract_text(body) == ""
+        """No parts → typed error carrying the finishReason."""
+        from email_triage.classify.gemini import GeminiResponseError
+
+        body = {"candidates": [{"content": {"parts": []},
+                                "finishReason": "RECITATION"}]}
+        with pytest.raises(GeminiResponseError, match="RECITATION"):
+            GeminiClassifier._extract_text(body)
 
 
 class TestCLIIntegration:

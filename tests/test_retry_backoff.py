@@ -1,4 +1,4 @@
-"""Tests for the shared retry-backoff math (#175 R-A).
+"""Tests for the shared retry-backoff math.
 
 Covers :mod:`email_triage.retry_backoff` — both pre-canned schedules
 + the :func:`compute_next_attempt_at` helper. Pure math, no I/O.

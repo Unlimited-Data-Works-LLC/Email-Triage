@@ -1,4 +1,4 @@
-"""Tests for PWA install plumbing (#94).
+"""Tests for PWA install plumbing.
 
 Browsers fire the "Install" prompt on the URL bar when:
 

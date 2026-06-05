@@ -58,7 +58,7 @@ class MoveAction(Action):
         from email_triage.actions.base import (
             check_idempotent_already_done, record_idempotent_done,
         )
-        prior = check_idempotent_already_done(
+        prior = await check_idempotent_already_done(
             flow, message, self.name,
         )
         if prior is not None:
@@ -73,7 +73,7 @@ class MoveAction(Action):
         # Per-call closure: pins the action-specific ``folder`` field
         # into every emission. Delegates the canonical extras shape
         # to ``build_action_log_extras`` (single source of truth at
-        # base.py per item #137-adjacent) so the same fields surface
+        # base.py per item -adjacent) so the same fields surface
         # on every action log line — owner + account_name + flow id —
         # without each action open-coding the redaction + account-
         # identifier logic.
@@ -135,7 +135,7 @@ class MoveAction(Action):
 
             await provider.move_message(message.message_id, folder)
             logger.info("Message moved to folder", extra=_extras())
-            record_idempotent_done(
+            await record_idempotent_done(
                 flow, message, self.name, external_id=folder,
             )
             return ActionOutput(

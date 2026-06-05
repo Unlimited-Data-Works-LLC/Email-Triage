@@ -1,4 +1,4 @@
-"""Render-side tests for the self-sent event triage path (#107).
+"""Render-side tests for the self-sent event triage path.
 
 Verifies the ``triage/_results.html`` partial paints the calendar
 icon + start time on a self-event row when the action's data envelope

@@ -1,4 +1,4 @@
-"""Trigger watchers for the HIPAA M-3 + M-7 distill queues (#171-B).
+"""Trigger watchers for the HIPAA M-3 + M-7 distill queues.
 
 The W2-β + W3 work shipped the DATA plane: the distill modules
 (:mod:`distill_hipaa`, :mod:`per_contact_hipaa`), the audit/queue
@@ -406,19 +406,23 @@ def enqueue_m3_triggers(
         if not decision.should_enqueue:
             continue
         try:
+            #  — the enqueue + counter-reset must be ONE
+            # transaction. A crash between them leaves a queued row
+            # with the counter un-reset; once the worker clears the
+            # queue row, the still-high counter re-triggers (a
+            # duplicate distill). enqueue defers its commit; the
+            # reset's commit lands both — or a crash rolls back both.
             enqueue_style_distill_retry(
                 conn,
                 account_id=decision.account_id,
                 last_error=f"trigger:{decision.reason}",
+                commit=False,
             )
-            # Reset the aggregate counter. The first-success path on
-            # the worker will not re-clear it (success clears the
-            # queue row only); leaving the counter ticking would
-            # immediately re-trigger.
             reset_hipaa_send_counter(
                 conn,
                 account_id=decision.account_id,
                 recipient_hash=HIPAA_SEND_COUNTER_AGGREGATE_HASH,
+                commit=True,
             )
             log.info(
                 "m3 trigger enqueued",
@@ -637,16 +641,21 @@ def enqueue_m7_triggers(
                 continue
             assert decision.recipient_hash is not None
             try:
+                #  — enqueue + counter-reset in ONE transaction
+                # (see the M-3 path); enqueue defers its commit, the
+                # reset commits both atomically.
                 enqueue_style_distill_contact_retry(
                     conn,
                     account_id=decision.account_id,
                     recipient_hash=decision.recipient_hash,
                     last_error=f"trigger:{decision.reason}",
+                    commit=False,
                 )
                 reset_hipaa_send_counter(
                     conn,
                     account_id=decision.account_id,
                     recipient_hash=decision.recipient_hash,
+                    commit=True,
                 )
                 # Log only the hash — privacy invariant.
                 log.info(

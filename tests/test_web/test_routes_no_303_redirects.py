@@ -2,7 +2,7 @@
 a 200 (HTMX-swappable) or 4xx error chip — never a 303 redirect.
 
 A 303 from an HTMX endpoint causes a full-page reload (HTMX follows
-redirects by default), which is the exact UX bug #116 fixes.
+redirects by default), which is the exact UX bug  fixes.
 
 The folder-prefs save IS allowed to 303 — it's a plain POST from a
 non-HTMX page (folder_prefs.html). This test scopes to the routes

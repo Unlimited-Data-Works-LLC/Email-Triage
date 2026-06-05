@@ -275,7 +275,7 @@ class TestWatcherPermanentFailure:
             async def get_latest_uid(self):
                 return 0
 
-            async def watch(self):
+            async def watch(self, since_uid: int = 0):
                 raise NotImplementedError(
                     "Real-time watch is not supported on this provider via "
                     "the generator path."
@@ -919,12 +919,12 @@ class TestWatcherManagerMultiMailbox:
         from email_triage.providers.base import PushCapable
 
         class _StubProvider(PushCapable):
-            async def watch(self):
+            async def watch(self, since_uid: int = 0):
                 yield "1"  # pragma: no cover
             async def close(self):
                 return None
 
-        with patch("email_triage.web.app._watch_account", new=_fake_watch), \
+        with patch("email_triage.web.watcher._watch_account", new=_fake_watch), \
              patch(
                  "email_triage.web.routers.ui._create_provider_from_account",
                  return_value=_StubProvider(),
@@ -945,6 +945,54 @@ class TestWatcherManagerMultiMailbox:
 
         # Cleanup.
         for k in list(keys):
+            task = mgr._tasks.pop(k, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    async def test_watcher_runs_under_task_supervisor(
+        self, app, db, admin_user,
+    ):
+        """With a TaskSupervisor present, watcher tasks spawn through it
+        — so a crash is restarted + surfaced on /health rather than the
+        task silently disappearing."""
+        import asyncio
+        from unittest.mock import patch
+        from email_triage.web.task_supervisor import TaskSupervisor
+
+        acct_id = _make_imap_account(db, admin_user["id"])
+        app.state.supervisor = TaskSupervisor()
+        mgr = app.state.watcher_manager
+
+        async def _fake_watch(manager, account_id, *, mailbox="INBOX"):
+            await asyncio.sleep(3600)
+
+        from email_triage.providers.base import PushCapable
+
+        class _StubProvider(PushCapable):
+            async def watch(self, since_uid: int = 0):
+                yield "1"  # pragma: no cover
+            async def close(self):
+                return None
+
+        with patch("email_triage.web.watcher._watch_account", new=_fake_watch), \
+             patch(
+                 "email_triage.web.routers.ui._create_provider_from_account",
+                 return_value=_StubProvider(),
+             ):
+            await mgr.start(acct_id)
+            await asyncio.sleep(0)
+
+        sup = app.state.supervisor
+        sup_name = f"watcher:{acct_id}:INBOX"
+        assert sup_name in sup.health_snapshot()["tasks"]
+        assert sup.is_running(sup_name)
+
+        # Cleanup.
+        for k in [k for k in mgr._tasks if k[0] == acct_id]:
             task = mgr._tasks.pop(k, None)
             if task and not task.done():
                 task.cancel()

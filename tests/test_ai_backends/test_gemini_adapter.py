@@ -1,4 +1,4 @@
-"""Tests for the Gemini adapter (#171-A).
+"""Tests for the Gemini adapter.
 
 Covers the canonical W1-A ``chat_complete()`` contract + the OpenAI-
 to-Gemini message translation + the :class:`Classifier`-ABC shim +
@@ -50,13 +50,13 @@ def _gemini_response(text: str) -> dict:
 
 
 def _patch_httpx(mock_resp):
+    """Patch the adapter's pooled LazyHttpClient so .get() yields a
+    mock client returning ``mock_resp`` from .post()."""
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
     cls_patch = patch(
-        "email_triage.ai_backends.gemini_adapter.httpx.AsyncClient",
-        return_value=mock_client,
+        "email_triage._http_client.LazyHttpClient.get",
+        new=AsyncMock(return_value=mock_client),
     )
     return cls_patch, mock_client
 
@@ -780,3 +780,29 @@ class TestClassifierShim:
     def test_shim_marks_is_local_false(self, classifier):
         """Gemini is always external — HIPAA gate posture."""
         assert classifier.is_local is False
+
+    def test_shim_is_jsonchatclassifier_subclass(self):
+        """ — the shim subclasses the shared JsonChatClassifier
+        base rather than re-implementing classify()."""
+        from email_triage.classify.base import JsonChatClassifier
+        assert issubclass(GeminiClassifierShim, JsonChatClassifier)
+
+    async def test_out_of_taxonomy_category_raises(self, classifier):
+        """ — a category outside the supplied taxonomy is a
+        classification FAILURE: the shared base raises ValueError so
+        the per-message error path fires, instead of silently building
+        a no-op Classification no route matches."""
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _gemini_response(json.dumps({
+            "category": "not-a-real-category",
+            "confidence": 0.9,
+            "reason": "model hallucinated a label",
+        }))
+        cls_patch, _ = _patch_httpx(mock_resp)
+        with cls_patch:
+            with pytest.raises(ValueError, match="outside the taxonomy"):
+                await classifier.classify(
+                    self._make_email(),
+                    {"fyi": "info", "to-respond": "needs reply"},
+                )

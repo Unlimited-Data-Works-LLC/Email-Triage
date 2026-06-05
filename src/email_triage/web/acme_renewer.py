@@ -159,7 +159,7 @@ def caa_preflight(
 
 
 # ---------------------------------------------------------------------------
-# CNAME pre-flight (#76)
+# CNAME pre-flight
 # ---------------------------------------------------------------------------
 
 def cname_preflight(
@@ -171,7 +171,7 @@ def cname_preflight(
 ) -> tuple[bool, list[str]]:
     """Verify the CNAME-delegation chain BEFORE publishing a TXT.
 
-    #76 -- the renewer publishes ``_acme-challenge.<update_zone>``
+     -- the renewer publishes ``_acme-challenge.<update_zone>``
     when CNAME delegation is configured. LE then queries
     ``_acme-challenge.<cert_subject>`` and follows the CNAME at that
     name to the update zone. If the CNAME isn't configured (or
@@ -942,7 +942,7 @@ class Rfc2136Publisher:
 # Test-button helpers (called from /admin/acme-status)
 # ---------------------------------------------------------------------------
 
-# #77 -- ACME error classification. Maps acme.messages.Error.typ
+#  -- ACME error classification. Maps acme.messages.Error.typ
 # (the URN form letsencrypt returns) to a small policy enum:
 #   "permanent": skip remaining retries, fail fast
 #   "rate_limited": skip + log reset hint
@@ -1330,7 +1330,7 @@ class AcmeRenewer:
         """Return the PEM-encoded RSA-2048 ACME account private key,
         generating + storing on first call.
 
-        #78: previously generated Ed25519 here and then immediately
+        : previously generated Ed25519 here and then immediately
         regenerated as RSA-2048 in issue_now (jwk-OKP isn't universally
         accepted by ACME directories). Generating RSA up front skips
         the throwaway, halves first-run latency, and removes a comment-
@@ -1377,10 +1377,26 @@ class AcmeRenewer:
 
     def cert_metadata(self) -> dict[str, Any]:
         """Read the cert + return ``{ subject_cn, sans, not_before,
-        not_after, days_remaining }`` for the admin status page."""
+        not_after, days_remaining }`` for the admin status page.
+
+        Return-shape contract:
+
+        * cert file absent  → ``{"present": False, "valid": False}``
+        * cert file present, parsed OK → ``{"present": True,
+          "valid": True, ...the metadata fields...}``
+        * cert file present, parse FAILED → ``{"present": True,
+          "valid": False, "parse_error": "..."}``
+
+        ``valid`` is the flag callers / templates must branch on
+        before reading metadata fields. Previously a parse failure
+        returned ``{"present": True, "parse_error": ...}`` — a
+        success-shaped dict missing every metadata key, so a caller
+        that checked only ``present`` then read ``not_after`` /
+        ``sans`` hit a ``KeyError`` or a Jinja ``Undefined``.
+        """
         crt, _ = self.cert_paths()
         if not crt.exists():
-            return {"present": False}
+            return {"present": False, "valid": False}
         try:
             from cryptography import x509
             from cryptography.x509.oid import NameOID
@@ -1407,6 +1423,7 @@ class AcmeRenewer:
             days_remaining = (na - now).days if na else None
             return {
                 "present": True,
+                "valid": True,
                 "subject_cn": cn,
                 "sans": sans,
                 "not_before": nb.isoformat(),
@@ -1414,7 +1431,7 @@ class AcmeRenewer:
                 "days_remaining": days_remaining,
             }
         except Exception as e:
-            return {"present": True, "parse_error": str(e)}
+            return {"present": True, "valid": False, "parse_error": str(e)}
 
     def needs_renewal(self) -> bool:
         """True iff cert is missing or within renewal_threshold_days
@@ -1481,7 +1498,7 @@ class AcmeRenewer:
         if not domains:
             raise RuntimeError("acme.domains is empty")
 
-        # #75 -- live re-attach state. Tells anything watching
+        #  -- live re-attach state. Tells anything watching
         # /admin/acme-status/job that an issue is in flight + which
         # phase it's in. Mark "starting" up front so a page-refresh
         # operator can see the worker exists; transition() updates
@@ -1531,7 +1548,7 @@ class AcmeRenewer:
                 notes=caa_problems,
             )
 
-        # #76 -- CNAME pre-flight. When the operator uses the
+        #  -- CNAME pre-flight. When the operator uses the
         # CNAME-delegation pattern (rfc2136.update_zone set to
         # something different from the cert subject), LE will query
         # _acme-challenge.<cert_subject> and follow the CNAME to the
@@ -1581,7 +1598,7 @@ class AcmeRenewer:
         account_key = serialization.load_pem_private_key(
             account_pem, password=None,
         )
-        # #78 -- ed25519 throwaway path removed. ensure_account_key()
+        #  -- ed25519 throwaway path removed. ensure_account_key()
         # now generates RSA-2048 directly. Older installs that already
         # have an Ed25519 account key from before this change are
         # detected here and regenerated as RSA-2048 (one-time
@@ -1648,7 +1665,7 @@ class AcmeRenewer:
         # compatible with browsers; ed25519 cert keys still aren't
         # universally accepted).
         cert_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        # #78 -- CN field has a 64-char hard limit per RFC 5280. When
+        #  -- CN field has a 64-char hard limit per RFC 5280. When
         # domains[0] overflows (long subdomains, internal naming
         # conventions), x509.NameAttribute raises ValueError. Fall
         # back to a SAN-only CSR -- modern CAs (LE included) accept
@@ -1683,7 +1700,7 @@ class AcmeRenewer:
         if self.cfg.challenge != "dns-01":
             raise NotImplementedError(
                 f"Only dns-01 implemented; got {self.cfg.challenge!r}. "
-                "HTTP-01 stub lives in this module — see #67 followups."
+                "HTTP-01 stub lives in this module — see  followups."
             )
 
         tsig_secret = self.secrets.get(self.cfg.rfc2136.tsig_secret_ref)
@@ -1718,7 +1735,7 @@ class AcmeRenewer:
             directory=("staging" if "staging" in directory else "prod"),
         )
         for attempt in range(1, max_attempts + 1):
-            # #103 -- cancel check at the top of every retry-loop
+            #  -- cancel check at the top of every retry-loop
             # iteration. A click while we were sleeping between
             # attempts (or sitting in propagation poll) takes effect
             # within ~one poll-cycle of the click. Mid-finalizing
@@ -1734,14 +1751,14 @@ class AcmeRenewer:
                 )
                 acme_job_state.finish_failure(err_msg, kind="cancelled")
                 raise RuntimeError(err_msg)
-            # #75 -- live re-attach phase tracking. transition() updates
+            #  -- live re-attach phase tracking. transition() updates
             # the singleton so the page can poll /admin/acme-status/job
             # and re-attach mid-issue.
             acme_job_state.transition(
                 "publishing", attempt=attempt, max_attempts=max_attempts,
             )
             order = client.new_order(csr_pem)
-            # #104 -- persist the LE order URL so a process kill
+            #  -- persist the LE order URL so a process kill
             # mid-finalize can resume from the same order rather
             # than burning a fresh duplicate-cert slot.
             try:
@@ -1899,7 +1916,7 @@ class AcmeRenewer:
                 break
             except ValidationError as e:
                 last_error = e
-                # #77 -- classify before deciding to retry. CAA / badCSR
+                #  -- classify before deciding to retry. CAA / badCSR
                 # / accountDoesNotExist / etc are permanent: retrying
                 # just burns the validation_retries budget and may
                 # rate-limit-trip the directory. rateLimited aborts
@@ -1967,7 +1984,7 @@ class AcmeRenewer:
 
             # Only reached on retry path (success path 'break'-ed above).
             if attempt < max_attempts:
-                # #77 -- backoff curve. Exponential / fibonacci default;
+                #  -- backoff curve. Exponential / fibonacci default;
                 # operator can pin to "fixed" via config.
                 delay = _retry_delay_secs(
                     attempt=attempt,
@@ -2034,7 +2051,7 @@ class AcmeRenewer:
         log.info("ACME: cert issued + written",
                  domain=domains[0], not_after=meta.get("not_after"),
                  attempt_id=attempt_id)
-        # #75 -- terminal-success state for the live re-attach.
+        #  -- terminal-success state for the live re-attach.
         acme_job_state.finish_success(meta)
         return meta
 
@@ -2055,7 +2072,7 @@ class AcmeRenewer:
         409); the admin UI surfaces "issuance already in progress",
         the renewal_loop catches and skips the tick.
 
-        #75 -- the live re-attach state singleton (acme_job_state) is
+         -- the live re-attach state singleton (acme_job_state) is
         marked finish_failure on any unhandled exception out of the
         inner sync issue_now. issue_now itself marks finish_success
         on the happy path and finish_failure on the loop-exhausted
@@ -2085,12 +2102,17 @@ class AcmeRenewer:
         """Async background-task entrypoint with single-flight on
         the actual issuance call."""
         from email_triage.single_flight import SingleFlightBusy
+        #  — check_and_renew_async is an async background task;
+        # route the acme-renewal-log writes (which insert + commit on
+        # the shared connection) off the event-loop thread.
+        from email_triage.web.db_threadpool import db_call
         if not self.cfg.enabled:
             return {"skipped": "acme.enabled=false"}
         if not self.cfg.domains:
             return {"skipped": "acme.domains empty"}
         if not self.needs_renewal():
-            insert_acme_renewal_log(
+            await db_call(
+                insert_acme_renewal_log,
                 self.db, domain=self.cfg.domains[0],
                 outcome="skipped_fresh",
                 not_after=self.cert_metadata().get("not_after"),
@@ -2106,7 +2128,8 @@ class AcmeRenewer:
             )
             return {"action": "deferred", "reason": "issue_in_progress"}
         except Exception as e:
-            insert_acme_renewal_log(
+            await db_call(
+                insert_acme_renewal_log,
                 self.db, domain=self.cfg.domains[0],
                 outcome="failed",
                 error=_fmt_exc(e),
@@ -2154,6 +2177,12 @@ async def renewal_loop(renewer: AcmeRenewer, *, stop_event: asyncio.Event) -> No
 
     Routes through the single-flight-guarded async path so a
     concurrent manual "Issue Now" click can't race the tick.
+
+    .. deprecated::
+        Superseded by :func:`acme_cert_renewer`, which ports this onto
+        ``supervised_interval_loop`` (lease-gated, supervisor-tracked).
+        Kept only for the back-compat import surface; the supervised
+        block in ``web/app.py`` registers ``acme_cert_renewer``.
     """
     interval = max(1, renewer.cfg.check_interval_hours) * 3600
     log.info("ACME: renewal loop starting",
@@ -2170,3 +2199,222 @@ async def renewal_loop(renewer: AcmeRenewer, *, stop_event: asyncio.Event) -> No
         else:
             break
     log.info("ACME: renewal loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# Supervised cert-renewer
+# ---------------------------------------------------------------------------
+#
+# ``renewal_loop`` above had ZERO callers — an ACME cert was issued once
+# (manually, via the admin "Issue Now" button) and then silently expired
+# ~90 days later because nothing ticked ``check_and_renew``. This block
+# ports the renewer onto the supervised-task machinery the rest of the
+# background loops use: ``supervised_interval_loop`` for the cadence +
+# crash isolation, lease-gating so exactly one instance renews per tick,
+# and a resume worker that consumes the ``resume_pending`` ACME job rows
+# that ``acme_job_state.resume_on_startup()`` stamps but nothing read.
+
+# Initial start delay — stagger past the o365/gmail renewers' first
+# sweeps so a cold boot doesn't fan three renewers out in the same
+# second. ACME cadence is hours, so the exact warm-up is cosmetic.
+_ACME_RENEWER_WARMUP_SECONDS = 120
+
+
+def _build_renewer_from_app(app) -> "AcmeRenewer":
+    """Construct an :class:`AcmeRenewer` from app state.
+
+    Same wiring the admin routes use (``auth_keys._resolve_renewer``):
+    ``config.tls.acme`` + the cert dir + the secrets store + the app
+    DB connection. Cert-dir resolution funnels through the shared
+    ``tls_csr._resolve_cert_dir`` so the supervised task, the admin
+    page, and the manual CSR workflow all agree on the path.
+    """
+    from email_triage.web.routers.tls_csr import _resolve_cert_dir
+    config = app.state.config
+    cert_dir = str(_resolve_cert_dir(config))
+    return AcmeRenewer(
+        cfg=config.tls.acme,
+        cert_dir=cert_dir,
+        secrets_store=app.state.secrets,
+        db=app.state.db,
+    )
+
+
+async def acme_cert_renewer(app) -> None:
+    """Supervised ACME cert-renewal loop.
+
+    Ticks every ``config.tls.acme.check_interval_hours`` (default 24h).
+    Each tick: resume any in-flight ACME job left ``resume_pending`` by
+    a prior process kill, then call ``check_and_renew_async`` which
+    no-ops unless the on-disk cert is within ``renewal_threshold_days``
+    of expiry.
+
+    No-op when ACME automation is disabled (``acme.enabled=false``) —
+    the loop still runs but every tick returns the skip verdict, so an
+    operator who flips ``enabled`` on later doesn't need a restart.
+
+    Lease-gated: an ACME order against Let's Encrypt is NOT
+    idempotent — every order burns one of the 5-certs/week/domain rate
+    slots. The single-flight decorator on ``issue_now_async`` already
+    blocks an in-process double-order, but the lease additionally keeps
+    a future multi-instance deployment from N instances each ordering.
+    """
+    from email_triage.web.task_supervisor import supervised_interval_loop
+
+    async def _tick() -> None:
+        renewer = _build_renewer_from_app(app)
+        # Resume-worker step first: clear any restart-orphaned job so a
+        # fresh check_and_renew below isn't blocked behind a stuck
+        # 'retrying' row on the recent-jobs surface.
+        try:
+            await _resume_pending_acme_jobs(app, renewer)
+        except Exception as e:
+            log.warning(
+                "ACME: resume-pending sweep raised (non-fatal)",
+                error=_fmt_exc(e),
+            )
+        try:
+            await renewer.check_and_renew_async()
+        except Exception as e:
+            # check_and_renew_async already logged + wrote an
+            # acme_renewal_log row; swallow so the loop survives.
+            log.error("ACME: renewal tick raised", error=_fmt_exc(e))
+
+    interval_secs = max(1, app.state.config.tls.acme.check_interval_hours) * 3600
+    await supervised_interval_loop(
+        "acme-cert-renewer", float(interval_secs), _tick,
+        warmup_secs=_ACME_RENEWER_WARMUP_SECONDS,
+        startup_jitter_secs=30.0,
+        lease_name="acme-cert-renewer",
+        lease_conn=app.state.db,
+    )
+
+
+async def _resume_pending_acme_jobs(app, renewer: "AcmeRenewer") -> int:
+    """Consume the ``resume_pending`` ACME job rows.
+
+    ``acme_job_state.resume_on_startup()`` (run once in the app
+    lifespan) stamps every non-terminal ``acme_jobs`` row killed
+    mid-issuance with a verdict: ``cancelled`` / ``cancelled_no_order``
+    / ``cancelled_stale`` are terminal already, but ``resume_pending``
+    rows (a live, recent LE order interrupted by the kill) sit in the
+    ``retrying`` phase with NOTHING consuming them — until this worker.
+
+    Resume policy: an interrupted order can't be re-driven from the
+    Python ``acme`` client without the original in-memory order object
+    and challenge responses, which the kill destroyed. Re-finalizing
+    blind is not safe. The correct, rate-limit-respectful action is to
+    mark the row terminal (``failed`` / kind ``resume_abandoned``) and
+    let the very next ``check_and_renew_async`` in this same tick place
+    a fresh order — that path is single-flight-guarded and idempotent
+    against the on-disk cert state. The interrupted order simply ages
+    out on LE's side (a placed-but-unfinalized order is not a cert and
+    doesn't consume the issuance rate slot).
+
+    Returns the number of rows resolved.
+    """
+    from email_triage.web import acme_job_state
+    try:
+        resumable = acme_job_state.find_resumable()
+    except Exception as e:
+        log.warning(
+            "ACME: find_resumable raised in resume worker",
+            error=_fmt_exc(e),
+        )
+        return 0
+    resolved = 0
+    for row in resumable:
+        if row.get("last_error_kind") != "resume_pending":
+            # Non-resume_pending non-terminal rows are either freshly
+            # in-flight in THIS process (the live job) or were already
+            # handled by resume_on_startup. Leave them alone.
+            continue
+        job_id = row.get("job_id")
+        if not job_id:
+            continue
+        try:
+            # ``finish_failure`` mutates the in-RAM ``_STATE`` singleton
+            # and write-throughs to whatever job ``_STATE`` currently
+            # points at. After a fresh restart ``_STATE`` is idle, so
+            # adopt the persisted row first — that binds ``_STATE`` to
+            # this job id and the write-through lands on the right row.
+            # #239d — adopt_persisted refuses while a *different* job is
+            # live (an operator "Issue Now" overlapping this tick); that
+            # refusal is benign here, the next tick retries this row.
+            if not acme_job_state.adopt_persisted(job_id):
+                log.warning(
+                    "ACME: resume worker could not adopt job row "
+                    "(another issuance live, or row vanished); "
+                    "deferring to next tick",
+                    job_id=job_id,
+                )
+                continue
+            acme_job_state.finish_failure(
+                "ACME issuance interrupted by a process restart; the "
+                "partial Let's Encrypt order is abandoned. The next "
+                "renewal tick places a fresh order if the cert still "
+                "needs one.",
+                kind="resume_abandoned",
+            )
+        except Exception as e:
+            log.warning(
+                "ACME: resume worker could not close job row",
+                job_id=job_id, error=_fmt_exc(e),
+            )
+            continue
+        resolved += 1
+        log.info(
+            "ACME: abandoned a restart-orphaned issuance job; the "
+            "renewal tick will reorder if needed",
+            job_id=job_id,
+            domains=row.get("domains"),
+        )
+    return resolved
+
+
+def read_tls_cert_health(app) -> dict[str, Any]:
+    """Compute the ``tls_cert`` block for ``/health/detail``.
+
+    Pure on-disk read — no network, no ACME-directory call. Uses the
+    existing cert readers (``read_cert_expiry`` / ``cert_metadata``)
+    so the health surface and the renewer agree on the cert state.
+
+    Shape::
+
+        {"present": bool,
+         "not_after": iso-or-None,
+         "days_remaining": int-or-None}
+
+    ``present`` is False when no cert is on disk yet (fresh install,
+    ACME not run). Never raises — a parse failure degrades to
+    ``{"present": False, "error": "..."}`` so an unreadable cert can't
+    take ``/health/detail`` down.
+    """
+    try:
+        renewer = _build_renewer_from_app(app)
+        meta = renewer.cert_metadata()
+        if not meta.get("present"):
+            return {
+                "present": False,
+                "not_after": None,
+                "days_remaining": None,
+            }
+        if meta.get("parse_error"):
+            return {
+                "present": True,
+                "not_after": None,
+                "days_remaining": None,
+                "error": meta["parse_error"],
+            }
+        return {
+            "present": True,
+            "not_after": meta.get("not_after"),
+            "days_remaining": meta.get("days_remaining"),
+        }
+    except Exception as e:
+        return {
+            "present": False,
+            "not_after": None,
+            "days_remaining": None,
+            "error": _fmt_exc(e),
+        }

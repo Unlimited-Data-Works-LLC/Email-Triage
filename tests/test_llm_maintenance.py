@@ -1,4 +1,4 @@
-"""Tests for LLM maintenance windows (#149 Bundle C)."""
+"""Tests for LLM maintenance windows."""
 
 from __future__ import annotations
 

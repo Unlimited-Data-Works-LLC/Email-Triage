@@ -1,8 +1,8 @@
 """Tests for ``GET /health`` (minimal, public) and ``GET /health/detail``
 (operator detail, admin-only).
 
-Split into two endpoints in #89 (2026-04-30). Keep these tests in sync
-with the Containerfile HEALTHCHECK + scripts/deploy-deployhost.sh post-deploy
+Split into two endpoints in  (2026-04-30). Keep these tests in sync
+with the Containerfile HEALTHCHECK + scripts/deploy-the deploy host.sh post-deploy
 probe (both still hit /health).
 """
 
@@ -26,7 +26,7 @@ def _admin_cookie_pair():
 
 
 # ---------------------------------------------------------------------------
-# /health -- minimal public probe (#89)
+# /health -- minimal public probe
 # ---------------------------------------------------------------------------
 
 def test_minimal_health_shape(client, db):
@@ -61,7 +61,7 @@ def test_minimal_health_503_on_db_error(client, db, app):
 
 
 # ---------------------------------------------------------------------------
-# /health/detail -- admin-only operator surface (#89)
+# /health/detail -- admin-only operator surface
 # ---------------------------------------------------------------------------
 
 def test_detail_requires_auth(client, db):
@@ -92,10 +92,10 @@ def test_detail_returns_full_shape(client, db, admin_user):
         "last_triage", "version",
         "tasks", "watchers_failing", "audit_failures",
         "csrf_rejects", "schema_version",
-        # #66 — top-level O365 push rollup mirrors the gmail_push line
+        #  — top-level O365 push rollup mirrors the gmail_push line
         # nested under watchers.
         "office365_push",
-        # #151 — classification cache counters (enabled, hits, misses,
+        #  — classification cache counters (enabled, hits, misses,
         # errors). Always present; values reflect the cache singleton
         # (disabled + zeros in the default test config).
         "classification_cache",
@@ -108,28 +108,32 @@ def test_detail_returns_full_shape(client, db, admin_user):
         # dicts in the default test config (no push integrations,
         # no Redis); admin/stats card hides itself in that case.
         "webhooks",
-        # 2026-05-15 — schema-compat verdict for Nagios. Same data
+        # 2026-05-15 — schema-compat verdict for the monitoring system. Same data
         # the admin /config banner uses, in machine-readable shape.
         # Failure-safe: reduces to {"state": "unknown", ...} if the
         # version helper throws.
         "version_status",
-        # 2026-05-15 — #169 Wave 2-α I7. BAA expiry surfacing.
+        # 2026-05-15 —  Wave 2-α I7. BAA expiry surfacing.
         # {"expiring_soon": int, "expired": int,
         #  "expired_hipaa_accounts_disabled": int}. All zeros in
         # the empty-DB test case; populated when ai_backends rows
         # carry close-to-expiry BAAs.
         "baa_status",
         # 2026-05-16 — HIPAA describe-and-discard distill 24h roll-up
-        # (#152 phases 3-4 S4). Sibling to version_status. Shape:
+        #. Sibling to version_status. Shape:
         # {local_24h, cloud_24h, failures_24h, scrubber_rejects_24h,
         #  total_24h}.
         "style_distill",
-        # 2026-05-17 — #175 R-B. Watcher per-message retry-queue
+        # 2026-05-17 —  R-B. Watcher per-message retry-queue
         # rollup. Shape: {pending, dead_24h, oldest_pending_age_sec,
         # dead_breakdown_24h}. Failure-safe: reduces to
         # {"state": "unknown", "error": ...} when the table is
         # missing (pre-v30 install).
         "retry_queue",
+        #  — on-disk TLS cert expiry. Shape: {present, not_after,
+        # days_remaining}. ``present=false`` when no cert on disk (the
+        # default test config has none). Pure file read; never raises.
+        "tls_cert",
     }
     assert body["status"] == "ok"
     sd = body["style_distill"]
@@ -137,6 +141,9 @@ def test_detail_returns_full_shape(client, db, admin_user):
               "scrubber_rejects_24h", "total_24h"):
         assert k in sd, f"style_distill missing key {k!r}"
         assert isinstance(sd[k], int)
+    tc = body["tls_cert"]
+    assert set(("present", "not_after", "days_remaining")) <= set(tc)
+    assert isinstance(tc["present"], bool)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +265,7 @@ def test_health_last_triage_rendered_in_local_tz(
     import time as _time
 
     # Force a specific tz for this test so the offset is predictable.
-    monkeypatch.setenv("TZ", "America/Detroit")
+    monkeypatch.setenv("TZ", "America/New_York")
     if hasattr(_time, "tzset"):
         _time.tzset()
 
@@ -292,17 +299,17 @@ def test_health_last_triage_rendered_in_local_tz(
     # Must parse as tz-aware.
     dt = datetime.fromisoformat(returned)
     assert dt.tzinfo is not None
-    # Detroit is UTC-4 (EDT) or UTC-5 (EST). Must NOT be +00:00.
+    # New York is UTC-4 (EDT) or UTC-5 (EST). Must NOT be +00:00.
     offset_hrs = dt.utcoffset().total_seconds() / 3600
     assert offset_hrs in (-4, -5), (
-        f"Expected Detroit offset -4/-5, got {offset_hrs} from {returned}"
+        f"Expected New York offset -4/-5, got {offset_hrs} from {returned}"
     )
     # Value-equality: parsed returned-dt equals parsed UTC-stored-dt.
     assert dt == datetime.fromisoformat(utc_ts)
 
 
 # ---------------------------------------------------------------------------
-# #120 — disabled accounts excluded from account_states
+#  — disabled accounts excluded from account_states
 # ---------------------------------------------------------------------------
 
 
@@ -316,7 +323,7 @@ def test_disabled_account_does_not_degrade_health(
     which would degrade /health forever.
 
     Regression test for the deploy-time 503 caused by a partially-
-    configured legacy account (item #120 health-aggregation fix)."""
+    configured legacy account (item  health-aggregation fix)."""
     now_iso = datetime.now(timezone.utc).isoformat()
     # Active account with a watching mailbox -> not degraded.
     cur = db.execute(
@@ -362,7 +369,7 @@ def test_disabled_account_does_not_degrade_health(
 
 
 # ---------------------------------------------------------------------------
-# #125 partial follow-up — version_status on /health/detail (Nagios surface)
+#  partial follow-up — version_status on /health/detail (the monitoring system surface)
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +385,7 @@ def test_health_detail_version_status_shape(client, db, admin_user, monkeypatch)
     body = resp.json()
     vs = body["version_status"]
     # Field shape — every key the dataclass exposes, plus our
-    # ``status`` -> ``state`` rename for Nagios consistency.
+    # ``status`` -> ``state`` rename for the monitoring system consistency.
     assert set(vs.keys()) == {
         "app_version",
         "db_schema_version",
@@ -465,7 +472,7 @@ def test_health_detail_version_status_state_incompatible_rollback(
 ):
     """When the ``:previous`` image's schema cap is below the live DB
     schema version (rollback would fail), state reads
-    ``incompatible_rollback`` -- the 2026-05-09 deploy-recovery case."""
+    ``incompatible_rollback`` -- the @skip=tests/* deploy-recovery case."""
     from email_triage import version as version_mod
     from email_triage.version import (
         VersionStatus, describe_status, STATUS_INCOMPATIBLE_ROLLBACK,
@@ -496,7 +503,7 @@ def test_health_detail_version_status_state_downgrade_not_supported(
     """When the live DB has been written by a newer binary than the one
     running, state reads ``downgrade_not_supported``. The runtime
     would refuse to open the DB; surfacing this in /health/detail
-    lets Nagios alarm without a crash loop."""
+    lets the monitoring system alarm without a crash loop."""
     monkeypatch.delenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", raising=False)
     from email_triage import version as version_mod
     from email_triage.version import (

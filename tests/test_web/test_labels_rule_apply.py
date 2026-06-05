@@ -1,4 +1,4 @@
-"""Tests for rule-driven label attachment (#129).
+"""Tests for rule-driven label attachment.
 
 A ``list_rules.adds_labels`` JSON array of slugs attaches labels to
 matching messages WITHOUT changing the LLM-assigned category. This

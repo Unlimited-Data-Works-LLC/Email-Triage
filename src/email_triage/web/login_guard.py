@@ -1,6 +1,6 @@
 """Login-attempt rate limiting for the OTP / WebAuthn / dev-keypair surfaces.
 
-Punch-list #92. Counts recent ``auth_events`` failure rows by email
+the backlog . Counts recent ``auth_events`` failure rows by email
 and by client IP within a sliding window; raises ``LoginLocked`` when
 the running count tips over the configured threshold. Combined with
 the existing ``web/ratelimit.py`` token bucket (which protects the
@@ -70,7 +70,7 @@ class LoginLocked(Exception):
 
 
 def _auth_tunables(config: Any) -> dict[str, int]:
-    """Pull the four #92 tunables off config.auth with safe defaults.
+    """Pull the four  tunables off config.auth with safe defaults.
 
     Defaults match ``AuthConfig`` field defaults so an install that
     has never written its YAML (fresh dev install) still gets the
@@ -178,9 +178,10 @@ def record_login_failure(
     degraded-but-not-broken condition. The ``audit_failures``
     counter on ``/health`` would be the right place to flag drift.
     """
-    try:
-        from email_triage.web.db import record_auth_event
-        record_auth_event(
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.db import record_auth_event
+    safe_audit_write(
+        lambda: record_auth_event(
             db,
             event_type=f"login_{surface}",
             email=email or "",
@@ -190,9 +191,9 @@ def record_login_failure(
             user_agent=user_agent,
             outcome="failure",
             detail=reason,
-        )
-    except Exception:
-        pass
+        ),
+        description=f"login_{surface}",
+    )
 
 
 def record_login_lockout(
@@ -212,9 +213,10 @@ def record_login_lockout(
     + ``threshold`` land in ``detail`` so a forensic reader can
     reconstruct which counter fired.
     """
-    try:
-        from email_triage.web.db import record_auth_event
-        record_auth_event(
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.db import record_auth_event
+    safe_audit_write(
+        lambda: record_auth_event(
             db,
             event_type="login_lockout",
             email=email or "",
@@ -224,6 +226,6 @@ def record_login_lockout(
             user_agent=user_agent,
             outcome="failure",
             detail=f"surface={surface} scope={scope} threshold={threshold}",
-        )
-    except Exception:
-        pass
+        ),
+        description="login_lockout",
+    )

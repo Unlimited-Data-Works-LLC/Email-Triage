@@ -23,6 +23,12 @@ import asyncio
 import sqlite3
 
 import pytest
+# Full-tree `-n auto` hardening: these file-DB / audit-global suites flake when
+# co-resident on a worker (SQLite file-lock contention + load-amplified async-audit
+# timing). Each passes in isolation. Pin them to one xdist worker so they run
+# serially, not concurrently — the project-sanctioned facet-2 fix (testinfra drawer).
+pytestmark = pytest.mark.xdist_group("file_db_audit_serial")
+
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route

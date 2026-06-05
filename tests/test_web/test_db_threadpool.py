@@ -1,4 +1,4 @@
-"""Tests for ``email_triage.web.db_threadpool`` (#135).
+"""Tests for ``email_triage.web.db_threadpool``.
 
 Verifies the thin wrapper over ``asyncio.to_thread``:
 - runs the sync helper on a thread pool (not the event loop)
@@ -60,52 +60,68 @@ class TestDbCall:
             await db_call(_boom)
 
     @pytest.mark.asyncio
-    async def test_concurrent_calls_overlap(self):
-        """Two slow helpers running through db_call should overlap on
-        the threadpool — total wall time roughly max(t1, t2), not sum."""
-        import time
+    async def test_concurrent_calls_serialise(self):
+        """ — concurrent ``db_call`` invocations must NOT overlap.
 
-        def _slow(secs: float) -> float:
-            time.sleep(secs)
-            return secs
+        The app keeps ONE shared ``sqlite3.Connection``; the Python
+        ``sqlite3`` driver rejects two threads using it concurrently
+        even for reads. ``db_call`` therefore serialises every
+        dispatched call through the process-wide DB lock. This test
+        proves the serialisation structurally: each worker records
+        whether any other worker was inside its critical section at
+        the same time. With the  lock that overlap count is
+        always 0; if ``db_call`` regressed to lock-free dispatch it
+        would be non-zero.
+        """
+        in_flight = 0
+        max_overlap = 0
+        guard = threading.Lock()
 
-        start = time.monotonic()
-        results = await asyncio.gather(
-            db_call(_slow, 0.1),
-            db_call(_slow, 0.1),
-            db_call(_slow, 0.1),
-        )
-        elapsed = time.monotonic() - start
-        assert results == [0.1, 0.1, 0.1]
-        # If they serialised the elapsed would be ~0.3s. With overlap
-        # we expect ~0.1s; allow generous slack for CI scheduling.
-        assert elapsed < 0.25, (
-            f"db_call calls did not overlap (elapsed={elapsed:.3f}s)"
+        def _worker(n: int) -> int:
+            nonlocal in_flight, max_overlap
+            with guard:
+                in_flight += 1
+                max_overlap = max(max_overlap, in_flight)
+            # Hold the section briefly so a genuine overlap would show.
+            import time
+
+            time.sleep(0.02)
+            with guard:
+                in_flight -= 1
+            return n
+
+        results = await asyncio.gather(*(
+            db_call(_worker, n) for n in range(3)
+        ))
+        # gather preserves input order — also confirms arg routing.
+        assert results == [0, 1, 2]
+        assert max_overlap == 1, (
+            f"db_call must serialise — saw {max_overlap} "
+            "workers inside the shared-connection section at once"
         )
 
     @pytest.mark.asyncio
-    async def test_five_way_concurrency(self):
-        """Five concurrent slow workers should all overlap on the pool.
+    async def test_db_write_helper_inside_db_call_does_not_deadlock(self):
+        """ — a ``@db_write`` helper called *inside* a ``db_call``
+        re-acquires the same lock instead of self-deadlocking.
 
-        Phase 2 spec: "spawn 5 concurrent requests against a converted
-        handler; assert no serialisation beyond what the underlying
-        read forces". The threadpool default is min(32, os.cpu_count()
-        + 4) — well above 5, so 5 calls should fan out fully.
+        ``db_call`` now takes ``get_write_lock()`` for the dispatched
+        call; ``@db_write`` takes the very same ``RLock``. Because it
+        is reentrant, a decorated helper invoked from within a
+        ``db_call`` body acquires the lock a second time on the same
+        thread and returns normally. A plain ``Lock`` (or two distinct
+        locks) would hang here until the 5s timeout trips.
         """
-        import time
+        from email_triage.web.db_writelock import db_write
 
-        def _slow(secs: float) -> float:
-            time.sleep(secs)
-            return secs
+        @db_write
+        def _inner_write(x: int) -> int:
+            return x * 2
 
-        start = time.monotonic()
-        results = await asyncio.gather(*(
-            db_call(_slow, 0.1) for _ in range(5)
-        ))
-        elapsed = time.monotonic() - start
-        assert results == [0.1] * 5
-        # Five serialised would be ~0.5s. With overlap we expect ~0.1s.
-        assert elapsed < 0.25, (
-            f"5 db_call calls did not overlap (elapsed={elapsed:.3f}s); "
-            f"likely a regression to a global lock or pool=1."
-        )
+        def _outer(x: int) -> int:
+            # Runs under db_call's lock; calls a @db_write helper that
+            # re-acquires the same RLock.
+            return _inner_write(x) + 1
+
+        result = await asyncio.wait_for(db_call(_outer, 21), timeout=5.0)
+        assert result == 43

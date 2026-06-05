@@ -1,4 +1,4 @@
-"""HIPAA-safe style-learning pipeline (#152 phases 3-4).
+"""HIPAA-safe style-learning pipeline.
 
 The pipeline modules live in this package:
 
@@ -15,7 +15,7 @@ The pipeline modules live in this package:
     M-3 but scoped to messages SENT TO a single recurring recipient,
     keyed on a salted SHA-256 hash of the recipient address rather
     than the plaintext address itself. Recipient identity NEVER
-    persisted in plaintext. Wave 3 of #152.
+    persisted in plaintext. Wave 3 of .
 
 The pre-Wave-2-β scaffold lives in
 :mod:`email_triage.actions.hipaa_style_distill`. The Wave-2-β + Wave-3

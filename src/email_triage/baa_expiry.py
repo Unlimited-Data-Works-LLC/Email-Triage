@@ -1,4 +1,4 @@
-"""BAA expiry tracking for admin-curated AI backends (#169 Wave 2-α — I7).
+"""BAA expiry tracking for admin-curated AI backends.
 
 The :func:`ai_backends.id`-keyed catalog (migration v26) tracks a
 ``baa_certified`` flag + optional ``baa_expires_at`` date per row.
@@ -397,7 +397,7 @@ def health_status_block(
 
     Shape (per the I7 spec): ``{"expiring_soon": int, "expired": int,
     "expired_hipaa_accounts_disabled": int}``. ``expiring_urgent``
-    rolls into ``expiring_soon`` for the health endpoint — Nagios
+    rolls into ``expiring_soon`` for the health endpoint — the monitoring system
     only needs the two-bucket signal "renew soon" vs "renew now".
     The admin banner + UI surfaces the three-bucket distinction
     separately.

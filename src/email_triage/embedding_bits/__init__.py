@@ -1,4 +1,4 @@
-"""Lazy-install runtime for the heavy embedding stack (#180).
+"""Lazy-install runtime for the heavy embedding stack.
 
 The v0.1.1+ container ships at ~250 MB by lifting torch + sentence-
 transformers + the all-MiniLM-L6-v2 model weights out of the image
@@ -78,6 +78,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
+
+#  — the install-state writer touches the SHARED app.state.db
+# connection. ``db_writelock`` is stdlib-only (no web-package import
+# cycle); decorating ``_update_state`` serialises it on the process-
+# wide DB lock so an installer worker thread or a ``reverify`` thread
+# does not race a ``db_call`` worker on the same sqlite3.Connection.
+from email_triage.web.db_writelock import db_write as _db_write
 
 # Telemetry-off env vars. Set at module import time so any later HF
 # import in the same process inherits them (env vars set after the
@@ -378,6 +385,7 @@ def _scrub_error(text: str | None) -> str | None:
     return flat[:500]
 
 
+@_db_write
 def _update_state(
     conn: sqlite3.Connection,
     *,

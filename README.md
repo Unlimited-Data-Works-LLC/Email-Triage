@@ -12,16 +12,16 @@ Built for operators whose inboxes carry data that shouldn't visit someone else's
 - **Drafts reply text** in the operator's own writing style. Style learning is opt-in per account and HIPAA-aware (describe-and-discard semantics — zero PHI persisted).
 - **Routes classified mail** to folders, applies labels, fires watches with optional webhook escalation.
 - **Calendar-aware meeting scheduling** — when a `meeting-request` lands, drafts a reply listing free windows from the operator's calendar.
-- **Daily digest** of overnight activity, BAA-expiry banner, /health endpoint for Nagios polling, tamper-evident audit hash chain.
+- **Daily digest** of overnight activity, BAA-expiry banner, /health endpoint for monitoring, tamper-evident audit hash chain.
 
 ## Privacy posture
 
 Operator-confirmed boundary, audited:
 
-- **Mail data** stays in your install's SQLite database. Encrypted at rest via Fernet; the master key lives in a podman secret on your deploy host.
+- **Mail data** stays in your install's SQLite database. Per-account credentials are Fernet-encrypted; since v0.1.2 the whole database is encrypted at rest with SQLCipher (AES-256, key derived from your master key) — on by default for new installs. The master key lives in a container secret, never the process environment.
 - **Outbound network** is restricted to: mail providers you configure (Gmail / Outlook / your IMAP server). No analytics, no telemetry by default, no CDN.
 - **LLM inference** runs on Ollama on your hardware. Cloud-LLM backends (OpenAI / Gemini / Azure OpenAI) are off by default; HIPAA-flagged accounts only see BAA-certified backends in the admin dropdown.
-- **HIPAA mode** per-account or install-wide. Audit hash chain (§164.312(b)). Describe-and-discard style learning means the LLM produces structured-output descriptors, not summaries — message bodies are read in memory and never persisted.
+- **HIPAA mode** per-account or install-wide — enforces MFA (WebAuthn passkey), rejects the deprecated env master-key backend at boot, and fails closed on database encryption. Audit hash chain (§164.312(b)). Describe-and-discard style learning means the LLM produces structured-output descriptors, not summaries — message bodies are read in memory and never persisted.
 
 Full detail: [docs/privacy.md](docs/privacy.md) and [docs/hipaa-audit.md](docs/hipaa-audit.md).
 
@@ -29,18 +29,21 @@ Full detail: [docs/privacy.md](docs/privacy.md) and [docs/hipaa-audit.md](docs/h
 
 ```bash
 # 1. Run the container (image is cosign-signed; verify before pulling)
-sudo cosign verify ghcr.io/unlimited-data-works-llc/email-triage:0.1.0 \
+sudo cosign verify ghcr.io/unlimited-data-works-llc/email-triage:0.1.2 \
     --certificate-identity-regexp 'https://github.com/Unlimited-Data-Works-LLC/.+/release\.yml@.+' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-sudo podman pull ghcr.io/unlimited-data-works-llc/email-triage:0.1.0
+sudo podman pull ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
 
 # 2. Generate master key + bootstrap secret backend
-sudo podman run --rm -it ghcr.io/unlimited-data-works-llc/email-triage:0.1.0 \
+sudo podman run --rm -it ghcr.io/unlimited-data-works-llc/email-triage:0.1.2 \
     secrets bootstrap
 
 # 3. Start the service (systemd quadlet or podman directly)
 sudo systemctl start email-triage
+
+# The database is encrypted at rest (SQLCipher) by default for new installs;
+# set EMAIL_TRIAGE_DB_ENCRYPTION=false for a plaintext install. See docs/install.md.
 ```
 
 Step-by-step guide: [docs/install.md](docs/install.md).
@@ -51,19 +54,33 @@ The container image ships at ~250 MB. The optional in-process embedding stack �
 
 On first run, the admin UI prompts to either install the local embedding backend (~600 MB, hash-verified against a pinned manifest baked into the image), sideload pre-staged bits (for restricted-egress installs), or point at an existing Ollama instance instead. All paths are hash-checked. See [docs/install.md](docs/install.md) for both setup paths.
 
-**Plan ~5 GB on the persistent volume** you bind to `/app/data`: the embedding install lands there (~2.1 GB unpacked), plus the SQLite DB grows with mail volume and the sent-mail-index vectors are persisted per indexed sent message. The most common install failure is mounting `/app/data` on a small partition — see `docs/install.md` § Disk allocation for the full breakdown (HIPAA installs with multi-year retention plan 50+ GB).
+**Plan ~5 GB on the persistent volume** you bind to `/app/data`: the embedding install lands there (~2.1 GB unpacked), plus the SQLite DB grows with mail volume and the sent-mail-index vectors are persisted per indexed sent message. The most common install failure is mounting `/app/data` on a small partition — see `docs/install.md` § Disk allocation for the full breakdown (HIPAA installs with multi-year retention should plan for 50+ GB).
 
 ## Container distribution
 
 Released container images are published to `ghcr.io/unlimited-data-works-llc/email-triage`. Tag scheme:
 
-- `X.Y.Z` — pinned semver release (e.g. `0.1.0`). The same image is also tagged `vX.Y.Z` (e.g. `v0.1.0`) so commands that match the git tag form still resolve. Both forms point at the same digest.
+- `X.Y.Z` — pinned semver release (e.g. `0.1.2`). The same image is also tagged `vX.Y.Z` (e.g. `v0.1.2`) so commands that match the git tag form still resolve. Both forms point at the same digest.
 - `X.Y`, `X` — semver aliases that move forward with each compatible release.
 - `:stable` — alias for the most recent semver release.
 - `:latest` — same as `:stable` at release time. Don't depend on it long-term in scripts.
 - `:edge` — every push to `main`; for operators tracking development.
 
 Every published image is cosign-signed (keyless OIDC). HIPAA installs additionally require an operator-issued in-toto attestation with a `hipaa_safe: true` predicate before applying an update — that's a second OIDC subject, separately approved by a human reviewer. The customer-side verification recipe is in [docs/install.md](docs/install.md) § Verifying a release.
+
+## Models
+
+Email Triage is model-agnostic — it uses whatever model your Ollama (or OpenAI-compatible) backend serves. No model is bundled or required.
+
+Recommendation: run an open-weight model locally so mail never leaves your hardware. The Qwen family has been tested extensively in development; Llama, Mistral, and Gemma open-weight models also work well. Larger instruct models classify more accurately, smaller ones run faster.
+
+| Hardware (VRAM/RAM) | Starting point |
+|---|---|
+| ~8 GB  | a 7–8B instruct model |
+| ~24 GB | a 30B-class model |
+| 40 GB+ | a 70B-class model (or quantize a larger one) |
+
+Set your choice in `classifier.model`. Cloud backends (OpenAI / Gemini / Azure) are supported but off by default; HIPAA accounts require a BAA-certified one.
 
 ## Email provider support
 

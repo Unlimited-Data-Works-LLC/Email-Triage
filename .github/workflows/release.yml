@@ -43,9 +43,9 @@ name: Release
 # `zstd --long=27 -d`, `podman load`, then verify cosign signature
 # against the REGISTRY-side signature copy that ships alongside the
 # image manifest. Compression switched from gzip to zstd 2026-05-17
-# (#180): GH Releases caps a single asset at 2 GiB; gzip --best on
+#: GH Releases caps a single asset at 2 GiB; gzip --best on
 # the v0.1.0 OCI archive came in at 2.30 GiB. zstd's higher ratio
-# (~25% smaller than gzip --best on this content) + the #180 image-
+# (~25% smaller than gzip --best on this content) + the  image-
 # slim work (~1.5 GiB uncompressed savings) keeps the tarball under
 # the cap with headroom for small future growth. Pre-upload size
 # guard in the job fails the build cleanly if the cap is ever
@@ -181,8 +181,10 @@ jobs:
             type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
           labels: |
             org.opencontainers.image.title=email-triage
-            org.opencontainers.image.description=Portable email triage with LLM classification and configurable routing
+            org.opencontainers.image.description=Privacy-first, HIPAA-aware email classification and reply drafting. Self-hosted; runs against any IMAP/Gmail/Office365 mailbox via a local Ollama LLM. Cosign-signed + SLSA-3 attested releases.
+            org.opencontainers.image.authors=Unlimited Data Works LLC <https://github.com/Unlimited-Data-Works-LLC>
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=https://www.udataworks.com/email-triage/
             org.opencontainers.image.licenses=Apache-2.0
 
       - name: Build and push
@@ -264,8 +266,8 @@ jobs:
       #    user-owned private repositories."
       # Source: https://docs.github.com/rest/repos/attestations
       #
-      # Until the public mirror exists (#150 — see PUNCH-LIST.md and
-      # docs/release-process.md), the SLSA-3 step is skipped on
+      # Until the public mirror exists ( — see the backlog and
+      # internal documentation), the SLSA-3 step is skipped on
       # private repos. Cosign keyless signature still attaches and
       # still proves CI built the image; SLSA provenance is the
       # additional belt-and-braces layer that GitHub's API gates.
@@ -284,7 +286,7 @@ jobs:
       - name: SLSA attestation skipped (private repo)
         if: github.event.repository.visibility != 'public'
         run: |
-          echo "::notice title=SLSA attestation skipped::Repository is private; GitHub's attestation API requires the repo to be public OR the account to be on a paid plan. Cosign keyless signature was attached successfully and is sufficient for customer-side verification of CI build origin. SLSA-3 provenance will start attaching automatically once the public mirror (#150) is established."
+          echo "::notice title=SLSA attestation skipped::Repository is private; GitHub's attestation API requires the repo to be public OR the account to be on a paid plan. Cosign keyless signature was attached successfully and is sufficient for customer-side verification of CI build origin. SLSA-3 provenance will start attaching automatically once the public mirror is established."
 
   # ──────────────────────────────────────────────────────────────────
   # release-tarball-asset — air-gap path (Version A install profile).
@@ -349,14 +351,14 @@ jobs:
       - name: Resolve version tag
         id: version
         # github.ref is `refs/tags/vX.Y.Z`; strip the prefix.
-        # 2026-05-17 (#180): filename suffix bumped from ``.tar.gz``
+        # 2026-05-17: filename suffix bumped from ``.tar.gz``
         # to ``.tar.zst``. The first v0.1.0 release-tarball-asset run
         # produced a 2.30 GiB gzip-compressed tarball, over GH
         # Releases' 2 GiB per-asset cap (asset upload rejected
         # outright; entire release blocked). Switching to zstd at
         # level 19 + ``--long=27`` cuts compressed size by another
         # ~25% vs gzip --best on this image content, which puts it
-        # under the cap with headroom. The slim-image work in #180
+        # under the cap with headroom. The slim-image work in 
         # itself drops the uncompressed footprint by ~1.5 GiB; zstd
         # buys belt-and-braces margin so a small future bloat
         # doesn't immediately re-fail the asset upload.
@@ -392,7 +394,7 @@ jobs:
         # us a clear actionable error AND avoids the partial-upload
         # state where some sibling assets land + the tarball doesn't.
         # If this fires post-#180, the image grew + needs further
-        # slimming (see ``Slim-down options`` in the punch-list).
+        # slimming (see ``Slim-down options`` in the backlog).
         run: |
           set -euo pipefail
           size=$(stat -c%s "${{ steps.version.outputs.filename }}")

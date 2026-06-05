@@ -1,6 +1,6 @@
 """Cross-concern helpers + module-level state for web.routers.ui.
 
-Split out of `web/routers/ui.py` (#144). Helpers + the module
+Split out of `web/routers/ui.py`. Helpers + the module
 prelude (imports, constants, _log, the APIRouter singleton)
 live HERE so each concern file's `globals().update(vars(_shared))`
 recreates the bare-name namespace handlers were originally
@@ -31,6 +31,7 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage._isotime import parse_iso
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
 from email_triage.web import settings_keys as _S
@@ -66,7 +67,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -81,8 +82,22 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _safe_int(raw: object, default: int = 0) -> int:
+    """Parse request-supplied input to int, never raising.
+
+    ``int(form.get("x"))`` raises ``ValueError`` on a non-numeric value
+    (a tampered form field, ``?offset=abc``) — uncaught, that escapes
+    the handler as a 500. This coerces a missing / blank / non-numeric
+    value to ``default`` instead.
+    """
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _triage_preset_to_query(preset: str, freeform: str) -> str:
-    """Map the #61 Search Query dropdown preset to an IMAP SEARCH query.
+    """Map the  Search Query dropdown preset to an IMAP SEARCH query.
 
     The Gmail provider's translator converts IMAP-style queries to
     Gmail ``q=`` at search time, so callers only need to emit IMAP
@@ -144,7 +159,7 @@ def _tag_message_hipaa(message, account: dict):
     return message
 
 
-def _render(templates, request, name, context=None):
+async def _render(templates, request, name, context=None):
     """Render a template using the Starlette 1.0 API.
 
     Auto-injects:
@@ -155,7 +170,30 @@ def _render(templates, request, name, context=None):
         ``admin/_baa_expiry_banner.html`` rendered from ``base.html``
         guards on ``baa_banner is defined and ... severity != silent``
         so non-admin / silent / off renders emit nothing.
+      - ``retry_queue_banner`` — admin-only retry-queue threshold
+        banner ctx; same admin-only gate + admin-path-rule shape.
     Silent fallback to False if state isn't available (e.g. in tests).
+
+     / Option B — this function is ``async`` because the two
+    auto-injected admin banners read the shared ``app.state.db``
+    connection. Before this change those reads ran inline on the event
+    loop, which is the per-Connection corruption hazard documented in
+    https://sqlite.org/isolation.html — two threads using one
+    ``sqlite3.Connection`` concurrently is undefined behaviour /
+    ``InterfaceError``. The fix is structural: route both injectors
+    through ``db_call`` so they run off the loop under the
+    process-wide write lock, and force every caller to ``await
+    _render(...)`` so a future caller cannot accidentally regress to
+    the on-loop path. Both injectors stay sync (they are internal to
+    this function — recon confirmed zero external callers) and are
+    co-dispatched in ONE ``db_call`` closure so a single threadpool
+    hop / lock acquisition covers both reads.
+
+    Starlette's ``TemplateResponse`` is fully synchronous (per
+    https://starlette.dev/templates/) so the construction at the end
+    is safe to call from this ``async def``; FastAPI awaits the
+    Response object itself when sending the response (per
+    https://fastapi.tiangolo.com/advanced/response-directly/).
     """
     ctx = context or {}
     if "hipaa_mode" not in ctx:
@@ -179,21 +217,31 @@ def _render(templates, request, name, context=None):
             ctx["ingestion_config"] = request.app.state.config.ingestion
         except Exception:
             ctx["ingestion_config"] = None
-    # #171-D — universal admin BAA-expiry banner. Computed here so every
-    # admin page picks it up without per-handler boilerplate; gated so
-    # the user-facing surface never carries admin-only copy (per the
-    # no-admin-path-in-user-copy rule).
-    if "baa_banner" not in ctx:
-        ctx["baa_banner"] = _inject_baa_banner_ctx(request, ctx.get("user"))
-    # #175 R-B — universal admin retry-queue threshold banner. Same
-    # admin-only gate + admin-path-rule shape. Renders a section when
-    # ≥3 dead rows in 24h on any single account OR ≥5 install-wide in
-    # 24h. Non-admin renders + clean-state admin renders see ``None``
-    # and the partial short-circuits to zero markup.
-    if "retry_queue_banner" not in ctx:
-        ctx["retry_queue_banner"] = _inject_retry_queue_banner_ctx(
-            request, ctx.get("user"),
-        )
+    #  / Option B — co-dispatch the two banner-ctx injectors in ONE
+    # db_call hop. Both touch the shared app.state.db; combining them
+    # halves the threadpool round-trips and shares the write-lock
+    # acquisition. The injectors stay sync — they're internal helpers
+    # to _render with zero external callers, and they run safely under
+    # the lock held by the db_call worker.
+    needs_baa = "baa_banner" not in ctx
+    needs_retry = "retry_queue_banner" not in ctx
+    if needs_baa or needs_retry:
+        from email_triage.web.db_threadpool import db_call
+        user_for_banners = ctx.get("user")
+
+        def _both_banners():
+            return (
+                _inject_baa_banner_ctx(request, user_for_banners)
+                if needs_baa else None,
+                _inject_retry_queue_banner_ctx(request, user_for_banners)
+                if needs_retry else None,
+            )
+
+        baa, rq = await db_call(_both_banners)
+        if needs_baa:
+            ctx["baa_banner"] = baa
+        if needs_retry:
+            ctx["retry_queue_banner"] = rq
     return templates.TemplateResponse(request, name, context=ctx)
 
 
@@ -215,7 +263,7 @@ def _inject_retry_queue_banner_ctx(
     Failure-safe: if R-A's helpers aren't on the import path yet,
     or the DB read throws, we return ``None`` so admin pages still
     render cleanly. The /health/detail endpoint surfaces the
-    failure separately (Nagios-pollable).
+    failure separately (the monitoring system-pollable).
     """
     if user is None:
         try:
@@ -270,7 +318,7 @@ def _inject_baa_banner_ctx(
     on every successful run; if the sweep raises, the cache holds the
     LAST successful summary. Bucket math is day-resolution so 1-25 hour
     staleness is invisible to operators. /health/detail surfaces a
-    Nagios-pollable failure signal separately.
+    the monitoring system-pollable failure signal separately.
     """
     if user is None:
         # Try to resolve at render time — most handlers pass `user` in
@@ -321,7 +369,7 @@ def _inject_baa_banner_ctx(
 
 
 # ---------------------------------------------------------------------------
-# PWA service worker (#94)
+# PWA service worker
 # ---------------------------------------------------------------------------
 #
 # The SW file lives in /static/ for distribution but the browser only
@@ -351,7 +399,7 @@ def _dashboard_health_chips(request: Request, db) -> dict:
         "watchers": {"ok": True, "connected": 0, "total": 0, "disconnected": []},
         "last_run": {"ok": True, "label": "No runs yet", "iso": None},
         "errors": {"ok": True, "count": 0, "label": "0 errors"},
-        # #66 — O365 Graph subscription chip (sibling of gmail_push).
+        #  — O365 Graph subscription chip (sibling of gmail_push).
         # ``ok=True + total=0`` is the "no O365 accounts subscribed"
         # baseline; the template can hide the chip in that case.
         "office365_push": {
@@ -513,7 +561,7 @@ def _dashboard_health_chips(request: Request, db) -> dict:
     except Exception:
         pass
 
-    # ---- O365 Graph push (#66) --------------------------------------
+    # ---- O365 Graph push --------------------------------------
     # Same chip-shape pattern as the existing Gmail Pub/Sub line.
     # Surfaces: total / active / expiring_in_24h / errored.
     try:
@@ -527,14 +575,9 @@ def _dashboard_health_chips(request: Request, db) -> dict:
         soon_dt = now_dt + timedelta(hours=24)
         for r in rows:
             status = (r.get("status") or "").strip()
-            try:
-                exp = datetime.fromisoformat(
-                    str(r.get("expiration_at", "")).replace("Z", "+00:00")
-                )
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-            except Exception:
-                exp = None
+            exp = parse_iso(r.get("expiration_at", ""))
+            if exp is not None and exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
             if status == "errored" or exp is None or exp <= now_dt:
                 errored += 1
                 continue
@@ -620,7 +663,7 @@ def _current_user_quiet_hours(db, user: dict) -> dict | None:
 
 
 def _build_dashboard_context(request: Request, user: dict) -> dict:
-    """Synchronous body of the dashboard build. #135: wrapped via
+    """Synchronous body of the dashboard build. : wrapped via
     ``db_call`` from the async handler so all the DB reads (getting-
     started checklist, recent runs, quiet hours, health chips, watcher
     banner) run on the threadpool instead of the event loop.
@@ -696,7 +739,7 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
         banner = None
     ctx["watcher_banner"] = banner
 
-    # #149 — LLM-backend health banner. End-user visible. Shows
+    #  — LLM-backend health banner. End-user visible. Shows
     # whichever of three states applies:
     #   * healthy (no banner)
     #   * unhealthy + maintenance window (calm copy: "back at HH:MM")
@@ -726,9 +769,14 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
                 ) for w in windows_cfg
             ]
             active = active_window_for(backend_name, rt_windows)
-            from email_triage.web.triage_retry_queue import queue_depth
+            from email_triage.web.db import count_pending_retries
             try:
-                depth = queue_depth(db)
+                # Consolidated retry queue: the LLM-down
+                # backlog is the pending rows whose failure_kind marks
+                # them as classify-failures awaiting the backend.
+                depth = count_pending_retries(
+                    db, failure_kind="llm_unreachable",
+                )
             except Exception:
                 depth = 0
             llm_banner = {
@@ -754,7 +802,7 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
 
 
 def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
-    """#135 phase 2 — every read for /admin/stats in one threadpool hop.
+    """ phase 2 — every read for /admin/stats in one threadpool hop.
 
     Bundles volume / perf / category / account / error rate plus the
     watcher-state mapping (which itself does an account roster fetch).
@@ -833,7 +881,7 @@ def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
     except Exception:
         pass
 
-    # #166 — Push-delivery rollup. Reads the persisted per-(account,
+    #  — Push-delivery rollup. Reads the persisted per-(account,
     # provider, day) counter table that the Gmail + O365 webhooks
     # write into on every successful queue.put_nowait. Empty list
     # when the table is empty / unreachable; template renders an
@@ -883,7 +931,7 @@ def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
 def _logs_page_snapshot(
     db, level_filter: str | None, offset: int, query: str | None,
 ) -> dict:
-    """#135 phase 2 — log entries + boundary events + account map in one
+    """ phase 2 — log entries + boundary events + account map in one
     threadpool hop."""
     from email_triage.web.db import (
         list_log_entries, list_hipaa_boundary_events, list_email_accounts,
@@ -912,11 +960,11 @@ def _logs_page_snapshot(
 
 
 def _compliance_page_snapshot(db, app_state) -> dict:
-    """#135 phase 2 — every read for /compliance in one threadpool hop.
+    """ phase 2 — every read for /compliance in one threadpool hop.
 
     The page joins seven different tables to assemble the audit view;
     the prior loop fired off a fresh DB hit for every account in the
-    boundary lookup. With the GROUP-BY query (#134.3) plus this wrap
+    boundary lookup. With the GROUP-BY query plus this wrap
     we get a single hop that finishes the whole snapshot.
     """
     from email_triage.web.db import (
@@ -978,7 +1026,7 @@ def _compliance_page_snapshot(db, app_state) -> dict:
 
 
 def _users_page_snapshot(db) -> list[dict]:
-    """#135 phase 2 — users-list fetch off the loop."""
+    """ phase 2 — users-list fetch off the loop."""
     rows = db.execute(
         "SELECT id, email, name, role, notify_email, created_at, last_login, "
         "disabled, disabled_at FROM users ORDER BY id"
@@ -989,7 +1037,7 @@ def _users_page_snapshot(db) -> list[dict]:
 def _get_lists_for_user(db, user) -> tuple[list[dict], list[dict]]:
     """Return (personal_lists, global_lists) with their rules.
 
-    #129 — each rule dict carries ``adds_labels_list`` (the JSON
+     — each rule dict carries ``adds_labels_list`` (the JSON
     string in ``list_rules.adds_labels`` parsed to a list[str]) so
     the template can render label chips without a Jinja JSON
     filter. Empty / NULL collapses to []. Raw column stays in the
@@ -1009,14 +1057,30 @@ def _get_lists_for_user(db, user) -> tuple[list[dict], list[dict]]:
            WHERE cl.is_global = 1 ORDER BY cl.id""",
     ).fetchall()
 
+    #  — pre-fetch every rule for these lists in ONE query
+    # instead of a per-list SELECT inside _enrich (the N+1). Group by
+    # list_id; _enrich attaches from the map.
+    _all_list_ids = (
+        [int(r["id"]) for r in personal]
+        + [int(r["id"]) for r in global_lists]
+    )
+    _rules_by_list: dict[int, list] = {}
+    if _all_list_ids:
+        _ph = ",".join("?" * len(_all_list_ids))
+        for _rr in db.execute(
+            f"SELECT * FROM list_rules WHERE list_id IN ({_ph}) "
+            "ORDER BY list_id, id",
+            _all_list_ids,
+        ).fetchall():
+            _rules_by_list.setdefault(
+                int(_rr["list_id"]), [],
+            ).append(_rr)
+
     def _enrich(rows):
         result = []
         for row in rows:
             d = dict(row)
-            rules = db.execute(
-                "SELECT * FROM list_rules WHERE list_id = ? ORDER BY id",
-                (d["id"],),
-            ).fetchall()
+            rules = _rules_by_list.get(int(d["id"]), [])
             rules_out = []
             for r in rules:
                 r_dict = dict(r)
@@ -1034,7 +1098,7 @@ def _get_lists_for_user(db, user) -> tuple[list[dict], list[dict]]:
                         r_dict["adds_labels_list"] = []
                 else:
                     r_dict["adds_labels_list"] = []
-                # #163 — provider_labels parsed to the same shape the
+                #  — provider_labels parsed to the same shape the
                 # edit-form snapshot delivers (entries carry a
                 # pre-computed _key for the picker checkbox).
                 r_dict["provider_labels_list"] = _parse_provider_labels(
@@ -1166,7 +1230,7 @@ def _writing_tab_context(db, user: dict) -> dict:
 
 
 def _profile_page_snapshot(db, user) -> dict:
-    """#135 phase 2 — every profile-page DB read in one threadpool hop.
+    """ phase 2 — every profile-page DB read in one threadpool hop.
 
     Pulls categories (system + personal), escalation prefs, meeting
     prefs, SMS prefs, and the writing-tab context. Snapshots collapse
@@ -1364,11 +1428,11 @@ def _build_style_data_entry(
     else:
         sample_display = list(index_summary.get("sample_subjects") or [])
 
-    # #157 — the Preview / Mine-now buttons need to know whether M-3
+    #  — the Preview / Mine-now buttons need to know whether M-3
     # can fire on this account. For non-HIPAA accounts the source-mail
     # read is unconditionally allowed; for HIPAA-flagged accounts the
     # path requires the per-account ``style_knobs_hipaa_allow`` opt-in
-    # (#152 phase 2). Without that opt-in the button renders disabled
+    #. Without that opt-in the button renders disabled
     # with a chip explaining how to enable it.
     from email_triage.web.db import (
         is_style_knobs_hipaa_allow,
@@ -1386,7 +1450,7 @@ def _build_style_data_entry(
     mine_disabled = is_hipaa_acct and not m1m2_hipaa_allow
 
     # 2026-05-11 — AI-learns toggle relocated onto the per-account row.
-    # Resolved value reflects #157 HIPAA-aware defaults: non-HIPAA →
+    # Resolved value reflects  HIPAA-aware defaults: non-HIPAA →
     # default ON, HIPAA → default OFF. ``rag_toggle_disabled`` follows
     # the same opt-in gate as the mine button: a HIPAA-flagged account
     # without the M-1+M-2 opt-in can't engage the toggle until the
@@ -1394,7 +1458,7 @@ def _build_style_data_entry(
     rag_enabled_resolved = is_rag_sent_index_enabled(db, acct["id"], account=acct)
     rag_toggle_disabled = is_hipaa_acct and not m1m2_hipaa_allow
 
-    # #161 item 2 — "Auto-scan on schedule" per-account checkbox.
+    #  item 2 — "Auto-scan on schedule" per-account checkbox.
     # HIPAA-aware default (OFF for HIPAA, ON for non-HIPAA) handled
     # inside :func:`is_auto_scan_enabled_for_account`; the disabled
     # gate matches the AI-learns toggle (HIPAA-without-opt-in renders
@@ -1409,7 +1473,7 @@ def _build_style_data_entry(
     auto_scan_enabled_resolved = is_auto_scan_enabled_for_account(acct)
     auto_scan_toggle_disabled = is_hipaa_acct and not m1m2_hipaa_allow
 
-    # #161 item 4 — per-account "Messages to mine" override + the
+    #  item 4 — per-account "Messages to mine" override + the
     # resolved value the page uses for placeholder display. The
     # explicit override on ``config_json["mine_limit_override"]``
     # surfaces as ``mine_limit_override_value`` (empty string when
@@ -1455,7 +1519,7 @@ def _build_style_data_entry(
     else:
         sent_folder_discovered = "Sent"
 
-    # Punch list #162 — alias-aware learning. Two surfaces feed the
+    # Punch list  — alias-aware learning. Two surfaces feed the
     # template: ``alias_mode_enabled`` drives the per-account toggle
     # checkbox; ``alias_entries`` is a list of per-alias descriptor
     # rows (from_address + last-built + sample count + preview) the
@@ -1544,7 +1608,7 @@ def _build_style_data_entry(
         "captured_pair_count": captured_count,
         "action_msg": None,
         "action_err": None,
-        # #157 — buttons render disabled when M-3 can't fire. The chip
+        #  — buttons render disabled when M-3 can't fire. The chip
         # explains why so the operator doesn't think the button broke.
         "mine_button_disabled": mine_disabled,
         "mine_disabled_reason": (
@@ -1566,13 +1630,13 @@ def _build_style_data_entry(
         "sent_folder_override_list": sent_folder_override_list,
         "sent_folder_discovered": sent_folder_discovered,
         "sent_folder_candidates": [],
-        # #161 item 2 + 4
+        #  item 2 + 4
         "auto_scan_enabled_resolved": auto_scan_enabled_resolved,
         "auto_scan_toggle_disabled": auto_scan_toggle_disabled,
         "mine_limit_override_value": mine_limit_override_value,
         "mine_limit_install_default": mine_limit_install_default,
         "mine_limit_resolved": mine_limit_resolved,
-        # Punch list #162 — alias-aware learning. ``alias_addresses``
+        # Punch list  — alias-aware learning. ``alias_addresses``
         # is the declared list (primary first); ``alias_entries`` is
         # the per-alias descriptor rows the picker renders.
         "alias_picker_available": alias_picker_available,
@@ -1683,10 +1747,10 @@ def _resolve_style_data_account(
 
 
 def _profile_style_data_snapshot(db, user) -> dict:
-    """#135 phase 2 — every per-account style-data read in one
+    """ phase 2 — every per-account style-data read in one
     threadpool hop.
 
-    #161 additions:
+     additions:
       * ``capture_interval_hours`` — live admin-set cadence for the
         banner at the top of the page.
       * ``mine_limit_install_default`` — install-wide mine-now default,
@@ -1851,13 +1915,13 @@ def resolve_embedding_gate(
 
 
 def _build_rules_page_snapshot(db, user: dict) -> dict:
-    """#135 phase 2 — lists + categories in one threadpool hop.
+    """ phase 2 — lists + categories in one threadpool hop.
 
     /rules pulls personal-and-global lists plus the categories list
     (rendered as the type-ahead in the inline-add-rule controls).
     Both are independent reads that previously serialised on the loop.
 
-    #129 — also include the labels catalog so the "Also adds labels"
+     — also include the labels catalog so the "Also adds labels"
     multi-select on the rule form can render the available slugs.
 
     2026-05-17 fix: categories MUST be fetched user-scoped so the
@@ -1883,15 +1947,15 @@ def _create_list_snapshot(
     db, name, category, owner_id, is_global, rule_type, pattern, skip_ai,
     adds_labels=None, provider_labels=None,
 ) -> bool:
-    """#135 phase 2 — list insert + optional first-rule insert + commit
+    """ phase 2 — list insert + optional first-rule insert + commit
     in one threadpool hop. Returns is_global flag for the redirect.
 
-    ``adds_labels`` (#129) is a list of label slugs attached to the
+    ``adds_labels`` is a list of label slugs attached to the
     first rule (if a first rule is created). Persisted as a JSON
     array string in ``list_rules.adds_labels``. None / empty list
     omit the column write.
 
-    ``provider_labels`` (#163) is a list of
+    ``provider_labels`` is a list of
     ``{"account_id": int, "label_slug": str}`` dicts persisted as a
     JSON array string in ``list_rules.provider_labels``. None /
     empty list writes NULL.
@@ -1932,7 +1996,7 @@ def _create_list_snapshot(
 def _delete_list_snapshot(
     db, list_id: int, user_id: int, user_role: str,
 ) -> tuple[str, bool]:
-    """#135 phase 2 — auth check + delete + commit in one hop. Returns
+    """ phase 2 — auth check + delete + commit in one hop. Returns
     ('ok' | 'not_found' | 'forbidden', is_global)."""
     row = db.execute(
         "SELECT owner_id, is_global FROM classification_lists WHERE id = ?",
@@ -1953,20 +2017,29 @@ def _add_rule_snapshot(
     db, list_id, rule_type, pattern, skip_ai, user_id, user_role,
     adds_labels=None, provider_labels=None,
 ) -> tuple[str, bool]:
-    """#135 phase 2 — auth check + insert + commit in one threadpool
+    """ phase 2 — auth check + insert + commit in one threadpool
     hop. Returns ('ok' | 'not_found' | 'forbidden', is_global).
 
-    ``adds_labels`` (#129) — list of label slugs persisted as a JSON
+    ``adds_labels`` — list of label slugs persisted as a JSON
     array string in ``list_rules.adds_labels``. Additive — labels
     fire alongside the category, not in place of it.
 
-    ``provider_labels`` (#163) — list of
+    ``provider_labels`` — list of
     ``{"account_id": int, "label_slug": str}`` dicts persisted as a
     JSON array string in ``list_rules.provider_labels``. Per-account
     scope; only entries whose account_id matches the message's
     account fire at apply time.
     """
     import json as _json
+    #  preventative: empty / whitespace-only patterns would
+    # silently match every email through the substring branch in
+    # _rule_matches. Reject at the boundary, paralleling the API path
+    # and matching the existing _create_list_snapshot skip-on-empty
+    # behavior (formalized into an explicit error here so the UI can
+    # surface it instead of silently dropping the row).
+    pattern_clean = (pattern or "").strip()
+    if not pattern_clean:
+        return "invalid_pattern", False
     row = db.execute(
         "SELECT owner_id, is_global FROM classification_lists WHERE id = ?",
         (list_id,),
@@ -1988,7 +2061,7 @@ def _add_rule_snapshot(
         "INSERT INTO list_rules (list_id, rule_type, pattern, skip_ai, "
         "adds_labels, provider_labels, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (list_id, rule_type, pattern, int(skip_ai == "1"),
+        (list_id, rule_type, pattern_clean, int(skip_ai == "1"),
          labels_json, provider_labels_json, now),
     )
     db.commit()
@@ -1998,7 +2071,7 @@ def _add_rule_snapshot(
 def _delete_rule_snapshot(
     db, list_id, rule_id, user_id, user_role,
 ) -> tuple[str, bool]:
-    """#135 phase 2 — auth check + delete + commit in one hop."""
+    """ phase 2 — auth check + delete + commit in one hop."""
     row = db.execute(
         "SELECT owner_id, is_global FROM classification_lists WHERE id = ?",
         (list_id,),
@@ -2018,12 +2091,12 @@ def _delete_rule_snapshot(
 def _get_rule_snapshot(
     db, list_id: int, rule_id: int, user_id: int, user_role: str,
 ):
-    """#160 — fetch a single rule (with owner auth + adds_labels
+    """ — fetch a single rule (with owner auth + adds_labels
     parsed back into a list) in one threadpool hop. Returns
     ('ok', rule_dict, list_row) | ('not_found', None, None) |
     ('forbidden', None, None).
 
-    #163 — also parses ``provider_labels`` JSON into a list of
+     — also parses ``provider_labels`` JSON into a list of
     ``{"account_id", "label_slug", "_key"}`` dicts so the rule-editor
     template can compare against the checkbox values in O(1) without
     a Jinja JSON filter. ``_key`` is the form-value form
@@ -2104,18 +2177,24 @@ def _save_rule_snapshot(
     skip_ai: str, user_id: int, user_role: str,
     adds_labels=None, provider_labels=None,
 ) -> tuple[str, dict | None, dict | None]:
-    """#160 — update an existing rule in-place. Auth-checks the
+    """ — update an existing rule in-place. Auth-checks the
     owning list, validates rule_type, persists the same shape the
     create + add-rule paths persist (adds_labels JSON), and returns
     the freshly-loaded rule + list rows for the row partial render.
 
-    #163 — also persists the new ``provider_labels`` JSON column
+     — also persists the new ``provider_labels`` JSON column
     (per-account provider-native label assignments).
 
     Returns ('ok', rule, list_row) | ('not_found', None, None) |
-    ('forbidden', None, None).
+    ('forbidden', None, None) | ('invalid_pattern', None, None).
     """
     import json as _json
+    #  preventative: empty / whitespace-only patterns on UPDATE
+    # would silently neutralize an existing rule into a match-every-
+    # email row. Reject at the boundary alongside the create path.
+    pattern_clean = (pattern or "").strip()
+    if not pattern_clean:
+        return "invalid_pattern", None, None
     list_row = db.execute(
         "SELECT id, owner_id, is_global FROM classification_lists WHERE id = ?",
         (list_id,),
@@ -2145,7 +2224,7 @@ def _save_rule_snapshot(
         "UPDATE list_rules SET rule_type = ?, pattern = ?, "
         "skip_ai = ?, adds_labels = ?, provider_labels = ? "
         "WHERE id = ? AND list_id = ?",
-        (rt, pattern.strip(), int(skip_ai == "1"),
+        (rt, pattern_clean, int(skip_ai == "1"),
          labels_json, provider_labels_json, rule_id, list_id),
     )
     db.commit()
@@ -2178,7 +2257,7 @@ def _require_admin_user(request: Request):
 
 
 def _build_categories_page_snapshot(db, scope: str) -> dict:
-    """#135 phase 2 — categories list + owner map in one threadpool hop."""
+    """ phase 2 — categories list + owner map in one threadpool hop."""
     from email_triage.web.db import list_categories
     if scope not in ("all", "system", "personal"):
         scope = "all"
@@ -2210,7 +2289,7 @@ def _build_categories_page_snapshot(db, scope: str) -> dict:
 def _categories_create_snapshot(
     db, slug: str, description: str,
 ) -> tuple[bool, list]:
-    """#135 phase 2 — create + list in one threadpool hop. Returns
+    """ phase 2 — create + list in one threadpool hop. Returns
     (success, categories_list)."""
     from email_triage.web.db import list_categories, create_category
     success = True
@@ -2224,7 +2303,7 @@ def _categories_create_snapshot(
 def _categories_update_snapshot(
     db, cat_id: int, slug: str, description: str,
 ) -> dict | None:
-    """#135 phase 2 — write + read-back in one threadpool hop."""
+    """ phase 2 — write + read-back in one threadpool hop."""
     from email_triage.web.db import update_category, get_category
     update_category(db, cat_id, slug, description)
     return get_category(db, cat_id)
@@ -2233,7 +2312,7 @@ def _categories_update_snapshot(
 def _personal_category_create_snapshot(
     db, slug: str, description: str, user_id: int,
 ) -> tuple[str, list]:
-    """#135 phase 2 — create + list in one threadpool hop. Returns
+    """ phase 2 — create + list in one threadpool hop. Returns
     (error_msg, personal_categories)."""
     from email_triage.web.db import create_category, list_categories
     error = ""
@@ -2252,7 +2331,7 @@ def _personal_category_create_snapshot(
 def _personal_category_delete_snapshot(
     db, cat_id: int, user_id: int,
 ) -> tuple[str, list]:
-    """#135 phase 2 — fetch + auth check + delete + re-list in one
+    """ phase 2 — fetch + auth check + delete + re-list in one
     threadpool hop. Returns ('ok' | 'forbidden', personal_categories)."""
     from email_triage.web.db import (
         get_category, delete_category, list_categories,
@@ -2270,7 +2349,7 @@ def _personal_category_delete_snapshot(
 def _categories_demote_form_snapshot(
     db, cat_id: int,
 ) -> tuple[str, dict | None, list]:
-    """#135 phase 2 — fetch + user-roster in one threadpool hop.
+    """ phase 2 — fetch + user-roster in one threadpool hop.
     Returns ('ok' | 'not_found' | 'not_system', cat, users)."""
     from email_triage.web.db import get_category
     cat = get_category(db, cat_id)
@@ -2291,8 +2370,7 @@ _PROVIDER_TYPES = {"imap", "gmail_api", "office365"}
 def _secret_key_for_account(account_id: int, provider_type: str) -> str | None:
     """Return the secrets-store key name for an account's password/secret.
 
-    Delegates to :func:`providers.traits.secret_key_for_account`
-    (#138.2). Kept under the old name so the 7+ call sites in this
+    Delegates to :func:`providers.traits.secret_key_for_account`. Kept under the old name so the 7+ call sites in this
     module continue to work without churn.
     """
     from email_triage.providers.traits import secret_key_for_account
@@ -2314,7 +2392,7 @@ def _enrich_account(acct: dict, secrets) -> dict:
 
 
 def _build_accounts_page_snapshot(request: Request, user: dict) -> dict:
-    """#135 phase 2 — single threadpool snapshot for /accounts.
+    """ phase 2 — single threadpool snapshot for /accounts.
 
     Bundles every sync DB read on the page (users list, account roster,
     enrichment chips that hit settings + secrets) so the operator-facing
@@ -2384,7 +2462,7 @@ def _build_accounts_page_snapshot(request: Request, user: dict) -> dict:
 
 
 def _api_keys_page_snapshot(db, user: dict) -> dict:
-    """#135 phase 2 — keys + users in one threadpool hop."""
+    """ phase 2 — keys + users in one threadpool hop."""
     from email_triage.web.auth import list_api_keys
     is_admin = user["role"] == "admin"
     if is_admin:
@@ -2425,7 +2503,7 @@ def _extract_provider_config(
     config: dict[str, Any] = dict(existing)
     if ptype == "imap":
         config["host"] = form.get("host", "")
-        config["port"] = int(form.get("port", 993))
+        config["port"] = _safe_int(form.get("port"), 993)
         config["username"] = form.get("username", "")
         # 2026-05-13 — separate "Your email address" field on the
         # IMAP edit form. The LOGIN username on many IMAP servers
@@ -2617,10 +2695,10 @@ def _extract_provider_config(
             "style_learning_per_contact_enabled"
         ]
 
-    # ── Per-account timezone (#109) ─────────────────────────────
+    # ── Per-account timezone ─────────────────────────────
     # IANA zone string used for the calendar API's pre-rendered
     # local-time fields. Validate against zoneinfo; fall back to
-    # the existing stored value, then to America/Detroit (the
+    # the existing stored value, then to America/New_York (the
     # backfill-migration default). Never default to UTC — UTC
     # times are not meant for the human-render path.
     raw_tz = (form.get("tz") or "").strip()
@@ -2636,7 +2714,7 @@ def _extract_provider_config(
         except ImportError:  # pragma: no cover — stdlib since 3.9
             chosen_tz = raw_tz
     if chosen_tz is None:
-        chosen_tz = existing.get("tz") or "America/Detroit"
+        chosen_tz = existing.get("tz") or "America/New_York"
     config["tz"] = chosen_tz
 
     return config
@@ -2645,7 +2723,7 @@ def _extract_provider_config(
 def _save_provider_secret(form, ptype: str, account_id: int, secrets) -> None:
     """Store password/secret from form into the secrets provider.
 
-    Migrated to traits-driven dispatch (#138.2): the per-provider
+    Migrated to traits-driven dispatch: the per-provider
     form-field name + secret key shape live on ``ProviderTraits``,
     so this fn collapses the original IMAP / O365 if-branches to
     a single registry lookup. Gmail's traits entry has
@@ -2662,7 +2740,7 @@ def _save_provider_secret(form, ptype: str, account_id: int, secrets) -> None:
 
 
 # ---------------------------------------------------------------------------
-# #95 sub-A — account-setup wizard (auto-chained flow)
+#  sub-A — account-setup wizard (auto-chained flow)
 #
 # Five-step linear flow at /accounts/new?step=N replacing the
 # Save → Back → Save → Back loop on the previous edit-page-driven
@@ -2752,8 +2830,7 @@ def _account_has_default_oauth_scopes(acct: dict) -> bool:
     """Step-3 skip heuristic helper: the account is at the default
     OAuth scope set when no extras (calendar, etc.) were opted in.
 
-    Delegates to :func:`providers.traits.has_default_scopes`
-    (#138.5 — wizard helper roll-up).
+    Delegates to :func:`providers.traits.has_default_scopes`.
     """
     from email_triage.providers.traits import has_default_scopes
     return has_default_scopes(acct)
@@ -2763,7 +2840,7 @@ def _account_only_inbox_selectable(acct: dict) -> bool:
     """Step-3 skip heuristic helper: True when the account's folder
     set is so trivial there's nothing to configure beyond INBOX.
 
-    Delegates to :func:`providers.traits.inbox_only` (#138.5).
+    Delegates to :func:`providers.traits.inbox_only`.
     """
     from email_triage.providers.traits import inbox_only
     return inbox_only(acct)
@@ -2839,7 +2916,7 @@ def _account_authenticated(db, secrets, acct: dict) -> bool:
     """Best-effort 'auth complete?' check used by the step-2 polling
     endpoint to decide when to auto-advance the operator.
 
-    Delegates to :func:`providers.traits.is_authenticated` (#138.5).
+    Delegates to :func:`providers.traits.is_authenticated`.
     The ``db`` arg is preserved for call-site compat — the trait
     only needs ``secrets`` + ``acct``, but a future ``last_seen``
     timestamp could fold in via the db handle without churning
@@ -2878,7 +2955,7 @@ def _apply_step3_defaults(db, watcher_mgr, acct: dict) -> None:
 def _accounts_edit_pre_provider(
     request: Request, db, secrets, user: dict, acct: dict,
 ) -> dict:
-    """#135 phase 2 — chip enrichment + delegates + grantable users +
+    """ phase 2 — chip enrichment + delegates + grantable users +
     digest configs + watches + wizard-resume detection bundled into one
     threadpool hop. Runs BEFORE the optional provider folder probe so
     the network-bound call doesn't block the DB reads."""
@@ -2930,7 +3007,7 @@ def _accounts_edit_pre_provider(
 
 
 def _accounts_row_snapshot(request: Request, account_id: int) -> dict | None:
-    """#135 phase 2 — fetch + enrich in one threadpool hop."""
+    """ phase 2 — fetch + enrich in one threadpool hop."""
     from email_triage.web.db import get_email_account
     db = get_db(request)
     secrets = get_secrets(request)
@@ -3081,7 +3158,7 @@ def _extract_digest_config_from_form(
         render_as=_render_as,
         group_by=(form.get("group_by") or "category").strip(),
         include_body_preview=("include_body_preview" in form),
-        max_rows=int(form.get("max_rows") or 50),
+        max_rows=_safe_int(form.get("max_rows"), 50),
         columns=columns,
         html_template=_html_template,
     )
@@ -3165,7 +3242,7 @@ async def _test_account_connection(
     shows — success or failure. Pulled out so accounts_create can run
     the exact same probe before flipping the watcher on.
     """
-    # #138 phase 2 — table-driven dispatch via ProviderDispatcher.
+    #  phase 2 — table-driven dispatch via ProviderDispatcher.
     # The per-ptype probe shapes (IMAP4_SSL login, Gmail list_labels,
     # O365 device-code deferral) live in providers/dispatcher.py.
     from email_triage.providers.dispatcher import get_dispatch
@@ -3202,7 +3279,7 @@ def _public_callback_url(request: Request) -> str:
     return f"{base}/oauth/google/callback" if base else ""
 
 
-# #137 phase 2 — ``_verify_account_owner`` deleted; the three gmail-api
+#  phase 2 — ``_verify_account_owner`` deleted; the three gmail-api
 # auth handlers below now use ``OwnedGmailApiAccount`` (Annotated alias
 # from web/dependencies.py) which raises HTTPException 401 / 404 / 403 /
 # 400 in the same shape the helper used to return as HTMLResponse.
@@ -3216,10 +3293,7 @@ def _render_gmail_push_status_label(watch: dict | None) -> str:
     # epoch expires_at) to hold the history cursor. These are not
     # "push on".
     topic = (watch.get("topic_name") or "").strip()
-    try:
-        expires = datetime.fromisoformat(str(watch.get("expires_at", "")).replace("Z", "+00:00"))
-    except Exception:
-        expires = None
+    expires = parse_iso(watch.get("expires_at", ""))
     if not topic or (expires is not None and expires <= datetime.now(timezone.utc)):
         return '<span style="color:var(--pico-muted-color);white-space:nowrap;">Push off</span>'
     remaining = expires - datetime.now(timezone.utc)
@@ -3258,16 +3332,14 @@ def _render_cadence_status_label(acct: dict, watch: dict | None, ingestion) -> s
     push_healthy = push_on
     if push_on and watch is not None:
         topic = (watch.get("topic_name") or "").strip()
-        try:
-            exp = datetime.fromisoformat(
-                str(watch.get("expires_at", "")).replace("Z", "+00:00")
-            )
+        exp = parse_iso(watch.get("expires_at", ""))
+        if exp is not None:
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
             if topic and exp > datetime.now(timezone.utc):
                 push_healthy = True
             elif topic:
                 push_healthy = False  # configured but expired
-        except Exception:
-            pass
 
     if not push_on and not poll_on:
         return (
@@ -3344,7 +3416,7 @@ def _enrich_account_chips(
     chip in its enabled-by-default form (matches prior behaviour).
     """
     from email_triage.web.db import get_gmail_watch
-    # #152 Phase 2 — surface the M-1+M-2 HIPAA opt-in flag so the
+    #  Phase 2 — surface the M-1+M-2 HIPAA opt-in flag so the
     # edit template can render its checkbox state. Read fails fall
     # back to False (the privacy-safe default per the audit runbook).
     try:
@@ -3359,7 +3431,7 @@ def _enrich_account_chips(
             acct["watch_active"] = watcher_mgr.is_running(acct["id"])
         except Exception:
             acct["watch_active"] = False
-        # #52 — per-mailbox watch state. WatcherManager.status() returns
+        #  — per-mailbox watch state. WatcherManager.status() returns
         # a "mailboxes" list with per-(account, mailbox) status. Surface
         # it on the row so an aggregate "Watching" doesn't paint over
         # one mailbox whose IDLE dropped while the others stay up.
@@ -3386,12 +3458,7 @@ def _enrich_account_chips(
         # should not surface a "push chip" in the edit panel — treat
         # them as no-watch for UI purposes.
         topic = (watch.get("topic_name") if watch else "") or ""
-        try:
-            exp = datetime.fromisoformat(
-                str((watch or {}).get("expires_at", "")).replace("Z", "+00:00")
-            )
-        except Exception:
-            exp = None
+        exp = parse_iso((watch or {}).get("expires_at", ""))
         is_active_push = bool(watch and topic.strip()
                               and exp is not None and exp > datetime.now(timezone.utc))
         # Prereqs for the user-facing Start Push button:
@@ -3458,7 +3525,7 @@ def _enrich_account_chips(
     acct["openclaw_status"] = _render_openclaw_status_label(db, acct["id"])
     acct["calendar_chip"] = _render_calendar_chip(db, acct)
     acct["calendar_status"] = _render_calendar_status_label(db, acct)
-    # Pre-rendered calendar-selection table (#105) — uses the
+    # Pre-rendered calendar-selection table — uses the
     # account's stored ``config.calendars`` list. Empty list
     # collapses to the "no calendars selected yet" placeholder
     # in the template; otherwise the table renders inline so
@@ -3469,7 +3536,7 @@ def _enrich_account_chips(
         (acct.get("config") or {}).get("calendars") or [],
         hipaa=_iah(acct),
     )
-    # Surrogate dropdown (#105 phase 1A++) — IMAP accounts have
+    # Surrogate dropdown — IMAP accounts have
     # no native calendar; operator picks another account
     # (gmail_api / office365 owned by the same user) whose provider
     # supplies the calendarList. Pre-rendered here so the editor
@@ -3502,13 +3569,15 @@ def _render_gmail_watch_chip(watch: dict | None) -> str:
         return (
             '<span style="color:var(--pico-muted-color);">Push off</span>'
         )
-    try:
-        expires = datetime.fromisoformat(watch["expires_at"].replace("Z", "+00:00"))
+    expires = parse_iso(watch.get("expires_at"))
+    if expires is None:
+        sub = ''
+    else:
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
         remaining = expires - datetime.now(timezone.utc)
         days = max(0, remaining.days)
         sub = f'expires in {days}d'
-    except Exception:
-        sub = ''
     return (
         f'<span style="color:var(--pico-ins-color);">🔔 Push active</span>'
         f' <small style="color:var(--pico-muted-color);">{sub}</small>'
@@ -3601,8 +3670,8 @@ def _render_o365_push_chip(sub: dict | None, account_id: int) -> str:
     sub_id = (sub.get("subscription_id") or "").strip()
     expires_iso = sub.get("expiration_at") or ""
     sub_text = ""
-    try:
-        exp = datetime.fromisoformat(str(expires_iso).replace("Z", "+00:00"))
+    exp = parse_iso(expires_iso)
+    if exp is not None:
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
@@ -3621,8 +3690,6 @@ def _render_o365_push_chip(sub: dict | None, account_id: int) -> str:
                     f' <small style="color:var(--pico-muted-color);">'
                     f'expires in {max(hours, 0)}h</small>'
                 )
-    except Exception:
-        pass
     safe_sub = sub_id[:36] if sub_id else "(unknown)"
     return (
         f'<span style="color:var(--pico-ins-color);">🔔 Push: ON</span>'
@@ -3655,7 +3722,7 @@ def _o365_subscription_create_args(request: Request, account_id: int) -> tuple[s
     3. **Auto-generate** a fresh 32-byte URL-safe value and store it
        under the per-account key.
 
-    Step 3 closes #132: previous behaviour returned the empty string
+    Step 3 closes : previous behaviour returned the empty string
     when neither secret was set, which the receiver then treated as
     "skip the HMAC compare entirely". Anyone who learned the
     subscriptionId could POST to /webhooks/office365 and queue triage
@@ -3757,7 +3824,7 @@ def _aadsts_translate(error_text: str) -> tuple[str | None, str]:
         our table, otherwise the verbatim error text trimmed to a
         sensible length so the chip doesn't blow up the layout.
 
-    Per the punch-list spec: never surface the bare AADSTS code as
+    Per the backlog spec: never surface the bare AADSTS code as
     the headline. The code rides along as a reference for operators
     who Google it; the English sentence does the explaining.
     """
@@ -3820,7 +3887,7 @@ def _render_o365_probe_chip_failure(
     Same hand-rolled tooltip shape as the success chip — see comment
     there for why we don't import the Jinja macro here.
 
-    #121-A — when a code is present we also emit an "Explain this
+    -A — when a code is present we also emit an "Explain this
     error" button beside the chip. The static AADSTS table only
     knows 7 codes; the AI picks up the slack for everything else
     (and adds context the static one-liner can't, like "Tenant ID
@@ -4001,11 +4068,20 @@ def _create_calendar_provider_from_account(
         client_secret = install.client_secret if install else ""
         is_personal = bool(cfg.get("is_personal_msa", False))
         tenant_id = "common" if is_personal else (install.tenant_id if install else "")
+        #  — per-account MSAL token-cache file, keyed by account id,
+        # matching the mail factory (factory.py:office365 branch). Mail
+        # + calendar for the same account intentionally share one cache
+        # file (same Microsoft account); two *different* accounts must
+        # not. An explicit ``token_cache_path`` in cfg still wins.
+        token_cache_path = cfg.get("token_cache_path") or (
+            f"./data/msal_cache_{acct['id']}.json"
+        )
         return Office365CalendarProvider(
             client_id=client_id,
             tenant_id=tenant_id or "common",
             client_secret=client_secret or "",
-            token_cache_path=cfg.get("token_cache_path", "./data/msal_cache.json"),
+            token_cache_path=token_cache_path,
+            username=cfg.get("account", ""),
         )
     return None
 
@@ -4425,7 +4501,7 @@ def _render_openclaw_chip(db, account_id: int) -> str:
 def _openclaw_quiet_save_snapshot(
     db, account_id: int, form_dict: dict,
 ) -> str:
-    """#135 phase 2 — read existing settings, apply form patch, write
+    """ phase 2 — read existing settings, apply form patch, write
     back, render chip — all in one threadpool hop."""
     from email_triage.web.db import get_setting, set_setting
     current = get_setting(db, _S.openclaw_quiet(account_id)) or {}
@@ -4486,7 +4562,7 @@ def _parse_watch_form(form, default_account_id: int | None = None):
 
 
 def _build_admin_watches_snapshot(db) -> list[dict]:
-    """#135 phase 2 — every watch + account roster + label decoration in
+    """ phase 2 — every watch + account roster + label decoration in
     one threadpool hop."""
     from email_triage.web.email_watches import list_watches
     from email_triage.web.db import list_email_accounts
@@ -4590,7 +4666,7 @@ def _collect_list_hints_for_message(
 ) -> list:
     """Collect matching list hints for a single message.
 
-    #134.1 — when called inside a triage loop, pass pre-loaded
+    .1 — when called inside a triage loop, pass pre-loaded
     ``lists`` + ``rules_by_list`` (built once per run via
     :func:`_load_all_list_hints`) so this function is pure
     in-memory matching, no DB round-trips. Single-message callers
@@ -4608,7 +4684,7 @@ def _collect_list_hints_for_message(
 # ---------------------------------------------------------------------------
 # Provider factory (from DB account config + secrets)
 #
-# Lifted to ``email_triage.providers.factory`` (#138.1). The setters and
+# Lifted to ``email_triage.providers.factory``. The setters and
 # resolvers below are thin re-export shims so existing imports keep
 # working — both for in-tree callers (``web/app.py``, ``cli.py``) and
 # for any external code that imported these names directly. The
@@ -4705,7 +4781,7 @@ async def _probe_missing_labels(
 
 
 # ``_create_provider_from_account`` is re-exported as an alias of
-# ``email_triage.providers.factory.build_provider`` (#138.1) — see the
+# ``email_triage.providers.factory.build_provider`` — see the
 # import block higher in this file.
 
 
@@ -4714,7 +4790,7 @@ async def _probe_missing_labels(
 # ---------------------------------------------------------------------------
 
 def _routes_pre_provider_snapshot(db, user: dict, acct: dict) -> dict:
-    """#135 phase 2 — DB reads that don't depend on the live folder
+    """ phase 2 — DB reads that don't depend on the live folder
     list. Routes table + per-user categories are independent of the
     network-bound folder fetch, so they go on the threadpool first."""
     from email_triage.web.db import list_account_routes
@@ -4727,7 +4803,7 @@ def _routes_pre_provider_snapshot(db, user: dict, acct: dict) -> dict:
 def _routes_post_provider_snapshot(
     db, account_id: int, all_folders: list[str],
 ) -> dict:
-    """#135 phase 2 — DB-side filter of all_folders + folder-prefs read
+    """ phase 2 — DB-side filter of all_folders + folder-prefs read
     bundled into one threadpool hop after the provider call returns."""
     from email_triage.web.db import get_visible_folders, get_folder_prefs
     folders = get_visible_folders(db, account_id, all_folders)
@@ -4782,7 +4858,7 @@ async def _build_routes_context(
 
     folder_msg = request.query_params.get("folder_msg", "")
 
-    # #163 follow-up — surface this account's provider-native labels
+    #  follow-up — surface this account's provider-native labels
     # so the route editor's `label` and `add-label` actions can pick
     # one or more by name instead of defaulting to the classification
     # category. The helper returns [] for IMAP / HIPAA /
@@ -4816,7 +4892,7 @@ async def _build_routes_context(
                     str(s) for s in labels if isinstance(s, str)
                 ]
 
-    # #129 tail — install-wide INTERNAL label catalog for the
+    #  tail — install-wide INTERNAL label catalog for the
     # routes-editor "add-label" picker (sibling to the provider-
     # native picker above). The two surfaces are complementary:
     # internal labels are install-local DB rows on /labels,
@@ -4838,7 +4914,7 @@ async def _build_routes_context(
         "folders": folders,
         "all_folder_count": len(all_folders),
         "excluded_count": excluded_count,
-        # #129 tail — order matters: existing routes editor renders
+        #  tail — order matters: existing routes editor renders
         # checkboxes in this order. Append ``add-label`` rather than
         # interleaving so saved routes from before this change keep
         # the same visual layout for the existing actions.
@@ -4947,230 +5023,6 @@ def _account_mailbox_address(acct: dict) -> str:
 
 # Simple RFC-5321-shape check for operator-supplied recipient addresses.
 _EMAIL_RE = __import__("re").compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-
-
-def _resolve_digest_recipient(
-    acct: dict,
-    user_email: str,
-    recipient_mode: str,
-    recipient_custom: str,
-    *,
-    hipaa: bool,
-) -> tuple[str, str, str]:
-    """Pick the digest destination, honouring HIPAA server-side.
-
-    Returns ``(destination, effective_mode, warning)`` where
-    ``warning`` is a log-worthy reason string (empty on normal paths).
-
-    A HIPAA-flagged account is LOCKED to ``back_to_account`` here
-    regardless of what the form submitted — that's the server-side
-    guard matching the UI lock. The warning string surfaces that fact
-    so the audit trail shows a down-shifted recipient mode with a
-    reason, not a silent override.
-    """
-    mode = recipient_mode or "back_to_account"
-    warning = ""
-    if hipaa and mode != "back_to_account":
-        warning = (
-            "HIPAA-flagged account forced back_to_account "
-            f"(requested={mode})"
-        )
-        mode = "back_to_account"
-
-    if mode == "user_email":
-        dest = (user_email or "").strip()
-        if not dest:
-            warning = warning or "user_email empty; falling back to back_to_account"
-            mode = "back_to_account"
-    elif mode == "other":
-        dest = (recipient_custom or "").strip()
-        if not _EMAIL_RE.match(dest):
-            warning = warning or f"recipient_custom invalid ({dest!r}); falling back"
-            mode = "back_to_account"
-
-    if mode == "back_to_account":
-        dest = _account_mailbox_address(acct)
-
-    return dest, mode, warning
-
-
-def _load_digest_schedules(db, account_id: int) -> list[dict]:
-    """Load digest schedules for an account.
-
-    Handles backward-compat: migrates old single-schedule format
-    (``digest:{id}``) into the new list format (``digest_schedules:{id}``).
-    """
-    from email_triage.web.db import get_setting, set_setting
-
-    schedules = get_setting(db, _S.digest_schedules(account_id))
-    if schedules is not None:
-        return schedules
-
-    # Migrate legacy single-schedule format.
-    old_cfg = get_setting(db, _S.digest(account_id)) or {}
-    if old_cfg.get("schedule_enabled"):
-        schedules = [{
-            "time_utc": old_cfg.get("schedule_time", "07:00"),
-            "category": old_cfg.get("category", "newsletters"),
-            "enabled": True,
-        }]
-    else:
-        schedules = []
-
-    # Persist the migrated format so we only do this once.
-    set_setting(db, _S.digest_schedules(account_id), schedules)
-    return schedules
-
-
-def _save_digest_schedules(db, account_id: int, schedules: list[dict]) -> None:
-    """Persist digest schedules for an account."""
-    from email_triage.web.db import set_setting
-    set_setting(db, _S.digest_schedules(account_id), schedules)
-
-
-def _render_digest_schedules(templates, request, acct, schedules, flash_msg: str = ""):
-    """Render the digest schedules partial for HTMX swap.
-
-    ``flash_msg`` is an optional one-shot notice shown above the table
-    (used after Run Now so the user sees confirmation).
-    """
-    return _render(templates, request, "accounts/_digest_schedules.html", {
-        "acct": acct,
-        "digest_schedules": schedules,
-        "flash_msg": flash_msg,
-    })
-
-
-def _local_time_to_utc(local_time: str, tz_offset_minutes: int) -> str:
-    """Convert a local HH:MM time to UTC using a timezone offset.
-
-    ``tz_offset_minutes`` follows JavaScript's ``getTimezoneOffset()``
-    convention: positive = behind UTC (e.g., EST = +300).
-    """
-    parts = local_time.split(":")
-    h, m = int(parts[0]), int(parts[1])
-    total_minutes = h * 60 + m + tz_offset_minutes  # Add offset to get UTC
-    total_minutes %= 1440  # Wrap around midnight
-    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
-
-
-# #72 — Cadence helpers. ``daily`` is the legacy default; ``weekly``
-# fires only on selected weekdays. Weekday encoding follows Python's
-# datetime convention (Monday=0 .. Sunday=6) so the scheduler can
-# call ``.weekday()`` directly without a lookup table.
-DIGEST_CADENCE_OPTIONS = ("daily", "weekly")
-DIGEST_DAYS_OF_WEEK = (
-    (0, "Mon"), (1, "Tue"), (2, "Wed"), (3, "Thu"),
-    (4, "Fri"), (5, "Sat"), (6, "Sun"),
-)
-
-
-def _parse_cadence_form(form) -> tuple[str, list[int]]:
-    """Read ``cadence`` + ``day_<n>`` checkboxes off a digest-form
-    submission. Returns ``("daily", [])`` for the legacy default,
-    or ``("weekly", [<int days>])`` when the operator picked weekly
-    + at least one weekday box. ``weekly`` with zero days falls back
-    to ``daily`` (the operator-friendly interpretation: "you didn't
-    pick any days, so we'll fire every day until you do")."""
-    raw = (form.get("cadence") or "daily").strip().lower()
-    cadence = raw if raw in DIGEST_CADENCE_OPTIONS else "daily"
-    days: list[int] = []
-    if cadence == "weekly":
-        for d, _label in DIGEST_DAYS_OF_WEEK:
-            if form.get(f"day_{d}") == "1":
-                days.append(d)
-        if not days:
-            # No weekdays checked → fall back to daily so the schedule
-            # still fires.
-            cadence = "daily"
-            days = []
-    return cadence, days
-
-
-def _digest_schedule_add_snapshot(
-    db, account_id: int, new_entry: dict,
-) -> list[dict]:
-    """#135 phase 2 — load + dedup-check + append + save in one threadpool
-    hop. Returns the resulting schedules list."""
-    schedules = _load_digest_schedules(db, account_id)
-    for s in schedules:
-        if (s["time_utc"] == new_entry["time_utc"]
-                and s["category"] == new_entry["category"]
-                and s.get("cadence", "daily") == new_entry["cadence"]
-                and (s.get("days_of_week") or []) == new_entry["days_of_week"]):
-            return schedules  # duplicate — no change
-    schedules.append(new_entry)
-    _save_digest_schedules(db, account_id, schedules)
-    return schedules
-
-
-def _digest_schedule_toggle_snapshot(
-    db, account_id: int, idx: int,
-) -> list[dict]:
-    """#135 phase 2 — load + toggle + save in one threadpool hop."""
-    schedules = _load_digest_schedules(db, account_id)
-    if 0 <= idx < len(schedules):
-        schedules[idx]["enabled"] = not schedules[idx]["enabled"]
-        _save_digest_schedules(db, account_id, schedules)
-    return schedules
-
-
-def _digest_schedule_reschedule_snapshot(
-    db, account_id: int, idx: int, new_utc: str,
-) -> tuple[str, list[dict]]:
-    """#135 phase 2 — load + collision-check + write in one threadpool
-    hop. Returns ('ok' | 'not_found' | 'collision', schedules)."""
-    schedules = _load_digest_schedules(db, account_id)
-    if not (0 <= idx < len(schedules)):
-        return "not_found", schedules
-    for i, s in enumerate(schedules):
-        if i == idx:
-            continue
-        if s["time_utc"] == new_utc and s["category"] == schedules[idx]["category"]:
-            return "collision", schedules
-    schedules[idx]["time_utc"] = new_utc
-    _save_digest_schedules(db, account_id, schedules)
-    return "ok", schedules
-
-
-def _digest_schedule_edit_form_snapshot(
-    db, account_id: int, idx: int, owner_id: int | None,
-) -> dict | None:
-    """#135 phase 2 — schedules + categories in one threadpool hop."""
-    schedules = _load_digest_schedules(db, account_id)
-    if not (0 <= idx < len(schedules)):
-        return None
-    cats = _get_categories_from_db(db, user_id=owner_id)
-    return {"sched": schedules[idx], "categories": cats}
-
-
-def _digest_schedule_edit_save_snapshot(
-    db, account_id: int, idx: int, new_entry_partial: dict,
-) -> tuple[str, list[dict]]:
-    """#135 phase 2 — load + range-check + write in one threadpool hop.
-    `new_entry_partial` is the operator-supplied portion (no ``enabled``)
-    so we can preserve the previous ``enabled`` value."""
-    schedules = _load_digest_schedules(db, account_id)
-    if not (0 <= idx < len(schedules)):
-        return "not_found", schedules
-    new_entry = {
-        **new_entry_partial,
-        "enabled": schedules[idx].get("enabled", True),
-    }
-    schedules[idx] = new_entry
-    _save_digest_schedules(db, account_id, schedules)
-    return "ok", schedules
-
-
-def _digest_schedule_delete_snapshot(
-    db, account_id: int, idx: int,
-) -> list[dict]:
-    """#135 phase 2 — load + remove + save in one threadpool hop."""
-    schedules = _load_digest_schedules(db, account_id)
-    if 0 <= idx < len(schedules):
-        schedules.pop(idx)
-        _save_digest_schedules(db, account_id, schedules)
-    return schedules
 
 
 def _get_hwm_context(db, account_id: int) -> dict:
@@ -5291,7 +5143,7 @@ def _gmail_api_watch_start_status(
 def _triage_page_snapshot(
     db, user: dict, owner_filter_q: str | None,
 ) -> dict:
-    """#135 phase 2 — accounts + recent bulk-triage jobs in one
+    """ phase 2 — accounts + recent bulk-triage jobs in one
     threadpool hop. The owner-filter logic is pure (no DB), so we keep
     it inside the hop to land a single coherent ctx dict."""
     from email_triage.web.db import (
@@ -5319,7 +5171,7 @@ def _triage_page_snapshot(
     ]
     accounts_by_id = {a["id"]: a for a in accounts}
 
-    # #129 — labels surface as a filter on the Triage form. Carry the
+    #  — labels surface as a filter on the Triage form. Carry the
     # full catalog (operator picks one slug). Empty list = no filter
     # control rendered, matching the bulk-tag toolbar's gate.
     all_labels = list_labels(db)
@@ -5424,7 +5276,7 @@ def _job_eta_secs(job: dict) -> int | None:
 def _discover_page_snapshot(
     db, user: dict, owner_filter_q: str | None,
 ) -> dict:
-    """#135 phase 2 — accounts list + visible-owners filter in one
+    """ phase 2 — accounts list + visible-owners filter in one
     threadpool hop."""
     from email_triage.web.db import list_email_accounts
     is_admin = user["role"] == "admin"
@@ -5511,7 +5363,7 @@ def _build_classifier_from_config(config):
 def _load_all_list_hints(db):
     """Load all classification lists and rules from the DB.
 
-    #134.1 — issues exactly TWO queries (lists, then a single
+    .1 — issues exactly TWO queries (lists, then a single
     ``list_rules`` SELECT bucketed by ``list_id`` in Python),
     replacing the prior 1 + N pattern (one rules-SELECT per list).
     Returns ``(lists, rules_by_list)`` so callers can pass the pair
@@ -5570,7 +5422,7 @@ _RUNTIME_DEFAULTS = {
     "dry_run": False,
     "log_level": "INFO",
     "hipaa": False,
-    # #101 — bulk whole-mailbox triage knobs. Deployment-specific
+    #  — bulk whole-mailbox triage knobs. Deployment-specific
     # because they depend on the local LLM backend's hardware
     # throughput + the provider rate limits the install operates
     # under. Conservative defaults: 1 concurrent message at a time,
@@ -5578,7 +5430,7 @@ _RUNTIME_DEFAULTS = {
     # after watching real-world LLM throughput.
     "bulk_triage_rate_msg_per_min": 30,
     "bulk_triage_concurrency": 1,
-    # #145.2 — operator-tunable burst depth for the per-job
+    # .2 — operator-tunable burst depth for the per-job
     # ``TokenBucket``. Default 1 keeps the legacy "single-step at the
     # configured cadence" behaviour so an upgrade preserves observed
     # throughput. Tuning higher lets the first N messages of a job
@@ -5596,7 +5448,7 @@ BULK_TRIAGE_RATE_MIN = 1
 BULK_TRIAGE_RATE_MAX = 600
 BULK_TRIAGE_CONCURRENCY_MIN = 1
 BULK_TRIAGE_CONCURRENCY_MAX = 8
-# #145.2 — burst floor of 1 keeps the legacy single-step behaviour;
+# .2 — burst floor of 1 keeps the legacy single-step behaviour;
 # a 100-token ceiling is well above any realistic warm-up need (the
 # bucket would empty in seconds at the configured rate either way).
 BULK_TRIAGE_BURST_MIN = 1
@@ -5619,8 +5471,40 @@ def _is_dry_run(db) -> bool:
     return _get_runtime_settings(db).get("dry_run", False)
 
 
-def _apply_runtime_settings(settings: dict) -> None:
-    """Push runtime overrides into the running process (logging, HIPAA)."""
+def _apply_runtime_settings(
+    settings: dict,
+    *,
+    allow_hipaa_change: bool = False,
+) -> None:
+    """Push runtime overrides into the running process (logging, HIPAA).
+
+    HIPAA-mode flip gate (Bundle E5  / Q4)
+    ────────────────────────────────────────
+    A HIPAA-mode flip is gated by ``allow_hipaa_change=True`` for
+    safety. This kwarg is keyword-only and should be passed ONLY by
+    ``admin_security_save`` (the canonical HIPAA off-ramp). Any other
+    caller that attempts to change HIPAA mode without the kwarg raises
+    ``RuntimeError`` — accidental or copy-paste-induced flips are
+    structurally impossible.
+
+    The Sub-check D regression test at
+    ``tests/test_web/test_runtime_settings_hipaa_gate.py`` enforces
+    "exactly one source location passes ``allow_hipaa_change=True``"
+    by greppping the source tree. If a new caller legitimately needs
+    to flip HIPAA mode, that test MUST be updated alongside the new
+    call site so the invariant stays explicit.
+
+    Boot-time exception: the FastAPI lifespan path (web/app.py:~2139)
+    deliberately bypasses this gate by writing directly to
+    ``triage_logging._hipaa_mode`` — the lifespan restore is the
+    canonical "DB-as-source-of-truth across restarts" replay; the
+    kwarg-gate is for POST-BOOT mutation attempts only.
+
+    HIPAA absent from ``settings``: the ``.get("hipaa", <current>)``
+    default preserves the current value rather than coercing to
+    ``False``. A partial-form submit that omits the key is therefore
+    a no-op on the flag, never a silent downgrade.
+    """
     import logging as stdlib_logging
     from email_triage import triage_logging
 
@@ -5629,8 +5513,18 @@ def _apply_runtime_settings(settings: dict) -> None:
     root = stdlib_logging.getLogger("email_triage")
     root.setLevel(getattr(stdlib_logging, level_name, stdlib_logging.INFO))
 
-    # Update HIPAA mode flag.
-    triage_logging._hipaa_mode = settings.get("hipaa", False)
+    # HIPAA mode flip gate (DESIGN-3 / Bundle E5 ).
+    new_hipaa = bool(settings.get("hipaa", triage_logging._hipaa_mode))
+    if new_hipaa != triage_logging._hipaa_mode:
+        if not allow_hipaa_change:
+            raise RuntimeError(
+                f"_apply_runtime_settings: caller attempted to change "
+                f"HIPAA mode from {triage_logging._hipaa_mode} to "
+                f"{new_hipaa} without allow_hipaa_change=True. HIPAA "
+                f"mode is a safety-critical predicate; explicit "
+                f"caller-intent token required. See Bundle E5 ."
+            )
+        triage_logging._hipaa_mode = new_hipaa
 
 
 # ---------------------------------------------------------------------------
@@ -5638,19 +5532,23 @@ def _apply_runtime_settings(settings: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _config_page_snapshot(db, config) -> dict:
-    """#135 phase 2 — runtime + BAA mirror + anti-AI install-wide guide
+    """ phase 2 — runtime + BAA mirror + anti-AI install-wide guide
     in one threadpool hop.
 
-    #161 — also includes the two style-learning admin knobs
+     — also includes the two style-learning admin knobs
     (auto-scan cadence, default mine size) + the inline-handoff
     ceiling so the section's copy stays in sync with the helper
     used by the inline mine path."""
     runtime = _get_runtime_settings(db)
     baa_status = None
     try:
-        cls = _build_classifier_from_config(config)
-        from email_triage.classify.baa_gate import classifier_baa_status
-        baa_status = classifier_baa_status(db, cls)
+        #  — derive BAA status straight from config; don't build a
+        # classifier just to read three endpoint attributes (and then
+        # leave its HTTP client un-closed).
+        from email_triage.classify.baa_gate import (
+            classifier_baa_status_from_config,
+        )
+        baa_status = classifier_baa_status_from_config(db, config)
     except Exception:
         pass
     try:
@@ -5682,14 +5580,16 @@ def _config_page_snapshot(db, config) -> dict:
 
 
 def _admin_security_snapshot(db, config) -> dict:
-    """#135 phase 2 — BAA mirror + CSRF reject counters + top-paths in one
+    """ phase 2 — BAA mirror + CSRF reject counters + top-paths in one
     threadpool hop. Touches access_log + (fallback) log_entries; both are
     DB reads."""
     baa_status = None
     try:
-        cls = _build_classifier_from_config(config)
-        from email_triage.classify.baa_gate import classifier_baa_status
-        baa_status = classifier_baa_status(db, cls)
+        #  — no-instantiation BAA status (see _config_page_snapshot).
+        from email_triage.classify.baa_gate import (
+            classifier_baa_status_from_config,
+        )
+        baa_status = classifier_baa_status_from_config(db, config)
     except Exception:
         pass
 
@@ -5811,7 +5711,7 @@ def _write_config_yaml(config) -> None:
         "use_tls": config.smtp.use_tls,
     }
 
-    # Health email (#27) + summary signature (#33).
+    # Health email + summary signature.
     # CR-2c — ``recipients`` is intentionally NOT written to the
     # ``health_email`` block here. The canonical destination is the
     # sibling ``admin_email`` block below. Legacy recipients are
@@ -5859,6 +5759,12 @@ def _write_config_yaml(config) -> None:
         "hipaa": config.logging.hipaa,
         "retention_days": config.logging.retention_days,
         "max_rows": config.logging.max_rows,
+        # H-04-flag (Cycle 7, 2026-05-24) — defense-in-depth
+        # Transmission Security boot-enforcement knobs. See
+        # `src/email_triage/web/transmission_security.py` for the
+        # enforcement helper invoked at lifespan startup.
+        "require_https_app_layer": config.logging.require_https_app_layer,
+        "perimeter_tls_attestation": config.logging.perimeter_tls_attestation,
     }
     if config.logging.file:
         data["logging"]["file"] = config.logging.file
@@ -5884,7 +5790,7 @@ def _write_config_yaml(config) -> None:
         "poll_poll_interval_min": config.ingestion.poll_poll_interval_min,
     }
 
-    # TLS + ACME (#67). Round-trip the cert_dir + acme block so the
+    # TLS + ACME. Round-trip the cert_dir + acme block so the
     # /admin/acme-status edit form can persist nameserver / TSIG /
     # domains without operator-side YAML editing.
     tls_block: dict[str, Any] = {}
@@ -5894,7 +5800,7 @@ def _write_config_yaml(config) -> None:
     # the loader's fallback flip the listener mode unexpectedly).
     tls_block["enabled"] = bool(config.tls.enabled)
     tls_block["csrf_enforce"] = bool(getattr(config.tls, "csrf_enforce", False))
-    # #82 item 4 — operator-defined CSRF exempt path prefixes.
+    #  item 4 — operator-defined CSRF exempt path prefixes.
     # Round-trip preserves the operator's list verbatim. Empty
     # list omitted (no harm in absence; default state).
     csrf_exempt = list(
@@ -5946,7 +5852,7 @@ def _write_config_yaml(config) -> None:
     if tls_block:
         data["tls"] = tls_block
 
-    # Auth / session TTL (#67 follow-up). Always written so the
+    # Auth / session TTL. Always written so the
     # round-trip is lossless even when the operator never touches
     # the dropdown (defaults survive). HIPAA cap is clamped at LOAD
     # time, not write time -- the writer just emits whatever the
@@ -5960,7 +5866,7 @@ def _write_config_yaml(config) -> None:
         "hipaa_session_ttl_secs": int(getattr(
             getattr(config, "auth", None), "hipaa_session_ttl_secs", 900,
         )),
-        # #92 login rate-limit tunables. Always emit so operator
+        #  login rate-limit tunables. Always emit so operator
         # /admin/security saves round-trip through YAML losslessly.
         "login_per_email_max": int(getattr(
             getattr(config, "auth", None), "login_per_email_max", 10,
@@ -5978,7 +5884,7 @@ def _write_config_yaml(config) -> None:
         )),
     }
 
-    # WebAuthn (#67). rp_id locked once registered — written here so
+    # WebAuthn. rp_id locked once registered — written here so
     # operator can configure via /admin/acme-status without editing
     # YAML by hand on the host.
     w = config.webauthn
@@ -6017,7 +5923,7 @@ def _write_config_yaml(config) -> None:
         push_block["bulk_max_batch_size"] = bs
     data["push"] = push_block
 
-    # #151 — Classification cache. Only emit when the operator has
+    #  — Classification cache. Only emit when the operator has
     # configured a URL; defaults are absent from YAML so a fresh
     # config file stays minimal.
     rc = getattr(config, "redis_cache", None)
@@ -6067,6 +5973,6 @@ def _write_config_yaml(config) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Daily health email — "Send now" (#27)
+# Daily health email — "Send now"
 # ---------------------------------------------------------------------------
 

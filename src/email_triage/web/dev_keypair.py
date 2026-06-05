@@ -1,7 +1,7 @@
 """Dev-keypair login: parse OpenSSH ed25519 public keys, fingerprint
 them, and verify ed25519 signatures against challenges.
 
-Admin-managed credential surface (#67). The admin pastes the public
+Admin-managed credential surface. The admin pastes the public
 key into ``/admin/dev-keys``; the matching private key never leaves
 the operator's machine. Login proceeds via challenge-response —
 server emits a 32-byte challenge, operator signs it with the

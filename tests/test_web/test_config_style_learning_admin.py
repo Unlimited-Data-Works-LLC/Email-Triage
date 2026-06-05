@@ -1,4 +1,4 @@
-"""#161 item 3 — /config Style learning admin section.
+""" item 3 — /config Style learning admin section.
 
 Covers:
 

@@ -1,4 +1,4 @@
-"""Tests for the #95 sub-A account-setup wizard.
+"""Tests for the  sub-A account-setup wizard.
 
 Five-step flow at /accounts/new?step=N. Each step's GET renders the
 matching template; each step's POST handler does its work and 303s
@@ -339,12 +339,12 @@ class TestWizardStep5:
 
 
 # ---------------------------------------------------------------------------
-# #120 — accounts disabled until wizard completes
+#  — accounts disabled until wizard completes
 # ---------------------------------------------------------------------------
 
 
 class TestWizardDisabledUntilDone:
-    """Item #120: new-account wizard creates rows with is_active=0
+    """Item : new-account wizard creates rows with is_active=0
     so background pollers/watchers don't fire on the half-configured
     stub. Step-5 finish flips to is_active=1.
     """
@@ -405,7 +405,7 @@ class TestWizardDisabledUntilDone:
     def test_manual_add_path_stays_active_by_default(self, db, regular_user):
         """Direct DB-helper smoke: manual-add (non-wizard) callers
         get is_active=True without explicitly passing the kwarg.
-        Item #120 only changes the wizard path; full-form callers
+        Item  only changes the wizard path; full-form callers
         keep working as before."""
         from email_triage.web.db import create_email_account
         aid = create_email_account(

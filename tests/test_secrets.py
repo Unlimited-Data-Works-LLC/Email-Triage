@@ -107,6 +107,19 @@ class TestDbSecrets:
         store = DbSecrets(db, master_key)
         assert store.get("NOTHING") is None
 
+    def test_get_undecryptable_raises_typed_error(self, db, master_key):
+        """A stored secret that won't decrypt (here: a master-key
+        mismatch) raises the typed SecretsDecryptError, not an opaque
+        cryptography InvalidToken escaping into callers."""
+        from email_triage.secrets import DbSecrets, SecretsDecryptError
+        # Encrypt with one key...
+        DbSecrets(db, master_key).set("SMTP_PASSWORD", "hunter2")
+        # ...read with a different key — the ciphertext is unreadable.
+        store = DbSecrets(db, DbSecrets.generate_master_key())
+        with pytest.raises(SecretsDecryptError) as exc:
+            store.get("SMTP_PASSWORD")
+        assert exc.value.key == "SMTP_PASSWORD"
+
     def test_set_overwrites(self, db, master_key):
         from email_triage.secrets import DbSecrets
         store = DbSecrets(db, master_key)
@@ -147,9 +160,11 @@ class TestDbSecrets:
 
         other_key = DbSecrets.generate_master_key()
         store2 = DbSecrets(db, other_key)
-        # Different Fernet key must not decrypt store1's ciphertext.
-        from cryptography.fernet import InvalidToken
-        with pytest.raises(InvalidToken):
+        # Different Fernet key must not decrypt store1's ciphertext —
+        # get() surfaces the typed SecretsDecryptError, not a
+        # raw cryptography InvalidToken.
+        from email_triage.secrets import SecretsDecryptError
+        with pytest.raises(SecretsDecryptError):
             store2.get("KEY")
 
     def test_require_raises_when_missing(self, db, master_key):
@@ -158,13 +173,17 @@ class TestDbSecrets:
         with pytest.raises(SecretNotFound):
             store.require("NOT_THERE")
 
-    def test_bootstrap_from_config(self, db, tmp_path: Path):
+    def test_bootstrap_from_config(self, db, tmp_path: Path, monkeypatch):
         """bootstrap_secrets_from_config wires env → DbSecrets end-to-end."""
         from email_triage.config import TriageConfig
         from email_triage.secrets import (
             DbSecrets, bootstrap_secrets_from_config,
         )
 
+        # H-07: opt into the dev/CI carve-out so the deprecation warning
+        # does not noise up the test log. Test exercises the env code
+        # path intentionally; the warning would fire otherwise.
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", "1")
         master_key = DbSecrets.generate_master_key()
         os.environ["TEST_MASTER_KEY"] = master_key
         try:
@@ -197,10 +216,11 @@ class TestDbSecrets:
         store2 = DbSecrets(db, new_key)
         assert store2.get("A") == "alpha"
 
-        # A fresh store using the OLD key no longer decrypts.
-        from cryptography.fernet import InvalidToken
+        # A fresh store using the OLD key no longer decrypts — get()
+        # surfaces the typed SecretsDecryptError.
+        from email_triage.secrets import SecretsDecryptError
         store_old = DbSecrets(db, master_key)
-        with pytest.raises(InvalidToken):
+        with pytest.raises(SecretsDecryptError):
             store_old.get("A")
 
     def test_rotate_master_key_empty_store(self, db, master_key):
@@ -228,7 +248,7 @@ class TestDbSecrets:
     def test_rotate_master_key_begin_immediate_before_select(
         self, db, master_key,
     ):
-        """#145.3 — verify the fix's ordering invariant directly:
+        """.3 — verify the fix's ordering invariant directly:
         BEGIN IMMEDIATE must run BEFORE the SELECT that reads the
         rows-to-rotate set. The previous order (SELECT first, BEGIN
         second) left a TOCTOU window in which a concurrent ``set()``
@@ -275,7 +295,7 @@ class TestDbSecrets:
         assert begin_idx < select_idx, (
             f"BEGIN must precede SELECT (begin={begin_idx}, "
             f"select={select_idx}); SELECT-before-BEGIN reintroduces "
-            f"the #145.3 TOCTOU window"
+            f"the .3 TOCTOU window"
         )
         # And the BEGIN must be IMMEDIATE (RESERVED lock) — a plain
         # BEGIN is DEFERRED, which gives no protection against
@@ -358,15 +378,206 @@ class TestDbSecrets:
 
         rot_conn.close()
 
-    def test_bootstrap_fails_when_master_key_missing(self, db):
+    def test_bootstrap_fails_when_master_key_missing(self, db, monkeypatch):
         """No master key in bootstrap store → SecretNotFound."""
         from email_triage.config import TriageConfig
         from email_triage.secrets import bootstrap_secrets_from_config
+        # H-07: opt into the dev/CI carve-out so the deprecation warning
+        # does not noise up the test log.
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", "1")
         cfg = TriageConfig()
         cfg.secrets.backend = "env"
         cfg.secrets.master_key_name = "DEFINITELY_NOT_SET_ANYWHERE_XYZ"
         with pytest.raises(SecretNotFound):
             bootstrap_secrets_from_config(db, cfg)
+
+
+class TestDbSecretsWriteLock:
+    """ — every DbSecrets method that touches the shared
+    ``sqlite3.Connection`` must hold the process-wide write lock while
+    it does so.
+
+    Why a dedicated test, not the  AST guard
+    --------------------------------------------
+    The  connection-safety guard cannot verify this. ``secrets.py``
+    contains no ``async def`` so it is outside the guard's scanned set;
+    and ``DbSecrets`` is invoked as ``secrets.<method>()`` — an
+    attribute method call on an instance, a shape the guard does not
+    resolve (not a connection-like name, not a sqlite method, not a
+    bare-name call). The guard going green is necessary but NOT
+    sufficient for the DbSecrets portion of  — this is the
+    sufficient proof: it instruments the connection and asserts the
+    write lock is held *at the moment of every execute/commit*.
+
+    ``DbSecrets`` is a process-wide singleton called from ~23 async
+    handlers; an unlocked touch races a request-surface ``db_call``
+    worker on the one shared connection → ``sqlite3.InterfaceError`` /
+    corruption in the encrypted credential store.
+    """
+
+    @pytest.fixture
+    def db(self):
+        from email_triage.web.db import init_db
+        return init_db(":memory:")
+
+    @pytest.fixture
+    def master_key(self):
+        from email_triage.secrets import DbSecrets
+        return DbSecrets.generate_master_key()
+
+    @staticmethod
+    def _lock_tracking_store(db, master_key):
+        """Return ``(store, lock_states)`` — a ``DbSecrets`` over a
+        connection PROXY whose ``execute``/``commit`` record whether
+        the process-wide write lock was held by the calling thread at
+        that instant.
+
+        A proxy (not attribute-patching) is required: ``execute`` on a
+        real ``sqlite3.Connection`` is a read-only C-level attribute.
+        The proxy forwards every other attribute untouched.
+
+        ``RLock._is_owned()`` is the reentrant-lock primitive for "does
+        the *current* thread hold this lock" — exactly the question
+        here, and reentrancy-safe (the real callers nest the lock under
+        ``db_call`` / ``@db_write``).
+        """
+        from email_triage.secrets import DbSecrets
+        from email_triage.web.db_writelock import get_write_lock
+
+        lock = get_write_lock()
+        lock_states: list[tuple[str, bool]] = []
+
+        class _SpyConn:
+            """Forwarding proxy that records lock-held state on each
+            connection touch."""
+
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+
+            def execute(self, *args, **kwargs):
+                lock_states.append(("execute", lock._is_owned()))
+                return self._real.execute(*args, **kwargs)
+
+            def commit(self, *args, **kwargs):
+                lock_states.append(("commit", lock._is_owned()))
+                return self._real.commit(*args, **kwargs)
+
+            def __getattr__(self, name):
+                # Everything else (rollback, cursor, row_factory, …)
+                # forwards straight through to the real connection.
+                return getattr(self._real, name)
+
+        return DbSecrets(_SpyConn(db), master_key), lock_states
+
+    def test_set_holds_write_lock(self, db, master_key):
+        store, states = self._lock_tracking_store(db, master_key)
+        store.set("IMAP_PASSWORD", "hunter2")
+        assert states, "set() did not touch the connection at all"
+        unlocked = [op for op, held in states if not held]
+        assert not unlocked, (
+            f"DbSecrets.set touched the shared connection WITHOUT the "
+            f"write lock held: {unlocked}"
+        )
+
+    def test_get_holds_write_lock(self, db, master_key):
+        # Seed first (set is already verified separately).
+        from email_triage.secrets import DbSecrets
+        DbSecrets(db, master_key).set("K", "v")
+        store, states = self._lock_tracking_store(db, master_key)
+        assert store.get("K") == "v"
+        assert states, "get() did not touch the connection at all"
+        unlocked = [op for op, held in states if not held]
+        assert not unlocked, (
+            f"DbSecrets.get read the shared connection WITHOUT the "
+            f"write lock held: {unlocked}"
+        )
+
+    def test_delete_holds_write_lock(self, db, master_key):
+        from email_triage.secrets import DbSecrets
+        DbSecrets(db, master_key).set("K", "v")
+        store, states = self._lock_tracking_store(db, master_key)
+        assert store.delete("K") is True
+        assert states, "delete() did not touch the connection at all"
+        unlocked = [op for op, held in states if not held]
+        assert not unlocked, (
+            f"DbSecrets.delete touched the shared connection WITHOUT "
+            f"the write lock held: {unlocked}"
+        )
+
+    def test_list_keys_holds_write_lock(self, db, master_key):
+        from email_triage.secrets import DbSecrets
+        DbSecrets(db, master_key).set("K", "v")
+        store, states = self._lock_tracking_store(db, master_key)
+        assert store.list_keys() == ["K"]
+        assert states, "list_keys() did not touch the connection at all"
+        unlocked = [op for op, held in states if not held]
+        assert not unlocked, (
+            f"DbSecrets.list_keys read the shared connection WITHOUT "
+            f"the write lock held: {unlocked}"
+        )
+
+    def test_rotate_master_key_holds_write_lock(self, db, master_key):
+        """The whole BEGIN IMMEDIATE … COMMIT transaction — including
+        the per-row SELECT/UPDATE loop — must run under the lock."""
+        from email_triage.secrets import DbSecrets
+        seed = DbSecrets(db, master_key)
+        for i in range(5):
+            seed.set(f"K_{i}", f"v_{i}")
+        store, states = self._lock_tracking_store(db, master_key)
+        store.rotate_master_key(DbSecrets.generate_master_key())
+        assert states, "rotate_master_key did not touch the connection"
+        unlocked = [op for op, held in states if not held]
+        assert not unlocked, (
+            f"DbSecrets.rotate_master_key touched the shared "
+            f"connection WITHOUT the write lock held: {unlocked}"
+        )
+
+    def test_lock_is_the_shared_process_wide_lock(self, db, master_key):
+        """Sanity: the lock DbSecrets takes is the SAME object
+        ``@db_write`` / ``db_call`` take — not a private one. Sharing
+        the one RLock is what actually serialises a DbSecrets touch
+        against a request-surface ``db_call`` worker.
+
+        Proven the hard way: while ``set`` is mid-DB-touch, a SEPARATE
+        thread tries to acquire ``get_write_lock()`` non-blocking — it
+        must FAIL, because the shared lock is held.
+        """
+        import threading
+        from email_triage.secrets import DbSecrets
+        from email_triage.web.db_writelock import get_write_lock
+
+        lock = get_write_lock()
+        held_during_set: list[bool] = []
+
+        class _ProbeConn:
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+
+            def execute(self, *args, **kwargs):
+                acquired_elsewhere: list[bool] = []
+
+                def _try():
+                    got = lock.acquire(blocking=False)
+                    acquired_elsewhere.append(got)
+                    if got:
+                        lock.release()
+
+                t = threading.Thread(target=_try)
+                t.start()
+                t.join()
+                held_during_set.append(not acquired_elsewhere[0])
+                return self._real.execute(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        DbSecrets(_ProbeConn(db), master_key).set("K", "v")
+        assert held_during_set and all(held_during_set), (
+            "the process-wide write lock was NOT held during the "
+            "DbSecrets.set DB touch — a concurrent thread could "
+            "acquire it, so it is not serialising shared-connection "
+            "access"
+        )
 
 
 class TestExternalProviderRegistry:
@@ -415,3 +626,280 @@ class TestExternalProviderRegistry:
 
         register_external_provider("_dummy_test_provider", Dummy)
         assert "_dummy_test_provider" in list_external_providers()
+
+
+class TestH07EnvBackendDeprecation:
+    """H-07 (Cycle 6, 2026-05-24) — env backend deprecation +
+    dev-CI-only carve-out via ``EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY``.
+
+    The selection-time deprecation warning fires from
+    :func:`_warn_env_backend_deprecation` called by
+    :func:`create_secrets_provider` and :func:`_resolve_auto_backend`.
+    Gated by HIPAA mode (G1' RuntimeError handles HIPAA case) and by
+    the carve-out env var (dev/CI opt-in).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_latch(self):
+        """Reset the once-per-process latch between tests.
+
+        The H-07 helper has a module-level ``_env_backend_selection_warned``
+        that latches True after the first warning. Without resetting,
+        a test that runs second would observe a no-op even if its
+        conditions would trigger a warning.
+        """
+        from email_triage.secrets import _reset_env_backend_warn_latch_for_tests
+        _reset_env_backend_warn_latch_for_tests()
+        yield
+        _reset_env_backend_warn_latch_for_tests()
+
+    def test_env_backend_emits_deprecation_warning_at_selection(
+        self, monkeypatch, caplog,
+    ):
+        """Selecting env backend (HIPAA off, carve-out off) emits
+        log.warning naming the deprecation + carve-out + sunset."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider, EnvSecrets
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.delenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            provider = create_secrets_provider("env")
+
+        assert isinstance(provider, EnvSecrets)
+        # The deprecation warning must be in the log capture.
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage()
+            or "DEPRECATED" in r.getMessage()
+        ]
+        assert deprecation_msgs, (
+            "expected env-backend deprecation warning to fire at "
+            "selection time; caplog records: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        # The warning should name the carve-out env var so the operator
+        # knows how to suppress (or, in v0.2.0, how to opt in).
+        msg_text = " ".join(r.getMessage() for r in deprecation_msgs)
+        assert "EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY" in msg_text
+
+    def test_warning_suppressed_when_carve_out_env_var_set(
+        self, monkeypatch, caplog,
+    ):
+        """Setting EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1 suppresses the
+        deprecation warning — the documented dev/CI opt-in."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider, EnvSecrets
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", "1")
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            provider = create_secrets_provider("env")
+
+        assert isinstance(provider, EnvSecrets)
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage()
+            or "DEPRECATED" in r.getMessage()
+        ]
+        assert not deprecation_msgs, (
+            "carve-out env var set; deprecation warning should be "
+            f"silent but got: {[r.getMessage() for r in deprecation_msgs]}"
+        )
+
+    def test_warning_suppressed_in_hipaa_mode(self, monkeypatch, caplog):
+        """In HIPAA mode the G1' RuntimeError handles env-backend
+        rejection (in enforce_master_key_at_rest_for_hipaa); the H-07
+        selection-time warning must be silent so as not to pile up on
+        top of an already-fatal boot."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider, EnvSecrets
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        monkeypatch.delenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            # NB: create_secrets_provider itself does NOT enforce HIPAA-
+            # mode rejection — that lives in enforce_master_key_at_rest_
+            # for_hipaa(). At the create_ site, we only suppress the
+            # additional H-07 deprecation warning to avoid double-warning.
+            provider = create_secrets_provider("env")
+
+        assert isinstance(provider, EnvSecrets)
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage()
+            or "DEPRECATED" in r.getMessage()
+        ]
+        assert not deprecation_msgs, (
+            "HIPAA mode on; H-07 deprecation warning should defer to "
+            "G1' RuntimeError handling but got: "
+            f"{[r.getMessage() for r in deprecation_msgs]}"
+        )
+
+    def test_carve_out_has_no_bypass_under_hipaa_mode(
+        self, monkeypatch, caplog
+    ):
+        """R-5 per db-sme-3 verdict 2026-05-24: HIPAA-on + carve-out-on
+        MUST still defer to G1' enforcement. The carve-out env var is a
+        non-HIPAA-mode opt-in; under HIPAA mode it has NO bypass effect.
+
+        Structural property: in _warn_env_backend_deprecation, the
+        HIPAA-mode gate is checked BEFORE the carve-out gate (per
+        secrets.py:776-788). This test pins the property against a
+        future refactor that might reorder them — reordering would
+        produce a silent-degradation surface where an operator who set
+        the carve-out var in dev/CI accidentally suppresses the warning
+        in a production deploy where HIPAA mode was also enabled.
+
+        The G1' RuntimeError still fires in
+        enforce_master_key_at_rest_for_hipaa; this test verifies that
+        the H-07 selection-time warning ALSO stays silent in HIPAA
+        mode regardless of the carve-out var, matching the no-double-
+        warning rationale of test_env_select_in_hipaa_mode_does_not_
+        emit_warning.
+        """
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider, EnvSecrets
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", "1")
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            provider = create_secrets_provider("env")
+
+        assert isinstance(provider, EnvSecrets)
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage()
+            or "DEPRECATED" in r.getMessage()
+        ]
+        assert not deprecation_msgs, (
+            "HIPAA mode on + carve-out env var set; H-07 deprecation "
+            "warning must STILL be silent (G1' RuntimeError handles "
+            "the rejection). Got: "
+            f"{[r.getMessage() for r in deprecation_msgs]}. If this "
+            "fails, the carve-out gate may have been reordered ahead "
+            "of the HIPAA-mode gate — verify _warn_env_backend_"
+            "deprecation at secrets.py."
+        )
+
+    def test_warning_once_per_process_latch(self, monkeypatch, caplog):
+        """The latch fires the warning at most once per process; a
+        second create_secrets_provider call in the same process is a
+        no-op for the H-07 warning."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.delenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            create_secrets_provider("env")
+            first_count = sum(
+                1 for r in caplog.records
+                if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+            )
+            create_secrets_provider("env")
+            create_secrets_provider("env")
+            second_count = sum(
+                1 for r in caplog.records
+                if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+            )
+
+        assert first_count == 1, (
+            f"expected exactly 1 deprecation warning after first call, "
+            f"got {first_count}"
+        )
+        assert second_count == 1, (
+            f"latch failed: deprecation warning fired again after "
+            f"second/third create_secrets_provider call, total: "
+            f"{second_count}"
+        )
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "True", "yes", "Yes", "YES"])
+    def test_carve_out_var_truthy_values(self, monkeypatch, caplog, value):
+        """Carve-out env var truthy values (case-insensitive) suppress."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", value)
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            create_secrets_provider("env")
+
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+        ]
+        assert not deprecation_msgs, (
+            f"truthy carve-out value {value!r} should suppress the "
+            f"warning; got: {[r.getMessage() for r in deprecation_msgs]}"
+        )
+
+    @pytest.mark.parametrize(
+        "value", ["", "0", "false", "FALSE", "no", "NO", "off", "garbage", "  "],
+    )
+    def test_carve_out_var_falsy_values_still_warn(
+        self, monkeypatch, caplog, value,
+    ):
+        """Carve-out env var with falsy/garbage value does NOT suppress —
+        the warning still fires. Only documented truthy values opt in."""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", value)
+
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            create_secrets_provider("env")
+
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+        ]
+        assert deprecation_msgs, (
+            f"falsy/garbage carve-out value {value!r} should NOT "
+            f"suppress; expected warning but got none"
+        )
+
+    def test_auto_resolution_to_env_also_emits_deprecation(
+        self, monkeypatch, caplog, tmp_path,
+    ):
+        """The auto-fallback path through _resolve_auto_backend also
+        triggers the H-07 deprecation warning. (The auto-fell-back
+        warning AND the H-07 deprecation warning fire — they are
+        distinct messages.)"""
+        import logging
+        import email_triage.triage_logging as _tl
+        from email_triage.secrets import create_secrets_provider, EnvSecrets
+
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.delenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", raising=False)
+
+        # tmp_path has no ET_MASTER_KEY file — auto must fall back to env.
+        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
+            provider = create_secrets_provider(
+                "auto", container_path=str(tmp_path), master_key_name="ET_MASTER_KEY",
+            )
+
+        assert isinstance(provider, EnvSecrets)
+        deprecation_msgs = [
+            r for r in caplog.records
+            if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+        ]
+        assert deprecation_msgs, (
+            "auto-fell-back-to-env path must also emit H-07 "
+            "deprecation warning; caplog: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )

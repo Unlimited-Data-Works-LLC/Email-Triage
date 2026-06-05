@@ -15,6 +15,12 @@ import logging
 import sqlite3
 
 import pytest
+# Full-tree `-n auto` hardening: these file-DB / audit-global suites flake when
+# co-resident on a worker (SQLite file-lock contention + load-amplified async-audit
+# timing). Each passes in isolation. Pin them to one xdist worker so they run
+# serially, not concurrently — the project-sanctioned facet-2 fix (testinfra drawer).
+pytestmark = pytest.mark.xdist_group("file_db_audit_serial")
+
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
@@ -248,7 +254,7 @@ def test_audit_failure_increments_counter(monkeypatch, db):
     counter on app.state. Response is still returned (we don't poison
     the user's request) but the failure is auditable.
 
-    #135.2: post-E-refactor the audit write is fire-and-forget on a
+    .2: post-E-refactor the audit write is fire-and-forget on a
     task tracked by ``app.state._audit_pending``. Patch the
     module-cached reference (access_audit imported the helper at
     module load) and drain the pending set before asserting."""
@@ -284,7 +290,7 @@ def test_audit_failure_strict_mode_reraises(monkeypatch, db):
     """In strict-audit mode, audit failure re-raises so the bug is
     visible.
 
-    #135.2 post-E: dispatch awaits ``_audit_write`` synchronously when
+    .2 post-E: dispatch awaits ``_audit_write`` synchronously when
     EMAIL_TRIAGE_AUDIT_STRICT is set so the exception surfaces on the
     request response (production path is fire-and-forget). Test
     patches the module-cached reference (E imported the helper at

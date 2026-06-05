@@ -1,4 +1,4 @@
-"""Admin-driven backup export + restore (punch-list #65).
+"""Admin-driven backup export + restore (the backlog ).
 
 Operator-driven on-demand bundle: admin clicks a button, types a
 passphrase, downloads an encrypted tarball. CLI inverse path
@@ -216,17 +216,43 @@ def _snapshot_sqlite(src_conn: sqlite3.Connection) -> bytes:
     try:
         # The destination connection owns the temp file. Backup is page-
         # by-page; default ``pages=-1`` copies the whole DB in one call.
-        dst = sqlite3.connect(tmp_path)
+        #
+        # N-18 (encryption-at-rest): on an encrypted install ``src_conn`` is a
+        # ``sqlcipher3`` connection. A plaintext ``sqlite3.connect`` destination
+        # here would (a) write a DECRYPTED copy of the whole PHI DB to /tmp
+        # (§164.312(a)(2)(iv) at-rest leak) and (b) fail the unsupported
+        # cross-binding ``sqlcipher3 -> sqlite3`` backup. ``open_dedicated_conn``
+        # self-selects from the boot-stamped context: encrypted installs get a
+        # SQLCipher destination keyed with the SAME storage key as the live DB
+        # (PRAGMA key first), so the snapshot temp file — and the bytes bundled —
+        # stay encrypted at rest. Restore is byte-verbatim
+        # (``write_unbundled_to_dir``), so an encrypted install reopens the
+        # encrypted snapshot with its master key: the backup<->restore symmetry
+        # holds. Plaintext installs keep the exact stdlib path.
+        from email_triage.db._engine import (
+            dedicated_conn_is_encrypted,
+            open_dedicated_conn,
+        )
+
+        if dedicated_conn_is_encrypted():
+            dst = open_dedicated_conn(tmp_path)
+        else:
+            dst = sqlite3.connect(tmp_path)
         try:
             src_conn.backup(dst)
         finally:
             dst.close()
         return Path(tmp_path).read_bytes()
     finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        # N-18: remove the temp DB *and* its WAL/SHM sidecars. The opener runs
+        # in WAL mode, so a ``-wal``/``-shm`` pair is created next to the temp
+        # file; unlinking only the main file would leave plaintext PHI pages
+        # (plaintext install) or SQLCipher pages (encrypted install) behind.
+        for _ext in ("", "-wal", "-shm"):
+            try:
+                Path(tmp_path + _ext).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _prune_log_entries_in_snapshot(snapshot_bytes: bytes) -> bytes:
@@ -244,7 +270,20 @@ def _prune_log_entries_in_snapshot(snapshot_bytes: bytes) -> bytes:
     os.close(tmp_fd)
     try:
         Path(tmp_path).write_bytes(snapshot_bytes)
-        conn = sqlite3.connect(tmp_path)
+        # N-18: on an encrypted install ``snapshot_bytes`` are SQLCipher-
+        # encrypted (see _snapshot_sqlite). Open with the encrypted opener, or
+        # the prune both fails to read the file AND a plaintext re-open would
+        # re-leak the PHI. Plaintext installs keep the stdlib path. The pruned
+        # file stays encrypted, so the bundled bytes never land plaintext-at-rest.
+        from email_triage.db._engine import (
+            dedicated_conn_is_encrypted,
+            open_dedicated_conn,
+        )
+
+        if dedicated_conn_is_encrypted():
+            conn = open_dedicated_conn(tmp_path)
+        else:
+            conn = sqlite3.connect(tmp_path)
         try:
             conn.execute(
                 "DELETE FROM log_entries "
@@ -258,10 +297,12 @@ def _prune_log_entries_in_snapshot(snapshot_bytes: bytes) -> bytes:
             conn.close()
         return Path(tmp_path).read_bytes()
     finally:
-        try:
-            Path(tmp_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        # N-18: remove the temp DB *and* its WAL/SHM sidecars (see _snapshot_sqlite).
+        for _ext in ("", "-wal", "-shm"):
+            try:
+                Path(tmp_path + _ext).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,4 @@
-"""Unit tests for the watcher per-message retry enqueue shim
-(#175 R-B).
+"""Unit tests for the watcher per-message retry enqueue shim.
 
 These tests exercise the consumer-side helper
 (:func:`email_triage.web.watcher_retry.enqueue_watcher_retry`)
@@ -43,7 +42,7 @@ class _FakeBackend:
         self, conn, *, account_id, provider_type,
         mailbox=None, uid=None, uidvalidity=None,
         gmail_msg_id=None, o365_msg_id=None,
-        error_class, error_msg,
+        error_class, error_msg, failure_kind=None,
     ) -> int:
         new_id = self._next_id
         self._next_id += 1
@@ -58,6 +57,7 @@ class _FakeBackend:
             "o365_msg_id": o365_msg_id,
             "error_class": error_class,
             "error_msg": error_msg,
+            "failure_kind": failure_kind,
         })
         return new_id
 
@@ -151,7 +151,11 @@ class TestEnqueueByProvider:
             error=err,
         )
         call = fake_backend.enqueue_calls[0]
-        assert call["provider_type"] == "gmail_api"
+        #  — the account provider_type 'gmail_api' is normalised
+        # to the queue slug 'gmail' before it reaches enqueue_retry
+        # (which only accepts {imap, gmail, office365}). Without the
+        # map, this raised ValueError + created NO retry row.
+        assert call["provider_type"] == "gmail"
         assert call["gmail_msg_id"] == "msg_abc123"
         assert call["mailbox"] is None
         assert call["uid"] is None

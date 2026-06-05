@@ -48,7 +48,7 @@ class _CertCache:
         self._ttl = ttl_seconds
         self._fetched_at: float = 0.0
         self._keys: dict[str, Any] = {}
-        # Long-lived httpx client (#139). The cache is a per-process
+        # Long-lived httpx client. The cache is a per-process
         # singleton on ``app.state._gmail_cert_cache``; the JWKS
         # refresh fires on cold-start + every ``ttl_seconds`` (1 h
         # default) + on any unknown ``kid``. Holding the connection

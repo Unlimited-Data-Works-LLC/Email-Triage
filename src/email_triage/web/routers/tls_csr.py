@@ -1,4 +1,4 @@
-"""Make-CSR / sign / import-cert admin surface (#74).
+"""Make-CSR / sign / import-cert admin surface.
 
 Routes:
 
@@ -27,6 +27,7 @@ from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from email_triage import tls_csr
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 
 log = logging.getLogger("email_triage.web.routers.tls_csr")
@@ -49,9 +50,11 @@ def _get_templates(request: Request):
     return request.app.state.templates
 
 
-def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
+async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
+    """ / Option B — async wrapper delegating to the shared async
+    ``_render``; callers ``await`` it."""
     from email_triage.web.routers.ui import _render as _render_ui
-    return _render_ui(_get_templates(request), request, name, ctx or {})
+    return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
 def _require_admin(request: Request):
@@ -75,7 +78,7 @@ def _resolve_cert_dir(config) -> Path:
     return Path("./data/certs")
 
 
-def _audit(
+async def _audit(
     db: sqlite3.Connection,
     *,
     event_type: str,
@@ -83,10 +86,13 @@ def _audit(
     outcome: str,
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    # ASYNC-DB: audit-event write off the event loop. Every
+    # caller is an ``async def`` handler, so this stays awaitable.
     try:
         from email_triage.web.db import record_auth_event
         detail = json.dumps(metadata or {}, separators=(",", ":"))
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type=event_type,
             email=email,
@@ -120,7 +126,7 @@ async def admin_tls_csr_page(request: Request):
                      (subject, issuer, expiry days) + "Make new CSR"
                      to start a rotation.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -129,7 +135,7 @@ async def admin_tls_csr_page(request: Request):
     state = tls_csr.detect_state(cert_dir)
     active_md = tls_csr.active_cert_metadata(cert_dir) if state == tls_csr.STATE_ACTIVE else None
 
-    return _render(request, "admin/tls_csr.html", {
+    return await _render(request, "admin/tls_csr.html", {
         "user": user,
         "state": state,
         "cert_dir": str(cert_dir),
@@ -153,7 +159,7 @@ async def admin_tls_csr_make(
     """Generate keypair + CSR. Returns the CSR as a download
     (operator's CA wants the PEM). Pending key stays on disk under
     server.key.pending until import or cancel."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -170,7 +176,7 @@ async def admin_tls_csr_make(
             organization=organization.strip() or "email-triage",
         )
     except tls_csr.CsrAlreadyPendingError as e:
-        _audit(
+        await _audit(
             db,
             event_type="tls_csr_make",
             email=user.get("email", ""),
@@ -188,7 +194,7 @@ async def admin_tls_csr_make(
         )
     except Exception as e:
         log.error("CSR generation failed: %s", e, exc_info=e)
-        _audit(
+        await _audit(
             db,
             event_type="tls_csr_make",
             email=user.get("email", ""),
@@ -200,7 +206,7 @@ async def admin_tls_csr_make(
             status_code=303,
         )
 
-    _audit(
+    await _audit(
         db,
         event_type="tls_csr_make",
         email=user.get("email", ""),
@@ -235,7 +241,7 @@ async def admin_tls_csr_make(
 async def admin_tls_csr_download(request: Request):
     """Re-download the pending CSR. Useful if the operator lost the
     initial download or needs to send the same CSR to a second CA."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -269,7 +275,7 @@ async def admin_tls_csr_cancel(request: Request):
     already submitted to a CA, the CSR they have is now orphaned
     (the held private key is gone, so the eventual signed cert can't
     be paired with it). Show a confirmation step in the UI."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -277,7 +283,7 @@ async def admin_tls_csr_cancel(request: Request):
     config = _get_config(request)
     cert_dir = _resolve_cert_dir(config)
     tls_csr.cancel_pending(cert_dir)
-    _audit(
+    await _audit(
         db,
         event_type="tls_csr_cancel",
         email=user.get("email", ""),
@@ -308,7 +314,7 @@ async def admin_tls_csr_import(
     server.crt, server.csr is removed, hot-reload watcher picks it up
     within 30s.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -348,7 +354,7 @@ async def admin_tls_csr_import(
             status_code=303,
         )
     except tls_csr.KeyMismatchError as e:
-        _audit(
+        await _audit(
             db,
             event_type="tls_csr_import",
             email=user.get("email", ""),
@@ -361,7 +367,7 @@ async def admin_tls_csr_import(
         )
     except Exception as e:
         log.error("Cert import failed: %s", e, exc_info=e)
-        _audit(
+        await _audit(
             db,
             event_type="tls_csr_import",
             email=user.get("email", ""),
@@ -373,7 +379,7 @@ async def admin_tls_csr_import(
             status_code=303,
         )
 
-    _audit(
+    await _audit(
         db,
         event_type="tls_csr_import",
         email=user.get("email", ""),
@@ -411,7 +417,7 @@ async def admin_tls_csr_self_sign(
     in flight; later, generates a CSR + imports the real cert which
     overwrites the self-signed.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -436,7 +442,7 @@ async def admin_tls_csr_self_sign(
         )
     except Exception as e:
         log.error("Self-sign failed: %s", e, exc_info=e)
-        _audit(
+        await _audit(
             db,
             event_type="tls_csr_self_sign",
             email=user.get("email", ""),
@@ -448,7 +454,7 @@ async def admin_tls_csr_self_sign(
             status_code=303,
         )
 
-    _audit(
+    await _audit(
         db,
         event_type="tls_csr_self_sign",
         email=user.get("email", ""),

@@ -1,4 +1,4 @@
-"""Tests for the self-sent event triage action (#107)."""
+"""Tests for the self-sent event triage action."""
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock

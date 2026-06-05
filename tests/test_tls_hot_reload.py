@@ -1,12 +1,12 @@
 """Test the SSLContext hot-reload behavior used by the cert watcher.
 
-Closes PUNCH-LIST #79. The watcher thread itself is hard to test
+Closes the backlog . The watcher thread itself is hard to test
 without spinning up uvicorn -- but the SSLContext.load_cert_chain
 contract (replace the cert on the same context object; future
 handshakes use the new cert) IS testable in isolation. If this
 breaks, the watcher's reload call would be a no-op, and the
 operator hits the "renewed cert sits on disk doing nothing" bug
-that PUNCH-LIST #79 documents.
+that the backlog  documents.
 """
 
 from __future__ import annotations

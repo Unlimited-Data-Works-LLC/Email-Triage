@@ -1,4 +1,4 @@
-"""HIPAA BAA acknowledgment gate (#59).
+"""HIPAA BAA acknowledgment gate.
 
 A Business Associate Agreement is required by HIPAA §164.308(b)(1)
 between a covered entity and any subprocessor that handles PHI. When
@@ -110,6 +110,80 @@ def classifier_baa_status(
     is_local = bool(getattr(classifier, "is_local", False))
     backend = _backend_for_classifier(classifier)
     host = _vendor_host_for_classifier(classifier)
+    if is_local:
+        return {
+            "is_local": True,
+            "backend": backend,
+            "host": host,
+            "baa_required": False,
+            "baa_acked": True,  # local is never PHI egress
+            "ack_record": None,
+        }
+    rec = get_baa_ack(conn, backend, host)
+    acked = bool(rec and rec.get("acked"))
+    return {
+        "is_local": False,
+        "backend": backend,
+        "host": host,
+        "baa_required": True,
+        "baa_acked": acked,
+        "ack_record": rec,
+    }
+
+
+def _endpoint_info_from_config(config: Any) -> tuple[str, str, bool]:
+    """Derive ``(backend, host, is_local)`` straight from the config.
+
+    Mirrors what :func:`classifier_baa_status` reads off a built
+    classifier (``type(cls).__name__``, ``cls._base_url``,
+    ``cls.is_local``) — but without instantiating one. The admin
+    Config / Security snapshots only need this metadata, so building
+    (and then having to ``close()``) a real classifier just to read
+    three attributes is needless work and a leak risk.
+
+    The backend ids match :func:`_backend_for_classifier`'s output:
+    ``ollama`` / ``openaicompat`` / ``gemini``.
+    """
+    from email_triage.classify.base import _is_local_host
+
+    backend = config.classifier.backend
+    local_suffixes = tuple(
+        getattr(config.tls, "local_url_suffixes", []) or []
+    )
+    if backend == "ollama":
+        base = (config.classifier.ollama_url or "").rstrip("/")
+        cls_id = "ollama"
+    elif backend == "openai":
+        base = (config.classifier.openai_base_url or "").rstrip("/")
+        cls_id = "openaicompat"
+    elif backend == "gemini":
+        # GeminiClassifier hard-codes GEMINI_BASE; it is always external.
+        from email_triage.classify.gemini import GEMINI_BASE
+        base = GEMINI_BASE.rstrip("/")
+        cls_id = "gemini"
+    else:
+        raise ValueError(f"Unknown classifier backend: {backend}")
+
+    is_local = (
+        False if backend == "gemini"
+        else _is_local_host(base, extra_suffixes=local_suffixes)
+    )
+    host = (urlparse(base).hostname or "").lower() if base else ""
+    return cls_id, host, is_local
+
+
+def classifier_baa_status_from_config(
+    conn: sqlite3.Connection,
+    config: Any,
+) -> dict[str, Any]:
+    """:func:`classifier_baa_status` without instantiating a classifier.
+
+    Same return shape; reads endpoint metadata from ``config`` via
+    :func:`_endpoint_info_from_config` so callers that only need the
+    BAA status (the admin Config + Security snapshots) don't build —
+    and then leak — a real classifier instance.
+    """
+    backend, host, is_local = _endpoint_info_from_config(config)
     if is_local:
         return {
             "is_local": True,

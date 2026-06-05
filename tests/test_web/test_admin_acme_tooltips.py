@@ -1,4 +1,4 @@
-"""Tests for /admin/acme-status per-field tooltip coverage (#80).
+"""Tests for /admin/acme-status per-field tooltip coverage.
 
 The form has many small fields that map to ACME / DNS-01 protocol
 concepts. Operators shouldn't have to read source to understand each

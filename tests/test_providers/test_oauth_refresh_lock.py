@@ -1,4 +1,4 @@
-"""Tests for the OAuth refresh-lock guard (#142).
+"""Tests for the OAuth refresh-lock guard.
 
 When N concurrent API calls all observe an expired access token, only
 ONE should fire the token-exchange request to Google. The remaining

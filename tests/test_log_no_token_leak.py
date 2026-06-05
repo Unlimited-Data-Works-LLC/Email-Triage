@@ -1,4 +1,4 @@
-"""SQLiteLogHandler token-leak guard for OAuth refresh paths (#111).
+"""SQLiteLogHandler token-leak guard for OAuth refresh paths.
 
 Sibling to ``tests/test_security_token_logging.py`` — that module
 covers the static-grep guard + standard-mode caplog inspection.

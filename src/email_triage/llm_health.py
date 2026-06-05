@@ -1,13 +1,13 @@
-"""LLM backend health cache (#149 Bundle B — circuit breaker).
+"""LLM backend health cache.
 
 A small, in-process registry that records "this LLM backend is
 unreachable" with a TTL. The classify path calls
 :func:`set_unhealthy` when an :class:`LLMBackendUnreachableError`
 fires, and watcher / triage entry points call :func:`is_healthy`
-before paying for a classifier round-trip — when False, they skip
-the batch and enqueue messages on the durable retry queue
-(``triage_retry_queue``) instead of burning connection-attempt
-latency repeatedly.
+before paying for a classifier round-trip — when False, the
+consolidated retry-queue drainer skips ``failure_kind='llm_unreachable'``
+rows on that tick (``watcher_retry_queue``) instead of burning
+connection-attempt latency repeatedly against a dead backend.
 
 Process-memory only. We deliberately do NOT persist this state to
 disk: a stuck-unhealthy state should never survive a restart. If
@@ -29,8 +29,10 @@ same way Ollama is treated).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Optional
 
@@ -209,10 +211,17 @@ def is_unreachable_error(exc: BaseException) -> bool:
         httpx = None  # type: ignore[assignment]
 
     if httpx is not None:
+        # ``RemoteProtocolError`` is referenced directly — it has been
+        # part of httpx's public API for years. A ``getattr(...,
+        # httpx.HTTPError)`` fallback would be actively dangerous:
+        # ``HTTPError`` is the base class of ``HTTPStatusError``, so an
+        # activated fallback would classify every 4xx/5xx as
+        # "unreachable" and wrongly trip the breaker on a backend that
+        # is up but misbehaving.
         if isinstance(exc, (
             httpx.ConnectError,
             httpx.ConnectTimeout,
-            getattr(httpx, "RemoteProtocolError", httpx.HTTPError),
+            httpx.RemoteProtocolError,
         )):
             return True
     msg = str(exc).lower()
@@ -240,6 +249,61 @@ def host_port_from_url(url: str, *, default_port: int = 80) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Circuit-breaker translation — shared by every HTTP classifier backend
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def translate_unreachable(
+    backend_name: str,
+    base_url: str,
+    *,
+    default_port: int,
+    ttl_seconds: float = 300.0,
+) -> Iterator[None]:
+    """Wrap a backend HTTP call so a connect-class failure trips the breaker.
+
+    Every HTTP classifier backend (Ollama, OpenAI-compatible, Gemini)
+    needs the identical "connect failure → ``set_unhealthy`` + raise
+    :class:`LLMBackendUnreachableError`" translation around its POST.
+    Before  that block was copy-pasted into ``OllamaClassifier``
+    twice (``_chat`` + ``complete``) and absent from the cloud
+    backends entirely — so a dead OpenAI / Gemini endpoint never
+    flipped the breaker. This is the single source of truth.
+
+    Usage::
+
+        with translate_unreachable("ollama", base_url, default_port=11434):
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+
+    On a connect-class error (``is_unreachable_error`` True) the
+    backend is marked unhealthy for ``ttl_seconds`` and a typed
+    :class:`LLMBackendUnreachableError` carrying host/port is raised.
+    Any other exception (429 / 500 / parse error) propagates
+    unchanged — those mean the backend is up but misbehaving and the
+    per-message error path handles them.
+
+    ``backend_name`` is the circuit-breaker key — it MUST match the
+    name the :func:`is_healthy` gate resolves for this backend (the
+    configured ``classifier.backend``: ``"ollama"`` / ``"openai"`` /
+    ``"gemini"``), otherwise a tripped breaker would never be seen by
+    the gate.
+    """
+    try:
+        yield
+    except Exception as exc:
+        if is_unreachable_error(exc):
+            host, port = host_port_from_url(base_url, default_port=default_port)
+            set_unhealthy(
+                backend_name, ttl_seconds=ttl_seconds, reason=str(exc)[:200],
+            )
+            raise LLMBackendUnreachableError(
+                backend_name, host, port, original=exc,
+            ) from exc
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Test helper
 # ---------------------------------------------------------------------------
 
@@ -256,5 +320,6 @@ __all__ = [
     "health_status",
     "is_unreachable_error",
     "host_port_from_url",
+    "translate_unreachable",
     "_reset_for_test",
 ]

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from email_triage._isotime import parse_iso
+
 
 # ---------------------------------------------------------------------------
 # Flow lifecycle
@@ -74,10 +76,27 @@ class RuleType(str, Enum):
 class Attachment:
     """A MIME part on an EmailMessage.
 
-    ``data`` and ``parsed`` are populated only for ``text/calendar`` parts
-    today — every other content type is surfaced as metadata only so we
-    don't blow memory on large binary blobs that nothing downstream uses.
-    ``parsed`` carries the dict shape returned by :func:`engine.ics.parse_ics`.
+    For every content type, only ``filename`` + ``content_type`` +
+    ``size_bytes`` survive the provider fetch. ``parsed`` is populated
+    only for ``text/calendar`` parts (the dict shape returned by
+    :func:`engine.ics.parse_ics`); it is the single downstream-consumer
+    surface (``actions/invite.py`` reads ``att.parsed``).
+
+    ``data`` (the raw bytes blob) is intentionally NOT retained by any
+    provider today — even on the ``text/calendar`` path, the bytes are
+    needed only transiently inside ``_extract_attachments`` to call
+    ``parse_ics(blob)`` and are dropped (``data=None``) at the
+    constructor call. Keeping the blob would extend in-memory PHI
+    residency on the Attachment for the rest of the flow lifetime
+    (§164.308(a)(1)(ii)(B) Risk Management, availability axis of the
+    CIA-triad) with NO consumer benefit: grep ``src/`` for ``att.data``
+    / ``attachment.data`` reads returns ZERO results.
+
+    A future feature that genuinely needs raw bytes (attachment
+    forwarding, attachment-level virus scanning, full-fidelity archive)
+    should re-enable ``data=blob`` deliberately, with a paired §164.316
+    register entry documenting the residency-window extension under
+    the same HIPAA-finding lineage.
     """
     filename: str
     content_type: str
@@ -357,14 +376,11 @@ class OutOfOfficeOverride:
         for key in ("start", "end"):
             v = raw.get(key)
             if isinstance(v, str) and v:
-                try:
-                    dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                dt = parse_iso(v)
+                if dt is not None:
                     if dt.tzinfo is None:
-                        from datetime import timezone as _tz
-                        dt = dt.replace(tzinfo=_tz.utc)
+                        dt = dt.replace(tzinfo=timezone.utc)
                     setattr(out, key, dt)
-                except ValueError:
-                    pass
         out.note = str(raw.get("note", ""))
         return out
 
@@ -498,14 +514,11 @@ class MailFilter:
         for key in ("after", "before"):
             v = raw.get(key)
             if isinstance(v, str) and v:
-                try:
-                    dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                dt = parse_iso(v)
+                if dt is not None:
                     if dt.tzinfo is None:
-                        from datetime import timezone as _tz
-                        dt = dt.replace(tzinfo=_tz.utc)
+                        dt = dt.replace(tzinfo=timezone.utc)
                     setattr(out, key, dt)
-                except ValueError:
-                    pass
             elif isinstance(v, datetime):
                 setattr(out, key, v)
         return out

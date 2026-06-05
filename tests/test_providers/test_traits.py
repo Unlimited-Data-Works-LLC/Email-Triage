@@ -1,4 +1,4 @@
-"""Tests for the ProviderTraits registry (#138.2)."""
+"""Tests for the ProviderTraits registry."""
 
 from __future__ import annotations
 

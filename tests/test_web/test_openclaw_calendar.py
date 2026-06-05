@@ -177,7 +177,7 @@ class TestEndpoints:
 
 
 # ---------------------------------------------------------------------------
-# Punch-list #109 — pre-rendered local-tz strings
+# the backlog  — pre-rendered local-tz strings
 #
 # These tests verify the calendar response carries the per-event
 # local-render fields the LLM-agent consumer relies on for an
@@ -185,7 +185,7 @@ class TestEndpoints:
 # ---------------------------------------------------------------------------
 
 
-def _make_account_with_tz(db, user_id, tz="America/Detroit"):
+def _make_account_with_tz(db, user_id, tz="America/New_York"):
     """Like _make_account but stamps a tz on config_json + always
     enables calendar. Saves repetition in the new tests below."""
     now = datetime.now(timezone.utc).isoformat()
@@ -254,7 +254,7 @@ class TestLocalRenderFields:
         assert ev["start_local_time"] == "8:20 AM"
         assert ev["end_local_time"] == "9:20 AM"
         assert ev["all_day_local_label"] is None
-        assert ev["tz"] == "America/Detroit"
+        assert ev["tz"] == "America/New_York"
         assert ev["tz_abbrev"] == "EDT"
 
     def test_get_emits_local_fields(
@@ -273,7 +273,7 @@ class TestLocalRenderFields:
         ev = resp.json()
         assert ev["start_local_weekday"] == "Friday"
         assert ev["start_local_time"] == "8:20 AM"
-        assert ev["tz"] == "America/Detroit"
+        assert ev["tz"] == "America/New_York"
         assert ev["tz_abbrev"] == "EDT"
 
     def test_all_day_event_label_and_null_times(
@@ -312,7 +312,7 @@ class TestLocalRenderFields:
     def test_dst_winter_uses_est_abbrev(
         self, client, db, admin_user, bearer,
     ):
-        """Standard time / EST: January in Detroit is UTC-5."""
+        """Standard time / EST: January in New York is UTC-5."""
         aid = _make_account_with_tz(db, admin_user["id"])
         ev = CalendarEvent(
             event_id="ev_winter", summary="Coffee",
@@ -365,8 +365,8 @@ class TestLocalRenderFields:
             )
         assert resp.status_code == 200
         ev = resp.json()["events"][0]
-        # Falls back to America/Detroit (the documented install default).
-        assert ev["tz"] == "America/Detroit"
+        # Falls back to America/New_York (the documented install default).
+        assert ev["tz"] == "America/New_York"
         assert ev["tz_abbrev"] == "EDT"
 
 
@@ -383,7 +383,7 @@ def _migration_seed_user(conn) -> int:
 
 class TestTzMigrationBackfill:
     def test_v6_backfills_default_tz(self):
-        """Migration v6 stamps America/Detroit on rows with no tz."""
+        """Migration v6 stamps America/New_York on rows with no tz."""
         from email_triage.web.db import init_db
         conn = init_db(":memory:")
         uid = _migration_seed_user(conn)
@@ -408,7 +408,7 @@ class TestTzMigrationBackfill:
             "SELECT config_json FROM email_accounts"
         ).fetchone()
         cfg = json.loads(row["config_json"])
-        assert cfg["tz"] == "America/Detroit"
+        assert cfg["tz"] == "America/New_York"
         assert cfg["host"] == "imap.example.com"
 
     def test_v6_idempotent(self):
@@ -438,7 +438,7 @@ class TestTzMigrationBackfill:
 class TestTzFormPersistence:
     def test_save_round_trips_tz(self, client, db, admin_user, admin_cookies):
         """POST to /accounts/{id}/save with tz=Europe/London persists it."""
-        aid = _make_account_with_tz(db, admin_user["id"], tz="America/Detroit")
+        aid = _make_account_with_tz(db, admin_user["id"], tz="America/New_York")
         resp = client.post(
             f"/accounts/{aid}/save",
             data={
@@ -464,7 +464,7 @@ class TestTzFormPersistence:
     ):
         """Bogus tz string falls back to the previously-saved value
         (or the install default for fresh rows). Never UTC by default."""
-        aid = _make_account_with_tz(db, admin_user["id"], tz="America/Detroit")
+        aid = _make_account_with_tz(db, admin_user["id"], tz="America/New_York")
         client.post(
             f"/accounts/{aid}/save",
             data={
@@ -481,4 +481,4 @@ class TestTzFormPersistence:
         )
         from email_triage.web.db import get_email_account
         acct = get_email_account(db, aid)
-        assert acct["config"]["tz"] == "America/Detroit"
+        assert acct["config"]["tz"] == "America/New_York"

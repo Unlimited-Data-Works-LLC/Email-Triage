@@ -130,7 +130,7 @@ class BackendAdapter(ABC):
         Returns
         -------
         The raw assistant text. Adapters strip <think>...</think>
-        blocks ([local-llm-model]) and markdown code fences before returning
+        blocks (Qwen3) and markdown code fences before returning
         when ``response_format='json'`` is in effect.
 
         Raises

@@ -4,7 +4,7 @@ Indexes the user's own sent messages so the draft-reply path can pull
 the most-similar past replies as few-shot examples for the AI prompt
 builder. This module ships ONLY the storage + helpers + privacy
 invariants -- the wiring into ``actions/draft_reply.py`` lives in
-M-5 (the next punch-list item) and is intentionally not done here.
+M-5 (the next the backlog item) and is intentionally not done here.
 
 Design choices captured here so M-5 doesn't have to re-derive them:
 
@@ -61,6 +61,7 @@ import numpy as np
 
 from email_triage.engine.models import EmailMessage
 from email_triage.triage_logging import get_logger, is_account_hipaa
+from email_triage.web.db_writelock import get_write_lock
 
 log = get_logger("actions.sent_mail_index")
 
@@ -245,12 +246,17 @@ class SentMailIndex:
     # -- account-state helpers ---------------------------------------------
 
     def _account_row(self) -> dict | None:
-        cur = self._db.execute(
-            "SELECT id, hipaa, created_under_system_hipaa "
-            "FROM email_accounts WHERE id = ?",
-            (self._account_id,),
-        )
-        row = cur.fetchone()
+        #  — hold the process-wide DB write lock for the shared-
+        # connection read. Callers reach this via db_call (which already
+        # holds the reentrant lock); the in-method acquire makes the
+        # method correct regardless of caller and clears the  ratchet.
+        with get_write_lock():
+            cur = self._db.execute(
+                "SELECT id, hipaa, created_under_system_hipaa "
+                "FROM email_accounts WHERE id = ?",
+                (self._account_id,),
+            )
+            row = cur.fetchone()
         if row is None:
             return None
         if hasattr(row, "keys"):
@@ -302,7 +308,12 @@ class SentMailIndex:
         on the row, not derived at retrieval time, so the boost is
         deterministic across model rebuilds.
         """
-        if self._hipaa_short_circuit("index_message"):
+        from email_triage.web.db_threadpool import db_call
+
+        #  — _hipaa_short_circuit does a shared-connection read
+        # (_account_row); index_message is awaited from the sent-mail-
+        # capture loop on the event-loop thread, so dispatch it off-loop.
+        if await db_call(self._hipaa_short_circuit, "index_message"):
             return
 
         rfc_id = message.headers.get("Message-ID") or message.headers.get(
@@ -310,12 +321,18 @@ class SentMailIndex:
         ) or ""
         # Skip rows we already have. Index look-up is on the unique
         # constraint -- O(log n) and avoids the embedding round-trip.
+        #  — index_message is awaited from the sent-mail-capture
+        # path on the event-loop thread; route the shared-connection
+        # read through db_call so it runs on the threadpool.
         if rfc_id:
-            existing = self._db.execute(
-                "SELECT 1 FROM sent_mail_index "
-                "WHERE account_id = ? AND rfc_message_id = ?",
-                (self._account_id, rfc_id),
-            ).fetchone()
+            def _existing_row_lookup():
+                return self._db.execute(
+                    "SELECT 1 FROM sent_mail_index "
+                    "WHERE account_id = ? AND rfc_message_id = ?",
+                    (self._account_id, rfc_id),
+                ).fetchone()
+
+            existing = await db_call(_existing_row_lookup)
             if existing is not None:
                 return
 
@@ -350,7 +367,7 @@ class SentMailIndex:
             excerpt = "[REDACTED]"
 
         # Precompute the L2 norm at write time so retrieval never has
-        # to recompute it (#136 -- on a 10k-row corpus that recompute
+        # to recompute it ( -- on a 10k-row corpus that recompute
         # was seconds of pure-Python multiplications + sqrts on the
         # event loop). We use math.sqrt over the original list rather
         # than numpy here because index_message is on the SLOW write
@@ -360,7 +377,10 @@ class SentMailIndex:
         norm = math.sqrt(sum(x * x for x in vec)) if vec else 0.0
 
         now = _now_iso()
-        try:
+
+        #  — the INSERT + commit run as one unit off the event-loop
+        # thread; db_call holds the process-wide DB lock for the hop.
+        def _insert_index_row():
             self._db.execute(
                 "INSERT OR IGNORE INTO sent_mail_index ("
                 "account_id, message_id, rfc_message_id, sent_at, "
@@ -384,6 +404,9 @@ class SentMailIndex:
                 ),
             )
             self._db.commit()
+
+        try:
+            await db_call(_insert_index_row)
         except sqlite3.Error as exc:
             log.warning(
                 "sent_mail_index: insert failed",
@@ -401,7 +424,10 @@ class SentMailIndex:
         Sent-folder snapshot returns 0 (idempotency invariant tested
         in test_sent_mail_index.py).
         """
-        if self._hipaa_short_circuit("index_recent"):
+        from email_triage.web.db_threadpool import db_call
+        #  — _hipaa_short_circuit does a shared-connection read;
+        # index_recent is an async def, so dispatch it off-loop.
+        if await db_call(self._hipaa_short_circuit, "index_recent"):
             return 0
         if self._provider is None:
             log.warning(
@@ -467,7 +493,10 @@ class SentMailIndex:
         # provider id changes is part of the design; we DO check
         # (account_id, rfc_message_id) inside index_message itself.
         new_count = 0
-        before = self._row_count()
+        #  — _row_count does a raw self._db.execute on the shared
+        # connection; dispatch it through db_call so the read runs off
+        # the event loop under the process-wide DB lock.
+        before = await db_call(self._row_count)
         for folder, mid in merged_pairs:
             try:
                 if folder:
@@ -485,15 +514,22 @@ class SentMailIndex:
                 )
                 continue
             await self.index_message(msg)
-        new_count = self._row_count() - before
+        #  — same as above: the closing count goes through db_call.
+        new_count = await db_call(self._row_count) - before
         return max(0, new_count)
 
     def _row_count(self) -> int:
-        cur = self._db.execute(
-            "SELECT COUNT(*) AS n FROM sent_mail_index WHERE account_id = ?",
-            (self._account_id,),
-        )
-        row = cur.fetchone()
+        #  — hold the process-wide DB write lock for the shared-
+        # connection read. db_call (the dispatching caller) already
+        # holds the reentrant lock; the in-method acquire makes the
+        # method correct regardless of caller and clears the  ratchet.
+        with get_write_lock():
+            cur = self._db.execute(
+                "SELECT COUNT(*) AS n FROM sent_mail_index "
+                "WHERE account_id = ?",
+                (self._account_id,),
+            )
+            row = cur.fetchone()
         if row is None:
             return 0
         return int(row["n"] if hasattr(row, "keys") else row[0])
@@ -511,7 +547,7 @@ class SentMailIndex:
         Centralised so the per-contact filter path and the global
         path stay in lockstep on dict shape + cosine math.
 
-        Cosine math is numpy-backed (#136). The candidate vector is
+        Cosine math is numpy-backed. The candidate vector is
         materialised via ``np.frombuffer`` (zero-copy view of the
         BLOB) and dotted against the precomputed ``qvec_np``; the
         candidate's L2 norm comes from the ``embedding_norm`` column
@@ -621,7 +657,10 @@ class SentMailIndex:
         when you want the filter applied, leave it ``None`` for the
         legacy global-pool behaviour.
         """
-        if self._hipaa_short_circuit("retrieve_similar"):
+        from email_triage.web.db_threadpool import db_call
+        #  — _hipaa_short_circuit does a shared-connection read;
+        # retrieve_similar is an async def, so dispatch it off-loop.
+        if await db_call(self._hipaa_short_circuit, "retrieve_similar"):
             return []
         if not query_text or not query_text.strip():
             return []
@@ -640,7 +679,7 @@ class SentMailIndex:
             return []
 
         # Materialise the query vector once + compute its L2 norm
-        # once, outside the per-row loop. This is the half of #136's
+        # once, outside the per-row loop. This is the half of 's
         # win that lives on the read path: the candidate norm comes
         # from the row (precomputed at write time) and the query
         # norm is amortised across every candidate in this call.
@@ -675,16 +714,21 @@ class SentMailIndex:
             # the contact is already lower-cased above. Cheap match
             # because the column is indexed on (account_id) and the
             # filter narrows further by the LIKE predicate.
-            rows = self._db.execute(
-                "SELECT id, message_id, rfc_message_id, sent_at, "
-                "to_addresses, subject, body_excerpt, embedding_vec, "
-                "embedding_model, is_captured_pair, embedding_norm "
-                "FROM sent_mail_index "
-                "WHERE account_id = ? "
-                "AND embedding_model = ? "
-                "AND LOWER(to_addresses) LIKE '%' || ? || '%'",
-                (self._account_id, self._model, contact_norm),
-            ).fetchall()
+            #  — retrieve_similar is awaited from the draft-reply
+            # path on the event-loop thread; route the read off-loop.
+            def _per_contact_rows():
+                return self._db.execute(
+                    "SELECT id, message_id, rfc_message_id, sent_at, "
+                    "to_addresses, subject, body_excerpt, embedding_vec, "
+                    "embedding_model, is_captured_pair, embedding_norm "
+                    "FROM sent_mail_index "
+                    "WHERE account_id = ? "
+                    "AND embedding_model = ? "
+                    "AND LOWER(to_addresses) LIKE '%' || ? || '%'",
+                    (self._account_id, self._model, contact_norm),
+                ).fetchall()
+
+            rows = await db_call(_per_contact_rows)
             for row in rows:
                 sim, entry, row_id = self._row_to_entry(
                     row, qvec_np, qvec_norm,
@@ -709,14 +753,18 @@ class SentMailIndex:
 
         global_entries: list[tuple[float, dict, int]] = []
         if need_global:
-            rows = self._db.execute(
-                "SELECT id, message_id, rfc_message_id, sent_at, "
-                "to_addresses, subject, body_excerpt, embedding_vec, "
-                "embedding_model, is_captured_pair, embedding_norm "
-                "FROM sent_mail_index "
-                "WHERE account_id = ? AND embedding_model = ?",
-                (self._account_id, self._model),
-            ).fetchall()
+            #  — route the global candidate read off the loop.
+            def _global_rows():
+                return self._db.execute(
+                    "SELECT id, message_id, rfc_message_id, sent_at, "
+                    "to_addresses, subject, body_excerpt, embedding_vec, "
+                    "embedding_model, is_captured_pair, embedding_norm "
+                    "FROM sent_mail_index "
+                    "WHERE account_id = ? AND embedding_model = ?",
+                    (self._account_id, self._model),
+                ).fetchall()
+
+            rows = await db_call(_global_rows)
             for row in rows:
                 sim, entry, row_id = self._row_to_entry(
                     row, qvec_np, qvec_norm,
@@ -752,11 +800,18 @@ class SentMailIndex:
         the HIPAA path NEEDS to delete in case rows snuck in pre-
         flip. Returns the number of rows deleted.
         """
-        cur = self._db.execute(
-            "DELETE FROM sent_mail_index WHERE account_id = ?",
-            (self._account_id,),
-        )
-        self._db.commit()
+        #  — this is a plain sync method called DIRECTLY (CLI,
+        # /profile delete path, tests) with no db_call dispatch, so it
+        # genuinely touched the shared connection off the write lock.
+        # The DELETE + commit must run as ONE atomic unit under the
+        # lock: a foreign commit between them would flush a half-built
+        # transaction. Hold get_write_lock() across both statements.
+        with get_write_lock():
+            cur = self._db.execute(
+                "DELETE FROM sent_mail_index WHERE account_id = ?",
+                (self._account_id,),
+            )
+            self._db.commit()
         try:
             return int(cur.rowcount or 0)
         except Exception:

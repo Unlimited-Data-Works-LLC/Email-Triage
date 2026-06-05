@@ -1,4 +1,4 @@
-"""Tests for the provider factory (#138.1).
+"""Tests for the provider factory.
 
 Verifies ``build_provider`` constructs the correct provider instance
 for each ``provider_type`` value, raises a clean ValueError on

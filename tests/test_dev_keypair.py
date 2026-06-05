@@ -1,4 +1,4 @@
-"""Tests for the dev-keypair module + DB helpers (#67)."""
+"""Tests for the dev-keypair module + DB helpers."""
 
 from __future__ import annotations
 

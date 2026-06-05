@@ -1,4 +1,4 @@
-"""Tests for the manual CSR / sign / import workflow (#74)."""
+"""Tests for the manual CSR / sign / import workflow."""
 
 from __future__ import annotations
 

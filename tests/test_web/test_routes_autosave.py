@@ -1,4 +1,4 @@
-"""Tests for routes-table auto-save behaviour (#116).
+"""Tests for routes-table auto-save behaviour.
 
 Covers:
   * Per-row POST hits /routes/save with category + actions and

@@ -1,4 +1,4 @@
-"""Tests for email watches storage + matcher (#100).
+"""Tests for email watches storage + matcher.
 
 Covers schema CRUD, every filter dimension, scope resolution,
 HIPAA exclusion from all-accounts scope, validation, payload
@@ -169,7 +169,7 @@ class TestMatcher:
 
     def test_subject_contains(self):
         w = _make_watch(filter=W.WatchFilter(subject_contains="invoice"))
-        assert W.matches(w, sender="x@y.test", subject="Invoice #123")
+        assert W.matches(w, sender="x@y.test", subject="Invoice ")
         assert not W.matches(w, sender="x@y.test", subject="hello")
 
     def test_keyword_matches_subject_or_body(self):

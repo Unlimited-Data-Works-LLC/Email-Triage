@@ -1,8 +1,8 @@
 """Job-state tracker for the ACME issuance worker.
 
-Originally (#75) this was a process-memory singleton: enough for
-the live re-attach UI but lost on every process restart. Punch-list
-#104 lifts the state to a persistent ``acme_jobs`` row so a kill
+Originally this was a process-memory singleton: enough for
+the live re-attach UI but lost on every process restart. the backlog
+ lifts the state to a persistent ``acme_jobs`` row so a kill
 mid-issuance doesn't drop the LE order context on the floor.
 
 The public surface (``start`` / ``transition`` / ``visibility`` /
@@ -16,7 +16,7 @@ runs at a time per install (``single_flight`` decorator on
 ``issue_now_async``), so a single "current job" record is the
 right shape. The DB just outlives the process.
 
-Additions for #103 / #104:
+Additions for  / :
   - ``cancel_requested`` flag exposed via ``is_cancel_requested()``;
     the worker checks at retry-loop boundaries and transitions to
     ``cancelled`` cleanly.
@@ -28,7 +28,7 @@ Additions for #103 / #104:
 
 Storage: a single ``acme_jobs`` row per issuance. The row carrying
 the live job is the most-recent ``created_at`` row; older rows are
-the recent-history surface (#104 calls for the last-10 list on
+the recent-history surface ( calls for the last-10 list on
 ``/admin/tls`` similar to Recent Bulk Runs).
 """
 
@@ -42,9 +42,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from email_triage._isotime import parse_iso
+from email_triage.db._helpers import apply_compatible_row_factory
+
 
 # Phase enum (string-typed to keep JSON serialization trivial).
-# 'cancelled' added in #103 -- separates operator-cancelled from
+# 'cancelled' added in  -- separates operator-cancelled from
 # automatic-failed for the UI status pill + future filtering on
 # the recent-jobs surface.
 PHASES: tuple[str, ...] = (
@@ -78,16 +81,89 @@ TERMINAL_PHASES: frozenset[str] = frozenset({
 # fallback simply skip the bind call.
 _db_lock = threading.Lock()
 _db: sqlite3.Connection | None = None
+# True when ``_db`` is a dedicated connection this module opened
+# itself (file-backed install) — so detach can close it. False when
+# ``_db`` is the shared app connection (in-memory / test path), which
+# this module must NOT close.
+_db_owned: bool = False
+
+
+def _resolve_main_db_path(conn: sqlite3.Connection) -> str | None:
+    """Return the file path backing ``conn``'s ``main`` database.
+
+    None for an in-memory database — a second ``connect(":memory:")``
+    opens an unrelated empty DB, so the dedicated-connection path
+    must fall back to the shared connection in that case.
+    """
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main":
+                return row[2] or None
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _open_dedicated_conn(db_path: str) -> sqlite3.Connection:
+    """Open a dedicated connection for ``acme_jobs`` writes, mirroring
+    the PRAGMAs ``init_db`` sets on the main connection.
+
+     — ``acme_job_state`` must not write the shared app
+    connection: a foreign ROLLBACK from a concurrent threadpool write
+    helper could discard a half-built ``acme_jobs`` write. Its own
+    connection isolates its commit scope.
+    """
+    # N-17: route through the encrypted-aware shared opener so the
+    # acme_jobs writer opens against an ENCRYPTED file on an encrypted
+    # install (raw sqlite3.connect would hard-crash at the first PRAGMA).
+    # The opener self-selects encrypted-vs-plaintext + applies the same
+    # WAL/busy/FK PRAGMAs this site set inline.
+    from email_triage.db._engine import open_dedicated_conn
+
+    conn = open_dedicated_conn(db_path, check_same_thread=False)
+    from email_triage.single_flight import set_cached_db_path
+
+    set_cached_db_path(conn, db_path)
+    # N-16: factory from the conn's own dbapi module (sqlite3.Row vs
+    # sqlcipher3.dbapi2.Row) — open_dedicated_conn may return either.
+    apply_compatible_row_factory(conn)
+    return conn
 
 
 def set_db_handle(conn: sqlite3.Connection | None) -> None:
     """Bind the SQLite connection used for ``acme_jobs`` persistence.
 
     Pass ``None`` to detach (used by tests that exercise the
-    RAM-only fallback path)."""
-    global _db
+    RAM-only fallback path).
+
+     — when ``conn`` is file-backed this module opens its OWN
+    dedicated connection on the same DB file (isolated commit scope,
+    so a foreign ROLLBACK on the shared connection can't discard an
+    ``acme_jobs`` write). For an in-memory database it keeps the
+    shared connection — a second ``:memory:`` connect would open an
+    unrelated empty DB.
+    """
+    global _db, _db_owned
     with _db_lock:
-        _db = conn
+        # Close a previously-opened dedicated connection before
+        # rebinding so a re-bind / detach doesn't leak a handle.
+        if _db_owned and _db is not None:
+            try:
+                _db.close()
+            except sqlite3.Error:
+                pass
+        if conn is None:
+            _db = None
+            _db_owned = False
+            return
+        db_path = _resolve_main_db_path(conn)
+        if db_path:
+            _db = _open_dedicated_conn(db_path)
+            _db_owned = True
+        else:
+            # In-memory database — cannot be reopened; share it.
+            _db = conn
+            _db_owned = False
 
 
 def _get_db() -> sqlite3.Connection | None:
@@ -210,7 +286,7 @@ class _JobState:
         with self._lock:
             # 'cancelled' kind routes to the cancelled terminal
             # phase so the UI can distinguish operator-aborted from
-            # automatic-failed (#103).
+            # automatic-failed.
             self.phase = "cancelled" if kind == "cancelled" else "failed"
             self.finished_at = time.time()
             self.last_error = str(error)
@@ -266,23 +342,15 @@ def _row_to_snapshot(row: sqlite3.Row | dict | None) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         visibility = {}
     started_at = d.get("started_at")
-    started_epoch = None
-    if started_at:
-        try:
-            started_epoch = datetime.fromisoformat(
-                started_at.replace("Z", "+00:00")
-            ).timestamp()
-        except (TypeError, ValueError):
-            started_epoch = None
-    finished_epoch = None
+    _started_dt = parse_iso(started_at)
+    started_epoch = (
+        _started_dt.timestamp() if _started_dt is not None else None
+    )
     ended_at = d.get("ended_at")
-    if ended_at:
-        try:
-            finished_epoch = datetime.fromisoformat(
-                ended_at.replace("Z", "+00:00")
-            ).timestamp()
-        except (TypeError, ValueError):
-            finished_epoch = None
+    _ended_dt = parse_iso(ended_at)
+    finished_epoch = (
+        _ended_dt.timestamp() if _ended_dt is not None else None
+    )
     elapsed = 0.0
     if started_epoch:
         ref = finished_epoch or time.time()
@@ -321,32 +389,38 @@ def _db_insert_row(state_snapshot: dict[str, Any], actor_user_id: int | None) ->
         datetime.fromtimestamp(state_snapshot["started_at"], tz=timezone.utc)
         .isoformat() if state_snapshot.get("started_at") else None
     )
+    # SW-1 (2026-05-31): serialize this acme dedicated-conn write with the main
+    # writer under the  process-wide write lock (INCIDENT-1 cross-conn
+    # WAL-contention class). No logging inside the locked region -> no handler.lock
+    # inversion;  is the outermost lock everywhere -> no deadlock.
+    from email_triage.web.db_writelock import get_write_lock
     try:
-        conn.execute(
-            """
-            INSERT INTO acme_jobs (
-                job_id, actor_user_id, domains_json, directory_url,
-                phase, attempt, max_attempts, visibility_json,
-                cancel_requested, started_at, last_progress_at,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                state_snapshot["job_id"],
-                actor_user_id,
-                json.dumps(state_snapshot["domains"]),
-                state_snapshot["directory_url"],
-                state_snapshot["phase"],
-                state_snapshot["attempt"],
-                state_snapshot["max_attempts"],
-                json.dumps(state_snapshot["visibility"]),
-                1 if state_snapshot["cancel_requested"] else 0,
-                started_iso,
-                now,
-                now,
-            ),
-        )
-        conn.commit()
+        with get_write_lock():
+            conn.execute(
+                """
+                INSERT INTO acme_jobs (
+                    job_id, actor_user_id, domains_json, directory_url,
+                    phase, attempt, max_attempts, visibility_json,
+                    cancel_requested, started_at, last_progress_at,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    state_snapshot["job_id"],
+                    actor_user_id,
+                    json.dumps(state_snapshot["domains"]),
+                    state_snapshot["directory_url"],
+                    state_snapshot["phase"],
+                    state_snapshot["attempt"],
+                    state_snapshot["max_attempts"],
+                    json.dumps(state_snapshot["visibility"]),
+                    1 if state_snapshot["cancel_requested"] else 0,
+                    started_iso,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
     except sqlite3.OperationalError:
         # Table missing (no migration ran) — fall back silently to
         # RAM-only state so older test setups keep working.
@@ -364,12 +438,15 @@ def _db_update_row(job_id: str | None, fields: dict[str, Any]) -> None:
         return
     cols = ", ".join(f"{k} = ?" for k in fields.keys())
     vals = list(fields.values()) + [job_id]
+    # SW-1: serialize with the main writer under  (see _db_insert_row).
+    from email_triage.web.db_writelock import get_write_lock
     try:
-        conn.execute(
-            f"UPDATE acme_jobs SET {cols} WHERE job_id = ?",
-            vals,
-        )
-        conn.commit()
+        with get_write_lock():
+            conn.execute(
+                f"UPDATE acme_jobs SET {cols} WHERE job_id = ?",
+                vals,
+            )
+            conn.commit()
     except sqlite3.OperationalError:
         pass
 
@@ -576,11 +653,27 @@ def adopt_persisted(job_id: str) -> bool:
     Used by the supervised worker on app startup -- it picks a
     resumable row, calls adopt, and proceeds with the existing
     transition() / finish_*() helpers as if it had originated the
-    job in this process."""
+    job in this process.
+
+    #239d -- refuses to rebind ``_STATE`` when a *different* job is
+    currently live (non-terminal phase) in this process. The resume
+    worker runs on every renewer tick, NOT under the ``single_flight``
+    lock that guards ``issue_now_async``; an operator clicking "Issue
+    Now" the instant the resume sweep fires would otherwise have its
+    live job's ``_STATE`` reset out from under it, corrupting both
+    rows. Adopting the same job id is still allowed (idempotent
+    re-adopt); an idle ``_STATE`` is always adoptable.
+    """
     row = get_persisted_row(job_id)
     if row is None:
         return False
     with _STATE._lock:
+        if (
+            _STATE.phase not in TERMINAL_PHASES
+            and _STATE.job_id is not None
+            and _STATE.job_id != job_id
+        ):
+            return False
         _STATE._reset_unlocked()
         _STATE.job_id = row["job_id"]
         _STATE.phase = row["phase"]
@@ -601,12 +694,12 @@ def adopt_persisted(job_id: str) -> bool:
 def resume_on_startup(*, max_age_secs: int = 7 * 24 * 3600) -> list[dict[str, Any]]:
     """Scan ``acme_jobs`` for non-terminal rows and resolve each.
 
-    Resume policy (#104):
+    Resume policy:
       1. ``order_url`` NULL              -> mark cancelled (the worker
          hadn't reached LE yet; safe-cheap to retry from the top via
          the next renewal tick rather than auto-resume here).
       2. ``order_url`` set, recent       -> leave as-is + log; the
-         resume worker (future #104 piece) polls LE.
+         resume worker (future  piece) polls LE.
       3. ``order_url`` set, stale (older
          than ``max_age_secs``)          -> mark cancelled; LE order
          likely aged out; operator decides whether to retry.
@@ -618,7 +711,7 @@ def resume_on_startup(*, max_age_secs: int = 7 * 24 * 3600) -> list[dict[str, An
     on case 2; that's a non-trivial async piece + needs the renewer
     instance + account key. For this bundle we mark the row with the
     resume verdict ("resume_pending" or "stale_cancelled") and let
-    the supervised worker (sibling piece on the punch-list) pick it
+    the supervised worker (sibling piece on the backlog) pick it
     up. Tests cover the verdict-stamp behaviour directly.
     """
     resolved: list[dict[str, Any]] = []

@@ -1,102 +1,157 @@
 # Install & Setup
 
-The v0.1.0+ container ships with a slim runtime image (~250 MB).
-The heavy embedding stack (PyTorch CPU + sentence-transformers +
-the `all-MiniLM-L6-v2` model, ~600 MB total) lazy-installs on
-first admin setup. Most customers download those bits on first
-run; air-gap installs ship them via a sideloaded tarball.
+This guide covers deploying the container, supplying its master key,
+turning on encryption-at-rest, and the environment variables that
+control startup — then the one-time embedding-stack setup.
 
-This page covers prerequisites, release verification, the pull
-+ boot, and the four flavours of the embedding-stack install
-flow.
+The container ships a slim runtime image (~250 MB). The heavy embedding
+stack (PyTorch CPU + sentence-transformers + the `all-MiniLM-L6-v2`
+model, ~600 MB) lazy-installs on first admin setup — see
+[Embedding stack setup](#first-time-embedding-setup-connected-install)
+below.
 
-## Prerequisites
+## Deploy the container
 
-- A Linux host with **Podman 5.0+** (or Docker 24+, with adjusted
-  commands). Rocky Linux 10, RHEL 10, Ubuntu 24.04+, and Debian 12+
-  are tested.
-- **~8 GB RAM** for the application + the local LLM. More if you
-  run multiple accounts or larger models.
-- Disk allocation depends on where the install lands — see the
-  **Disk allocation** table below. Most installs need ~10 GB
-  comfortable; HIPAA installs with multi-year retention plan
-  50+ GB on the persistent volume.
-- A local **Ollama** install for the LLM (or an OpenAI-compatible
-  endpoint on the same network). Cloud-LLM backends are optional
-  and BAA-gated for HIPAA accounts.
-- **cosign 2.0+** on the deploy host for image signature
-  verification before pull. Strongly recommended; required for
-  HIPAA installs.
+The image runs under Podman or Docker. It needs two volumes and a
+config path:
+
+| Mount / env | Purpose |
+|---|---|
+| `/app/data` (volume) | SQLite database, MSAL token cache, the lazy-installed embedding runtime |
+| `/app/config` (volume) | `email-triage.yaml` + optional TLS certs |
+| `EMAIL_TRIAGE_CONFIG` | Path to the config inside the container (default `/app/config/email-triage.yaml`) |
+
+Compose is the simplest path (`compose.yaml` ships in the repo):
+
+```bash
+# 1. Put your email-triage.yaml in ./config/
+# 2. Create the master-key secret (see "Master key & secrets" below)
+# 3. Start:
+podman-compose up -d
+podman-compose logs -f
+```
+
+Or a direct run:
+
+```bash
+podman run -d --name email-triage \
+    -p 8080:8080 \
+    -v ./data:/app/data \
+    -v ./config:/app/config \
+    --secret ET_MASTER_KEY \
+    ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+```
+
+The container's built-in healthcheck reports readiness on `/health`.
+
+## Master key & secrets
+
+Every user-managed secret (IMAP passwords, OAuth tokens, API keys) is
+stored Fernet-encrypted in the database. At boot the app needs exactly
+one thing to open that store: the **master key**. How it's supplied is
+the *bootstrap backend*, set by `secrets.backend` in `email-triage.yaml`:
+
+| Backend | Where the key comes from |
+|---|---|
+| `auto` *(default)* | Container secret `/run/secrets/ET_MASTER_KEY` if present, else `env` with a loud startup warning |
+| `container` | `/run/secrets/<master_key_name>` (Podman/Docker secret) |
+| `keyfile` | A file on disk (headless servers) |
+| `keyring` | OS credential store (desktop) |
+| `external:<name>` | A plugin provider (Vault, KeePass, …) — see [secrets_external_providers.md](secrets_external_providers.md) |
+| `env` | **Deprecated — dev/CI only.** Key sits in the process environment (visible via `/proc/<pid>/environ`). Rejected at boot in HIPAA mode. |
+
+Create the container secret — its name must match `secrets.master_key_name`
+(default `ET_MASTER_KEY`):
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" \
+    | podman secret create ET_MASTER_KEY -
+```
+
+> **Back up the master key.** Losing it makes every stored credential —
+> and, with encryption-at-rest on, the entire database — unrecoverable.
+> `email-triage backup export` produces a separate `*.etbkkey` bundle;
+> store it apart from the data bundle.
+
+The deprecated `env` backend is allowed for local dev / CI only; set
+`EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1` there to silence the deprecation
+warning. **HIPAA mode rejects the `env` backend at boot unconditionally**
+— the carve-out var does not bypass it. (Sunset: hard error in v0.2.0
+non-HIPAA, removed in v0.3.0.)
+
+## Encryption at rest (v0.1.2)
+
+v0.1.2 can encrypt the single SQLite database file with **SQLCipher
+(AES-256)**, keyed by an HKDF-SHA256 derivation of the master key — no
+new key to manage. **New installs are encrypted by default** — the `init`
+scaffold and the example configs set `encryption_enabled: true`. The setting
+only *defaults* off as a dataclass fallback, so an existing plaintext install
+keeps booting unchanged after an upgrade until you migrate it.
+
+**Requirements:** the `encryption` extra (`sqlcipher3-binary`,
+Linux/container only — already baked into the published image) and a
+reachable master key.
+
+**Control it** with either:
+- YAML — `persistence: { encryption_enabled: true }`, or
+- env — `EMAIL_TRIAGE_DB_ENCRYPTION=true` (overrides the YAML field).
+
+**New install:** the database is created encrypted at first boot
+(`init_db_encrypted`) — no migration step. Set `encryption_enabled: false`
+to opt out.
+
+**Existing plaintext install — one-time migration:**
+
+```bash
+# 1. Stop the service.
+# 2. Migrate in place (derives the SQLCipher key from ET_MASTER_KEY;
+#    leaves a *.plaintext.bak rollback alongside the DB):
+email-triage db encrypt --db /app/data/triage.db --yes
+# 3. Redeploy with encryption enabled (EMAIL_TRIAGE_DB_ENCRYPTION=true
+#    or persistence.encryption_enabled: true).
+```
+
+The migration is reversible with `email-triage db decrypt`. Once the
+cutover is confirmed healthy, **shred the plaintext rollback**
+(`shred -u /app/data/triage.db.plaintext.bak`) — it is unencrypted data
+at rest until you do.
+
+> **Fail-closed in HIPAA mode.** Once encryption resolves ON, a missing
+> `sqlcipher3` import or an unreachable master key raises a boot error —
+> the app never silently falls back to plaintext.
+
+On encrypted installs the backup bundle's SQLite snapshot is itself
+SQLCipher-encrypted before the Fernet wrap, so the export never stages
+plaintext data on disk.
+
+## Startup environment variables
+
+These override the matching `email-triage.yaml` fields at boot (env
+wins). Set them in the container `environment:` block.
+
+| Variable | Effect |
+|---|---|
+| `EMAIL_TRIAGE_CONFIG` | Path to `email-triage.yaml` inside the container |
+| `EMAIL_TRIAGE_DB_ENCRYPTION` | `true`/`1` enables SQLCipher encryption-at-rest (overrides `persistence.encryption_enabled`) |
+| `EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY` | `1` silences the `env`-backend deprecation warning (dev/CI only; no effect in HIPAA mode) |
+| `EMAIL_TRIAGE_CSRF_ENFORCE` | `true` flips CSRF from soft-launch (count-only) to hard enforcement |
+| `EMAIL_TRIAGE_AUDIT_STRICT` | `1` makes audit-write failures re-raise synchronously instead of fail-soft (debug aid) |
+| `EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE` | Integer bound for the single-writer queue (backpressure tuning) |
+
+HIPAA mode itself is a YAML setting (`logging.hipaa: true`), not an env
+var. In HIPAA mode the `env` secrets backend is rejected, MFA is
+enforced, and encryption is fail-closed.
 
 ## Disk allocation
 
-Total host disk is the wrong frame — what matters is how much
-space each mount point has independently. The most common install
-failure is the persistent-volume bind sitting on a small partition:
-pip dies mid-unpack during the embedding install with `Errno 28 No
-space left on device`. Allocate per the table below.
-
 | Location | Minimum | Why |
 |---|---|---|
-| Container image storage (podman/docker overlay layer) | ~3 GB | v0.1.0 image is ~250 MB but the engine keeps the active `:latest`, the rollback `:previous`, and any intermediate build layers. Plan for two generations + headroom. On RHEL-family systems this is typically `/var/lib/containers/storage`. |
+| Container image storage (podman/docker overlay layer) | ~3 GB | The image is ~250 MB but the engine keeps the active `:latest`, the rollback `:previous`, and any intermediate build layers. Plan for two generations + headroom. |
 | Persistent volume mounted at `/app/data` | **~5 GB minimum** | This is where the embedding stack installs (lazy on first admin setup): ~600 MB downloaded + ~1.5 GB unpacked = ~2.1 GB. Plus the embedding model cache (~90 MB; more if you switch models). Plus the SQLite DB which grows with mail volume, the sent-mail-index vectors (~3 KB per indexed sent message), and the audit hash chain (~1 KB per row, indefinite retention). For HIPAA installs with multi-year retention plan **50+ GB**. |
-| `/app/config` | ~10 MB | YAML + TLS certs only. Usually a small bind mount; doesn't need its own LV. |
-| Host `/tmp` available during install | ~1 GB | pip's wheel-unpack scratch space when the embedding install runs. Constrained-`/tmp` hosts can fail mid-install even with plenty of room on `/app/data`. |
+| `/app/config` | ~10 MB | YAML + TLS certs only |
+| Host `/tmp` available during install | ~1 GB | pip's wheel-unpack scratch space when the embedding install runs |
 
-If your container engine separates image-layer storage from the
-persistent-volume bind, each path needs the headroom listed above
-independently. Mounted-where matters more than total host capacity.
-
-## Verify the release before pull
-
-Email Triage container images are signed with cosign keyless OIDC
-and (when destined for HIPAA installs) carry an operator-issued
-in-toto attestation with a `hipaa_safe: true` predicate.
-
-For all installs:
-
-```bash
-sudo cosign verify ghcr.io/unlimited-data-works-llc/email-triage:0.1.0 \
-    --certificate-identity-regexp \
-        'https://github.com/Unlimited-Data-Works-LLC/.+/release\.yml@.+' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
-```
-
-> **Tag form:** the registry publishes both `:0.1.0` and `:v0.1.0`
-> pointing at the same digest, matching whichever form your tooling
-> defaults to. Examples in this doc use the bare semver (`0.1.0`)
-> matching standard docker-pull convention.
-
-For **HIPAA installs**, additionally verify the operator
-attestation:
-
-```bash
-sudo cosign verify-attestation ghcr.io/unlimited-data-works-llc/email-triage:0.1.0 \
-    --type custom \
-    --certificate-identity-regexp \
-        'https://github.com/Unlimited-Data-Works-LLC/.+/operator-attest\.yml@.+' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  | jq -r '.payload | @base64d | fromjson | .predicate | select(.hipaa_safe == true)'
-```
-
-The `jq` filter returns the attestation predicate body if and
-only if `hipaa_safe: true` is asserted. Empty output means the
-operator has NOT signed off on this build for HIPAA use; HIPAA
-installs MUST NOT apply it.
-
-## Pull + boot
-
-```bash
-sudo podman pull ghcr.io/unlimited-data-works-llc/email-triage:0.1.0
-sudo podman tag  ghcr.io/unlimited-data-works-llc/email-triage:0.1.0 \
-                 localhost/email-triage:latest
-```
-
-Boot the container with your usual systemd quadlet / compose /
-direct-run setup. The slim image boots cleanly without the
-embedding stack — basic mail-routing + classification work
-immediately. The style-learning features that need vector
-retrieval are disabled until the embedding install completes.
+If your container engine separates image-layer storage from the persistent-volume bind (the typical RHEL-family layout: `/var/lib/containers/storage` + a dedicated bind for `/app/data`), each path needs the headroom listed above independently. The most common install failure is the persistent-volume bind sitting on a small partition: pip dies mid-unpack with `Errno 28 No space left on device`. Mounted-where matters more than total host capacity.
 
 ## First-time embedding setup (connected install)
 
@@ -219,8 +274,8 @@ To switch to a different sentence-transformers model:
      stale until re-embedded against the new backend.
    * Click the per-account **Reindex embeddings** button (admin-
      only; visible on the AI Backends tab once the runtime is
-     ready) to enqueue a `triage_jobs` row with `kind='embedding_
-     reindex'`. The bulk runner drains it in batches of 100 and
+     ready) to enqueue a `triage_jobs` row with
+     `kind='embedding_reindex'`. The bulk runner drains it in batches of 100 and
      updates the rows in place.
    * Monitor progress on the Triage → Bulk runs page.
 
@@ -234,7 +289,7 @@ For switching to Ollama (remote embedder, e.g. `nomic-embed-text`):
 3. Reindex as above.
 
 > The privacy gate rejects non-LAN embedding URLs at startup. See
-> `docs/privacy-audit-runbook.md` for the local-only rationale.
+> `internal documentation` for the local-only rationale.
 
 ## Command reference
 

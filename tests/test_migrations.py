@@ -187,6 +187,61 @@ def test_checksum_mismatch_refuses_to_run(conn):
         run_migrations(conn)
 
 
+def test_cosmetic_edit_does_not_trip_checksum_guard(conn):
+    """A docstring / comment / whitespace edit to a shipped migration
+    must NOT change its checksum — only an executable-token
+    change should trip the edit-after-ship guard."""
+    mig_mod.MIGRATIONS.clear()
+
+    @mig_mod.register(1, "shipped")
+    def _v1(c):
+        c.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY)")
+
+    run_migrations(conn)
+
+    # Re-register version 1 with a body that differs ONLY in a comment,
+    # an added docstring, and whitespace — the executable tokens are
+    # identical. The runner must accept it.
+    mig_mod.MIGRATIONS.clear()
+
+    @mig_mod.register(1, "shipped")
+    def _v1_cosmetic(c):
+        """A freshly added docstring — purely cosmetic."""
+        # an extra explanatory comment
+        c.execute(
+            "CREATE TABLE foo (id INTEGER PRIMARY KEY)"
+        )
+
+    # No MigrationError — already applied, checksum still matches.
+    assert run_migrations(conn) == []
+
+
+def test_normalize_body_drops_comments_and_docstrings():
+    """``_normalize_body`` reduces a body to its executable tokens."""
+    src_plain = (
+        "def f(c):\n"
+        "    # a comment\n"
+        "    c.execute(\"X\")\n"
+    )
+    src_decorated = (
+        "def f(c):\n"
+        "    \"\"\"docstring\"\"\"\n"
+        "    c.execute(  \"X\"  )   # other comment\n"
+    )
+    src_changed = (
+        "def f(c):\n"
+        "    c.execute(\"Y\")\n"
+    )
+    assert (
+        mig_mod._normalize_body(src_plain)
+        == mig_mod._normalize_body(src_decorated)
+    )
+    assert (
+        mig_mod._normalize_body(src_plain)
+        != mig_mod._normalize_body(src_changed)
+    )
+
+
 def test_db_newer_than_code_refuses(conn):
     """If the bookkeeping table reports a higher version than this
     code knows about (rollback to older code), runner refuses."""

@@ -1,4 +1,4 @@
-"""Provider-native label enumeration for the rule editor (#163).
+"""Provider-native label enumeration for the rule editor.
 
 The install-internal ``labels`` catalog (v18 migration) is independent
 of the labels operators already maintain on their provider mailboxes:
@@ -188,7 +188,10 @@ async def list_provider_labels_for_account(
     # Look up the account row. Admin view (user_id=None) returns every
     # account, so we can isolate by id without knowing the requesting
     # user — the caller is responsible for the auth check.
-    rows = list_email_accounts(db, user_id=None)
+    #  — list_provider_labels_for_account is an async def; route
+    # the account-list read off the event-loop thread.
+    from email_triage.web.db_threadpool import db_call
+    rows = await db_call(list_email_accounts, db, user_id=None)
     acct = next((r for r in rows if int(r["id"]) == int(account_id)), None)
     if acct is None:
         log.warning(

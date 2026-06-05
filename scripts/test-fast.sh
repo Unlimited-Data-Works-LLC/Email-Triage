@@ -11,7 +11,7 @@
 #   ./scripts/test-fast.sh tests/foo.py    # explicit files
 #   ./scripts/test-fast.sh -k pattern      # pytest -k expression
 #
-# Tier rationale: per feedback_strict_action_gating, deploy to deploy-host is
+# Tier rationale: per feedback_strict_action_gating, deploy to the deploy host is
 # Tier 2 (recoverable). A targeted fast tier is the right gate — broad
 # sweep runs in background via test-broad.sh and failure produces a
 # patch-forward, not a roll-back.

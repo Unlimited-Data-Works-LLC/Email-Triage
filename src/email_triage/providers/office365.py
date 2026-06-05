@@ -28,6 +28,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from email_triage._isotime import parse_iso
 from email_triage.engine.models import EmailMessage
 from email_triage.providers.base import EmailProvider, PushCapable
 from email_triage.providers._oauth_http import oauth_request, refresh_lock_for
@@ -107,7 +108,13 @@ class Office365Provider(EmailProvider, PushCapable):
         (device-code flow).
     token_cache_path:
         Path to persist the MSAL token cache.  Defaults to
-        ``./data/msal_cache.json``.
+        ``./data/msal_cache.json``. Multiple O365 accounts MUST be
+        given distinct paths — a shared cache file lets one
+        account's silent-acquire pick up another account's tokens.
+    username:
+        The mailbox address this provider authenticates as. Used to
+        select the matching cached MSAL account when several are
+        present in the cache, instead of blindly taking ``accounts[0]``. Empty falls back to the legacy first-account behaviour.
     scopes:
         Graph API permission scopes.  Defaults to Mail.Read,
         Mail.ReadWrite, Mail.Send.
@@ -119,6 +126,7 @@ class Office365Provider(EmailProvider, PushCapable):
         tenant_id: str = "common",
         client_secret: str = "",
         token_cache_path: str = "./data/msal_cache.json",
+        username: str = "",
         scopes: list[str] | None = None,
     ):
         if not HAS_MSAL:
@@ -130,10 +138,18 @@ class Office365Provider(EmailProvider, PushCapable):
         self._tenant_id = tenant_id
         self._client_secret = client_secret
         self._token_cache_path = Path(token_cache_path)
+        self._username = (username or "").strip().lower()
         self._scopes = scopes or DEFAULT_SCOPES
         self._http: httpx.AsyncClient | None = None
         self._app: Any = None  # MSAL application
         self._cache: Any = None  # MSAL SerializableTokenCache
+        # In-memory access-token cache. MSAL's own cache is
+        # consulted by ``acquire_token_silent``, but every Graph call
+        # still pays a (blocking) silent-acquire round-trip through the
+        # MSAL library. Caching the bearer string until shortly before
+        # its expiry skips that work on the hot path entirely.
+        self._access_token: str | None = None
+        self._token_expires_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -182,22 +198,60 @@ class Office365Provider(EmailProvider, PushCapable):
             )
         return self._app
 
-    async def acquire_token(self) -> str:
-        """Get a valid access token, refreshing if necessary.
+    # Re-acquire a token this many seconds before its stated expiry so
+    # an in-flight request never races the boundary.
+    _TOKEN_EXPIRY_SKEW_SECS = 120
 
-        For cached accounts, uses the silent flow (refresh token).
-        If no cached account exists, initiates device-code flow.
-        Returns the access token string.
+    def _select_account(self, accounts: list) -> Any:
+        """Pick the cached MSAL account that matches ``self._username``.
+
+        With a per-account token-cache file there is normally exactly
+        one account, but a cache shared by an earlier build (or a
+        re-auth that left a stale entry) can hold several. Matching on
+        ``username`` instead of taking ``accounts[0]`` prevents
+        authenticating one mailbox with another mailbox's tokens.
         """
+        if not accounts:
+            return None
+        if self._username:
+            for acc in accounts:
+                if str(acc.get("username", "")).strip().lower() == self._username:
+                    return acc
+            logger.warning(
+                "no cached MSAL account matched username; "
+                "falling back to first cached account",
+                extra={"username": self._username,
+                       "cached_count": len(accounts)},
+            )
+        return accounts[0]
+
+    def _acquire_token_blocking(self) -> tuple[str, float]:
+        """Synchronous MSAL token acquisition. Runs off the event loop.
+
+        Returns ``(access_token, expires_at_monotonic)``. All MSAL
+        library calls and the token-cache file I/O are blocking, so
+        :meth:`acquire_token` dispatches this through ``to_thread``.
+        """
+        import time as _time
         app = self._get_app()
+
+        def _expiry_from(result: dict) -> float:
+            # MSAL returns ``expires_in`` (seconds). Be defensive — a
+            # missing value collapses to "expired now" so the next call
+            # re-acquires rather than trusting a stale token.
+            try:
+                return _time.monotonic() + float(result.get("expires_in", 0))
+            except (TypeError, ValueError):
+                return _time.monotonic()
 
         # Try silent acquisition first (cached refresh token).
         accounts = app.get_accounts()
-        if accounts:
-            result = app.acquire_token_silent(self._scopes, account=accounts[0])
+        account = self._select_account(accounts)
+        if account is not None:
+            result = app.acquire_token_silent(self._scopes, account=account)
             if result and "access_token" in result:
                 self._save_cache()
-                return result["access_token"]
+                return result["access_token"], _expiry_from(result)
 
         # For confidential client (daemon), use client credentials.
         if self._client_secret:
@@ -207,7 +261,7 @@ class Office365Provider(EmailProvider, PushCapable):
             )
             if result and "access_token" in result:
                 self._save_cache()
-                return result["access_token"]
+                return result["access_token"], _expiry_from(result)
             error = result.get("error_description", result.get("error", "Unknown"))
             raise RuntimeError(f"Failed to acquire token: {error}")
 
@@ -235,19 +289,59 @@ class Office365Provider(EmailProvider, PushCapable):
             raise RuntimeError(f"Device code auth failed: {error}")
 
         self._save_cache()
-        return result["access_token"]
+        return result["access_token"], _expiry_from(result)
+
+    async def acquire_token(self, *, force: bool = False) -> str:
+        """Get a valid access token, refreshing if necessary.
+
+        For cached accounts, uses the silent flow (refresh token).
+        If no cached account exists, initiates device-code flow.
+        Returns the access token string.
+
+        The MSAL library calls and token-cache file I/O are blocking;
+        they run in a worker thread via ``asyncio.to_thread`` so a
+        Graph call never stalls the event loop. A successfully
+        acquired token is cached in-process until shortly before its
+        expiry so back-to-back Graph calls skip the work entirely.
+
+        ``force=True`` bypasses the in-process cache — used as the
+        :func:`oauth_request` refresh callback so a server-side 401
+        (token revoked / rotated before its stated expiry) really does
+        re-acquire instead of handing back the stale cached string.
+        """
+        import time as _time
+
+        # Fast path: a still-fresh cached token.
+        if (
+            not force
+            and self._access_token is not None
+            and _time.monotonic()
+            < self._token_expires_at - self._TOKEN_EXPIRY_SKEW_SECS
+        ):
+            return self._access_token
+
+        token, expires_at = await asyncio.to_thread(
+            self._acquire_token_blocking
+        )
+        self._access_token = token
+        self._token_expires_at = expires_at
+        return token
+
+    async def _refresh_token(self) -> str:
+        """Force-refresh callback for :func:`oauth_request`'s 401 retry."""
+        return await self.acquire_token(force=True)
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create an authenticated HTTP client.
 
-        Wrapped in the per-instance ``asyncio.Lock`` (#142) so two
+        Wrapped in the per-instance ``asyncio.Lock`` so two
         concurrent coroutines hitting the cold path can't both run
         the device-code / silent-token-acquisition flow + each
         construct their own httpx client. The second would orphan
         the first's connection pool and waste a token exchange
         round-trip with Microsoft.
 
-        Phase 2 (#138 phase 2): the client no longer carries a
+        Phase 2: the client no longer carries a
         persistent ``Authorization`` header. Auth is attached per
         request via :func:`oauth_request`, matching the Gmail shape.
         Acquiring the token here still warms the MSAL cache so the
@@ -286,7 +380,7 @@ class Office365Provider(EmailProvider, PushCapable):
     ) -> Any:
         """Make an authenticated Graph API request.
 
-        Body lifted onto :func:`oauth_request` in #138 phase 2.
+        Body lifted onto :func:`oauth_request` in  phase 2.
         ``acquire_token`` is the source of truth for the bearer
         token (MSAL handles refresh internally), and the typed
         :class:`GraphError` factory is the error_factory callback.
@@ -318,7 +412,7 @@ class Office365Provider(EmailProvider, PushCapable):
             params=request_params,
             json_data=json_data,
             initial_token=token,
-            refresh_token=self.acquire_token,
+            refresh_token=self._refresh_token,
             error_factory=GraphError,
         )
 
@@ -399,7 +493,7 @@ class Office365Provider(EmailProvider, PushCapable):
         the underlying Graph cursor (undocumented but on the order
         of hours-to-days). If the cursor expires, Graph errors and
         the runner can fall back to a fresh walk while the dedup
-        table (#101 step 8) catches duplicates.
+        table catches duplicates.
         """
         page_size = min(int(batch_size), 1000)
         path = "/me/messages"
@@ -444,7 +538,7 @@ class Office365Provider(EmailProvider, PushCapable):
     def _translate_filter(filt) -> str:
         """MailFilter → Graph OData $filter string.
 
-        Delegates to :func:`engine.query_lang.emit_o365_filter` (#138.3).
+        Delegates to :func:`engine.query_lang.emit_o365_filter`.
         """
         from email_triage.engine.query_lang import emit_o365_filter
         return emit_o365_filter(filt)
@@ -453,8 +547,7 @@ class Office365Provider(EmailProvider, PushCapable):
     def _translate_query(query: str) -> str:
         """Translate common query shortcuts to OData $filter.
 
-        Delegates to :func:`engine.query_lang.translate_imap_query_to_o365`
-        (#138.3). Returns an OData filter string, or empty string to
+        Delegates to :func:`engine.query_lang.translate_imap_query_to_o365`. Returns an OData filter string, or empty string to
         signal ``$search`` should be used instead.
         """
         from email_triage.engine.query_lang import translate_imap_query_to_o365
@@ -493,8 +586,7 @@ class Office365Provider(EmailProvider, PushCapable):
         """Convert a Graph message resource to EmailMessage.
 
         Extract Graph-dialect fields then hand off to the shared
-        :func:`providers._normalize.build_email_message` helper
-        (#145.8) for the final assembly + link extraction.
+        :func:`providers._normalize.build_email_message` helper for the final assembly + link extraction.
         """
         from email_triage.providers._normalize import build_email_message
 
@@ -528,15 +620,12 @@ class Office365Provider(EmailProvider, PushCapable):
         if not body_text:
             body_text = data.get("bodyPreview", "")
 
-        # Parse date.
+        # Parse date. Graph returns ISO 8601 with a Z suffix; an absent
+        # or unparseable value leaves the now() default in place.
         date = datetime.now(timezone.utc)
-        received = data.get("receivedDateTime")
-        if received:
-            try:
-                # Graph returns ISO 8601 with Z suffix.
-                date = datetime.fromisoformat(received.replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                pass
+        _received_dt = parse_iso(data.get("receivedDateTime"))
+        if _received_dt is not None:
+            date = _received_dt
 
         labels = data.get("categories", [])
         attachments = self._extract_attachments(data)
@@ -600,11 +689,17 @@ class Office365Provider(EmailProvider, PushCapable):
                         blob = None
                 if blob:
                     parsed = parse_ics(blob)
+            #  / N-03 — drop raw bytes after parse_ics; see the
+            # matching comment in providers/gmail_api.py. Narrower-
+            # residency mitigation under §164.308(a)(1)(ii)(B). For
+            # non-calendar parts blob is already None (the branch
+            # above gates contentBytes decode on text/calendar), so
+            # the change only flips text/calendar from blob → None.
             out.append(Attachment(
                 filename=filename or "attachment",
                 content_type=content_type or "application/octet-stream",
                 size_bytes=size,
-                data=blob,
+                data=None,
                 parsed=parsed,
             ))
         return out
@@ -872,6 +967,12 @@ class Office365Provider(EmailProvider, PushCapable):
                 break
 
             for entry in data.get("value", []) or []:
+                # Skip @removed entries (delete / move-out): the id
+                # names a message that no longer exists in this folder,
+                # so a downstream fetch_message would 404 — a wasted
+                # Graph round-trip per removal per poll.
+                if "@removed" in entry:
+                    continue
                 mid = entry.get("id")
                 if mid and mid not in seen:
                     seen.add(mid)
@@ -1000,4 +1101,5 @@ class Office365Provider(EmailProvider, PushCapable):
         if self._http is not None:
             await self._http.aclose()
             self._http = None
-        self._save_cache()
+        # ``_save_cache`` does blocking file I/O — keep it off the loop.
+        await asyncio.to_thread(self._save_cache)

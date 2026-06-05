@@ -15,15 +15,13 @@ from typing import Any
 import httpx
 
 from email_triage._http_client import LazyHttpClient
-from email_triage.classify.base import Classifier
-from email_triage.classify.prompts import build_system_prompt, build_user_prompt
-from email_triage.engine.models import Classification, EmailMessage, ListHint
+from email_triage.classify.base import JsonChatClassifier
 
 logger = logging.getLogger("email_triage.classify.ollama")
 
 
 def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks from [local-llm-model]-style reasoning output.
+    """Remove <think>...</think> blocks from Qwen3-style reasoning output.
 
     Three cases:
 
@@ -51,10 +49,10 @@ def _strip_think_tags(text: str) -> str:
 def _parse_llm_json(text: str) -> dict[str, Any]:
     """Extract a JSON object from LLM output.
 
-    Handles common quirks: [local-llm-model] <think> tags, markdown fences,
+    Handles common quirks: Qwen3 <think> tags, markdown fences,
     trailing text after the object, leading whitespace.
     """
-    # Strip thinking blocks first ([local-llm-model] wraps reasoning in <think> tags).
+    # Strip thinking blocks first (Qwen3 wraps reasoning in <think> tags).
     cleaned = _strip_think_tags(text).strip()
 
     # Strip markdown code fences if present.
@@ -78,7 +76,7 @@ def _parse_llm_json(text: str) -> dict[str, Any]:
 _LOADED_CACHE_TTL_SECONDS = 30
 
 
-class OllamaClassifier(Classifier):
+class OllamaClassifier(JsonChatClassifier):
     """Classify emails via the Ollama REST API.
 
     When ``prefer_loaded`` is True (default), each call probes
@@ -86,7 +84,7 @@ class OllamaClassifier(Classifier):
     falling back to the configured ``model`` when nothing is loaded.
     Prevents "configured model can't load because GPU is full of a
     different model" 500s in homelab setups, and absorbs version
-    drift ([local-llm-model] → [local-llm-model]) without a config chase.
+    drift (qwen3.5 → qwen3.6) without a config chase.
 
     The /api/ps result is cached for 30 s per instance so we don't
     add an HTTP round trip to every classification.
@@ -94,7 +92,7 @@ class OllamaClassifier(Classifier):
 
     def __init__(
         self,
-        model: str = "[local-llm-model]
+        model: str = "qwen3.5:35b",
         base_url: str = "http://localhost:11434",
         timeout: float = 120.0,
         prefer_loaded: bool = True,
@@ -107,7 +105,7 @@ class OllamaClassifier(Classifier):
         self._loaded_cache: tuple[float, str | None] = (0.0, None)
         # Long-lived httpx client for /api/chat + /api/ps + /api/embeddings.
         # Per-call ``timeout=`` overrides on the probe path keep the
-        # 5 s probe budget without standing up a second client (#139).
+        # 5 s probe budget without standing up a second client.
         self._http = LazyHttpClient(timeout=self._timeout)
         # Ollama is usable as local OR as a remote hosted service.
         # Classify the configured URL so HIPAA-sensitive actions can
@@ -166,56 +164,20 @@ class OllamaClassifier(Classifier):
         self._loaded_cache = (now, resolved)
         return resolved
 
-    async def classify(
-        self,
-        message: EmailMessage,
-        categories: dict[str, str],
-        list_hints: list[ListHint] | None = None,
-    ) -> Classification:
-        system_prompt = build_system_prompt(categories, list_hints)
-        user_prompt = build_user_prompt(message)
+    async def _chat(
+        self, system_prompt: str, user_prompt: str, model: str,
+    ) -> str:
+        """Issue an Ollama ``/api/chat`` request; return the raw text.
 
-        model = await self._resolve_model()
-
-        # 2026-05-13 two-level cache lookup. Returns:
-        #   (outer_key, inner_field, cached_classification, hint_text)
-        # - cached_classification non-None → Branch 1 (skip LLM, return cache)
-        # - hint_text non-None → Branch 2 (prepend hint, run LLM)
-        # - both None → cold miss (run LLM uninformed)
-        outer_key: str | None = None
-        inner_field: str | None = None
-        cache_entry: Classification | None = None
-        hint_text: str | None = None
-        try:
-            from email_triage.cache.classification import (
-                cache_lookup_for_message,
-            )
-            outer_key, inner_field, cache_entry, hint_text = (
-                cache_lookup_for_message(
-                    message, model, categories,
-                )
-            )
-            if cache_entry is not None:
-                logger.info("Classification cache hit (cache_hit=True)")
-            elif hint_text is not None:
-                logger.info(
-                    "Classification cache hint fired (cache_hit=False); "
-                    "biasing LLM with sender history",
-                )
-        except Exception as e:
-            logger.debug("Classification cache lookup error: %s", e)
-
-        if cache_entry is not None:
-            return cache_entry
-
-        # Prepend the cache-history hint to the system prompt when
-        # Branch 2 fired. Keeps the prompt builder (list_hints) path
-        # untouched — hint is a literal pre-rendered sentence.
-        if hint_text:
-            system_prompt = (
-                f"[SENDER HISTORY HINT] {hint_text}\n\n{system_prompt}"
-            )
-
+         Bundle B /  — the POST is wrapped in the shared
+        circuit-breaker helper :func:`llm_health.translate_unreachable`:
+        connect-class errors (Ollama down, network blip) trip the
+        breaker via ``set_unhealthy`` and re-raise as
+        ``LLMBackendUnreachableError`` so the watcher / push consumer /
+        poll loop can distinguish "infrastructure weather" from a
+        genuine classifier error. It MUST propagate —
+        :meth:`JsonChatClassifier.classify` never catches around this.
+        """
         payload = {
             "model": model,
             "messages": [
@@ -224,95 +186,36 @@ class OllamaClassifier(Classifier):
             ],
             "stream": False,
             "format": "json",
-            "think": False,  # Disable thinking for [local-llm-model]+ models (Ollama API)
+            "think": False,  # Disable thinking for Qwen3+ models (Ollama API)
             "options": {
                 "temperature": 0.3,
                 "num_predict": 256,
             },
         }
 
-        # #149 Bundle B — circuit breaker + typed-exception wrapping
-        # layered on top of J's long-lived AsyncClient (#139).
-        # Connect-class errors (Ollama down, network blip) trip the
-        # breaker via ``set_unhealthy`` and re-raise as
-        # ``LLMBackendUnreachableError`` so the watcher / push
-        # consumer / poll loop can distinguish "infrastructure
-        # weather" from a genuine classifier error.
-        from email_triage.llm_health import (
-            LLMBackendUnreachableError, set_unhealthy,
-            is_unreachable_error, host_port_from_url,
-        )
-        try:
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "ollama", self._base_url, default_port=11434,
+        ):
             client = await self._http.get()
             resp = await client.post(
                 f"{self._base_url}/api/chat",
                 json=payload,
             )
             resp.raise_for_status()
-        except Exception as exc:
-            if is_unreachable_error(exc):
-                host, port = host_port_from_url(
-                    self._base_url, default_port=11434,
-                )
-                set_unhealthy(
-                    "ollama", ttl_seconds=300, reason=str(exc)[:200],
-                )
-                raise LLMBackendUnreachableError(
-                    "ollama", host, port, original=exc,
-                ) from exc
-            raise
 
         body = resp.json()
-        raw_text = body.get("message", {}).get("content", "")
-        logger.debug("Ollama raw response", extra={"raw": raw_text[:500]})
-
-        parsed = _parse_llm_json(raw_text)
-
-        category = parsed.get("category", "")
-        if category not in categories:
-            logger.warning(
-                "LLM returned unknown category '%s', treating as low confidence",
-                category,
-            )
-
-        confidence = float(parsed.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-
-        reason = parsed.get("reason", "")
-
-        result = Classification(
-            category=category,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
-        )
-
-        # 2026-05-13 — best-effort store via two-level shape.
-        # ``is_hipaa`` strips the ``reason`` field at store time so
-        # HIPAA-flagged accounts can cache safely (category + confidence
-        # are non-PHI). No-ops on (None, None) outer/inner pair.
-        try:
-            from email_triage.cache.classification import (
-                cache_store_for_message,
-            )
-            cache_store_for_message(
-                outer_key, inner_field, model, result, categories,
-                is_hipaa=bool(getattr(message, "hipaa", False)),
-            )
-        except Exception as e:
-            logger.debug("Classification cache store error: %s", e)
-
-        return result
+        return body.get("message", {}).get("content", "")
 
     async def complete(self, prompt: str) -> str:
         """Raw text completion via Ollama /api/chat.
 
         ``num_predict`` ceiling is generous (8192) because the
-        ``think: False`` flag is template-dependent — [local-llm-model] stock
+        ``think: False`` flag is template-dependent — Qwen3 stock
         templates emit ``<think>...</think>`` reasoning regardless,
         and that reasoning bites into the same generation budget the
         actual answer needs. With a tight 2048-token cap the
-        explain-this-error path (#121-A) was hitting truncation in
+        explain-this-error path was hitting truncation in
         production: the screenshot operator caught on 2026-05-12
         showed an explanation cut mid-word at "provider's serve"
         — Ollama returned ``done_reason: "length"`` and the post-
@@ -335,30 +238,18 @@ class OllamaClassifier(Classifier):
             },
         }
 
-        # #149 + #139 — circuit breaker layered on long-lived client.
-        from email_triage.llm_health import (
-            LLMBackendUnreachableError, set_unhealthy,
-            is_unreachable_error, host_port_from_url,
-        )
-        try:
+        #  +  +  — shared circuit-breaker helper layered on
+        # the long-lived client (same translation as _chat()).
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "ollama", self._base_url, default_port=11434,
+        ):
             client = await self._http.get()
             resp = await client.post(
                 f"{self._base_url}/api/chat",
                 json=payload,
             )
             resp.raise_for_status()
-        except Exception as exc:
-            if is_unreachable_error(exc):
-                host, port = host_port_from_url(
-                    self._base_url, default_port=11434,
-                )
-                set_unhealthy(
-                    "ollama", ttl_seconds=300, reason=str(exc)[:200],
-                )
-                raise LLMBackendUnreachableError(
-                    "ollama", host, port, original=exc,
-                ) from exc
-            raise
 
         body = resp.json()
         raw_text = body.get("message", {}).get("content", "")
@@ -376,7 +267,7 @@ class OllamaClassifier(Classifier):
                     "raw_len": len(raw_text),
                 }},
             )
-        # Strip [local-llm-model] thinking tags if present.
+        # Strip Qwen3 thinking tags if present.
         return _strip_think_tags(raw_text).strip()
 
     async def close(self) -> None:

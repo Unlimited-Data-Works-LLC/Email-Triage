@@ -1,4 +1,4 @@
-"""Fixtures for the embedding-bits installer test bundle (#180)."""
+"""Fixtures for the embedding-bits installer test bundle."""
 
 from __future__ import annotations
 

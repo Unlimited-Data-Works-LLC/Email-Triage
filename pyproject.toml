@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-triage"
-version = "0.1.0"
+version = "0.1.2"
 description = "Portable email triage system with LLM classification and configurable routing"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ dependencies = [
     "itsdangerous>=2.2.0",
     "pyjwt[crypto]>=2.8.0",
     "icalendar>=5.0",
-    # Auth-surface upgrade (#67): dev-keypair + WebAuthn + ACME automation.
+    # Auth-surface upgrade: dev-keypair + WebAuthn + ACME automation.
     # cryptography was previously transitive via pyjwt[crypto]; promoting
     # to direct dep because dev_keypair + acme_renewer use it directly.
     "cryptography>=43.0.0",
@@ -33,21 +33,52 @@ dependencies = [
     # DNS-01 challenge needs dnspython for RFC-2136 (TSIG-signed dynamic
     # updates against the operator's BIND).
     "dnspython>=2.4",
-    # Vector math for the M-4 sent-mail RAG cosine hot-path (#136). Pure
+    # Vector math for the M-4 sent-mail RAG cosine hot-path. Pure
     # Python cosine over ~10k rows x 768 dims is seconds per draft reply
     # and blocks the event loop. numpy + precomputed L2 norms get the
     # per-call cost into the millisecond range.
     "numpy>=1.26",
+    # Timeout-bounded regex engine (PyPI ``regex``) for operator-authored
+    # SUBJECT rule patterns in ``classify/hints.py``. Stdlib ``re`` has no
+    # per-call timeout and a pathological pattern (e.g. ``(a|aa)+$``)
+    # against a long subject pegs the worker thread until catastrophic
+    # backtracking finishes. ``regex.search(..., timeout=1.0)`` raises
+    # TimeoutError instead. Bounded threat model: rules are operator-
+    # authored via admin UI, not external input — but admin typo or
+    # curiosity-test of an evil regex is still a foot-gun we close here.
+    "regex>=2024.0",
+    # v0.1.2 single-file encryption: SQLAlchemy Core 2.x engine
+    # factory + connection pool + Alembic migration scaffolding. NOT ORM
+    # — hand-tuned SQL with qmark ``?`` params is retained at every
+    # callsite. SA Core is the engine/pool/Alembic layer only; the
+    # ``WriterBackend`` Protocol sits on top of it.
+    # Rationale: ``internal documentation`` §0 + §2.
+    # Forward-compat seam: v0.2.0  Postgres retrofit swaps the
+    # engine URL + ``WriterBackend`` impl (``AsyncpgWriterPool``) with
+    # zero callsite changes per §7.
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
 keyfile = ["cryptography>=43.0.0"]
 keyring = ["keyring>=25.0.0"]
+# v0.1.2 single-file encryption: SQLCipher single-file encryption-at-rest. The
+# coleifer ``sqlcipher3`` fork (actively maintained, ships
+# ``sqlcipher3-binary`` wheels for CPython 3.11+) — NOT the deprecated
+# rigglemania ``pysqlcipher3`` (last release 2019, no 3.11+/ARM64
+# wheels). ARM64 wheel availability is verified at execution-time per
+# internal documentation §4; fallback is a source build
+# against system libsqlcipher-dev. Linux/container ONLY (no Windows
+# wheel). Required only when persistence.encryption_enabled is ON; the
+# rest of the codebase imports cleanly without it (the boot path
+# fail-closes if encryption is requested but this extra is absent).
+encryption = ["sqlcipher3-binary>=0.5.4,<0.6"]
 imap = ["aioimaplib>=1.1.0"]
 office365 = ["msal>=1.30.0"]
 openai = ["openai>=1.0.0"]
 gemini = ["google-generativeai>=0.8.0"]
-# #151 — optional Redis-backed classification cache. Operator paste a
+#  — optional Redis-backed classification cache. Operator paste a
 # Redis URL into /admin/integrations to enable. ``valkey`` (Linux
 # Foundation fork) speaks the identical wire protocol and works with
 # the same client unchanged — no library change is needed.

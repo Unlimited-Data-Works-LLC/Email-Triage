@@ -1,4 +1,4 @@
-"""Best-effort Redis-backed counter persistence (#2026-05-13).
+"""Best-effort Redis-backed counter persistence.
 
 Process-local counters reset on every container restart. For
 operators who deploy frequently, that erases the long-horizon

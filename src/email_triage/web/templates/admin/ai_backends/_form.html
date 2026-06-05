@@ -77,10 +77,10 @@
     </label>
 
     <label>
-        Model{{ m.help("Specific model identifier. Examples — Ollama: '[local-llm-model] or 'llama3.1:8b' . Azure OpenAI: the deployment name you set in Azure portal (NOT the OpenAI model name). OpenAI: 'gpt-4o-mini' or 'gpt-4o'. Gemini: 'gemini-2.0-flash'. Leave empty to use the adapter's default.") }}
+        Model{{ m.help("Specific model identifier. Examples — Ollama: 'qwen3.6:8b' or 'llama3.1:8b' . Azure OpenAI: the deployment name you set in Azure portal (NOT the OpenAI model name). OpenAI: 'gpt-4o-mini' or 'gpt-4o'. Gemini: 'gemini-2.0-flash'. Leave empty to use the adapter's default.") }}
         <input type="text" name="model" maxlength="120"
                value="{{ row.model or '' }}"
-               placeholder="e.g. [local-llm-model]
+               placeholder="e.g. qwen3.6:8b">
     </label>
 
     {# ── API key section ─────────────────────────────────────────

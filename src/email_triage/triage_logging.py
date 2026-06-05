@@ -182,7 +182,7 @@ class TriageLogger:
     # rotation and could not be expunged without breaking the
     # chain (HIPAA §164.312(b) audit controls + §164.312(e)(1)
     # transmission security — but the rule applies universally,
-    # not only on HIPAA installs). Audit punch-list #111
+    # not only on HIPAA installs). Audit the backlog 
     # (2026-05-08).
     #
     # Adding a key here propagates to every log row across the
@@ -315,13 +315,25 @@ class SQLiteLogHandler(logging.Handler):
     Designed to be added to the ``email_triage`` root logger alongside
     the console handler.
 
-    #131 — keeps the last emitted ``row_hash`` in memory
+     — keeps the last emitted ``row_hash`` in memory
     (``self._last_row_hash``) so the hot path no longer pays a SELECT
     per emit. ``logging.Handler.emit`` is serialised per-handler by
     ``self.lock`` and this handler is the only writer to ``log_entries``
     in the running process (the offline ``insert_log_entry`` helper is
     test/structured-event use only). The first emit primes the cache via
     one SELECT; subsequent emits chain off the in-memory tail.
+
+     — ``shares_app_connection`` controls whether emit/flush acquire
+    the process-wide DB write lock around their connection touches.
+    Production (file-backed DB) follows the  design: ``add_sqlite_handler``
+    hands the handler its OWN dedicated connection, so it owns its
+    commit/rollback scope and the lock is needless overhead — pass
+    ``False`` (default). The in-memory test fallback shares
+    ``app.state.db`` with every other writer; on that path
+    ``logging.Handler.lock`` does NOT protect against a concurrent
+    ``db_call`` threadpool worker on the same connection, so emit/flush
+    MUST acquire ``get_write_lock()`` — ``add_sqlite_handler`` passes
+    ``True`` on that branch.
     """
 
     def __init__(
@@ -329,11 +341,17 @@ class SQLiteLogHandler(logging.Handler):
         conn: "sqlite3.Connection",
         flush_interval: int = 10,
         level: int = logging.INFO,
+        *,
+        shares_app_connection: bool = False,
     ) -> None:
         super().__init__(level)
         self._conn = conn
         self._flush_interval = flush_interval
         self._pending = 0
+        #  — see class docstring. Default False matches the production
+        # (file-backed, dedicated-connection) path; tests / in-memory
+        # callers pass True.
+        self._shares_app_connection = bool(shares_app_connection)
         # Sentinel ``None`` means "cache cold — read from DB on next
         # emit". After the first emit the cache holds the empty-string
         # genesis or the previous emit's row_hash.
@@ -378,42 +396,78 @@ class SQLiteLogHandler(logging.Handler):
 
             extra_json = _json.dumps(extra) if extra else "{}"
 
-            # #42 — hash-chain. logging.Handler.emit is serialized
+            #  — hash-chain. logging.Handler.emit is serialized
             # per-handler by self.lock, so the read-then-insert here
-            # is race-free within one process.
-            # #131 — the SELECT on the hot path was a per-emit cost on
+            # is race-free between two emit() calls.
+            #
+            #  — conditional locking. On the production (file-backed)
+            # path the handler owns its OWN dedicated connection
+            # ( — add_sqlite_handler hands it a fresh one via
+            # _open_dedicated_log_conn) and self.lock is sufficient: no
+            # other writer touches that connection. On the in-memory
+            # test path the handler shares app.state.db with db_call
+            # threadpool workers — self.lock does NOT serialise against
+            # those, so the read-then-insert chain invariant requires
+            # the process-wide DB write lock. _maybe_lock() returns
+            # the live lock on the shared path, nullcontext on the
+            # dedicated path.
+            #
+            #  — the SELECT on the hot path was a per-emit cost on
             # an indexed-but-not-trivial table. Cache the last row_hash
             # on the instance; only hit the DB on the very first emit
             # (cold cache).
+            # H-02a (Cycle 6, 2026-05-23): hash_alg + master_key_version
+            # land on every new row. The web.db re-export shim covers
+            # compute_log_row_hash + get_last_log_row_hash; we add
+            # _get_current_hmac_version to the late-import so the hot
+            # path can stamp the correct version for THIS row without
+            # a separate registry lookup per insert.
             from email_triage.web.db import (
-                compute_log_row_hash, get_last_log_row_hash,
+                compute_log_row_hash,
+                get_last_log_row_hash,
+                _get_current_hmac_version,
             )
-            if self._last_row_hash is None:
-                self._last_row_hash = get_last_log_row_hash(self._conn)
-            prev_hash = self._last_row_hash
-            row_hash = compute_log_row_hash(
-                prev_hash, ts, record.levelname, record.name,
-                record.getMessage(), extra_json,
-            )
+            with self._maybe_lock():
+                if self._last_row_hash is None:
+                    self._last_row_hash = get_last_log_row_hash(self._conn)
+                prev_hash = self._last_row_hash
+                # Capture current HMAC version ONCE per emit. Rotation
+                # requires an app-stop (per README's rotate ceremony),
+                # so the version is stable for the lifetime of this
+                # process; this still re-reads on every emit because
+                # the registry lookup is a cheap dict-get under a
+                # single threading.Lock acquisition.
+                current_mkv = _get_current_hmac_version()
+                hash_alg = "hmac-sha256-v1"
+                row_hash = compute_log_row_hash(
+                    prev_hash, ts, record.levelname, record.name,
+                    record.getMessage(), extra_json,
+                    hash_alg=hash_alg,
+                    master_key_version=current_mkv,
+                )
 
-            self._conn.execute(
-                "INSERT INTO log_entries "
-                "(ts, level, logger, message, extra_json, created_at, "
-                " prev_hash, row_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (ts, record.levelname, record.name, record.getMessage(),
-                 extra_json, ts, prev_hash, row_hash),
-            )
-            # Update in-memory tail BEFORE the commit decision — even
-            # if the next handler operation crashes, the cache state
-            # mirrors what's in the (uncommitted) connection.
-            self._last_row_hash = row_hash
-            self._pending += 1
-            if self._pending >= self._flush_interval:
-                self._conn.commit()
-                self._pending = 0
+                # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                self._conn.execute(
+                    "INSERT INTO log_entries "
+                    "(ts, level, logger, message, extra_json, created_at, "
+                    " prev_hash, row_hash, hash_alg, master_key_version) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ts, record.levelname, record.name,
+                     record.getMessage(),
+                     extra_json, ts, prev_hash, row_hash,
+                     hash_alg, current_mkv or 0),
+                )
+                # Update in-memory tail BEFORE the commit decision —
+                # even if the next handler operation crashes, the cache
+                # state mirrors what's in the (uncommitted) connection.
+                self._last_row_hash = row_hash
+                self._pending += 1
+                if self._pending >= self._flush_interval:
+                    # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                    self._conn.commit()
+                    self._pending = 0
         except sqlite3.ProgrammingError:
-            # #148 — DB connection was closed (typically during
+            #  — DB connection was closed (typically during
             # container shutdown after the audit-anchor flush). The
             # row would have been lost regardless; suppress the
             # user-visible traceback that ``handleError`` writes to
@@ -422,7 +476,7 @@ class SQLiteLogHandler(logging.Handler):
             # format. Reset ``_last_row_hash`` so any subsequent
             # emit (rare during shutdown but possible) re-syncs from
             # whatever connection is still alive — the chain anchor
-            # at #131.1 covers the on-disk continuity, the in-memory
+            # at .1 covers the on-disk continuity, the in-memory
             # cache just needs to drop the stale tail.
             self._last_row_hash = None
             fallback = logging.lastResort
@@ -434,6 +488,70 @@ class SQLiteLogHandler(logging.Handler):
                     # nothing more we can safely do. Swallow.
                     pass
         except Exception:
+            # #239e — a transient write error here would otherwise
+            # silently drop the whole uncommitted batch: with
+            # flush_interval>1, up to flush_interval-1 emitted-but-
+            # uncommitted rows plus this one are lost when the
+            # connection rolls back. The next emit re-chains from the
+            # last *committed* row, so verify_log_chain sees a CLEAN
+            # chain with NO gap marker — an invisible audit-integrity
+            # hole (HIPAA §164.312(c)(1)).
+            #
+            # Two-part mitigation, in order:
+            #  1. Try once to commit the surviving batch. If the
+            #     failure was on THIS row's INSERT, rows already in
+            #     the pending transaction are intact and a commit
+            #     salvages them (dropped batch -> not dropped).
+            #  2. Insert a 'prechain' sentinel row (empty row_hash,
+            #     empty prev_hash) and commit it. verify_log_chain
+            #     counts empty-row_hash rows as prechain_count, so
+            #     even a genuinely-lost batch leaves a visible marker
+            #     at the gap (dropped batch -> visible). The sentinel
+            #     is skipped by get_last_log_row_hash (WHERE
+            #     row_hash != ''), so the chain re-anchors cleanly on
+            #     the next real row.
+            #
+            #  — conditional locking, same shape as the happy path.
+            # On the shared-connection (in-memory test) branch the lock
+            # is required so a concurrent db_call worker can't
+            # interleave a foreign commit/rollback mid-recovery. On the
+            # dedicated-conn (production) branch _maybe_lock() is a
+            # nullcontext — the handler owns its own commit scope.
+            try:
+                with self._maybe_lock():
+                    # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                    self._conn.commit()
+                    self._pending = 0
+            except Exception:
+                pass
+            try:
+                import json as _json
+                _sentinel_ts = datetime.now(timezone.utc).isoformat()
+                with self._maybe_lock():
+                    # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                    self._conn.execute(
+                        "INSERT INTO log_entries "
+                        "(ts, level, logger, message, extra_json, "
+                        " created_at, prev_hash, row_hash) "
+                        "VALUES (?, ?, ?, ?, ?, ?, '', '')",
+                        (
+                            _sentinel_ts, "ERROR",
+                            "email_triage.triage_logging",
+                            "SQLiteLogHandler write error — one or more "
+                            "audit log rows may have been dropped; this "
+                            "sentinel marks the gap for verify_log_chain",
+                            _json.dumps(
+                                {"error_kind": "log_handler_drop"},
+                            ),
+                            _sentinel_ts,
+                        ),
+                    )
+                    # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                    self._conn.commit()
+            except Exception:
+                # Connection itself is broken — nothing more we can
+                # safely do; handleError still surfaces it.
+                pass
             # Reset the cache on any failure so the next emit
             # re-syncs from the DB. Keeps the chain consistent if
             # an INSERT failed and was rolled back.
@@ -442,11 +560,35 @@ class SQLiteLogHandler(logging.Handler):
 
     def flush(self) -> None:
         if self._pending > 0:
+            #  — conditional locking. Shared-connection path (tests)
+            # needs the process-wide DB write lock so a concurrent
+            # db_call worker can't interleave; dedicated-conn path
+            # (production) doesn't — _maybe_lock() picks the right
+            # one based on shares_app_connection.
             try:
-                self._conn.commit()
-                self._pending = 0
+                with self._maybe_lock():
+                    # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
+                    self._conn.commit()
+                    self._pending = 0
             except Exception:
                 pass
+
+    @contextmanager
+    def _maybe_lock(self):
+        """Conditional lock for each emit/flush DB touch.
+
+         — only the in-memory (test) fallback shares the app
+        connection; the file-backed handler owns a dedicated
+        connection and must NOT take the process-wide write lock
+        (that would couple isolated log writes to request-path
+        db_call workers). Lock the shared-connection path only.
+        """
+        if self._shares_app_connection:
+            from email_triage.web.db_writelock import get_write_lock
+            with get_write_lock():
+                yield
+        else:
+            yield
 
     def close(self) -> None:
         self.flush()
@@ -463,12 +605,95 @@ _STANDARD_LOG_KEYS = frozenset({
 })
 
 
+def _resolve_main_db_path(conn: "sqlite3.Connection") -> str | None:
+    """Return the file path backing a connection's ``main`` database.
+
+    ``PRAGMA database_list`` yields ``(seq, name, file)`` rows; the
+    ``main`` row's ``file`` is the on-disk path (empty string for an
+    in-memory or temp database). Returns None when the connection is
+    in-memory — a second ``sqlite3.connect(":memory:")`` opens a
+    *separate* empty database, so the dedicated-connection path must
+    fall back to the shared connection in that case.
+    """
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            # Row is (seq, name, file) regardless of row_factory.
+            name = row[1]
+            path = row[2]
+            if name == "main":
+                return path or None
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _open_dedicated_log_conn(db_path: str) -> "sqlite3.Connection":
+    """Open a dedicated SQLite connection on ``db_path`` for the log
+    handler, mirroring the PRAGMAs ``init_db`` sets on the main one.
+
+     — the SQLite log handler must NOT share the app's single
+    connection: a foreign ``ROLLBACK`` from a concurrent write helper
+    on a threadpool worker would orphan the handler's cached row tail
+    and permanently break the audit hash-chain. Its own connection
+    isolates its commit/rollback scope.
+    """
+    # N-17: route through the encrypted-aware shared opener so the
+    # §164.312(b) audit-chain handler opens against an ENCRYPTED file on an
+    # encrypted install (raw sqlite3.connect would hard-crash at the first
+    # PRAGMA there). The opener self-selects encrypted-vs-plaintext from the
+    # boot-stamped context + applies the same WAL/busy/FK PRAGMAs this site
+    # set inline. Local imports keep this low-level logging module free of
+    # an import-time package edge.
+    from email_triage.db._engine import open_dedicated_conn
+    from email_triage.db._helpers import apply_compatible_row_factory
+    conn = open_dedicated_conn(db_path, check_same_thread=False)
+    # N-16: factory from the conn's own dbapi module (sqlite3.Row vs
+    # sqlcipher3.dbapi2.Row) — open_dedicated_conn may return either.
+    apply_compatible_row_factory(conn)
+    from email_triage.single_flight import set_cached_db_path
+
+    set_cached_db_path(conn, db_path)
+    return conn
+
+
 def add_sqlite_handler(conn: "sqlite3.Connection") -> None:
     """Add a SQLite log handler to the email_triage root logger.
 
     Call after ``setup_logging()`` and after ``init_db()`` has created
     the ``log_entries`` table.
+
+     — when the database is file-backed the handler is given its
+    OWN connection (isolated commit/rollback scope, so the audit
+    hash-chain can never be orphaned by a foreign ROLLBACK). For an
+    in-memory database the handler falls back to the shared connection
+    — a second ``:memory:`` connect would open an unrelated empty DB.
     """
     root = logging.getLogger("email_triage")
-    handler = SQLiteLogHandler(conn, flush_interval=5)
+    db_path = _resolve_main_db_path(conn)
+    if db_path:
+        handler_conn = _open_dedicated_log_conn(db_path)
+        shares_app_connection = False
+    else:
+        # In-memory database — cannot be reopened; share the connection.
+        handler_conn = conn
+        #  — flag the shared-connection branch so emit/flush take
+        # the process-wide DB write lock (the dedicated-conn branch
+        # above doesn't need it; see SQLiteLogHandler docstring).
+        shares_app_connection = True
+    handler = SQLiteLogHandler(
+        handler_conn,
+        # 2026-05-31 encrypted-cutover incident: on the file-backed
+        # (production / dedicated-conn) path, commit EVERY emit so the
+        # audit conn never holds the WAL write-lock across a multi-emit
+        # batch. Under SQLCipher the per-page crypto widens every
+        # write's lock-hold window; a batched hold (flush_interval=5)
+        # parked the single WAL write-lock long enough that the main
+        # app conn + the single_flight lease conn piled past the 30s
+        # busy_timeout -> sustained "database is locked". Per-emit commit
+        # keeps each hold to one row, and shrinks the lost-batch window
+        # to zero (§164.312(c)(1) durability bonus). The in-memory test
+        # path (shares_app_connection) keeps batching — no WAL there.
+        flush_interval=1 if not shares_app_connection else 5,
+        shares_app_connection=shares_app_connection,
+    )
     root.addHandler(handler)

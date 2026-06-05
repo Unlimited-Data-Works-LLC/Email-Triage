@@ -1,4 +1,4 @@
-"""Background runner for whole-mailbox triage jobs (#101).
+"""Background runner for whole-mailbox triage jobs.
 
 Distinct from ``triage_runner.py`` (which handles synchronous inline
 runs of <=100 messages via the /triage/run HTTP path). This module
@@ -6,7 +6,7 @@ hosts the long-running task that drains the ``triage_jobs`` queue —
 one job at a time, under operator-tunable rate-limit + concurrency
 knobs, with cancel-checks at every batch boundary.
 
-Design (full design lives in punch-list #101):
+Design (full design lives in the backlog ):
 
 * Single supervised task per app process. ``app.py`` registers it
   via ``TaskSupervisor.supervise()`` so a crash gets a bounded
@@ -57,6 +57,7 @@ from email_triage.web.db import (
     requeue_orphaned_triage_jobs,
     update_triage_job_cursor,
 )
+from email_triage.web.db_threadpool import db_call
 
 
 _log = logging.getLogger("email_triage.web.triage_runner_bulk")
@@ -119,53 +120,66 @@ class TokenBucket:
 
 async def _process_one_message(
     *,
+    ctx,
     msg_id: str,
-    provider,
-    classifier,
-    categories,
-    routes_by_cat,
-    registry,
     conn,
     acct,
-    account_hipaa: bool,
     actor_user_id: int | None,
     job_id: str,
-    bucket: TokenBucket,
-    sem: asyncio.Semaphore,
-    self_from_addr: str = "",
-    list_hints_lists=None,
-    list_hints_rules_by_list=None,
+    bucket: "TokenBucket",
+    sem: "asyncio.Semaphore",
 ):
-    """Classify one message + fire its routed actions.
+    """Classify + act on one message under the bulk runner's primitives.
 
-    Mirrors the inner-loop body of ``triage_runner.run_triage`` but
-    runs under the bulk runner's rate-limit + concurrency primitives
-    and writes a per-message ``triage_runs`` row immediately rather
-    than batching them into a single end-of-run write.
+     — the classify + act body is the shared
+    :func:`email_triage.web.triage_one.triage_single_message`. This
+    wrapper keeps the bulk-runner-specific concerns: the per-job dedup
+    gate, the rate-limit token + concurrency semaphore, and the
+    immediate per-message ``triage_runs`` row write (vs the inline
+    path's batched end-of-run write).
 
-    Returns a one-letter status used by the caller to bump the
-    right counter:
-      'p' — processed (classified + acted)
-      's' — skipped   (e.g. our own X-Email-Triage header)
-      'e' — error
+    Before  this path registered only Move/Label/AddLabel/Notify/
+    DraftReply and never fired / rule-labels or  watches —
+    that drift is now fixed: ``ctx`` carries the full action set + the
+    rule-label maps, so a bulk sweep applies labels + fires watches
+    exactly like the inline path.
+
+    Returns a one-letter status:
+      'p' processed | 's' skipped | 'e' error | 'd' dedup (already done)
     """
     from email_triage.web.db import record_triage_run
-    from email_triage.web.routers.ui import (
-        _collect_list_hints_for_message, _is_dry_run,
-    )
-    from email_triage.mail_headers import get_triage_header, is_self_origin
+    from email_triage.web.triage_one import triage_single_message
 
-    # Dedup gate (#101 step 8). A prior crashed-and-resumed pass
-    # may have already classified + acted on this message; the
-    # triage_job_messages table records every (job_id, msg_id)
-    # the runner finished. Hit -> return 'd' (dedup) without
-    # bumping any counter — the counters were bumped on the
-    # original pass, and run_triage_all pre-bumps them from
-    # count_processed_messages_in_job at job start so resume
-    # shows the right totals. Skipping here also avoids burning
-    # a rate-limit token on work that's already done.
-    if is_message_processed_in_job(conn, job_id, msg_id):
+    # Dedup gate. A prior crashed-and-resumed pass may
+    # have already classified + acted on this message.
+    # ASYNC-DB: dedup read off the event loop. The bulk runner
+    # is a supervised task that shares the app event loop, so a
+    # blocking SELECT here stalls every concurrent HTTP request too.
+    if await db_call(is_message_processed_in_job, conn, job_id, msg_id):
         return "d"
+
+    def _record_outcome(conn, entry, status, errors):
+        # ASYNC-DB: per-message triage_runs row + dedup row,
+        # batched into ONE off-loop hop instead of two separate
+        # threadpool round-trips per message.
+        try:
+            record_triage_run(
+                conn, acct["id"], acct.get("name", ""),
+                query=f"bulk:{job_id}",
+                total_messages=1,
+                results=[entry],
+                errors=errors,
+                elapsed_secs=0.0,
+                actor_user_id=actor_user_id,
+            )
+        except Exception:
+            pass
+        try:
+            record_processed_message(conn, job_id, msg_id, status)
+        except Exception:
+            # Dedup write itself failed — likely DB locked. Don't mask
+            # the real per-message outcome.
+            pass
 
     # Rate-limit + concurrency caps gate the actual provider /
     # classifier work. Token first (system-wide cadence), then a
@@ -173,186 +187,56 @@ async def _process_one_message(
     await bucket.acquire()
     async with sem:
         try:
-            message = await provider.fetch_message(msg_id)
-            message.hipaa = account_hipaa
-            et_header = get_triage_header(getattr(message, "headers", {}) or {})
-            if et_header:
-                # Loop prevention — our own outbound digests / drafts
-                # carry this header; classifying them would re-trigger
-                # actions on synthetic mail.
-                record_triage_run(
-                    conn, acct["id"], acct.get("name", ""),
-                    query=f"bulk:{job_id}",
-                    total_messages=1,
-                    results=[{
-                        "message_id": msg_id,
-                        "status": "skipped",
-                        "skip_reason": "x_email_triage_header",
-                        "reason": "self_origin",
-                        "x_email_triage": et_header,
-                    }],
-                    errors=[],
-                    elapsed_secs=0.0,
-                    actor_user_id=actor_user_id,
-                )
-                record_processed_message(conn, job_id, msg_id, "s")
-                return "s"
-            # Defense in depth (#117): downstream MTA may have stripped
-            # the X-Email-Triage header. Match on sender == install's
-            # smtp.from_addr as a secondary self-origin skip.
-            if is_self_origin(
-                getattr(message, "sender", "") or "", self_from_addr,
-            ):
-                record_triage_run(
-                    conn, acct["id"], acct.get("name", ""),
-                    query=f"bulk:{job_id}",
-                    total_messages=1,
-                    results=[{
-                        "message_id": msg_id,
-                        "status": "skipped",
-                        "skip_reason": "self_from_match",
-                        "reason": "self_origin",
-                    }],
-                    errors=[],
-                    elapsed_secs=0.0,
-                    actor_user_id=actor_user_id,
-                )
-                record_processed_message(conn, job_id, msg_id, "s")
-                return "s"
-
-            hints = _collect_list_hints_for_message(
-                conn, message,
-                lists=list_hints_lists,
-                rules_by_list=list_hints_rules_by_list,
-            )
-            classification = await classifier.classify(
-                message, categories, hints or None,
-            )
-
-            # Resolve actions for the classification's category. Bulk
-            # uses the same per-account routes table as inline.
-            entry = {
-                "message_id": msg_id,
-                "category": classification.category,
-                "confidence": classification.confidence,
-                "source": classification.source,
-            }
-            if not account_hipaa:
-                entry["sender"] = getattr(message, "sender", None)
-                entry["subject"] = getattr(message, "subject", None)
-            try:
-                if message.date:
-                    entry["date"] = message.date.isoformat()
-            except Exception:
-                pass
-
-            # Fire actions resolved by the route table. Mirrors the
-            # inline path's behaviour: dry-run skips action.execute
-            # while still recording the resolved category.
-            #
-            # ``routes_by_cat[cat]`` is the route row's ``actions``
-            # list — each entry a ``{"action": <name>, "config": <dict>}``
-            # dict (same shape ``list_account_routes`` returns). Iterating
-            # the list yields these dicts; the inline path at
-            # ``triage_runner.py:621`` pulls ``action_def.get("action", "")``
-            # off each dict to look up the registered action. Before this
-            # fix, the bulk loop iterated the dicts directly into
-            # ``registry.get(...)`` which always returned None — every
-            # action silently no-opped in bulk mode (operator-invisible
-            # because no test asserted on ``actions_fired`` in bulk).
-            dry_run = _is_dry_run(conn)
-            actions_fired: list[str] = []
-            for action_def in routes_by_cat.get(classification.category, []):
-                action_name = (
-                    action_def.get("action", "")
-                    if isinstance(action_def, dict) else str(action_def)
-                )
-                if not action_name:
-                    continue
-                action = registry.get(action_name)
-                if action is None:
-                    continue
-                if dry_run:
-                    actions_fired.append(f"dry-run:{action_name}")
-                    continue
-                try:
-                    await action.execute(
-                        # Bulk doesn't materialise FlowState rows for
-                        # every message — actions that need state_bag
-                        # context (calendar_provider, meeting_prefs)
-                        # operate on a stand-in dict. The inline
-                        # path's calendar invite + suggest-meeting
-                        # actions use this; bulk callers would skip
-                        # those routes by configuration.
-                        _StateBag(acct=acct),
-                        message, classification, provider,
-                    )
-                    actions_fired.append(action_name)
-                except Exception as ae:
-                    actions_fired.append(f"err:{action_name}:{ae}")
-            entry["actions"] = actions_fired
-
-            record_triage_run(
-                conn, acct["id"], acct.get("name", ""),
-                query=f"bulk:{job_id}",
-                total_messages=1,
-                results=[entry],
-                errors=[],
-                elapsed_secs=0.0,
-                actor_user_id=actor_user_id,
-            )
-            record_processed_message(conn, job_id, msg_id, "p")
-            return "p"
+            message = await ctx.provider.fetch_message(msg_id)
         except Exception as e:
             _log.warning(
-                "bulk per-message error",
+                "bulk per-message fetch error",
                 extra={"job_id": job_id, "msg_id": msg_id, "err": repr(e)},
             )
-            try:
-                record_triage_run(
-                    conn, acct["id"], acct.get("name", ""),
-                    query=f"bulk:{job_id}",
-                    total_messages=1,
-                    results=[{
-                        "message_id": msg_id,
-                        "status": "error",
-                        "error": f"{type(e).__name__}: {e}",
-                    }],
-                    errors=[f"{type(e).__name__}: {e}"],
-                    elapsed_secs=0.0,
-                    actor_user_id=actor_user_id,
-                )
-            except Exception:
-                pass
-            try:
-                record_processed_message(conn, job_id, msg_id, "e")
-            except Exception:
-                # Dedup write itself failed — likely DB locked.
-                # Don't mask the real per-message error.
-                pass
+            err_entry = {
+                "message_id": msg_id,
+                "status": "error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+            await db_call(
+                _record_outcome, conn, err_entry, "e",
+                [f"{type(e).__name__}: {e}"],
+            )
             return "e"
 
+        try:
+            res = await triage_single_message(ctx, message, msg_id)
+            entry = res.entry
+            status = res.status
+        except Exception as e:
+            # The shared helper re-raises LLMBackendUnreachableError so
+            # the watcher / poll / push paths can route it to their
+            # retry queues. The bulk runner has no per-message retry
+            # queue — and a raised exception would abort the whole
+            # ``asyncio.gather`` batch — so catch it here, mirroring
+            # the pre-#199 bulk path's broad per-message ``except``.
+            _log.warning(
+                "bulk per-message triage error",
+                extra={"job_id": job_id, "msg_id": msg_id, "err": repr(e)},
+            )
+            entry = {
+                "message_id": msg_id,
+                "status": "error",
+                "error": f"{type(e).__name__}: {e}",
+            }
+            status = "e"
 
-class _StateBag:
-    """Placeholder flow-shaped object for action.execute signatures.
+        # Persist the per-message triage_runs row + dedup row
+        # immediately (the bulk runner writes incrementally rather
+        # than batching). ASYNC-DB: both writes batched into one
+        # off-loop hop.
+        await db_call(
+            _record_outcome, conn, entry, status,
+            [entry.get("error", "")] if status == "e" else [],
+        )
+        return status
 
-    The Action base class signature expects something with attributes
-    the inline path's :class:`FlowState` provides. Bulk doesn't
-    materialise full flows; this stand-in carries the minimum set
-    actions actually read (account dict for HIPAA flag etc.). Routes
-    that touch calendar / meeting state (AcceptInviteAction,
-    SuggestMeetingTimesAction) need the inline path's flow shape and
-    operators should not wire them into bulk routes.
-    """
-    def __init__(self, *, acct: dict):
-        self.acct = acct
-        self.state_bag: dict = {}
-        # Common flow attrs that some actions read on existence checks.
-        self.flow_id = ""
-        self.message_id = ""
-        self.actions_pending: list[str] = []
-        self.actions_completed: list[str] = []
-        self.revision = 0
+
 
 
 async def run_style_mine_job(
@@ -360,7 +244,7 @@ async def run_style_mine_job(
     conn: sqlite3.Connection,
     job: dict,
 ) -> None:
-    """#161 item 5 — Execute one ``kind='style_mine'`` job end-to-end.
+    """ item 5 — Execute one ``kind='style_mine'`` job end-to-end.
 
     Sibling of :func:`run_triage_all` for the style-mine variant. The
     inline ``_mine_or_preview`` path on /profile/style-data hands off
@@ -420,7 +304,10 @@ async def run_style_mine_job(
     # Parse limit out of the query column. Format set at queue time
     # is ``style_mine:limit=N``; any other shape falls back to the
     # install-wide default. Clamp defensively.
-    limit = get_style_learning_mine_limit_default(conn)
+    #  — run_style_mine_job is awaited from the bulk dispatcher
+    # loop on the event-loop thread; route the setting read off-loop.
+    from email_triage.web.db_threadpool import db_call
+    limit = await db_call(get_style_learning_mine_limit_default, conn)
     if raw_query.startswith("style_mine:limit="):
         try:
             limit = int(raw_query.split("=", 1)[1])
@@ -434,38 +321,51 @@ async def run_style_mine_job(
     secrets = app.state.secrets
     config = getattr(app.state, "config", None)
 
-    acct = get_email_account(conn, account_id)
+    def _validate_style_job(conn, account_id, job_id):
+        # ASYNC-DB: account read + owner-disabled read + HIPAA-gate
+        # read + (on failure) finish_triage_job write, batched into one
+        # off-loop hop. The bulk runner shares the app event loop, so
+        # blocking SELECTs here stall every concurrent HTTP request.
+        acct_ = get_email_account(conn, account_id)
+        if acct_ is None:
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="account not found",
+            )
+            return None, None, False
+        owner_id_ = acct_.get("user_id")
+        if owner_id_ is not None and is_user_disabled(conn, owner_id_):
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="account owner disabled",
+            )
+            return None, None, False
+        # HIPAA gate (defence in depth — the inline handler already
+        # checked, but a queued job survives an operator re-flag while
+        # waiting in the queue). HIPAA-flagged + no opt-in fails the
+        # job before any provider fetch.
+        account_hipaa_ = is_account_hipaa(acct_)
+        if account_hipaa_ and not is_style_knobs_hipaa_allow(
+            conn, account_id,
+        ):
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="hipaa_gate: opt-in required",
+            )
+            return None, None, False
+        return acct_, owner_id_, account_hipaa_
+
+    acct, owner_id, account_hipaa = await db_call(
+        _validate_style_job, conn, account_id, job_id,
+    )
     if acct is None:
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="account not found",
-        )
-        return
-
-    owner_id = acct.get("user_id")
-    if owner_id is not None and is_user_disabled(conn, owner_id):
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="account owner disabled",
-        )
-        return
-
-    # HIPAA gate (defence in depth — the inline handler already
-    # checked, but a queued job survives an operator re-flag while
-    # waiting in the queue). HIPAA-flagged + no opt-in fails the
-    # job before any provider fetch.
-    account_hipaa = is_account_hipaa(acct)
-    if account_hipaa and not is_style_knobs_hipaa_allow(conn, account_id):
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="hipaa_gate: opt-in required",
-        )
         return
 
     # Provider + classifier build. Same shape as run_triage_all.
     if config is None:
-        finish_triage_job(
-            conn, job_id, status="failed",
+        # ASYNC-DB: terminal-state write off the loop.
+        await db_call(
+            finish_triage_job, conn, job_id, status="failed",
             error_text="classifier not configured",
         )
         return
@@ -473,8 +373,9 @@ async def run_style_mine_job(
         provider = _create_provider_from_account(acct, secrets)
         classifier = _build_classifier_from_config(config)
     except Exception as e:
-        finish_triage_job(
-            conn, job_id, status="failed",
+        # ASYNC-DB: terminal-state write off the loop.
+        await db_call(
+            finish_triage_job, conn, job_id, status="failed",
             error_text=f"setup: {type(e).__name__}: {e}",
         )
         return
@@ -491,7 +392,9 @@ async def run_style_mine_job(
         and actor_user_id != owner_id
     ):
         try:
-            audit_event_id = record_hipaa_access_event(
+            # ASYNC-DB: HIPAA audit-row write off the loop.
+            audit_event_id = await db_call(
+                record_hipaa_access_event,
                 conn, actor_user_id, account_id, "style_mine_bulk",
                 outcome="in_progress",
             )
@@ -559,7 +462,11 @@ async def run_style_mine_job(
                     seen_keys.add(key)
                     merged_pairs.append(key)
 
-        bump_triage_job_counters(conn, job_id, seen=len(merged_pairs))
+        # ASYNC-DB: counter write off the loop.
+        await db_call(
+            bump_triage_job_counters, conn, job_id,
+            seen=len(merged_pairs),
+        )
 
         messages = []
         for folder, mid in merged_pairs:
@@ -578,21 +485,29 @@ async def run_style_mine_job(
             failed_with = "no_messages: nothing in the sent folder"
         else:
             # M-6 captured-pair set for the corpus weighting.
-            captured_ids: set[str] = set()
-            try:
-                rows = conn.execute(
-                    "SELECT message_id FROM sent_mail_index "
-                    "WHERE account_id = ? AND is_captured_pair = 1",
-                    (account_id,),
-                ).fetchall()
-                for r in rows:
-                    mid = (
-                        r["message_id"] if hasattr(r, "keys") else r[0]
-                    )
-                    if mid:
-                        captured_ids.add(str(mid))
-            except Exception:
-                captured_ids = set()
+            def _read_captured_ids(conn, account_id):
+                # ASYNC-DB: sent_mail_index captured-pair read
+                # off the loop.
+                ids_: set[str] = set()
+                try:
+                    rows_ = conn.execute(
+                        "SELECT message_id FROM sent_mail_index "
+                        "WHERE account_id = ? AND is_captured_pair = 1",
+                        (account_id,),
+                    ).fetchall()
+                    for r in rows_:
+                        mid_ = (
+                            r["message_id"] if hasattr(r, "keys") else r[0]
+                        )
+                        if mid_:
+                            ids_.add(str(mid_))
+                except Exception:
+                    return set()
+                return ids_
+
+            captured_ids: set[str] = await db_call(
+                _read_captured_ids, conn, account_id,
+            )
 
             # 2026-05-13 — alias-mode parity with the inline path.
             # Before this fix, the bulk runner always called
@@ -610,8 +525,9 @@ async def run_style_mine_job(
             # wide descriptor from the largest bucket so the legacy
             # ``style_profile:<id>`` row stays accurate as the
             # fallback.
-            alias_mode_on = is_alias_mode_enabled_for_account(
-                conn, account_id,
+            # ASYNC-DB: alias-mode flag read off the loop.
+            alias_mode_on = await db_call(
+                is_alias_mode_enabled_for_account, conn, account_id,
             )
             if alias_mode_on:
                 known_addresses = _account_addresses(acct)
@@ -622,51 +538,63 @@ async def run_style_mine_job(
                         captured_message_ids=captured_ids,
                     )
                 )
-                persisted = 0
-                for addr, prof in alias_descriptors.items():
-                    try:
-                        set_account_style_per_alias(
-                            conn, account_id, addr,
-                            prof.to_dict(),
-                            sample_count=prof.sample_count,
+
+                def _persist_alias_profiles(conn):
+                    # ASYNC-DB: per-alias persist loop + account-
+                    # wide refresh + counter bump, batched into one
+                    # off-loop hop.
+                    persisted_ = 0
+                    for addr, prof in alias_descriptors.items():
+                        try:
+                            set_account_style_per_alias(
+                                conn, account_id, addr,
+                                prof.to_dict(),
+                                sample_count=prof.sample_count,
+                            )
+                            persisted_ += 1
+                        except Exception as e:
+                            _log.warning(
+                                "style_mine: per-alias persist failed; "
+                                "continuing",
+                                extra={
+                                    "job_id": job_id,
+                                    "account_id": account_id,
+                                    "addr": addr,
+                                    "err": repr(e),
+                                },
+                            )
+                    # Refresh the account-wide row from the largest
+                    # bucket so the fallback (when alias-mode flips
+                    # OFF later) carries the dominant style. Mirrors
+                    # the inline path's set_style_profile call inside
+                    # the alias branch.
+                    if alias_descriptors:
+                        best = max(
+                            alias_descriptors.values(),
+                            key=lambda p: p.sample_count,
                         )
-                        persisted += 1
-                    except Exception as e:
-                        _log.warning(
-                            "style_mine: per-alias persist failed; continuing",
-                            extra={
-                                "job_id": job_id,
-                                "account_id": account_id,
-                                "addr": addr,
-                                "err": repr(e),
-                            },
-                        )
-                # Refresh the account-wide row from the largest bucket
-                # so the fallback (when alias-mode flips OFF later)
-                # carries the dominant style. Mirrors the inline path's
-                # set_style_profile call inside the alias branch.
-                if alias_descriptors:
-                    best = max(
-                        alias_descriptors.values(),
-                        key=lambda p: p.sample_count,
+                        try:
+                            set_style_profile(
+                                conn, account_id, best.to_dict(),
+                            )
+                        except Exception:
+                            pass
+                    # 2026-05-18 — bump by the actual message count,
+                    # not 1. Pre-fix this incremented total_processed
+                    # by 1 (the agent's "one logical output = one
+                    # descriptor" semantic), but the Recent bulk runs
+                    # UI renders ``total_processed / total_seen`` as a
+                    # progress bar — "1 / 100" reads as "1 of 100
+                    # messages done" / "half-broken" to any operator
+                    # (or customer) even though all 100 messages WERE
+                    # actually mined. Bumping by ``len(messages)``
+                    # gets the bar to 100%.
+                    bump_triage_job_counters(
+                        conn, job_id, processed=len(messages),
                     )
-                    try:
-                        set_style_profile(conn, account_id, best.to_dict())
-                    except Exception:
-                        pass
-                # 2026-05-18 — bump by the actual message count, not 1.
-                # Pre-fix this incremented total_processed by 1 (the
-                # agent's "one logical output = one descriptor"
-                # semantic), but the Recent bulk runs UI renders
-                # ``total_processed / total_seen`` as a progress bar
-                # — "1 / 100" reads as "1 of 100 messages done" /
-                # "half-broken" to any operator (or any customer)
-                # even though all 100 messages WERE actually mined.
-                # Bumping by ``len(messages)`` gets the bar to 100%
-                # and matches the natural reading.
-                bump_triage_job_counters(
-                    conn, job_id, processed=len(messages),
-                )
+                    return persisted_
+
+                persisted = await db_call(_persist_alias_profiles, conn)
                 _log.info(
                     "style_mine: per-alias profiles saved",
                     extra={
@@ -684,12 +612,18 @@ async def run_style_mine_job(
                     messages, classifier,
                     captured_message_ids=captured_ids,
                 )
-                set_style_profile(conn, account_id, profile.to_dict())
-                # See alias branch above for the rationale on bumping
-                # by ``len(messages)`` instead of 1.
-                bump_triage_job_counters(
-                    conn, job_id, processed=len(messages),
-                )
+
+                def _persist_profile(conn):
+                    # ASYNC-DB: account-wide profile write +
+                    # counter bump, batched into one off-loop hop.
+                    set_style_profile(conn, account_id, profile.to_dict())
+                    # See alias branch above for the rationale on
+                    # bumping by ``len(messages)`` instead of 1.
+                    bump_triage_job_counters(
+                        conn, job_id, processed=len(messages),
+                    )
+
+                await db_call(_persist_profile, conn)
                 _log.info(
                     "style_mine: profile saved",
                     extra={
@@ -717,22 +651,28 @@ async def run_style_mine_job(
             except Exception:
                 pass
 
-    # Resolve terminal state.
-    latest = get_triage_job(conn, job_id)
-    if latest and latest["status"] == "running":
-        if failed_with:
-            finish_triage_job(
-                conn, job_id, status="failed",
-                error_text=failed_with,
-            )
-        else:
-            finish_triage_job(conn, job_id, status="done")
+    def _finalise_style_job(conn):
+        # ASYNC-DB: terminal-state resolution read + (conditional)
+        # finish write, batched into one off-loop hop.
+        latest = get_triage_job(conn, job_id)
+        if latest and latest["status"] == "running":
+            if failed_with:
+                finish_triage_job(
+                    conn, job_id, status="failed",
+                    error_text=failed_with,
+                )
+            else:
+                finish_triage_job(conn, job_id, status="done")
+
+    await db_call(_finalise_style_job, conn)
 
     # Close HIPAA audit row.
     if audit_event_id is not None:
         outcome = "error" if failed_with else "success"
         try:
-            update_hipaa_access_event(
+            # ASYNC-DB: HIPAA audit-row update off the loop.
+            await db_call(
+                update_hipaa_access_event,
                 conn, audit_event_id, outcome,
                 f"style_mine job {job_id}",
             )
@@ -781,14 +721,12 @@ async def run_triage_all(
     )
     from email_triage.web.routers.ui import (
         _create_provider_from_account, _build_classifier_from_config,
-        _get_categories_from_db, _load_all_list_hints,
+        _get_categories_from_db, _load_all_list_hints, _is_dry_run,
     )
-    from email_triage.actions.move import MoveAction
-    from email_triage.actions.label import LabelAction
-    from email_triage.actions.add_label import AddLabelAction
-    from email_triage.actions.notify import NotifyAction
-    from email_triage.actions.draft_reply import DraftReplyAction
-    from email_triage.actions.registry import ActionRegistry
+    from email_triage.web.triage_one import (
+        TriageContext, build_default_registry,
+        _build_rule_labels_map, _build_rule_provider_labels_map,
+    )
 
     job_id = job["job_id"]
     account_id = job["account_id"]
@@ -799,31 +737,42 @@ async def run_triage_all(
 
     secrets = app.state.secrets
 
-    acct = get_email_account(conn, account_id)
+    def _validate_bulk_job(conn, account_id, job_id):
+        # ASYNC-DB: account read + owner-disabled read + category
+        # read + route read + (on failure) finish_triage_job write,
+        # batched into one off-loop hop. The bulk runner shares the app
+        # event loop, so blocking SELECTs here stall every concurrent
+        # HTTP request.
+        acct_ = get_email_account(conn, account_id)
+        if acct_ is None:
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="account not found",
+            )
+            return None, None, None, None
+        owner_id_ = acct_.get("user_id")
+        if owner_id_ is not None and is_user_disabled(conn, owner_id_):
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="account owner disabled",
+            )
+            return None, None, None, None
+        categories_ = _get_categories_from_db(conn, user_id=owner_id_)
+        if not categories_:
+            finish_triage_job(
+                conn, job_id, status="failed",
+                error_text="no categories configured",
+            )
+            return None, None, None, None
+        routes_ = list_account_routes(conn, account_id)
+        return acct_, owner_id_, categories_, routes_
+
+    acct, owner_id, categories, account_routes = await db_call(
+        _validate_bulk_job, conn, account_id, job_id,
+    )
     if acct is None:
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="account not found",
-        )
         return
 
-    owner_id = acct.get("user_id")
-    if owner_id is not None and is_user_disabled(conn, owner_id):
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="account owner disabled",
-        )
-        return
-
-    categories = _get_categories_from_db(conn, user_id=owner_id)
-    if not categories:
-        finish_triage_job(
-            conn, job_id, status="failed",
-            error_text="no categories configured",
-        )
-        return
-
-    account_routes = list_account_routes(conn, account_id)
     routes_by_cat = {r["category"]: r["actions"] for r in account_routes}
     account_hipaa = is_account_hipaa(acct)
 
@@ -834,8 +783,9 @@ async def run_triage_all(
         provider = _create_provider_from_account(acct, secrets)
         classifier = _build_classifier_from_config(app.state.config)
     except Exception as e:
-        finish_triage_job(
-            conn, job_id, status="failed",
+        # ASYNC-DB: terminal-state write off the loop.
+        await db_call(
+            finish_triage_job, conn, job_id, status="failed",
             error_text=f"setup: {type(e).__name__}: {e}",
         )
         return
@@ -851,203 +801,310 @@ async def run_triage_all(
         and actor_user_id != owner_id
     ):
         try:
-            audit_event_id = record_hipaa_access_event(
+            # ASYNC-DB: HIPAA audit-row write off the loop.
+            audit_event_id = await db_call(
+                record_hipaa_access_event,
                 conn, actor_user_id, account_id, "bulk_triage",
                 outcome="in_progress",
             )
         except Exception:
             _log.exception("HIPAA audit row write failed (in_progress)")
 
-    registry = ActionRegistry()
-    registry.register(MoveAction())
-    registry.register(LabelAction())
-    registry.register(AddLabelAction())
-    registry.register(NotifyAction())
-    registry.register(DraftReplyAction())
-
-    # #145.2 — burst is operator-tunable via the /config page. Read
-    # the saved runtime setting at job-RUN time (not job-CREATE time)
-    # so an operator's mid-queue tuning takes effect on the next job
-    # without restarting. Default 1 preserves legacy "single-step at
-    # the configured cadence" behaviour for installs that never set
-    # the knob. Falls back to the legacy heuristic only if the saved
-    # value is missing OR explicitly zero (a 0 from a stale save would
-    # otherwise short-circuit to 1 here, masking operator intent).
-    operator_burst: int | None = None
-    try:
-        from email_triage.web.db import get_setting as _get_setting
-        runtime_saved = _get_setting(conn, "runtime_settings") or {}
-        if "bulk_triage_burst" in runtime_saved:
-            operator_burst = int(runtime_saved["bulk_triage_burst"])
-    except Exception:
-        # Don't let a settings lookup hiccup take down the runner;
-        # fall through to the heuristic.
-        operator_burst = None
-    burst = (
-        max(1, operator_burst)
-        if operator_burst is not None and operator_burst > 0
-        else max(1, rate_msg_per_min // 6)
-    )
-    bucket = TokenBucket(rate_msg_per_min, burst=burst)
-    sem = asyncio.Semaphore(concurrency)
-
-    # #134.1 — load classification lists + rules once per JOB. A bulk
-    # sweep can process tens of thousands of messages; the prior
-    # per-message refetch was the dominant DB-noise source on long runs.
-    try:
-        list_hints_lists, list_hints_rules_by_list = _load_all_list_hints(conn)
-    except Exception:
-        # Don't let a missing-table / mid-migration race kill the run;
-        # fall back to per-message lookup for safety.
-        _log.exception("preload _load_all_list_hints failed")
-        list_hints_lists = None
-        list_hints_rules_by_list = None
-
+    #  — terminal-state flags initialised BEFORE the outer try so
+    # the audit-row close in its ``finally`` can read them even when a
+    # failure fires in the job-setup window (registry / runtime-burst
+    # read / preload / context build). Previously that window sat
+    # *outside* every try block: an exception there skipped the audit
+    # close at the end of the function entirely, leaving the
+    # ``in_progress`` HIPAA row open forever.
     cancelled = False
     failed_with: str | None = None
 
-    # Resume support (#101 step 8): if the row was requeued after a
-    # crash, the previous pass may have already processed N
-    # messages — those rows live in triage_job_messages and
-    # is_message_processed_in_job will short-circuit them inside
-    # _process_one_message. Pre-bump the aggregate counters from
-    # the dedup table so the UI doesn't show "0 / 10000 processed"
-    # at restart while the dedup gate keeps clearing already-done
-    # work. The seen counter still grows from the search_iter
-    # walk; processed/skipped/errors come from the dedup record.
-    pre = count_processed_messages_in_job(conn, job_id)
-    if pre["p"] or pre["s"] or pre["e"]:
-        bump_triage_job_counters(
-            conn, job_id,
-            processed=pre["p"], skipped=pre["s"], errors=pre["e"],
+    #  — outer try whose ``finally`` ALWAYS closes the
+    # ``in_progress`` audit row, no matter where in the job a failure
+    # occurs. It opens immediately after the ``in_progress`` write so
+    # there is no longer an unguarded window between the row being
+    # opened and the row being closed.
+    try:
+        #  — uniform action set across every ingestion path. Calendar
+        # actions (invite / suggest-meeting) are registered but stay inert
+        # for bulk: the bulk runner does not wire a calendar provider, so
+        # the meeting-intercept inject is a no-op (calendar_wired=False)
+        # and any explicitly-routed calendar action would skip. This is
+        # behaviour-preserving — the pre-#199 bulk path had no calendar
+        # support — while keeping a single registry shape.
+        registry = build_default_registry(
+            include_add_label=True, include_self_event=True,
         )
 
-    # High-water-mark cursor (#101 step 9). On a fresh run the row
-    # has cursor=NULL; on resume after a crash, the persisted
-    # cursor lets the provider's search_iter restart from the last
-    # successful batch boundary. Provider-specific format (IMAP
-    # max-UID-int, Gmail pageToken, O365 nextLink URL); the runner
-    # just opaque-passes it through.
-    resume_cursor = job.get("cursor")
+        # .2 — burst is operator-tunable via the /config page. Read
+        # the saved runtime setting at job-RUN time (not job-CREATE time)
+        # so an operator's mid-queue tuning takes effect on the next job
+        # without restarting. Default 1 preserves legacy "single-step at
+        # the configured cadence" behaviour for installs that never set
+        # the knob. Falls back to the legacy heuristic only if the saved
+        # value is missing OR explicitly zero (a 0 from a stale save
+        # would otherwise short-circuit to 1 here, masking operator
+        # intent).
+        operator_burst: int | None = None
+        try:
+            from email_triage.web.db import get_setting as _get_setting
+            # ASYNC-DB: runtime-settings read off the loop.
+            runtime_saved = await db_call(
+                _get_setting, conn, "runtime_settings",
+            ) or {}
+            if "bulk_triage_burst" in runtime_saved:
+                operator_burst = int(runtime_saved["bulk_triage_burst"])
+        except Exception:
+            # Don't let a settings lookup hiccup take down the runner;
+            # fall through to the heuristic.
+            operator_burst = None
+        burst = (
+            max(1, operator_burst)
+            if operator_burst is not None and operator_burst > 0
+            else max(1, rate_msg_per_min // 6)
+        )
+        bucket = TokenBucket(rate_msg_per_min, burst=burst)
+        sem = asyncio.Semaphore(concurrency)
 
-    # Query-stage self-skip (#117). Same rewrite as triage_runner —
-    # exclude install-self-from at the SEARCH stage so a long bulk
-    # sweep doesn't burn FETCH calls on every digest the install
-    # ever delivered to its own watched mailbox.
-    from email_triage.mail_headers import build_self_skip_query
-    _self_from_addr = getattr(
-        getattr(app.state.config, "smtp", None), "from_addr", "",
-    )
-    effective_query = build_self_skip_query(
-        query, _self_from_addr, provider_type=acct["provider_type"],
-    )
-
-    try:
-        async for batch, batch_cursor in provider.search_iter(
-            effective_query,
-            batch_size=BATCH_SIZE,
-            resume_cursor=resume_cursor,
-        ):
-            # Cancel check at batch boundary BEFORE any work.
-            latest = get_triage_job(conn, job_id)
-            if latest is None or latest["status"] == "cancelled":
-                cancelled = True
-                break
-
-            bump_triage_job_counters(conn, job_id, seen=len(batch))
-
-            # Schedule per-message tasks; the semaphore inside
-            # _process_one_message caps actual parallelism. Letting
-            # asyncio queue every task in the batch is fine — they
-            # contend on the semaphore and the rate-limit bucket
-            # serialises further.
-            tasks = [
-                asyncio.create_task(_process_one_message(
-                    msg_id=msg_id, provider=provider, classifier=classifier,
-                    categories=categories, routes_by_cat=routes_by_cat,
-                    registry=registry, conn=conn, acct=acct,
-                    account_hipaa=account_hipaa,
-                    actor_user_id=actor_user_id, job_id=job_id,
-                    bucket=bucket, sem=sem,
-                    self_from_addr=_self_from_addr,
-                    list_hints_lists=list_hints_lists,
-                    list_hints_rules_by_list=list_hints_rules_by_list,
-                ))
-                for msg_id in batch
-            ]
-            statuses = await asyncio.gather(*tasks, return_exceptions=False)
-
-            processed = sum(1 for s in statuses if s == "p")
-            skipped = sum(1 for s in statuses if s == "s")
-            errors = sum(1 for s in statuses if s == "e")
-            bump_triage_job_counters(
-                conn, job_id,
-                processed=processed, skipped=skipped, errors=errors,
+        # .1 — load classification lists + rules once per JOB. A bulk
+        # sweep can process tens of thousands of messages; the prior
+        # per-message refetch was the dominant DB-noise source on long
+        # runs.
+        #
+        # ASYNC-DB: the once-per-job preload — list hints, the
+        # resume counter read + pre-bump, the rule-label maps, the
+        # dry-run flag — is one clean sequence of reads (plus one
+        # conditional write), batched into a single off-loop hop.
+        def _preload_job(conn, job_id):
+            try:
+                lh_lists, lh_rules = _load_all_list_hints(conn)
+            except Exception:
+                # Don't let a missing-table / mid-migration race kill
+                # the run; fall back to per-message lookup for safety.
+                _log.exception("preload _load_all_list_hints failed")
+                lh_lists = None
+                lh_rules = None
+            # Resume support: if the row was requeued
+            # after a crash, the previous pass may have already
+            # processed N messages — those rows live in
+            # triage_job_messages and is_message_processed_in_job will
+            # short-circuit them inside _process_one_message. Pre-bump
+            # the aggregate counters from the dedup table so the UI
+            # doesn't show "0 / 10000 processed" at restart while the
+            # dedup gate keeps clearing already-done work. The seen
+            # counter still grows from the search_iter walk;
+            # processed/skipped/errors come from the dedup record.
+            pre_ = count_processed_messages_in_job(conn, job_id)
+            if pre_["p"] or pre_["s"] or pre_["e"]:
+                bump_triage_job_counters(
+                    conn, job_id,
+                    processed=pre_["p"], skipped=pre_["s"],
+                    errors=pre_["e"],
+                )
+            return (
+                lh_lists, lh_rules,
+                _build_rule_labels_map(conn),
+                _build_rule_provider_labels_map(conn),
+                _is_dry_run(conn),
             )
 
-            # Persist the resume cursor AFTER the batch's per-message
-            # work completes. Crash-during-batch leaves the cursor
-            # at the previous batch's value; resume re-walks the
-            # current batch's UIDs but the dedup table (#101 step 8)
-            # short-circuits the already-processed entries so the
-            # only repeated work is the provider page fetch + the
-            # dedup-table lookups.
-            if batch_cursor is not None:
-                try:
-                    update_triage_job_cursor(
-                        conn, job_id, batch_cursor,
-                    )
-                except Exception:
-                    _log.exception(
-                        "cursor persist failed; continuing",
-                        extra={"job_id": job_id},
-                    )
-    except asyncio.CancelledError:
-        # Process shutdown. Don't write a terminal row — leave it
-        # 'running' so the next start's requeue picks it up. Re-raise
-        # so the supervisor sees the cancellation cleanly.
-        raise
-    except Exception as e:
-        failed_with = f"{type(e).__name__}: {e}"
-        _log.exception("bulk run failed", extra={"job_id": job_id})
-    finally:
+        (
+            list_hints_lists, list_hints_rules_by_list,
+            rule_labels_map, rule_provider_labels_map, dry_run_flag,
+        ) = await db_call(_preload_job, conn, job_id)
+
+        # High-water-mark cursor. On a fresh run the row
+        # has cursor=NULL; on resume after a crash, the persisted
+        # cursor lets the provider's search_iter restart from the last
+        # successful batch boundary. Provider-specific format (IMAP
+        # max-UID-int, Gmail pageToken, O365 nextLink URL); the runner
+        # just opaque-passes it through.
+        resume_cursor = job.get("cursor")
+
+        # Query-stage self-skip. Same rewrite as triage_runner —
+        # exclude install-self-from at the SEARCH stage so a long bulk
+        # sweep doesn't burn FETCH calls on every digest the install
+        # ever delivered to its own watched mailbox.
+        from email_triage.mail_headers import build_self_skip_query
+        _self_from_addr = getattr(
+            getattr(app.state.config, "smtp", None), "from_addr", "",
+        )
+        effective_query = build_self_skip_query(
+            query, _self_from_addr, provider_type=acct["provider_type"],
+        )
+
+        #  — build the shared per-message context ONCE per job. The
+        # bulk path does NOT use the durable rfc-id / $EmailTriaged
+        # dedup gates (its per-job triage_job_messages table is the
+        # dedup mechanism) so durable_dedup / mark_triaged_on_success
+        # stay False. It now DOES fire / rule-labels + 
+        # watches via this ctx — the pre-#199 bulk path skipped them.
+        ctx = TriageContext(
+            db=conn, config=app.state.config, secrets=secrets, acct=acct,
+            classifier=classifier, provider=provider, registry=registry,
+            categories=categories,
+            routes_by_cat=routes_by_cat,
+            list_hints_lists=list_hints_lists,
+            list_hints_rules_by_list=list_hints_rules_by_list,
+            rule_labels_map=rule_labels_map,
+            rule_provider_labels_map=rule_provider_labels_map,
+            self_from_addr=_self_from_addr,
+            dry_run=dry_run_flag,
+            account_hipaa=account_hipaa,
+            actor_user_id=actor_user_id,
+            durable_dedup=False,
+            mark_triaged_on_success=False,
+            set_keyword_on_success=False,
+            fire_watches=True,
+        )
+
         try:
-            await provider.close()
-        except Exception:
-            pass
-        # #139 — drain the classifier's long-lived httpx pool.
-        if "classifier" in locals() and hasattr(classifier, "close"):
+            async for batch, batch_cursor in provider.search_iter(
+                effective_query,
+                batch_size=BATCH_SIZE,
+                resume_cursor=resume_cursor,
+            ):
+                # Cancel check at batch boundary BEFORE any work.
+                # ASYNC-DB: cancel-check read off the loop.
+                latest = await db_call(get_triage_job, conn, job_id)
+                if latest is None or latest["status"] == "cancelled":
+                    cancelled = True
+                    break
+
+                # ASYNC-DB: per-batch seen-counter write off loop.
+                await db_call(
+                    bump_triage_job_counters, conn, job_id,
+                    seen=len(batch),
+                )
+
+                # Schedule per-message tasks; the semaphore inside
+                # _process_one_message caps actual parallelism. Letting
+                # asyncio queue every task in the batch is fine — they
+                # contend on the semaphore and the rate-limit bucket
+                # serialises further.
+                tasks = [
+                    asyncio.create_task(_process_one_message(
+                        ctx=ctx, msg_id=msg_id, conn=conn, acct=acct,
+                        actor_user_id=actor_user_id, job_id=job_id,
+                        bucket=bucket, sem=sem,
+                    ))
+                    for msg_id in batch
+                ]
+                statuses = await asyncio.gather(
+                    *tasks, return_exceptions=False,
+                )
+
+                processed = sum(1 for s in statuses if s == "p")
+                skipped = sum(1 for s in statuses if s == "s")
+                errors = sum(1 for s in statuses if s == "e")
+
+                def _persist_batch_progress(
+                    conn, processed, skipped, errors, batch_cursor,
+                ):
+                    # ASYNC-DB: per-batch counter bump +
+                    # resume-cursor persist, one off-loop hop.
+                    bump_triage_job_counters(
+                        conn, job_id,
+                        processed=processed, skipped=skipped,
+                        errors=errors,
+                    )
+                    # Persist the resume cursor AFTER the batch's
+                    # per-message work completes. Crash-during-batch
+                    # leaves the cursor at the previous batch's value;
+                    # resume re-walks the current batch's UIDs but the
+                    # dedup table short-circuits the
+                    # already-processed entries so the only repeated
+                    # work is the provider page fetch + the dedup-table
+                    # lookups.
+                    if batch_cursor is not None:
+                        try:
+                            update_triage_job_cursor(
+                                conn, job_id, batch_cursor,
+                            )
+                        except Exception:
+                            _log.exception(
+                                "cursor persist failed; continuing",
+                                extra={"job_id": job_id},
+                            )
+
+                await db_call(
+                    _persist_batch_progress, conn,
+                    processed, skipped, errors, batch_cursor,
+                )
+        except asyncio.CancelledError:
+            # Process shutdown. Don't write a terminal row — leave it
+            # 'running' so the next start's requeue picks it up.
+            # Re-raise so the supervisor sees the cancellation cleanly.
+            raise
+        except Exception as e:
+            failed_with = f"{type(e).__name__}: {e}"
+            _log.exception("bulk run failed", extra={"job_id": job_id})
+        finally:
             try:
-                await classifier.close()
+                await provider.close()
             except Exception:
                 pass
+            #  — drain the classifier's long-lived httpx pool.
+            if "classifier" in locals() and hasattr(classifier, "close"):
+                try:
+                    await classifier.close()
+                except Exception:
+                    pass
 
-    # Resolve terminal state. Cancelled writes are owned by the UI
-    # path; only finalise here if the row is still 'running'.
-    latest = get_triage_job(conn, job_id)
-    if latest and latest["status"] == "running":
-        if cancelled:
-            finish_triage_job(conn, job_id, status="cancelled")
-        elif failed_with:
-            finish_triage_job(
-                conn, job_id, status="failed", error_text=failed_with,
-            )
-        else:
-            finish_triage_job(conn, job_id, status="done")
+        # Resolve terminal state. Cancelled writes are owned by the UI
+        # path; only finalise here if the row is still 'running'.
+        def _finalise_bulk_job(conn):
+            # ASYNC-DB: terminal-state resolution read +
+            # (conditional) finish write, one off-loop hop.
+            latest = get_triage_job(conn, job_id)
+            if latest and latest["status"] == "running":
+                if cancelled:
+                    finish_triage_job(conn, job_id, status="cancelled")
+                elif failed_with:
+                    finish_triage_job(
+                        conn, job_id, status="failed",
+                        error_text=failed_with,
+                    )
+                else:
+                    finish_triage_job(conn, job_id, status="done")
 
-    # Close the HIPAA audit row.
-    if audit_event_id is not None:
-        outcome = (
-            "cancelled" if cancelled
-            else ("error" if failed_with else "success")
-        )
-        try:
-            update_hipaa_access_event(
-                conn, audit_event_id, outcome,
-                f"bulk job {job_id}",
+        await db_call(_finalise_bulk_job, conn)
+    except asyncio.CancelledError:
+        #  — a cancel anywhere in the job-setup window (before the
+        # inner try took over) still reaches here. Mark cancelled so
+        # the audit row in the finally closes as "cancelled", then
+        # re-raise so the supervisor sees the cancellation cleanly.
+        cancelled = True
+        raise
+    except Exception as e:
+        #  — a failure in the job-setup window (registry build,
+        # runtime-burst read, preload, context build) or in
+        # _finalise_bulk_job lands here. It previously escaped every
+        # try block, skipping the audit-row close entirely. Record it
+        # so the finally closes the row as "error", then re-raise to
+        # preserve the prior propagate-to-caller behaviour.
+        if failed_with is None:
+            failed_with = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        #  — ALWAYS close the HIPAA audit row. This finally covers
+        # the whole span from immediately after the in_progress write,
+        # so no exception path can leave the row stuck "in_progress".
+        if audit_event_id is not None:
+            outcome = (
+                "cancelled" if cancelled
+                else ("error" if failed_with else "success")
             )
-        except Exception:
-            _log.exception("HIPAA audit row update failed")
+            try:
+                # ASYNC-DB: HIPAA audit-row update off the loop.
+                await db_call(
+                    update_hipaa_access_event,
+                    conn, audit_event_id, outcome,
+                    f"bulk job {job_id}",
+                )
+            except Exception:
+                _log.exception("HIPAA audit row update failed")
 
 
 async def bulk_triage_runner(app) -> None:
@@ -1069,7 +1126,8 @@ async def bulk_triage_runner(app) -> None:
     # Startup recovery — runs once before the loop. Any rows left
     # in ``running`` from a previous process flip back to ``queued``.
     try:
-        n = requeue_orphaned_triage_jobs(conn)
+        # ASYNC-DB: startup-recovery write off the loop.
+        n = await db_call(requeue_orphaned_triage_jobs, conn)
         if n:
             _log.info(
                 "Requeued orphaned bulk-triage jobs after restart",
@@ -1083,7 +1141,8 @@ async def bulk_triage_runner(app) -> None:
 
     while True:
         try:
-            job = claim_next_queued_triage_job(conn)
+            # ASYNC-DB: atomic job-claim write off the loop.
+            job = await db_call(claim_next_queued_triage_job, conn)
         except Exception:
             _log.exception("claim_next_queued_triage_job raised; sleeping")
             await asyncio.sleep(POLL_INTERVAL_SECS)
@@ -1099,7 +1158,7 @@ async def bulk_triage_runner(app) -> None:
         # the safety net for "body raised before reaching
         # finish_triage_job".
         #
-        # #161 item 5 — branch on ``kind`` (v21 column). Default to
+        #  item 5 — branch on ``kind`` (v21 column). Default to
         # legacy 'triage' on missing/unknown so a future kind that
         # arrives without a handler doesn't deadletter — it would
         # run through the triage classifier path and emit an
@@ -1110,7 +1169,7 @@ async def bulk_triage_runner(app) -> None:
             if kind == "style_mine":
                 await run_style_mine_job(app, conn, job)
             elif kind == "embedding_reindex":
-                # #180 C — re-embed an account's sent_mail_index rows
+                #  C — re-embed an account's sent_mail_index rows
                 # after a backend swap. Lazy-imported so the
                 # embedding-bits package isn't pulled on every
                 # dispatcher tick (most installs are not actively
@@ -1136,15 +1195,23 @@ async def bulk_triage_runner(app) -> None:
                 extra={"job_id": job["job_id"]},
             )
             try:
-                # Re-read so we don't clobber a state another path
-                # already moved to terminal (e.g. cancel arriving
-                # right before the exception).
-                latest = get_triage_job(conn, job["job_id"])
-                if latest and latest["status"] == "running":
-                    finish_triage_job(
-                        conn, job["job_id"], status="failed",
-                        error_text=f"{type(e).__name__}: {e}",
-                    )
+                def _safety_net_finish(conn, job_id, err_text):
+                    # ASYNC-DB: re-read + conditional finish write,
+                    # batched into one off-loop hop. Re-read so we don't
+                    # clobber a state another path already moved to
+                    # terminal (e.g. cancel arriving right before the
+                    # exception).
+                    latest = get_triage_job(conn, job_id)
+                    if latest and latest["status"] == "running":
+                        finish_triage_job(
+                            conn, job_id, status="failed",
+                            error_text=err_text,
+                        )
+
+                await db_call(
+                    _safety_net_finish, conn, job["job_id"],
+                    f"{type(e).__name__}: {e}",
+                )
             except Exception:
                 _log.exception(
                     "finish_triage_job(failed) write also raised; "

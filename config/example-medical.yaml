@@ -56,6 +56,7 @@ secrets:
 
 persistence:
   db_path: ./data/triage.db              # Local data directory
+  encryption_enabled: true               # SQLCipher AES-256 at rest — required posture for HIPAA / PHI installs
 
 # No push section — use polling mode:
 #   email-triage watch --interval 300

@@ -34,6 +34,32 @@ class TestDefaults:
         cfg = TriageConfig()
         assert cfg.logging.hipaa is False
 
+    def test_secrets_parser_default_backend_is_auto_not_env(self, tmp_path):
+        """R-4 per H-07 verify-don't-accept review 2026-05-24 (DA-4
+        catch). When operator YAML has a `secrets:` block but omits the
+        `backend:` line, the parser MUST default to `auto`, not `env`.
+
+        Before this fix (config.py:1181 `s.get("backend", "env")`), the
+        parser silently leaked `"env"` whenever the operator's YAML had
+        a `secrets:` block configured for `keyfile_path` / `external` /
+        etc. but didn't explicitly name `backend:`. That's the second
+        site of H-07's structural-hollow closure surface (alongside the
+        init template at cli.py:1496).
+
+        Per project_hipaa_asap_policy.md no-defer-tier, both sites had
+        to land Cycle 6.
+        """
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text(
+            "secrets:\n"
+            "  keyfile_path: ~/.config/email-triage/key\n"
+        )
+        cfg = load_config(str(yaml_file))
+        assert cfg.secrets.backend == "auto", (
+            "parser default for missing `backend:` must be `auto` per "
+            "H-07 closure. Got: " + repr(cfg.secrets.backend)
+        )
+
 
 class TestLoadFromYaml:
     def test_load_minimal_yaml(self, tmp_path: Path):
@@ -43,7 +69,7 @@ provider:
   type: imap
 classifier:
   backend: ollama
-  model: [local-llm-model]
+  model: qwen3.5:35b
   ollama_url: http://llmhost:11434
 """)
         cfg = load_config(yaml_file)
@@ -77,13 +103,13 @@ escalation:
         yaml_file = tmp_path / "config.yaml"
         yaml_file.write_text("""\
 webhooks:
-  - url: http://agenthost:3000/hooks/triage
+  - url: http://the agent host:3000/hooks/triage
     events: [flow.classified, flow.finished]
     secret_key: webhook_hmac_secret
 """)
         cfg = load_config(yaml_file)
         assert len(cfg.webhooks) == 1
-        assert cfg.webhooks[0].url == "http://agenthost:3000/hooks/triage"
+        assert cfg.webhooks[0].url == "http://the agent host:3000/hooks/triage"
         assert "flow.classified" in cfg.webhooks[0].events
 
     def test_missing_explicit_path_raises(self):
@@ -189,7 +215,7 @@ _dev:
         regressions where someone re-introduces a server-side YAML-level
         secret check ahead of the OTP/dev-keypair/WebAuthn paths.
         Ported from the retired tests/test_dev_config_strict.py."""
-        # #144 — login handler lives in `routers/ui/users.py` after
+        #  — login handler lives in `routers/ui/users.py` after
         # the per-concern split.
         src = (
             Path(__file__).resolve().parents[0].parent

@@ -1,4 +1,4 @@
-"""Bundle E2 / #135 phase 2 — async DB conversion regression sweep.
+"""Bundle E2 /  phase 2 — async DB conversion regression sweep.
 
 Phase 1 (Bundle E) wrapped /health, /health/detail, /dashboard.
 Phase 2 (this bundle) wrapped ~85 additional handlers. The handlers
@@ -60,54 +60,61 @@ def test_phase2_handlers_render(client, db, admin_user, admin_cookies, url):
     assert "text/html" in resp.headers.get("content-type", "")
 
 
-def test_phase2_concurrent_dashboard_polls_dont_serialise(
+def test_phase2_concurrent_accounts_polls_dont_collide(
     client, db, admin_user, admin_cookies,
 ):
-    """Five concurrent /accounts requests should not serialise.
+    """ — eight concurrent /accounts requests must not collide on
+    the shared SQLite connection.
 
-    With the wrap-at-snapshot pattern each request runs its DB reads
-    on the threadpool, leaving the event loop free to handle the next
-    request. Threading regressions (e.g. a global lock around the
-    pool) would surface as elapsed ≈ 5 × single-request time.
+    The app keeps ONE shared ``sqlite3.Connection``; the Python
+    ``sqlite3`` driver rejects two threads using it concurrently —
+    even for two reads — with ``InterfaceError: bad parameter or
+    other API misuse``. Before  this surfaced as intermittent
+    500s under concurrent ``GET /accounts`` (33/40 stress trials
+    failed).  serialises every ``db_call`` through the
+    process-wide DB lock, so a concurrent reader queues instead of
+    colliding.
 
-    Wall-clock assertion is conservative — TestClient adds its own
-    overhead and SQLite uses WAL so reads parallelise well, but
-    cold-cache I/O variance on Windows is high. Using a generous
-    upper bound to keep CI stable while still catching a real
-    serialisation regression.
+    QA-gap note: the previous version of this test ran its
+    ``assert r.status_code == 200`` *inside the worker thread*. A
+    failed assertion there becomes a ``PytestUnhandledThreadException``
+    *warning* — the test itself still PASSED while the bug was live.
+    This version collects every worker's outcome (status code AND any
+    exception) into shared lists and asserts on the MAIN thread, so a
+    collision actually fails the test.
     """
     import threading
-    import time
 
-    elapsed_per_thread: list[float] = []
+    statuses: list[int] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
 
     def _hit():
-        t0 = time.monotonic()
-        r = client.get("/accounts", cookies=admin_cookies)
-        elapsed_per_thread.append(time.monotonic() - t0)
-        assert r.status_code == 200, r.text[:200]
+        try:
+            r = client.get("/accounts", cookies=admin_cookies)
+            with lock:
+                statuses.append(r.status_code)
+        except BaseException as exc:  # noqa: BLE001 — surfaced below
+            with lock:
+                errors.append(exc)
 
-    threads = [threading.Thread(target=_hit) for _ in range(5)]
-    start = time.monotonic()
+    # 8-way fan-out — comfortably above the 1-2 needed to trip the
+    # driver's concurrent-use guard, matching the stress-trial setup.
+    threads = [threading.Thread(target=_hit) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    elapsed = time.monotonic() - start
 
-    # Sanity: every request succeeded.
-    assert len(elapsed_per_thread) == 5
-
-    # Don't assert tight bounds — TestClient + Windows scheduling
-    # noise + the in-memory SQLite contention floor make exact
-    # numbers unreliable. The point is "5 concurrent reads finish
-    # in roughly the time of one slow read, not 5 × single-read",
-    # so a 2× single-request budget is the practical regression
-    # canary. If the threadpool were size=1 (or there were a lock
-    # around db_call) we'd see ≥4× the single-request time.
-    single = max(elapsed_per_thread)
-    assert elapsed < single * 2.5, (
-        f"5-way concurrency took {elapsed:.3f}s; "
-        f"slowest single request was {single:.3f}s. "
-        f"Looks like serialisation."
+    # Assertions run on the MAIN thread — a failure here fails the
+    # test instead of being swallowed as a thread-exception warning.
+    assert not errors, (
+        f"{len(errors)} worker(s) raised: {errors[0]!r}"
+    )
+    assert len(statuses) == 8, (
+        f"expected 8 responses, got {len(statuses)}"
+    )
+    assert all(s == 200 for s in statuses), (
+        f"non-200 responses under concurrency: {statuses} — "
+        "looks like a shared-connection collision"
     )

@@ -49,6 +49,13 @@ async def _apply_one(
             await provider.move_message(message_id, args["folder"])
             return BulkItemResult(message_id=message_id, status="ok")
         if operation == "archive":
+            # H-06 sister-site sweep (per hipaa-sme-3 R-3 verify-don't-accept
+            # review 2026-05-24): per-item BulkItemResult below carries
+            # structured "error" status to the caller on archive failure;
+            # the HTTP caller sees the failure inline and no PHI state-
+            # divergence is buried. NOT a H-06 surface — see
+            # actions/digest.py:486 for the divergence-visibility primary
+            # site (§164.308(a)(7) Contingency Plan).
             await provider.archive(message_id)
             return BulkItemResult(message_id=message_id, status="ok")
         return BulkItemResult(

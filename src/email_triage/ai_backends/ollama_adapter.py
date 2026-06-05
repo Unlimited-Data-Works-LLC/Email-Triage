@@ -5,7 +5,7 @@ The pre-#169 Ollama integration lives in
 already carries the long-lived httpx client, the ``prefer_loaded``
 model-resolution heuristic, the circuit-breaker integration with
 :mod:`email_triage.llm_health`, and the <think>-tag stripping for
-[local-llm-model] output. Re-implementing any of that here would duplicate the
+Qwen3 output. Re-implementing any of that here would duplicate the
 gnarly bits without changing behaviour.
 
 This adapter wraps a single :class:`OllamaClassifier` instance and
@@ -34,7 +34,7 @@ from email_triage.ai_backends.base import BackendAdapter
 # is called. Mirrors classify.ollama.OllamaClassifier defaults — keep
 # in sync if those defaults change.
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "[local-llm-model]
+DEFAULT_OLLAMA_MODEL = "qwen3.5:35b"
 
 
 class OllamaAdapter(BackendAdapter):

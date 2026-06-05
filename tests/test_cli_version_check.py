@@ -1,6 +1,6 @@
-"""Tests for the ``email-triage version-check`` CLI subcommand (#125 partial).
+"""Tests for the ``email-triage version-check`` CLI subcommand.
 
-Exit codes are the load-bearing surface (Nagios + future deploy.sh
+Exit codes are the load-bearing surface (the monitoring system + future deploy.sh
 pre-flight will read them):
 
 * 0 = up_to_date
@@ -45,7 +45,7 @@ def _seed_db_at_version(path: Path, version: int) -> None:
 # ---------------------------------------------------------------------------
 
 class TestExitCodes:
-    """Each exit code is independently asserted — Nagios / deploy.sh
+    """Each exit code is independently asserted — the monitoring system / deploy.sh
     rely on the contract."""
 
     def test_up_to_date_exits_zero(

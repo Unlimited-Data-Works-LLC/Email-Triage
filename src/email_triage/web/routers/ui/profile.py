@@ -1,6 +1,6 @@
 """Routes for the profile concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -38,10 +38,13 @@ from email_triage.web.auth import (
     verify_otp,
 )
 from email_triage.web.db_threadpool import db_call
+from email_triage.web.db_writelock import get_write_lock
 from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
+    RequireUser,
+    RequireUserFragment,
     get_current_user,
     get_session_secret,
     require_auth,
@@ -58,7 +61,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -99,12 +102,8 @@ def __getattr__(name):
 
 
 @router.get("/profile", response_class=HTMLResponse)
-async def profile_page(request: Request):
+async def profile_page(request: Request, user: RequireUser):
     """User settings page — notify address + per-category escalation."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -112,7 +111,7 @@ async def profile_page(request: Request):
 
     snap = await db_call(_profile_page_snapshot, db, user)
 
-    return _render(templates, request, "profile.html", {
+    return await _render(templates, request, "profile.html", {
         "user": user,
         "current_user": user,
         "categories": snap["categories"],
@@ -129,19 +128,38 @@ async def profile_page(request: Request):
     })
 
 
+@router.post("/profile/sign-out-all")
+async def profile_sign_out_all(request: Request, user: RequireUser):
+    """ — revoke every session for the current user.
+
+    Bumps ``users.session_epoch``; every outstanding session token —
+    including the cookie making this request — carries an older epoch
+    and is rejected by :func:`dependencies.get_current_user` on its
+    next use. Drops the current cookie and redirects to /login. Use
+    this if a device or a copied session is suspected compromised:
+    ``/logout`` only clears one cookie, this kills them all.
+    """
+    from email_triage.web.db import bump_session_epoch
+    db = get_db(request)
+    await db_call(bump_session_epoch, db, int(user["id"]))
+    log.info(
+        "All sessions revoked via sign-out-all",
+        user_id=user.get("id"), email=user.get("email"),
+    )
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE_NAME)
+    return resp
+
+
 @router.post("/profile/save", response_class=HTMLResponse)
-async def profile_save(request: Request):
+async def profile_save(request: Request, user: RequireUser):
     """Save user settings (notify address + escalation prefs).
 
-    #73 — primary path is the carrier dropdown + cell number, which
+     — primary path is the carrier dropdown + cell number, which
     computes the email-to-SMS gateway address and writes it into
     ``users.notify_email``. Free-text ``notify_email`` field stays as
     an Advanced override for non-SMS recipients.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     form = await request.form()
@@ -160,11 +178,26 @@ async def profile_save(request: Request):
     sms_carrier = (form.get("sms_carrier") or "").strip()
     notify_email_free = (form.get("notify_email") or "").strip()
 
-    # Render-state helpers used both on the happy + error paths so the
-    # form can re-display with the operator's input intact.
-    categories = list_categories(db, user_id=user["id"])
-    personal_categories = list_categories(db, user_id=user["id"], scope="personal")
-    meeting_prefs = _load_meeting_prefs_with_default_tz(db, user["id"])
+    #  — render-state reads (categories ×2, meeting prefs, the
+    # writing-tab context) all touch the shared connection. Dispatch
+    # them through one db_call hop so none run on the event-loop thread.
+    def _profile_save_render_reads() -> dict:
+        return {
+            "categories": list_categories(db, user_id=user["id"]),
+            "personal_categories": list_categories(
+                db, user_id=user["id"], scope="personal",
+            ),
+            "meeting_prefs": _load_meeting_prefs_with_default_tz(
+                db, user["id"],
+            ),
+            "writing_ctx": _writing_tab_context(db, user),
+        }
+
+    _reads = await db_call(_profile_save_render_reads)
+    categories = _reads["categories"]
+    personal_categories = _reads["personal_categories"]
+    meeting_prefs = _reads["meeting_prefs"]
+    writing_ctx = _reads["writing_ctx"]
 
     # Thread the form-submitted tab back into the re-render so the
     # operator stays on the tab they saved from. profile.html's
@@ -172,11 +205,10 @@ async def profile_save(request: Request):
     # (query params are empty after form submit).
     active_tab = _resolve_profile_tab(request, form)
 
-    writing_ctx = _writing_tab_context(db, user)
-
-    def _re_render(*, save_msg: str | None, error: str | None,
-                   sms_prefs: dict, escalation: set[str]) -> HTMLResponse:
-        return _render(templates, request, "profile.html", {
+    async def _re_render(*, save_msg: str | None, error: str | None,
+                         sms_prefs: dict, escalation: set[str]) -> HTMLResponse:
+        #  / Option B — async because the shared `_render` is async.
+        return await _render(templates, request, "profile.html", {
             "user": user,
             "current_user": user,
             "categories": categories,
@@ -199,41 +231,33 @@ async def profile_save(request: Request):
     if sms_number_raw and sms_carrier:
         norm = normalize_us_cell_number(sms_number_raw)
         if norm is None:
-            return _re_render(
+            escalation = await db_call(
+                get_user_escalation_categories, db, user["id"],
+            )
+            return await _re_render(
                 save_msg=None,
                 error="Cell number must be a 10-digit US number "
                       "(11 digits OK if it starts with 1).",
                 sms_prefs={"number": sms_number_raw, "carrier": sms_carrier},
-                escalation=get_user_escalation_categories(db, user["id"]),
+                escalation=escalation,
             )
         addr = build_sms_address(norm, sms_carrier)
         if addr is None:
-            return _re_render(
+            escalation = await db_call(
+                get_user_escalation_categories, db, user["id"],
+            )
+            return await _re_render(
                 save_msg=None,
                 error=f"Unknown carrier: {sms_carrier!r}.",
                 sms_prefs={"number": sms_number_raw, "carrier": sms_carrier},
-                escalation=get_user_escalation_categories(db, user["id"]),
+                escalation=escalation,
             )
         notify_email = addr
         sms_prefs = {"number": norm, "carrier": sms_carrier}
-        set_setting(db, _S.escalation_sms(user["id"]), sms_prefs)
     elif notify_email_free:
-        # Advanced free-text override — clear any prior SMS dropdown
-        # choice so the form doesn't render a stale carrier on revisit.
-        delete_setting(db, _S.escalation_sms(user["id"]))
         notify_email = notify_email_free
     else:
-        # Both empty — clear everything.
-        delete_setting(db, _S.escalation_sms(user["id"]))
         notify_email = None
-
-    db.execute(
-        "UPDATE users SET notify_email = ? WHERE id = ?",
-        (notify_email, user["id"]),
-    )
-    db.commit()
-    user = dict(user)
-    user["notify_email"] = notify_email
 
     # Build escalation categories from the form checkboxes.
     selected = []
@@ -241,8 +265,32 @@ async def profile_save(request: Request):
         slug = cat["slug"]
         if f"escalate_{slug}" in form:
             selected.append(slug)
-    set_user_escalation_categories(db, user["id"], selected)
     escalation_categories = set(selected)
+
+    #  — fold every write (escalation-SMS setting, the raw
+    # users.notify_email UPDATE, escalation-categories save) into one
+    # threadpool hop so none of it — nor the  lock acquisition —
+    # runs on the event-loop thread.
+    def _profile_save_writes() -> None:
+        if sms_number_raw and sms_carrier:
+            set_setting(db, _S.escalation_sms(user["id"]), sms_prefs)
+        else:
+            # Free-text override or both-empty: clear any prior SMS
+            # dropdown choice so the form doesn't render a stale
+            # carrier on revisit.
+            delete_setting(db, _S.escalation_sms(user["id"]))
+        # Raw write on the shared connection — runs under the DB lock
+        # held by db_call for the whole closure.
+        db.execute(
+            "UPDATE users SET notify_email = ? WHERE id = ?",
+            (notify_email, user["id"]),
+        )
+        db.commit()
+        set_user_escalation_categories(db, user["id"], selected)
+
+    await db_call(_profile_save_writes)
+    user = dict(user)
+    user["notify_email"] = notify_email
 
     msg = "Settings saved."
     if selected and notify_email:
@@ -258,14 +306,14 @@ async def profile_save(request: Request):
         sms_carrier=sms_prefs.get("carrier") or "(none)",
     )
 
-    return _re_render(
+    return await _re_render(
         save_msg=msg, error=None,
         sms_prefs=sms_prefs, escalation=escalation_categories,
     )
 
 
 # ---------------------------------------------------------------------------
-# Punch-list #102 — "Test Now" button on /profile?tab=notifications
+# the backlog  — "Test Now" button on /profile?tab=notifications
 #
 # Operator sets cell + carrier (or free-text notify_email), flips one or
 # more Escalation Categories on, then taps Test Now to fire a single
@@ -287,7 +335,7 @@ async def profile_save(request: Request):
 @router.post(
     "/profile/escalation-test-send", response_class=HTMLResponse,
 )
-async def profile_escalation_test_send(request: Request):
+async def profile_escalation_test_send(request: Request, user: RequireUser):
     """Fire a single fixed-text test message through the live
     escalation send path so the operator can verify wiring before
     waiting on a real urgent email.
@@ -297,10 +345,6 @@ async def profile_escalation_test_send(request: Request):
     ``escalation_test``) with the resolved gateway address in
     ``detail`` (NOT the body).
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     is_htmx = request.headers.get("HX-Request") == "true"
 
@@ -314,7 +358,9 @@ async def profile_escalation_test_send(request: Request):
     # address, but a direct POST must still fail soft.
     notify_email = (user.get("notify_email") or "").strip()
     if not notify_email:
-        record_auth_event(
+        #  — record_auth_event is @db_write; off-loop hop.
+        await db_call(
+            record_auth_event,
             db,
             event_type="escalation_test",
             email=user["email"],
@@ -333,9 +379,12 @@ async def profile_escalation_test_send(request: Request):
     # impact. Using a category the user has actually flagged means the
     # synthetic alert text matches what they'd see in production, so
     # the test exercises the same _build_notification branch.
-    selected = get_user_escalation_categories(db, user["id"])
+    #  — get_user_escalation_categories touches the shared
+    # connection; dispatch off the event-loop thread.
+    selected = await db_call(get_user_escalation_categories, db, user["id"])
     if not selected:
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type="escalation_test",
             email=user["email"],
@@ -348,7 +397,7 @@ async def profile_escalation_test_send(request: Request):
             status_code=200,
         )
 
-    cats = list_categories(db, user_id=user["id"])
+    cats = await db_call(list_categories, db, user_id=user["id"])
     # Highest sort_order among the user's escalation set = lowest
     # impact. Fall back to the last selected slug if no row matches.
     eligible = [c for c in cats if c["slug"] in selected]
@@ -369,7 +418,8 @@ async def profile_escalation_test_send(request: Request):
     now_mono = time.monotonic()
     last = bucket.get(user["id"], 0.0)
     if last and (now_mono - last) < _ESCALATION_TEST_RL_WINDOW_SEC:
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type="escalation_test",
             email=user["email"],
@@ -401,7 +451,8 @@ async def profile_escalation_test_send(request: Request):
         # Mirror the escalate-action's "smtp not configured" path. The
         # operator-visible chip says "sender rejected" because to a
         # non-developer the result is identical: nothing arrived.
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type="escalation_test",
             email=user["email"],
@@ -433,7 +484,9 @@ async def profile_escalation_test_send(request: Request):
     import json as _json
     from email_triage.web.smtp_send import send_simple_smtp_email
     try:
-        send_simple_smtp_email(
+        # smtplib is blocking — run it off the event loop.
+        await asyncio.to_thread(
+            send_simple_smtp_email,
             smtp_host=smtp.host,
             smtp_port=smtp.port,
             smtp_user=smtp.username,
@@ -448,7 +501,8 @@ async def profile_escalation_test_send(request: Request):
         )
     except Exception as e:
         err_str = f"{type(e).__name__}: {e}"
-        record_auth_event(
+        await db_call(
+            record_auth_event,
             db,
             event_type="escalation_test",
             email=user["email"],
@@ -474,7 +528,8 @@ async def profile_escalation_test_send(request: Request):
     # transient SMTP failure doesn't lock the operator out for a minute.
     bucket[user["id"]] = now_mono
 
-    record_auth_event(
+    await db_call(
+        record_auth_event,
         db,
         event_type="escalation_test",
         email=user["email"],
@@ -502,7 +557,7 @@ async def profile_escalation_test_send(request: Request):
 
 
 @router.post("/profile/writing/save", response_class=HTMLResponse)
-async def profile_writing_save(request: Request):
+async def profile_writing_save(request: Request, user: RequireUser):
     """Save the per-user writing-style knobs (M-1 + M-2).
 
     Tone / length / greeting are validated against the canonical
@@ -512,10 +567,6 @@ async def profile_writing_save(request: Request):
     a hand-crafted POST should still produce a coherent stored
     state). Free-text fields are length-capped before the DB write.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     form = await request.form()
 
@@ -543,8 +594,6 @@ async def profile_writing_save(request: Request):
         "style_greeting_custom": (form.get("style_greeting_custom") or "").strip()[:120],
         "style_guide":           (form.get("style_guide") or "").strip()[:2000],
     }
-    set_user_style_knobs(db, user["id"], knobs)
-
     # Anti-AI style guide (per-user override + disable-global flag).
     # Cap length defensively so a hand-crafted 1MB POST can't stuff the
     # DB even though the UI textarea sets ``maxlength`` server-side.
@@ -554,11 +603,18 @@ async def profile_writing_save(request: Request):
     anti_ai_disable_global = (
         form.get("anti_ai_style_guide_disable_global") in ("1", "on", "true")
     )
-    set_user_anti_ai_style_guide(
-        db, user["id"],
-        text=anti_ai_user_text,
-        disable_global=anti_ai_disable_global,
-    )
+
+    #  — both writes are @db_write helpers; fold them into one
+    # threadpool hop so neither runs (nor locks) on the loop thread.
+    def _writing_save_db_work() -> None:
+        set_user_style_knobs(db, user["id"], knobs)
+        set_user_anti_ai_style_guide(
+            db, user["id"],
+            text=anti_ai_user_text,
+            disable_global=anti_ai_disable_global,
+        )
+
+    await db_call(_writing_save_db_work)
 
     _log.info(
         "User writing knobs saved",
@@ -577,12 +633,8 @@ async def profile_writing_save(request: Request):
 
 
 @router.post("/profile/meeting-prefs", response_class=HTMLResponse)
-async def profile_meeting_prefs_save(request: Request):
+async def profile_meeting_prefs_save(request: Request, user: RequireUser):
     """Save the per-user meeting-request intercept preferences."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     form = await request.form()
 
@@ -662,7 +714,9 @@ async def profile_meeting_prefs_save(request: Request):
         working_hours=wh,
         ooo_override=ooo,
     )
-    set_meeting_prefs(db, user["id"], prefs.to_dict())
+    #  — set_meeting_prefs touches the shared connection; dispatch
+    # it off the event-loop thread.
+    await db_call(set_meeting_prefs, db, user["id"], prefs.to_dict())
 
     # 303-redirect to the GET so the page reloads on the same tab the
     # operator submitted from. profile_page's tab resolver reads from
@@ -676,16 +730,12 @@ async def profile_meeting_prefs_save(request: Request):
 
 
 @router.post("/profile/meeting-prefs/group-apply", response_class=HTMLResponse)
-async def profile_meeting_prefs_group_apply(request: Request):
+async def profile_meeting_prefs_group_apply(request: Request, user: RequireUser):
     """Apply one start/end pair to all weekdays / weekend / all days.
 
     Overwrites the first interval of each affected day and clears any
     second interval (the user can re-add lunch breaks per-day).
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     form = await request.form()
     scope = (form.get("scope") or "weekdays").strip()
@@ -694,7 +744,6 @@ async def profile_meeting_prefs_group_apply(request: Request):
 
     from email_triage.engine.models import MeetingPreferences
     from email_triage.web.db import get_meeting_prefs, set_meeting_prefs
-    prefs = MeetingPreferences.from_dict(get_meeting_prefs(db, user["id"]))
 
     if scope == "weekend":
         days = ("sat", "sun")
@@ -703,15 +752,20 @@ async def profile_meeting_prefs_group_apply(request: Request):
     else:  # weekdays (default)
         days = ("mon", "tue", "wed", "thu", "fri")
 
-    if start and end and start < end:
-        for day in days:
-            setattr(prefs.working_hours, day, [(start, end)])
-    elif not start and not end:
-        # Both blank → mark scope as off.
-        for day in days:
-            setattr(prefs.working_hours, day, [])
+    #  — read-modify-write the meeting prefs in one threadpool hop
+    # so neither the get nor the set touches the event-loop thread.
+    def _group_apply_db_work() -> None:
+        prefs = MeetingPreferences.from_dict(get_meeting_prefs(db, user["id"]))
+        if start and end and start < end:
+            for day in days:
+                setattr(prefs.working_hours, day, [(start, end)])
+        elif not start and not end:
+            # Both blank → mark scope as off.
+            for day in days:
+                setattr(prefs.working_hours, day, [])
+        set_meeting_prefs(db, user["id"], prefs.to_dict())
 
-    set_meeting_prefs(db, user["id"], prefs.to_dict())
+    await db_call(_group_apply_db_work)
     # 303-redirect mirrors profile_meeting_prefs_save — keeps the
     # operator on the Meetings tab they just edited rather than
     # bouncing to "notifications".
@@ -748,12 +802,8 @@ async def profile_meeting_prefs_group_apply(request: Request):
 
 
 @router.get("/profile/style-data", response_class=HTMLResponse)
-async def profile_style_data_page(request: Request):
+async def profile_style_data_page(request: Request, user: RequireUser):
     """M-8 — show what writing-style data we have for each account."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -772,7 +822,7 @@ async def profile_style_data_page(request: Request):
             entry, secrets,
         )
 
-    # #180 F — embedding-runtime gate. Probes app.state for the live
+    #  F — embedding-runtime gate. Probes app.state for the live
     # backend (post-boot truth) + the configured backend type. End-
     # user-facing copy in resolve_embedding_gate names "the AI Backends
     # config page" but does NOT carry the admin URL — disabled state
@@ -795,19 +845,19 @@ async def profile_style_data_page(request: Request):
         fallback_backend_type=fallback_btype,
     )
 
-    return _render(templates, request, "profile/style_data.html", {
+    return await _render(templates, request, "profile/style_data.html", {
         "user": user,
         "current_user": user,
         "accounts": snap["accounts"],
         "master_enabled": snap["master_enabled"],
-        # #161 — cadence banner + install-default placeholder for the
+        #  — cadence banner + install-default placeholder for the
         # per-account "Messages to mine" override.
         "capture_interval_hours": snap.get("capture_interval_hours", 6),
         "mine_limit_install_default": snap.get(
             "mine_limit_install_default", 50,
         ),
         "inline_limit_ceiling": snap.get("inline_limit_ceiling", 50),
-        # #180 F — embedding-runtime gate (end-user audience copy).
+        #  F — embedding-runtime gate (end-user audience copy).
         "embedding_required": embedding_gate["required"],
         "embedding_runtime_ready": embedding_gate["ready"],
         "embedding_disabled_reason": embedding_gate["reason"],
@@ -895,7 +945,7 @@ async def _probe_sent_folder_candidates(entry: dict, secrets) -> list[dict]:
 
 
 @router.post("/profile/style-data/export", response_class=HTMLResponse)
-async def profile_style_data_export(request: Request):
+async def profile_style_data_export(request: Request, user: RequireUser):
     """Export the per-account style metadata as a JSON download.
 
     The export deliberately excludes raw message bodies and embedding
@@ -906,24 +956,8 @@ async def profile_style_data_export(request: Request):
     export never leaks PHI to disk; counts and timestamps remain
     accurate so the user can compare to what's on screen.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
-    if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type="style_data_export",
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
-        return HTMLResponse(err or "Forbidden", status_code=403)
 
     from fastapi.responses import JSONResponse
     from email_triage.web.db import (
@@ -932,60 +966,85 @@ async def profile_style_data_export(request: Request):
         get_captured_pair_count,
     )
 
-    profile_dict = get_style_profile(db, acct["id"]) or {}
-    index_summary = get_sent_mail_index_summary(db, acct["id"])
-    captured = get_captured_pair_count(db, acct["id"])
+    #  — every shared-connection touch (account resolve, the three
+    # style-data reads, the audit + HIPAA-access writes) folds into one
+    # threadpool hop. Returns (acct_or_None, err, payload_or_None).
+    def _style_data_export_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_export",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
+            )
+            return None, err, None
 
-    # HIPAA-aware sample shaping. The summary helper does NOT redact;
-    # gating happens here so a non-HIPAA install gets readable
-    # subjects in the download while HIPAA installs are scrubbed.
-    if acct.get("hipaa"):
-        sample_subjects = ["[redacted]" for _ in (index_summary.get("sample_subjects") or [])]
-    else:
-        sample_subjects = list(index_summary.get("sample_subjects") or [])
+        profile_dict = get_style_profile(db, acct["id"]) or {}
+        index_summary = get_sent_mail_index_summary(db, acct["id"])
+        captured = get_captured_pair_count(db, acct["id"])
 
-    payload = {
-        "schema": "email-triage style-data export v1",
-        "exported_at": __import__("datetime").datetime.now(
-            __import__("datetime").timezone.utc,
-        ).isoformat(),
-        "account": {
-            "id": acct["id"],
-            "name": acct.get("name") or "",
-            "hipaa": bool(acct.get("hipaa")),
-        },
-        "writing_style_summary": profile_dict,
-        "recent_reply_examples": {
-            "count": index_summary.get("count", 0),
-            "oldest": index_summary.get("oldest"),
-            "newest": index_summary.get("newest"),
-            "embedding_model": index_summary.get("embedding_model", ""),
-            "sample_subjects": sample_subjects,
-        },
-        "captured_edit_pairs": {
-            "count": captured,
-        },
-        "notes": (
-            "This export contains metadata and the structured "
-            "writing-style summary only. Raw message bodies and "
-            "embedding vectors are NOT included by design."
-        ),
-    }
+        # HIPAA-aware sample shaping. The summary helper does NOT
+        # redact; gating happens here so a non-HIPAA install gets
+        # readable subjects in the download while HIPAA installs are
+        # scrubbed.
+        if acct.get("hipaa"):
+            sample_subjects = [
+                "[redacted]"
+                for _ in (index_summary.get("sample_subjects") or [])
+            ]
+        else:
+            sample_subjects = list(index_summary.get("sample_subjects") or [])
 
-    _record_style_data_audit(
-        db,
-        event_type="style_data_export",
-        actor_user_id=user["id"],
-        actor_email=user.get("email") or "",
-        account_id=acct["id"],
-        outcome="success",
-    )
-    _record_style_data_hipaa_access(
-        db,
-        actor_user_id=user["id"],
-        account=acct,
-        operation="style_data_export",
-    )
+        import datetime as _dt
+        payload = {
+            "schema": "email-triage style-data export v1",
+            "exported_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "account": {
+                "id": acct["id"],
+                "name": acct.get("name") or "",
+                "hipaa": bool(acct.get("hipaa")),
+            },
+            "writing_style_summary": profile_dict,
+            "recent_reply_examples": {
+                "count": index_summary.get("count", 0),
+                "oldest": index_summary.get("oldest"),
+                "newest": index_summary.get("newest"),
+                "embedding_model": index_summary.get("embedding_model", ""),
+                "sample_subjects": sample_subjects,
+            },
+            "captured_edit_pairs": {
+                "count": captured,
+            },
+            "notes": (
+                "This export contains metadata and the structured "
+                "writing-style summary only. Raw message bodies and "
+                "embedding vectors are NOT included by design."
+            ),
+        }
+
+        _record_style_data_audit(
+            db,
+            event_type="style_data_export",
+            actor_user_id=user["id"],
+            actor_email=user.get("email") or "",
+            account_id=acct["id"],
+            outcome="success",
+        )
+        _record_style_data_hipaa_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="style_data_export",
+        )
+        return acct, None, payload
+
+    acct, err, payload = await db_call(_style_data_export_db_work)
+    if acct is None:
+        return HTMLResponse(err or "Forbidden", status_code=403)
 
     filename = f"style-data-account-{acct['id']}.json"
     return JSONResponse(
@@ -997,221 +1056,247 @@ async def profile_style_data_export(request: Request):
 
 
 @router.post("/profile/style-data/delete-profile", response_class=HTMLResponse)
-async def profile_style_data_delete_profile(request: Request):
+async def profile_style_data_delete_profile(request: Request, user: RequireUser):
     """Delete the writing-style summary (M-3) for an account."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
-    if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type="style_data_delete_profile",
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
-        return HTMLResponse(err or "Forbidden", status_code=403)
 
-    try:
-        from email_triage.web.db import (
-            delete_account_style_per_alias,
-            delete_style_profile,
-        )
-        deleted = delete_style_profile(db, acct["id"])
-        # Punch list #162 — drop per-alias descriptors alongside the
-        # account-wide row. The two are conceptually one "writing-
-        # style summary" surface, and the user-facing "Delete writing-
-        # style summary" button has to clear both for the page to
-        # render an empty state consistently.
-        alias_deleted = delete_account_style_per_alias(db, acct["id"])
-        outcome = "success" if (deleted or alias_deleted) else "noop"
-    except Exception as e:
+    from email_triage.web.db import (
+        delete_account_style_per_alias,
+        delete_style_profile,
+    )
+
+    #  — account resolve + both delete helpers + audit/HIPAA-access
+    # writes fold into one threadpool hop. Returns (acct_or_None, err).
+    def _delete_profile_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_profile",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
+            )
+            return None, err
+
+        try:
+            deleted = delete_style_profile(db, acct["id"])
+            # Punch list  — drop per-alias descriptors alongside
+            # the account-wide row. The two are conceptually one
+            # "writing-style summary" surface, and the user-facing
+            # "Delete writing-style summary" button has to clear both
+            # for the page to render an empty state consistently.
+            alias_deleted = delete_account_style_per_alias(db, acct["id"])
+            outcome = "success" if (deleted or alias_deleted) else "noop"
+        except Exception as e:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_profile",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=acct["id"],
+                outcome="failure",
+                detail=fmt_exc(e),
+            )
+            raise
+
         _record_style_data_audit(
             db,
             event_type="style_data_delete_profile",
             actor_user_id=user["id"],
             actor_email=user.get("email") or "",
             account_id=acct["id"],
-            outcome="failure",
-            detail=fmt_exc(e),
+            outcome=outcome,
         )
-        raise
+        _record_style_data_hipaa_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="style_data_delete_profile",
+        )
+        return acct, None
 
-    _record_style_data_audit(
-        db,
-        event_type="style_data_delete_profile",
-        actor_user_id=user["id"],
-        actor_email=user.get("email") or "",
-        account_id=acct["id"],
-        outcome=outcome,
-    )
-    _record_style_data_hipaa_access(
-        db,
-        actor_user_id=user["id"],
-        account=acct,
-        operation="style_data_delete_profile",
-    )
+    acct, err = await db_call(_delete_profile_db_work)
+    if acct is None:
+        return HTMLResponse(err or "Forbidden", status_code=403)
 
     return RedirectResponse("/profile/style-data", status_code=303)
 
 
 @router.post("/profile/style-data/delete-index", response_class=HTMLResponse)
-async def profile_style_data_delete_index(request: Request):
+async def profile_style_data_delete_index(request: Request, user: RequireUser):
     """Delete the recent reply examples (M-4 sent_mail_index) for an account."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
-    if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type="style_data_delete_index",
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
-        return HTMLResponse(err or "Forbidden", status_code=403)
 
-    try:
-        from email_triage.web.db import delete_sent_mail_index_for_account
-        deleted = delete_sent_mail_index_for_account(db, acct["id"])
-    except Exception as e:
+    from email_triage.web.db import delete_sent_mail_index_for_account
+
+    #  — account resolve + delete helper + audit/HIPAA-access
+    # writes fold into one threadpool hop. Returns (acct_or_None, err).
+    def _delete_index_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_index",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
+            )
+            return None, err
+
+        try:
+            deleted = delete_sent_mail_index_for_account(db, acct["id"])
+        except Exception as e:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_index",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=acct["id"],
+                outcome="failure",
+                detail=fmt_exc(e),
+            )
+            raise
+
         _record_style_data_audit(
             db,
             event_type="style_data_delete_index",
             actor_user_id=user["id"],
             actor_email=user.get("email") or "",
             account_id=acct["id"],
-            outcome="failure",
-            detail=fmt_exc(e),
+            outcome="success",
+            detail=f"deleted={deleted}",
         )
-        raise
+        _record_style_data_hipaa_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="style_data_delete_index",
+        )
+        return acct, None
 
-    _record_style_data_audit(
-        db,
-        event_type="style_data_delete_index",
-        actor_user_id=user["id"],
-        actor_email=user.get("email") or "",
-        account_id=acct["id"],
-        outcome="success",
-        detail=f"deleted={deleted}",
-    )
-    _record_style_data_hipaa_access(
-        db,
-        actor_user_id=user["id"],
-        account=acct,
-        operation="style_data_delete_index",
-    )
+    acct, err = await db_call(_delete_index_db_work)
+    if acct is None:
+        return HTMLResponse(err or "Forbidden", status_code=403)
 
     return RedirectResponse("/profile/style-data", status_code=303)
 
 
 @router.post("/profile/style-data/delete-all", response_class=HTMLResponse)
-async def profile_style_data_delete_all(request: Request):
+async def profile_style_data_delete_all(request: Request, user: RequireUser):
     """Delete EVERYTHING (profile + index) for an account, transactionally.
 
     Wrapped in a single SAVEPOINT so a partial failure (e.g. profile
     delete OK, index delete fails) rolls back so the user can retry
     without leaving half the data behind.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
-    if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type="style_data_delete_all",
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
-        return HTMLResponse(err or "Forbidden", status_code=403)
 
-    from email_triage.web.db import _has_table
+    from email_triage.web.db import _has_table, invalidate_setting_cache
 
-    # Atomic two-step delete via raw SQL inside one SAVEPOINT. We
-    # bypass the per-helper ``conn.commit()`` calls (which would
-    # implicitly release the savepoint) and emit DELETE statements
-    # directly so a failure on the second statement rolls back the
-    # first via ROLLBACK TO SAVEPOINT.
-    sp_name = "m8_delete_all"
-    db.execute(f"SAVEPOINT {sp_name}")
-    try:
-        # Profile row in the settings table.
-        db.execute(
-            "DELETE FROM settings WHERE key = ?",
-            (_S.style_profile(acct["id"]),),
-        )
-        # Sent-mail-index rows (M-4 + M-6 share this table; deleting
-        # by account_id removes both reply examples and captured
-        # edit pairs in one shot).
-        if _has_table(db, "sent_mail_index"):
-            db.execute(
-                "DELETE FROM sent_mail_index WHERE account_id = ?",
-                (acct["id"],),
+    #  — the whole unit (account resolve, the raw SAVEPOINT delete
+    # block, the audit + HIPAA-access writes) folds into one threadpool
+    # hop. db_call holds the process-wide DB lock for the whole closure,
+    # which is exactly the / invariant the old explicit
+    # ``with get_write_lock()`` block enforced — no other writer's
+    # commit() can prematurely release the savepoint. Returns
+    # (acct_or_None, err).
+    def _delete_all_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_all",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
             )
-        # Punch list #162 — per-alias descriptor rows. Dropped under
-        # the same savepoint so a partial failure rolls back together.
-        if _has_table(db, "account_style_per_alias"):
-            db.execute(
-                "DELETE FROM account_style_per_alias WHERE account_id = ?",
-                (acct["id"],),
-            )
-        db.execute(f"RELEASE SAVEPOINT {sp_name}")
-        db.commit()
-        # Keep the in-process settings cache (#140.2) coherent — the
-        # DELETE above bypassed delete_setting() to share the
-        # savepoint transaction.
-        from email_triage.web.db import invalidate_setting_cache
-        invalidate_setting_cache(_S.style_profile(acct["id"]))
-    except Exception as e:
+            return None, err
+
+        # Atomic two-step delete via raw SQL inside one SAVEPOINT. We
+        # bypass the per-helper ``conn.commit()`` calls (which would
+        # implicitly release the savepoint) and emit DELETE statements
+        # directly so a failure on the second statement rolls back the
+        # first via ROLLBACK TO SAVEPOINT.
+        sp_name = "m8_delete_all"
         try:
-            db.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-            db.execute(f"RELEASE SAVEPOINT {sp_name}")
-        except Exception:
-            pass
+            db.execute(f"SAVEPOINT {sp_name}")
+            try:
+                # Profile row in the settings table.
+                db.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    (_S.style_profile(acct["id"]),),
+                )
+                # Sent-mail-index rows (M-4 + M-6 share this table;
+                # deleting by account_id removes both reply examples
+                # and captured edit pairs in one shot).
+                if _has_table(db, "sent_mail_index"):
+                    db.execute(
+                        "DELETE FROM sent_mail_index WHERE account_id = ?",
+                        (acct["id"],),
+                    )
+                # Punch list  — per-alias descriptor rows. Dropped
+                # under the same savepoint so a partial failure rolls
+                # back together.
+                if _has_table(db, "account_style_per_alias"):
+                    db.execute(
+                        "DELETE FROM account_style_per_alias "
+                        "WHERE account_id = ?",
+                        (acct["id"],),
+                    )
+                db.execute(f"RELEASE SAVEPOINT {sp_name}")
+                db.commit()
+            except Exception:
+                try:
+                    db.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    db.execute(f"RELEASE SAVEPOINT {sp_name}")
+                except Exception:
+                    pass
+                raise
+            # Keep the in-process settings cache coherent —
+            # the DELETE above bypassed delete_setting() to share the
+            # savepoint transaction.
+            invalidate_setting_cache(_S.style_profile(acct["id"]))
+        except Exception as e:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_delete_all",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=acct["id"],
+                outcome="failure",
+                detail=fmt_exc(e),
+            )
+            raise
+
         _record_style_data_audit(
             db,
             event_type="style_data_delete_all",
             actor_user_id=user["id"],
             actor_email=user.get("email") or "",
             account_id=acct["id"],
-            outcome="failure",
-            detail=fmt_exc(e),
+            outcome="success",
         )
-        raise
+        _record_style_data_hipaa_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="style_data_delete_all",
+        )
+        return acct, None
 
-    _record_style_data_audit(
-        db,
-        event_type="style_data_delete_all",
-        actor_user_id=user["id"],
-        actor_email=user.get("email") or "",
-        account_id=acct["id"],
-        outcome="success",
-    )
-    _record_style_data_hipaa_access(
-        db,
-        actor_user_id=user["id"],
-        account=acct,
-        operation="style_data_delete_all",
-    )
+    acct, err = await db_call(_delete_all_db_work)
+    if acct is None:
+        return HTMLResponse(err or "Forbidden", status_code=403)
 
     return RedirectResponse("/profile/style-data", status_code=303)
 
@@ -1234,7 +1319,7 @@ async def profile_style_data_delete_all(request: Request):
 
 
 @router.post("/profile/style-data/toggle-rag", response_class=HTMLResponse)
-async def profile_style_data_toggle_rag(request: Request):
+async def profile_style_data_toggle_rag(request: Request, user: RequireUser):
     """Persist the per-account "AI learns from your past replies" toggle.
 
     Form fields:
@@ -1248,13 +1333,12 @@ async def profile_style_data_toggle_rag(request: Request):
     write. The opt-in lives on the account-edit page; user-facing
     UI here surfaces a reason chip on the checkbox.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
+    #  — account resolve touches the shared connection; off-loop.
+    acct, err = await db_call(
+        _resolve_style_data_account, db, user, account_id_raw,
+    )
     if acct is None:
         return HTMLResponse(err or "Forbidden", status_code=403)
 
@@ -1268,7 +1352,18 @@ async def profile_style_data_toggle_rag(request: Request):
         is_style_knobs_hipaa_allow,
         set_rag_sent_index_enabled,
     )
-    if bool(acct.get("hipaa")) and not is_style_knobs_hipaa_allow(db, acct["id"]):
+
+    #  — HIPAA gate read + the toggle write fold into one hop.
+    def _toggle_rag_db_work() -> bool:
+        if bool(acct.get("hipaa")) and not is_style_knobs_hipaa_allow(
+            db, acct["id"],
+        ):
+            return False
+        set_rag_sent_index_enabled(db, acct["id"], enabled=desired)
+        return True
+
+    saved = await db_call(_toggle_rag_db_work)
+    if not saved:
         _log.info(
             "AI-learns toggle refused — HIPAA without opt-in",
             account_id=acct["id"],
@@ -1276,7 +1371,6 @@ async def profile_style_data_toggle_rag(request: Request):
         )
         return RedirectResponse("/profile/style-data", status_code=303)
 
-    set_rag_sent_index_enabled(db, acct["id"], enabled=desired)
     _log.info(
         "AI-learns toggle saved",
         account_id=acct["id"],
@@ -1291,8 +1385,8 @@ async def profile_style_data_toggle_rag(request: Request):
     "/profile/style-data/toggle-auto-scan",
     response_class=HTMLResponse,
 )
-async def profile_style_data_toggle_auto_scan(request: Request):
-    """#161 item 2 — per-account "Auto-scan on schedule" toggle.
+async def profile_style_data_toggle_auto_scan(request: Request, user: RequireUser):
+    """ item 2 — per-account "Auto-scan on schedule" toggle.
 
     When OFF, the background ``_sent_mail_capture_loop`` skips this
     account on every tick (logged INFO with account_id + reason). The
@@ -1310,13 +1404,12 @@ async def profile_style_data_toggle_auto_scan(request: Request):
     gate; flipping this checkbox would be a no-op + confuse the
     operator). The opt-in lives on the account-edit page.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
+    #  — account resolve touches the shared connection; off-loop.
+    acct, err = await db_call(
+        _resolve_style_data_account, db, user, account_id_raw,
+    )
     if acct is None:
         return HTMLResponse(err or "Forbidden", status_code=403)
 
@@ -1327,7 +1420,18 @@ async def profile_style_data_toggle_auto_scan(request: Request):
         is_style_knobs_hipaa_allow,
         set_auto_scan_enabled_for_account,
     )
-    if bool(acct.get("hipaa")) and not is_style_knobs_hipaa_allow(db, acct["id"]):
+
+    #  — HIPAA gate read + the toggle write fold into one hop.
+    def _toggle_auto_scan_db_work() -> bool:
+        if bool(acct.get("hipaa")) and not is_style_knobs_hipaa_allow(
+            db, acct["id"],
+        ):
+            return False
+        set_auto_scan_enabled_for_account(db, acct["id"], desired)
+        return True
+
+    saved = await db_call(_toggle_auto_scan_db_work)
+    if not saved:
         _log.info(
             "Auto-scan toggle refused — HIPAA without opt-in",
             account_id=acct["id"],
@@ -1335,7 +1439,6 @@ async def profile_style_data_toggle_auto_scan(request: Request):
         )
         return RedirectResponse("/profile/style-data", status_code=303)
 
-    set_auto_scan_enabled_for_account(db, acct["id"], desired)
     _log.info(
         "Auto-scan toggle saved",
         account_id=acct["id"],
@@ -1350,8 +1453,8 @@ async def profile_style_data_toggle_auto_scan(request: Request):
     "/profile/style-data/mine-limit-override",
     response_class=HTMLResponse,
 )
-async def profile_style_data_mine_limit_override(request: Request):
-    """#161 item 4 — per-account "Messages to mine" override.
+async def profile_style_data_mine_limit_override(request: Request, user: RequireUser):
+    """ item 4 — per-account "Messages to mine" override.
 
     Persisted on ``email_accounts.config_json["mine_limit_override"]``
     as int | None. Empty submit clears the key (falls back to the
@@ -1369,13 +1472,12 @@ async def profile_style_data_mine_limit_override(request: Request):
     No HIPAA gate — the limit is metadata, not source mail; the
     M-3 distill path itself enforces the HIPAA opt-in.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
+    #  — account resolve touches the shared connection; off-loop.
+    acct, err = await db_call(
+        _resolve_style_data_account, db, user, account_id_raw,
+    )
     if acct is None:
         return HTMLResponse(err or "Forbidden", status_code=403)
 
@@ -1402,7 +1504,9 @@ async def profile_style_data_mine_limit_override(request: Request):
         elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
             v = STYLE_LEARNING_MINE_LIMIT_MAX
         value = v
-    update_account_config_keys(
+    #  — update_account_config_keys is @db_write; off-loop hop.
+    await db_call(
+        update_account_config_keys,
         db, acct["id"], mine_limit_override=value,
     )
     _log.info(
@@ -1419,7 +1523,7 @@ async def profile_style_data_mine_limit_override(request: Request):
     "/profile/style-data/sent-folder-override",
     response_class=HTMLResponse,
 )
-async def profile_style_data_sent_folder_override(request: Request):
+async def profile_style_data_sent_folder_override(request: Request, user: RequireUser):
     """Persist the per-account Sent-folder override (config_json key).
 
     Empty submit clears the override; non-empty stores the literal
@@ -1427,13 +1531,12 @@ async def profile_style_data_sent_folder_override(request: Request):
     capture-loop paths) in preference to ``find_sent_folder`` when
     set. No HIPAA gate — folder names aren't PHI.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
+    #  — account resolve touches the shared connection; off-loop.
+    acct, err = await db_call(
+        _resolve_style_data_account, db, user, account_id_raw,
+    )
     if acct is None:
         return HTMLResponse(err or "Forbidden", status_code=403)
 
@@ -1456,7 +1559,9 @@ async def profile_style_data_sent_folder_override(request: Request):
     # update_account_config_keys' None-means-delete contract); non-empty
     # → store the list verbatim.
     from email_triage.web.db import update_account_config_keys
-    update_account_config_keys(
+    #  — update_account_config_keys is @db_write; off-loop hop.
+    await db_call(
+        update_account_config_keys,
         db, acct["id"],
         sent_folder_override=(folders if folders else None),
     )
@@ -1471,7 +1576,7 @@ async def profile_style_data_sent_folder_override(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Punch list #162 — alias-aware learning toggle
+# Punch list  — alias-aware learning toggle
 #
 # A single per-account checkbox that flips the style mine + draft
 # stitch into partition-by-From-address mode. When off, behaviour is
@@ -1491,7 +1596,7 @@ async def profile_style_data_sent_folder_override(request: Request):
     "/profile/style-data/toggle-alias-mode",
     response_class=HTMLResponse,
 )
-async def profile_style_data_toggle_alias_mode(request: Request):
+async def profile_style_data_toggle_alias_mode(request: Request, user: RequireUser):
     """Persist the per-account alias-aware-learning toggle.
 
     Form fields:
@@ -1505,23 +1610,27 @@ async def profile_style_data_toggle_alias_mode(request: Request):
     HIPAA-access row write regardless so an operator-side review
     can see refused attempts.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
+
+    #  — account resolve + the not-found audit write fold into one
+    # threadpool hop. Returns (acct_or_None, err).
+    def _alias_mode_resolve_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type="style_data_toggle_alias_mode",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
+            )
+        return acct, err
+
+    acct, err = await db_call(_alias_mode_resolve_db_work)
     if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type="style_data_toggle_alias_mode",
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
         return HTMLResponse(err or "Forbidden", status_code=403)
 
     form = await request.form()
@@ -1531,53 +1640,60 @@ async def profile_style_data_toggle_alias_mode(request: Request):
         is_style_knobs_hipaa_allow,
         set_alias_mode_enabled_for_account,
     )
-    # HIPAA gate. Refuse the write when account is HIPAA + not opted
-    # in. Audit row + HIPAA access row are both written so an admin
-    # review surfaces the refused attempt as well as a successful
-    # flip. The owner-self-access carve-out applies to the HIPAA
-    # access row; the audit row writes regardless.
-    is_hipaa = bool(acct.get("hipaa"))
-    if is_hipaa and not is_style_knobs_hipaa_allow(db, acct["id"]):
+
+    #  — HIPAA gate read + the toggle write + audit / HIPAA-access
+    # rows fold into one threadpool hop. Returns True iff the toggle
+    # was applied (False = HIPAA gate refused).
+    def _alias_mode_apply_db_work() -> bool:
+        # HIPAA gate. Refuse the write when account is HIPAA + not
+        # opted in. Audit row + HIPAA access row are both written so
+        # an admin review surfaces the refused attempt as well as a
+        # successful flip. The owner-self-access carve-out applies to
+        # the HIPAA access row; the audit row writes regardless.
+        is_hipaa = bool(acct.get("hipaa"))
+        if is_hipaa and not is_style_knobs_hipaa_allow(db, acct["id"]):
+            _record_style_data_audit(
+                db,
+                event_type="style_data_toggle_alias_mode",
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=acct["id"],
+                outcome="failure",
+                detail="hipaa_gate",
+            )
+            _record_style_data_hipaa_access(
+                db,
+                actor_user_id=user["id"],
+                account=acct,
+                operation="style_data_toggle_alias_mode",
+                outcome="failure",
+            )
+            return False
+
+        set_alias_mode_enabled_for_account(db, acct["id"], enabled=desired)
         _record_style_data_audit(
             db,
             event_type="style_data_toggle_alias_mode",
             actor_user_id=user["id"],
             actor_email=user.get("email") or "",
             account_id=acct["id"],
-            outcome="failure",
-            detail="hipaa_gate",
+            outcome="success",
+            detail=f"enabled={desired}",
         )
         _record_style_data_hipaa_access(
             db,
             actor_user_id=user["id"],
             account=acct,
             operation="style_data_toggle_alias_mode",
-            outcome="failure",
         )
-        return RedirectResponse("/profile/style-data", status_code=303)
+        return True
 
-    set_alias_mode_enabled_for_account(db, acct["id"], enabled=desired)
-    _record_style_data_audit(
-        db,
-        event_type="style_data_toggle_alias_mode",
-        actor_user_id=user["id"],
-        actor_email=user.get("email") or "",
-        account_id=acct["id"],
-        outcome="success",
-        detail=f"enabled={desired}",
-    )
-    _record_style_data_hipaa_access(
-        db,
-        actor_user_id=user["id"],
-        account=acct,
-        operation="style_data_toggle_alias_mode",
-    )
-
+    await db_call(_alias_mode_apply_db_work)
     return RedirectResponse("/profile/style-data", status_code=303)
 
 
 # ---------------------------------------------------------------------------
-# #157 — On-demand mine + dry-run preview for the style-data page
+#  — On-demand mine + dry-run preview for the style-data page
 #
 # Two handlers + one shared corpus-builder so the dry-run preview and
 # the "Mine the Sent Items Now" button stay in lockstep on which
@@ -1596,7 +1712,7 @@ async def profile_style_data_toggle_alias_mode(request: Request):
 # fetch) so a HIPAA-flagged account without the per-account opt-in
 # never leaves the function with bytes from its Sent folder in
 # memory. The opt-in (``style_knobs_hipaa_allow``) is the same flag
-# #152 phase 2 plumbed for M-1+M-2; we reuse it for M-3 dry-run /
+#  phase 2 plumbed for M-1+M-2; we reuse it for M-3 dry-run /
 # mine-now because the same §164.502(a) self-disclosure carve-out
 # applies — operator is the data subject, so opt-in by operator
 # lifts the hard-off posture.
@@ -1618,44 +1734,45 @@ async def _mine_or_preview(
     Returns an HTMX fragment (``text/html``) for both branches so
     the page's ``hx-swap`` target updates inline.
     """
-    user = get_current_user(request)
+    db = get_db(request)
+    #  — get_current_user takes the DB write lock; off-loop hop.
+    user = await db_call(get_current_user, request)
     if user is None:
         return HTMLResponse("Unauthorized", status_code=401)
 
-    db = get_db(request)
     account_id_raw = request.query_params.get("account_id")
-    acct, err = _resolve_style_data_account(db, user, account_id_raw)
     event_type = (
         "style_data_mine_now" if commit else "style_data_preview"
     )
 
-    if acct is None:
-        _record_style_data_audit(
-            db,
-            event_type=event_type,
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=int(account_id_raw or 0),
-            outcome="failure",
-            detail=err,
-        )
-        return HTMLResponse(
-            _mine_result_fragment(
-                state="error",
-                title="Could not find that account",
-                body=err or "Forbidden",
-            ),
-            status_code=403,
-        )
-
-    # HIPAA gate — must run BEFORE the provider fetch. M-3 reads
-    # source-mail bodies; the per-account opt-in lifts that for
-    # operator-owned HIPAA mailboxes per §164.502(a). Without the
-    # opt-in we refuse and audit.
     from email_triage.triage_logging import is_account_hipaa
     from email_triage.web.db import is_style_knobs_hipaa_allow
-    if is_account_hipaa(acct):
-        if not is_style_knobs_hipaa_allow(db, acct["id"]):
+
+    #  — account resolve + the not-found audit + the HIPAA gate
+    # read & refusal audit all touch the shared connection. Fold the
+    # whole preamble into one threadpool hop. Returns a 3-tuple:
+    #   (acct_or_None, err, gate)  where gate is one of
+    #   'ok' | 'not_found' | 'hipaa'.
+    def _mine_preamble_db_work():
+        acct, err = _resolve_style_data_account(db, user, account_id_raw)
+        if acct is None:
+            _record_style_data_audit(
+                db,
+                event_type=event_type,
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=int(account_id_raw or 0),
+                outcome="failure",
+                detail=err,
+            )
+            return None, err, "not_found"
+        # HIPAA gate — must run BEFORE the provider fetch. M-3 reads
+        # source-mail bodies; the per-account opt-in lifts that for
+        # operator-owned HIPAA mailboxes per §164.502(a). Without the
+        # opt-in we refuse and audit.
+        if is_account_hipaa(acct) and not is_style_knobs_hipaa_allow(
+            db, acct["id"],
+        ):
             _record_style_data_audit(
                 db,
                 event_type=event_type,
@@ -1665,7 +1782,21 @@ async def _mine_or_preview(
                 outcome="failure",
                 detail="hipaa_gate",
             )
-            return HTMLResponse(
+            return acct, err, "hipaa"
+        return acct, err, "ok"
+
+    acct, err, _gate = await db_call(_mine_preamble_db_work)
+    if _gate == "not_found":
+        return HTMLResponse(
+            _mine_result_fragment(
+                state="error",
+                title="Could not find that account",
+                body=err or "Forbidden",
+            ),
+            status_code=403,
+        )
+    if _gate == "hipaa":
+        return HTMLResponse(
                 _mine_result_fragment(
                     state="error",
                     title="HIPAA mailbox — opt-in required",
@@ -1692,7 +1823,8 @@ async def _mine_or_preview(
     try:
         provider = _create_provider_from_account(acct, secrets)
     except Exception as exc:
-        _record_style_data_audit(
+        await db_call(
+            _record_style_data_audit,
             db,
             event_type=event_type,
             actor_user_id=user["id"],
@@ -1761,10 +1893,10 @@ async def _mine_or_preview(
     # ``in:sent`` so the call has something to send.
     from email_triage.providers.traits import default_search_query
     query = default_search_query(acct.get("provider_type", "")) or "in:sent"
-    # #161 item 4 — limit resolution:
+    #  item 4 — limit resolution:
     #   per-account override > install-wide default > 50.
     # Resolved value > STYLE_LEARNING_INLINE_LIMIT_CEILING triggers
-    # the bulk-handoff branch below (#161 item 5). Inline path keeps
+    # the bulk-handoff branch below. Inline path keeps
     # the historical "50 messages, ~30 s" behaviour for the common
     # case so most operators see the result in the page without
     # leaving it.
@@ -1772,9 +1904,10 @@ async def _mine_or_preview(
         resolve_account_mine_limit,
         STYLE_LEARNING_INLINE_LIMIT_CEILING,
     )
-    limit = resolve_account_mine_limit(db, acct)
+    #  — resolve_account_mine_limit touches the shared connection.
+    limit = await db_call(resolve_account_mine_limit, db, acct)
 
-    # #161 item 5 — Bulk-worker handoff for limits > ceiling. The
+    #  item 5 — Bulk-worker handoff for limits > ceiling. The
     # inline HTMX request would block past the browser timeout on a
     # 200-message scan; hand off to the supervised bulk runner
     # (kind='style_mine'), return immediately with a "watching the
@@ -1795,7 +1928,44 @@ async def _mine_or_preview(
             await provider.close()
         except Exception:
             pass
-        if count_active_triage_jobs_for_account(db, acct["id"]) > 0:
+        #  — active-job check + create_triage_job (@db_write) +
+        # audit / HIPAA-access writes fold into one threadpool hop.
+        # Returns job_id, or None if a bulk run is already active.
+        def _bulk_handoff_db_work() -> str | None:
+            if count_active_triage_jobs_for_account(db, acct["id"]) > 0:
+                return None
+            job_id = create_triage_job(
+                db,
+                account_id=acct["id"],
+                actor_user_id=user["id"],
+                # Encode the resolved limit into the query column so
+                # the bulk-style-mine runner can recover it without a
+                # second DB hop on the account row. Format is stable +
+                # parsed in run_triage_all_style_mine.
+                query=f"style_mine:limit={limit}",
+                rate_msg_per_min=int(limit),
+                concurrency=1,
+                kind="style_mine",
+            )
+            _record_style_data_audit(
+                db,
+                event_type=event_type,
+                actor_user_id=user["id"],
+                actor_email=user.get("email") or "",
+                account_id=acct["id"],
+                outcome="queued",
+                detail=f"job_id={job_id}; limit={limit}",
+            )
+            _record_style_data_hipaa_access(
+                db,
+                actor_user_id=user["id"],
+                account=acct,
+                operation=event_type,
+            )
+            return job_id
+
+        job_id = await db_call(_bulk_handoff_db_work)
+        if job_id is None:
             return HTMLResponse(
                 _mine_result_fragment(
                     state="empty",
@@ -1809,34 +1979,6 @@ async def _mine_or_preview(
                 ),
                 status_code=200,
             )
-        job_id = create_triage_job(
-            db,
-            account_id=acct["id"],
-            actor_user_id=user["id"],
-            # Encode the resolved limit into the query column so the
-            # bulk-style-mine runner can recover it without a second
-            # DB hop on the account row. Format is stable + parsed
-            # in run_triage_all_style_mine.
-            query=f"style_mine:limit={limit}",
-            rate_msg_per_min=int(limit),
-            concurrency=1,
-            kind="style_mine",
-        )
-        _record_style_data_audit(
-            db,
-            event_type=event_type,
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=acct["id"],
-            outcome="queued",
-            detail=f"job_id={job_id}; limit={limit}",
-        )
-        _record_style_data_hipaa_access(
-            db,
-            actor_user_id=user["id"],
-            account=acct,
-            operation=event_type,
-        )
         return HTMLResponse(
             _mine_result_fragment(
                 state="ok",
@@ -1907,7 +2049,8 @@ async def _mine_or_preview(
                 merged_pairs.append(key)
 
     if not merged_pairs:
-        _record_style_data_audit(
+        await db_call(
+            _record_style_data_audit,
             db,
             event_type=event_type,
             actor_user_id=user["id"],
@@ -1992,25 +2135,7 @@ async def _mine_or_preview(
             status_code=200,
         )
 
-    # M-6 hook — captured edit pairs get double-weighted in the
-    # distillation corpus. Same shape as the CLI path.
-    captured_ids: set[str] = set()
-    try:
-        rows = db.execute(
-            "SELECT message_id FROM sent_mail_index "
-            "WHERE account_id = ? AND is_captured_pair = 1",
-            (acct["id"],),
-        ).fetchall()
-        for r in rows:
-            mid = r["message_id"] if hasattr(r, "keys") else r[0]
-            if mid:
-                captured_ids.add(str(mid))
-    except Exception:
-        # Pre-M-6 install (sent_mail_index table missing) — fall
-        # through with an empty set.
-        captured_ids = set()
-
-    # Punch list #162 — alias-aware learning. When alias-mode is on,
+    # Punch list  — alias-aware learning. When alias-mode is on,
     # the per-alias picker may scope this mine to one From-address.
     # The picker submits ``alias_from_address`` as a query param; the
     # rest of the path partitions by parsed-From header and either
@@ -2029,8 +2154,31 @@ async def _mine_or_preview(
         request.query_params.get("alias_from_address") or ""
     ).strip().lower()
     alias_from_address_norm = _norm_addr(alias_from_address)
-    alias_mode_on = _is_alias_mode_on(db, acct["id"])
     known_addresses = _account_addresses(acct)
+
+    #  — the M-6 captured-pair read + the alias-mode flag read both
+    # touch the shared connection; fold them into one threadpool hop.
+    def _mine_corpus_reads() -> tuple[set[str], bool]:
+        # M-6 hook — captured edit pairs get double-weighted in the
+        # distillation corpus. Same shape as the CLI path.
+        captured_ids: set[str] = set()
+        try:
+            rows = db.execute(
+                "SELECT message_id FROM sent_mail_index "
+                "WHERE account_id = ? AND is_captured_pair = 1",
+                (acct["id"],),
+            ).fetchall()
+            for r in rows:
+                mid = r["message_id"] if hasattr(r, "keys") else r[0]
+                if mid:
+                    captured_ids.add(str(mid))
+        except Exception:
+            # Pre-M-6 install (sent_mail_index table missing) — fall
+            # through with an empty set.
+            captured_ids = set()
+        return captured_ids, _is_alias_mode_on(db, acct["id"])
+
+    captured_ids, alias_mode_on = await db_call(_mine_corpus_reads)
 
     from email_triage.actions.style_profile import extract_style_profile
     if config is None:
@@ -2048,7 +2196,7 @@ async def _mine_or_preview(
         )
     classifier = _build_classifier_from_config(config)
 
-    # Punch list #162 — when alias-mode is on, split the corpus by
+    # Punch list  — when alias-mode is on, split the corpus by
     # From-address. The result drives either a single-bucket write
     # (when the picker scoped to one alias) or a multi-bucket write
     # (when the operator clicked the top-level mine button while
@@ -2069,7 +2217,8 @@ async def _mine_or_preview(
                 )
             )
         except Exception as exc:
-            _record_style_data_audit(
+            await db_call(
+                _record_style_data_audit,
                 db,
                 event_type=event_type,
                 actor_user_id=user["id"],
@@ -2105,44 +2254,56 @@ async def _mine_or_preview(
         # so an admin review sees the full set in one row.
         if commit:
             from email_triage.web.db import set_style_profile
-            persisted_addrs: list[str] = []
-            persist_err: str = ""
-            try:
-                # Persist each non-empty bucket into the per-alias table.
-                for addr, prof in alias_descriptors.items():
-                    _set_alias_descriptor(
-                        db, acct["id"], addr, prof.to_dict(),
-                        sample_count=prof.sample_count,
-                    )
-                    persisted_addrs.append(addr or "(no-bucket)")
-                # Also refresh the account-wide descriptor when the
-                # operator mined every alias at once (no
-                # ``alias_from_address`` filter). The account-wide
-                # row stays as the fallback when alias-mode is later
-                # turned off; without this refresh it would point at
-                # a stale single-style result.
-                if (
-                    not alias_from_address_norm
-                    and alias_descriptors
-                ):
-                    # Pick the largest-sample bucket as the
-                    # account-wide fallback. Operators with one
-                    # dominant address get the natural choice; the
-                    # account-wide row is never the "no-bucket"
-                    # unknown unless that's the only data we have.
-                    best = max(
-                        alias_descriptors.values(),
-                        key=lambda p: p.sample_count,
-                    )
-                    try:
-                        set_style_profile(db, acct["id"], best.to_dict())
-                    except Exception:
-                        # Non-fatal — per-alias rows are still saved.
-                        pass
-            except Exception as exc:
-                persist_err = fmt_exc(exc)[:200]
+
+            #  — the per-alias descriptor writes + the account-wide
+            # fallback refresh fold into one threadpool hop. Returns
+            # (persisted_addrs, persist_err).
+            def _alias_persist_db_work() -> tuple[list[str], str]:
+                persisted_addrs: list[str] = []
+                persist_err: str = ""
+                try:
+                    # Persist each non-empty bucket into the per-alias
+                    # table.
+                    for addr, prof in alias_descriptors.items():
+                        _set_alias_descriptor(
+                            db, acct["id"], addr, prof.to_dict(),
+                            sample_count=prof.sample_count,
+                        )
+                        persisted_addrs.append(addr or "(no-bucket)")
+                    # Also refresh the account-wide descriptor when the
+                    # operator mined every alias at once (no
+                    # ``alias_from_address`` filter). The account-wide
+                    # row stays as the fallback when alias-mode is
+                    # later turned off; without this refresh it would
+                    # point at a stale single-style result.
+                    if not alias_from_address_norm and alias_descriptors:
+                        # Pick the largest-sample bucket as the
+                        # account-wide fallback. Operators with one
+                        # dominant address get the natural choice; the
+                        # account-wide row is never the "no-bucket"
+                        # unknown unless that's the only data we have.
+                        best = max(
+                            alias_descriptors.values(),
+                            key=lambda p: p.sample_count,
+                        )
+                        try:
+                            set_style_profile(
+                                db, acct["id"], best.to_dict(),
+                            )
+                        except Exception:
+                            # Non-fatal — per-alias rows are still
+                            # saved.
+                            pass
+                except Exception as exc:
+                    persist_err = fmt_exc(exc)[:200]
+                return persisted_addrs, persist_err
+
+            persisted_addrs, persist_err = await db_call(
+                _alias_persist_db_work,
+            )
             if persist_err:
-                _record_style_data_audit(
+                await db_call(
+                    _record_style_data_audit,
                     db,
                     event_type=event_type,
                     actor_user_id=user["id"],
@@ -2164,24 +2325,29 @@ async def _mine_or_preview(
                     ),
                     status_code=200,
                 )
-            _record_style_data_audit(
-                db,
-                event_type=event_type,
-                actor_user_id=user["id"],
-                actor_email=user.get("email") or "",
-                account_id=acct["id"],
-                outcome="success",
-                detail=(
-                    f"aliases={','.join(sorted(persisted_addrs))};"
-                    f"unknown_count={len(alias_unknown_counts)}"
-                ),
-            )
-            _record_style_data_hipaa_access(
-                db,
-                actor_user_id=user["id"],
-                account=acct,
-                operation=event_type,
-            )
+            #  — success audit + HIPAA-access rows fold into one
+            # threadpool hop.
+            def _alias_success_audit_db_work() -> None:
+                _record_style_data_audit(
+                    db,
+                    event_type=event_type,
+                    actor_user_id=user["id"],
+                    actor_email=user.get("email") or "",
+                    account_id=acct["id"],
+                    outcome="success",
+                    detail=(
+                        f"aliases={','.join(sorted(persisted_addrs))};"
+                        f"unknown_count={len(alias_unknown_counts)}"
+                    ),
+                )
+                _record_style_data_hipaa_access(
+                    db,
+                    actor_user_id=user["id"],
+                    account=acct,
+                    operation=event_type,
+                )
+
+            await db_call(_alias_success_audit_db_work)
         # Both commit + preview return the per-alias fragment.
         return HTMLResponse(
             _mine_result_fragment(
@@ -2206,7 +2372,8 @@ async def _mine_or_preview(
             captured_message_ids=captured_ids,
         )
     except Exception as exc:
-        _record_style_data_audit(
+        await db_call(
+            _record_style_data_audit,
             db,
             event_type=event_type,
             actor_user_id=user["id"],
@@ -2232,19 +2399,45 @@ async def _mine_or_preview(
 
     # Commit branch — persist + audit.
     if commit:
-        try:
-            from email_triage.web.db import set_style_profile
-            set_style_profile(db, acct["id"], profile.to_dict())
-        except Exception as exc:
+        from email_triage.web.db import set_style_profile
+
+        #  — the descriptor write + the success/failure audit +
+        # HIPAA-access rows fold into one threadpool hop. Returns the
+        # persist-failure string, or "" on success.
+        def _mine_persist_db_work() -> str:
+            try:
+                set_style_profile(db, acct["id"], profile.to_dict())
+            except Exception as exc:
+                persist_err = fmt_exc(exc)[:200]
+                _record_style_data_audit(
+                    db,
+                    event_type=event_type,
+                    actor_user_id=user["id"],
+                    actor_email=user.get("email") or "",
+                    account_id=acct["id"],
+                    outcome="failure",
+                    detail=f"persist: {persist_err}",
+                )
+                return persist_err
             _record_style_data_audit(
                 db,
                 event_type=event_type,
                 actor_user_id=user["id"],
                 actor_email=user.get("email") or "",
                 account_id=acct["id"],
-                outcome="failure",
-                detail=f"persist: {fmt_exc(exc)[:200]}",
+                outcome="success",
+                detail=f"samples={profile.sample_count}",
             )
+            _record_style_data_hipaa_access(
+                db,
+                actor_user_id=user["id"],
+                account=acct,
+                operation=event_type,
+            )
+            return ""
+
+        persist_err = await db_call(_mine_persist_db_work)
+        if persist_err:
             return HTMLResponse(
                 _mine_result_fragment(
                     state="error",
@@ -2258,21 +2451,6 @@ async def _mine_or_preview(
                 ),
                 status_code=200,
             )
-        _record_style_data_audit(
-            db,
-            event_type=event_type,
-            actor_user_id=user["id"],
-            actor_email=user.get("email") or "",
-            account_id=acct["id"],
-            outcome="success",
-            detail=f"samples={profile.sample_count}",
-        )
-        _record_style_data_hipaa_access(
-            db,
-            actor_user_id=user["id"],
-            account=acct,
-            operation=event_type,
-        )
 
     # Both branches render the same descriptor fragment; the commit
     # branch also got the audit + persistence above.
@@ -2505,7 +2683,7 @@ def _mine_result_fragment(
 
 @router.post("/profile/style-data/preview", response_class=HTMLResponse)
 async def profile_style_data_preview(request: Request):
-    """#157 — dry-run M-3 distillation. Returns the descriptor the
+    """ — dry-run M-3 distillation. Returns the descriptor the
     install would save, without writing it. Operator uses this to
     sanity-check the privacy / style trade before opting in.
     """
@@ -2514,7 +2692,7 @@ async def profile_style_data_preview(request: Request):
 
 @router.post("/profile/style-data/mine-now", response_class=HTMLResponse)
 async def profile_style_data_mine_now(request: Request):
-    """#157 — on-demand M-3 distillation. Runs the same distillation
+    """ — on-demand M-3 distillation. Runs the same distillation
     as the scheduled tick + persists the result + writes an audit
     row. Operator uses this to refresh after a big style shift.
     """
@@ -2522,7 +2700,7 @@ async def profile_style_data_mine_now(request: Request):
 
 
 @router.get("/accounts/api-keys", response_class=HTMLResponse)
-async def api_keys_page(request: Request):
+async def api_keys_page(request: Request, user: RequireUser):
     """Render the API Keys management page.
 
     Admins see all keys across all users; regular users see only their
@@ -2530,28 +2708,20 @@ async def api_keys_page(request: Request):
     raw value is shown ONCE at creation time (stored hashed in the DB)
     so the user must copy it then.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     snap = await db_call(_api_keys_page_snapshot, db, user)
 
-    return _render(templates, request, "accounts/api_keys.html", {
+    return await _render(templates, request, "accounts/api_keys.html", {
         "user": user, "keys": snap["keys"], "is_admin": snap["is_admin"],
         "all_users": snap["all_users"], "new_key_open": False,
     })
 
 
 @router.post("/accounts/api-keys", response_class=HTMLResponse)
-async def api_keys_create(request: Request):
+async def api_keys_create(request: Request, user: RequireUserFragment):
     """Mint a new API key. Returns an HTMX fragment that shows the
     raw key exactly once — it's stored hashed server-side."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     form = await request.form()
     name = (form.get("name") or "").strip()
@@ -2572,7 +2742,8 @@ async def api_keys_create(request: Request):
     from email_triage.web.auth import (
         get_user_by_email, generate_api_key, hash_api_key, store_api_key,
     )
-    target = get_user_by_email(db, target_email)
+    #  — get_user_by_email touches the shared connection; off-loop.
+    target = await db_call(get_user_by_email, db, target_email)
     if target is None:
         return HTMLResponse(
             f'<small style="color:var(--pico-del-color);">'
@@ -2590,7 +2761,9 @@ async def api_keys_create(request: Request):
 
     raw_key = generate_api_key()
     key_hash = hash_api_key(raw_key)
-    key_id = store_api_key(
+    #  — store_api_key is @db_write; dispatch off the loop thread.
+    key_id = await db_call(
+        store_api_key,
         db, key_hash, name, target["id"], expires_at,
         actor_user_id=user["id"],
         actor_email=user["email"],
@@ -2655,19 +2828,15 @@ async def api_keys_create(request: Request):
 
 
 @router.delete("/accounts/api-keys/{key_id}", response_class=HTMLResponse)
-async def api_keys_delete(request: Request, key_id: int):
+async def api_keys_delete(request: Request, key_id: int, user: RequireUserFragment):
     """Revoke an API key. Ownership required (admin or own key)."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     from email_triage.web.auth import delete_api_key
 
     def _api_key_delete_snapshot(
         db, key_id, actor_user_id, actor_email, user_role,
     ):
-        """#135 phase 2 — auth check + delete in one threadpool hop."""
+        """ phase 2 — auth check + delete in one threadpool hop."""
         row = db.execute(
             "SELECT user_id FROM api_keys WHERE id = ?", (key_id,),
         ).fetchone()
@@ -2694,7 +2863,7 @@ async def api_keys_delete(request: Request, key_id: int):
 
 
 # ---------------------------------------------------------------------------
-# /profile/watches — #154 match-and-fire watch editor (replaces the
+# /profile/watches —  match-and-fire watch editor (replaces the
 # per-account /accounts/{id}/edit?tab=watches surface, which is retired).
 #
 # Schema shape post-migration v17: one ``email_watches`` row per
@@ -2756,12 +2925,8 @@ def _profile_watches_page_snapshot(db, user) -> dict:
 
 
 @router.get("/profile/watches", response_class=HTMLResponse)
-async def profile_watches_page(request: Request):
+async def profile_watches_page(request: Request, user: RequireUser):
     """List the operator's watches + show the New-watch form."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     snap = await db_call(_profile_watches_page_snapshot, db, user)
@@ -2771,7 +2936,7 @@ async def profile_watches_page(request: Request):
     from email_triage.web.email_watches import EmailWatch
     blank_watch = EmailWatch(enabled=True)
 
-    return _render(templates, request, "profile/watches.html", {
+    return await _render(templates, request, "profile/watches.html", {
         "user": user,
         "current_user": user,
         "groups": snap["groups"],
@@ -2786,12 +2951,8 @@ async def profile_watches_page(request: Request):
 @router.get(
     "/profile/watches/{group_id:path}/edit", response_class=HTMLResponse,
 )
-async def profile_watches_edit_page(request: Request, group_id: str):
+async def profile_watches_edit_page(request: Request, group_id: str, user: RequireUser):
     """Edit an existing watch group (fan-out across accounts)."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     from email_triage.web.email_watches import (
@@ -2815,7 +2976,7 @@ async def profile_watches_edit_page(request: Request, group_id: str):
     if snap["group"] is None:
         return HTMLResponse("Watch not found", status_code=404)
 
-    return _render(templates, request, "profile/watches.html", {
+    return await _render(templates, request, "profile/watches.html", {
         "user": user,
         "current_user": user,
         "groups": snap["groups"],
@@ -2858,7 +3019,7 @@ def _profile_watches_collect_target_ids(
     2026-05-11 fix: previous version dropped ALL HIPAA accounts
     including the owner's own, leaving the operator with no surface
     to create a watch on their own HIPAA-flagged mailbox after
-    #154 removed the per-account Watches tab.
+     removed the per-account Watches tab.
     """
     raw = form.getlist("account_ids") if hasattr(form, "getlist") else []
     requested: set[int] = set()
@@ -2893,12 +3054,8 @@ def _profile_watches_collect_target_ids(
 @router.post(
     "/profile/watches/new/save", response_class=HTMLResponse,
 )
-async def profile_watches_save_new(request: Request):
+async def profile_watches_save_new(request: Request, user: RequireUser):
     """Create a new watch group across the ticked accounts."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     form = await request.form()
@@ -2929,7 +3086,7 @@ async def profile_watches_save_new(request: Request):
             ).list_watch_groups_for_user(db, u["id"]),
             db, user,
         )
-        return _render(templates, request, "profile/watches.html", {
+        return await _render(templates, request, "profile/watches.html", {
             "user": user, "current_user": user,
             "groups": groups, "user_accounts": user_accounts,
             "group": None, "w": w, "errors": errors,
@@ -3023,12 +3180,8 @@ async def profile_watches_save_new(request: Request):
 @router.post(
     "/profile/watches/{group_id:path}/save", response_class=HTMLResponse,
 )
-async def profile_watches_save_existing(request: Request, group_id: str):
+async def profile_watches_save_existing(request: Request, group_id: str, user: RequireUser):
     """Update an existing watch group across the ticked accounts."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     form = await request.form()
@@ -3066,7 +3219,7 @@ async def profile_watches_save_existing(request: Request, group_id: str):
         groups = await db_call(
             list_watch_groups_for_user, db, user["id"],
         )
-        return _render(templates, request, "profile/watches.html", {
+        return await _render(templates, request, "profile/watches.html", {
             "user": user, "current_user": user,
             "groups": groups, "user_accounts": user_accounts,
             "group": existing, "w": w, "errors": errors,
@@ -3126,12 +3279,8 @@ async def profile_watches_save_existing(request: Request, group_id: str):
 @router.post(
     "/profile/watches/{group_id:path}/delete", response_class=HTMLResponse,
 )
-async def profile_watches_delete(request: Request, group_id: str):
+async def profile_watches_delete(request: Request, group_id: str, user: RequireUser):
     """Delete every row in a watch group."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     from email_triage.web.email_watches import (
         get_watch_group, delete_watch,

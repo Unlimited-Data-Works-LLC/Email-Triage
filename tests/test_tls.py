@@ -1,4 +1,4 @@
-"""Tests for self-signed TLS cert generation + cert-dir lookup (#48)."""
+"""Tests for self-signed TLS cert generation + cert-dir lookup."""
 
 import os
 import subprocess
@@ -25,13 +25,13 @@ class TestSelfSigned:
         assert b"-----BEGIN PRIVATE KEY-----" in key_pem
 
     def test_cert_has_hostname_san(self):
-        cert_pem, _ = generate_self_signed_cert("deployhost.example.com")
+        cert_pem, _ = generate_self_signed_cert("the deploy host.example.com")
         cert = x509.load_pem_x509_certificate(cert_pem)
         san = cert.extensions.get_extension_for_class(
             x509.SubjectAlternativeName
         ).value
         names = [d.value for d in san if isinstance(d, x509.DNSName)]
-        assert "deployhost.example.com" in names
+        assert "the deploy host.example.com" in names
         assert "localhost" in names
 
     def test_cert_has_loopback_ip_sans(self):
@@ -128,7 +128,7 @@ class TestFetchTailscale:
 
         with patch("subprocess.run", side_effect=fake_run):
             crt, key = fetch_tailscale_cert(
-                "deployhost.example.ts.net", cert_dir,
+                "the deploy host.example.ts.net", cert_dir,
             )
         assert crt.exists()
         assert key.exists()

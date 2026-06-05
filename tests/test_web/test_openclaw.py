@@ -132,9 +132,12 @@ class TestHipaaGate:
 
 
 class TestOwnership:
-    def test_other_users_account_is_403(
+    def test_other_users_account_is_404(
         self, client, db, regular_user, admin_user,
     ):
+        """ — a not-owned account returns a uniform 404, identical
+        to a non-existent account. A distinguishable 403 would turn
+        this endpoint into an account-id enumeration oracle."""
         from email_triage.web.auth import generate_api_key, hash_api_key, store_api_key
         # Token belongs to regular_user.
         raw = generate_api_key()
@@ -146,7 +149,39 @@ class TestOwnership:
             f"/api/openclaw/accounts/{aid}/messages?q=ALL",
             headers=bearer,
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
+
+    def test_not_owned_and_missing_accounts_are_indistinguishable(
+        self, client, db, regular_user, admin_user,
+    ):
+        """ — the enumeration-oracle regression guard: a not-owned
+        account id and a never-existed account id must yield byte-for-
+        byte identical responses (status + body), so a caller cannot
+        tell which account ids are live."""
+        from email_triage.web.auth import (
+            generate_api_key, hash_api_key, store_api_key,
+        )
+        raw = generate_api_key()
+        store_api_key(
+            db, hash_api_key(raw), name="t", user_id=regular_user["id"],
+        )
+        bearer = {"Authorization": f"Bearer {raw}"}
+
+        owned_by_other = _make_account(
+            db, admin_user["id"], name="AdminBox",
+        )
+        never_existed = owned_by_other + 99999
+
+        not_owned = client.get(
+            f"/api/openclaw/accounts/{owned_by_other}/messages?q=ALL",
+            headers=bearer,
+        )
+        missing = client.get(
+            f"/api/openclaw/accounts/{never_existed}/messages?q=ALL",
+            headers=bearer,
+        )
+        assert not_owned.status_code == missing.status_code == 404
+        assert not_owned.json() == missing.json()
 
     def test_admin_token_does_not_bypass_other_user_account(
         self, client, db, admin_user, regular_user, bearer,
@@ -154,7 +189,10 @@ class TestOwnership:
         """OpenClaw is strict-per-user even for admins. Admin's
         bearer token can fetch admin's accounts but NOT regular
         user's accounts. Cross-user visibility belongs in the web
-        UI, not in agent-driven API access. (Punch-list 2026-04-30)"""
+        UI, not in agent-driven API access. (the backlog 2026-04-30)
+
+         — a not-owned account returns a uniform 404 (not 403):
+        the not-owned/not-found split was an enumeration oracle."""
         # ``bearer`` fixture is admin's token. Account belongs to
         # regular_user.
         other_aid = _make_account(
@@ -164,7 +202,7 @@ class TestOwnership:
             f"/api/openclaw/accounts/{other_aid}/messages?q=ALL",
             headers=bearer,
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
     def test_admin_token_lists_only_own_accounts(
         self, client, db, admin_user, regular_user, bearer,

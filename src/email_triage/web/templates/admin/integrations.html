@@ -311,14 +311,14 @@
             Public webhook base URL
             <input type="url" name="public_url"
                    value="{{ push.public_url }}"
-                   placeholder="https://deployhost.your-tailnet.ts.net">
+                   placeholder="https://the deploy host.your-tailnet.ts.net">
         </label>
         <p><small style="color:var(--pico-muted-color);">
             The base URL Google's Pub/Sub push servers can reach (no path, no
             trailing slash). The webhook lives at
             <code>{{ push.public_url or '&lt;public_url&gt;' }}/webhooks/gmail</code>.
             For the homelab default, this is the Tailscale Funnel hostname
-            (e.g.&nbsp;<code>https://deployhost.&lt;tailnet&gt;.ts.net</code>).
+            (e.g.&nbsp;<code>https://the deploy host.&lt;tailnet&gt;.ts.net</code>).
             Internal UI stays at the private domain; the webhook is the only
             path Funnel exposes publicly.
         </small></p>
@@ -353,7 +353,7 @@
             Audience claim
             <input type="url" name="gmail_audience"
                    value="{{ push.gmail_audience }}"
-                   placeholder="https://deployhost.your-tailnet.ts.net">
+                   placeholder="https://the deploy host.your-tailnet.ts.net">
         </label>
         <p><small style="color:var(--pico-muted-color);">
             Must equal the Pub/Sub subscription's
@@ -443,7 +443,7 @@
     </div>
 </article>
 
-{# ── Classification cache (#151) ─────────────────────────────── #}
+{# ── Classification cache ─────────────────────────────── #}
 <article class="et-card et-card-stack">
     <header class="et-card-header">
         <h3>Classification cache <small style="color:var(--pico-muted-color);">(optional — Redis / valkey)</small></h3>

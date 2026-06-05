@@ -1,4 +1,4 @@
-"""Centralised settings-key catalogue (#140.3).
+"""Centralised settings-key catalogue.
 
 All ``settings`` table keys go through this module so the canonical
 shape lives in one place. Two motivations:
@@ -14,7 +14,7 @@ shape lives in one place. Two motivations:
 2. **Per-account delete sweep** — :func:`account_settings_keys`
    returns every key shape that is parameterised by ``account_id``,
    and :func:`delete_account_settings` deletes them all in one
-   transaction. Useful for the future account-delete handler (#65)
+   transaction. Useful for the future account-delete handler
    plus backup/restore tests that want to round-trip a single
    account's settings cleanly.
 
@@ -56,12 +56,27 @@ def calendar_enabled(account_id: int) -> str:
 
 
 def digest(account_id: int) -> str:
-    """``digest:<id>`` — legacy single-schedule digest config."""
+    """``digest:<id>`` — legacy single-config digest settings key.
+
+    The UI that read/wrote this (digest_save_config + digest_generate)
+    was retired in . Key builder stays: old installs can carry
+    vestigial ``digest:<id>`` rows and ``_ACCOUNT_KEY_CATALOG``
+    references the prefix for delete-sweep cleanup. Canonical
+    definition of the key shape.
+    """
     return f"digest:{int(account_id)}"
 
 
 def digest_schedules(account_id: int) -> str:
-    """``digest_schedules:<id>`` — multi-schedule digest config."""
+    """``digest_schedules:<id>`` — legacy multi-schedule digest config.
+
+    The digest_schedules CRUD UI was retired in , but the key
+    builder stays: old installs can still carry vestigial
+    ``digest_schedules:<id>`` rows, and ``_ACCOUNT_KEY_CATALOG``
+    references this prefix so the per-account delete sweep cleans
+    them up. This function is the canonical definition of that key
+    shape.
+    """
     return f"digest_schedules:{int(account_id)}"
 
 
@@ -99,13 +114,13 @@ def style_knobs_hipaa_allow(account_id: int) -> str:
     """``style_knobs_hipaa_allow:<id>`` — per-account opt-in for the
     M-1+M-2 operator-stated style knobs on a HIPAA-flagged account.
 
-    Punch-list #152 Phase 2 (2026-05-11). Default OFF; operator
+    the backlog  Phase 2 (2026-05-11). Default OFF; operator
     explicitly ticks to enable. M-1+M-2 take operator-typed strings
     (style guide + tone / length / greeting / signature radios), which
     are operator self-disclosure (§164.502(a)) — not PHI by
     construction. M-3 / M-4 / M-7 stay hard-off regardless of this
-    flag; see ``docs/m-series-hipaa-audit.md`` for the audit and
-    ``docs/privacy-audit-runbook.md`` for the sign-off log.
+    flag; see ``internal documentation`` for the audit and
+    ``internal documentation`` for the sign-off log.
     """
     return f"style_knobs_hipaa_allow:{int(account_id)}"
 
@@ -113,6 +128,20 @@ def style_knobs_hipaa_allow(account_id: int) -> str:
 def office365_clientstate(account_id: int) -> str:
     """``office365_clientstate:<id>`` — Graph webhook clientState (in secrets)."""
     return f"office365_clientstate:{int(account_id)}"
+
+
+def office365_poll_cursor(account_id: int) -> str:
+    """``office365_poll_cursor:<id>`` — Graph delta cursor for poll mode.
+
+     — the unified poll loop's O365 dispatch walks the Inbox delta
+    feed; the ``@odata.deltaLink`` it gets back must persist between
+    ticks so the next tick fetches only what changed. The push path
+    stores its cursor on the ``office365_subscriptions`` row, but a
+    poll-only account (push not configured) has no such row — this
+    settings key is the poll-mode cursor home. Value shape:
+    ``{"delta_link": "<absolute-url>"}``.
+    """
+    return f"office365_poll_cursor:{int(account_id)}"
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +168,7 @@ def last_routes_account_id(user_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 #: ``cache.redis_url`` — install-wide Redis connection URL for the
-#: optional classification cache (#151). Empty / missing = cache OFF.
+#: optional classification cache. Empty / missing = cache OFF.
 #: Real persistence lives in YAML (``config.redis_cache.url``); these
 #: constants exist so call sites can reach for the same name as the
 #: settings key registry rather than hand-typing the string. The
@@ -209,6 +238,9 @@ _ACCOUNT_KEY_CATALOG: tuple[tuple[str, bool], ...] = (
     ("watch_hwm:", False),  # covers both legacy-single + per-mailbox shapes
     ("calendar_enabled:", True),
     ("digest:", True),
+    # The legacy digest_schedules CRUD UI was removed, but old
+    # installs may still carry vestigial digest_schedules:<id> rows —
+    # keep the prefix so the per-account delete sweep cleans them up.
     ("digest_schedules:", True),
     ("digest_test_lock:", True),
     ("auth_stale:", True),
@@ -219,6 +251,7 @@ _ACCOUNT_KEY_CATALOG: tuple[tuple[str, bool], ...] = (
     ("rag_sent_index_enabled:", True),
     ("style_knobs_hipaa_allow:", True),
     ("office365_clientstate:", True),
+    ("office365_poll_cursor:", True),
     ("account_state:", False),  # legacy <prefix><id>:<thing>
     ("backup_paths:", True),
     ("listener_restart_pending:", True),
@@ -228,7 +261,7 @@ _ACCOUNT_KEY_CATALOG: tuple[tuple[str, bool], ...] = (
 def account_settings_keys(account_id: int) -> Iterable[tuple[str, bool]]:
     """Yield ``(key_or_prefix, exact_match)`` pairs for ``account_id``.
 
-    Useful for callers that want to inspect (e.g. backup #65) what's
+    Useful for callers that want to inspect (e.g. backup ) what's
     on file before / after a delete sweep.
     """
     aid = int(account_id)
@@ -272,7 +305,7 @@ def delete_account_settings(
         conn.rollback()
         raise
 
-    # Keep the in-process settings cache (#140.2) coherent. The bulk
+    # Keep the in-process settings cache coherent. The bulk
     # DELETE bypasses delete_setting(); a per-key invalidation here
     # would require knowing every legacy <prefix>:<id>:<segments>
     # variant in flight, so flush the entire cache instead. Account

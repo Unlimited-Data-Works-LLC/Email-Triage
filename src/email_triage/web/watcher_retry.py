@@ -1,4 +1,4 @@
-"""Small consumer shim for the watcher per-message retry queue (#175).
+"""Small consumer shim for the watcher per-message retry queue.
 
 The durable backbone (table, schema migration, backoff helper,
 queue helpers, sweeper) is built by R-A in parallel. This module
@@ -82,6 +82,22 @@ def _is_auth_revoked(error_class: str, error_msg: str) -> bool:
     return False
 
 
+# Provider-type normalisation. Account records carry the
+# ``gmail_api`` provider_type, but ``enqueue_retry`` (the v30 schema)
+# only accepts the {imap, gmail, office365} addressing-tuple slugs.
+# Without this map a Gmail push failure raised ``ValueError`` inside
+# ``enqueue_retry``, got swallowed by the watcher's broad except, and
+# NO retry row was ever created. Map account provider_type →
+# the queue's provider_type slug here, at the single watcher-retry
+# call site, so every ingestion path stays consistent.
+_PROVIDER_TYPE_TO_QUEUE_SLUG: dict[str, str] = {
+    "gmail_api": "gmail",
+    "gmail": "gmail",
+    "imap": "imap",
+    "office365": "office365",
+}
+
+
 def enqueue_watcher_retry(
     db: Any,
     *,
@@ -93,6 +109,7 @@ def enqueue_watcher_retry(
     gmail_msg_id: str | None = None,
     o365_msg_id: str | None = None,
     error: BaseException,
+    failure_kind: str | None = None,
 ) -> int | None:
     """Enqueue a retry row for a watcher per-message failure.
 
@@ -109,9 +126,23 @@ def enqueue_watcher_retry(
     early-return) so the operator gets a durable artefact in the
     admin retry-queue page showing what the watcher saw + when,
     with a clear "this won't retry — re-auth the account" label.
+
+    ``provider_type`` is normalised through
+    :data:`_PROVIDER_TYPE_TO_QUEUE_SLUG`, so an account whose
+    ``provider_type`` is ``gmail_api`` produces a valid ``gmail``
+    queue row instead of a swallowed ``ValueError``.
+
+    ``failure_kind`` is passed straight through to
+    :func:`email_triage.web.db.enqueue_retry` — ``'llm_unreachable'``
+    for a classify-step LLM-backend failure, NULL for an ordinary
+    per-message fetch/process failure.
     """
     error_class = type(error).__name__
     error_msg = fmt_exc(error)
+    #  — map the account provider_type onto the queue slug.
+    queue_provider_type = _PROVIDER_TYPE_TO_QUEUE_SLUG.get(
+        str(provider_type).lower().strip(), str(provider_type),
+    )
 
     try:
         from email_triage.web.db import (  # noqa: F401  # R-A's helper
@@ -126,7 +157,7 @@ def enqueue_watcher_retry(
         retry_id = enqueue_retry(
             db,
             account_id=int(account_id),
-            provider_type=str(provider_type),
+            provider_type=queue_provider_type,
             mailbox=mailbox,
             uid=str(uid) if uid is not None else None,
             uidvalidity=(
@@ -136,6 +167,7 @@ def enqueue_watcher_retry(
             o365_msg_id=o365_msg_id,
             error_class=error_class,
             error_msg=error_msg,
+            failure_kind=failure_kind,
         )
     except Exception as exc:  # pragma: no cover - DB failure path
         _log.warning(
@@ -171,8 +203,76 @@ def enqueue_watcher_retry(
     return int(retry_id) if retry_id is not None else None
 
 
+class WatchDeliveryFailed(Exception):
+    """Synthetic exception used to enqueue a retry row when one or more
+    live-path email-watch fires failed to deliver.
+
+    The retry-queue row carries the exception's class + message in its
+    ``last_error_*`` columns; using a distinct class makes the source
+    of the retry obvious in ``/admin/retry-queue`` ("the message itself
+    was fine, but escalation didn't deliver") versus the ordinary
+    fetch/process exception lineage. The message text MUST be free of
+    PHI — it is the failure count and nothing else.
+    """
+
+
+def enqueue_watch_delivery_retry(
+    db: Any,
+    *,
+    account_id: int,
+    provider_type: str,
+    failed_count: int,
+    total_count: int,
+    mailbox: str | None = None,
+    uid: str | int | None = None,
+    uidvalidity: str | int | None = None,
+    gmail_msg_id: str | None = None,
+    o365_msg_id: str | None = None,
+) -> int | None:
+    """Enqueue a ``watcher_retry_queue`` row for a live-path message
+    whose email-watch fire(s) did not deliver.
+
+    Thin shim around :func:`enqueue_watcher_retry` that builds a
+    :class:`WatchDeliveryFailed` synthetic exception (PHI-free body —
+    the failure count and total only) and stamps
+    ``failure_kind='watch_delivery_failure'`` so the row is
+    distinguishable from ordinary fetch/process retries in operator
+    surfaces. The drainer's existing LLM-breaker gate is keyed on
+    ``failure_kind == 'llm_unreachable'`` only, so the new kind drains
+    on every tick alongside NULL.
+
+    The retry is safe to enqueue on every non-delivered fire because
+    's ``watch_fire_idempotency`` table records only DELIVERED
+    fires; the drainer's re-call of
+    :func:`fire_watches_for_message` will skip the already-delivered
+    watches on this message and re-attempt only the not-yet-delivered
+    ones.
+
+    Returns the new retry row id, or ``None`` on enqueue failure
+    (matching :func:`enqueue_watcher_retry`'s contract — the caller's
+    live-path log line already fired).
+    """
+    err = WatchDeliveryFailed(
+        f"{failed_count} of {total_count} watch fire(s) did not deliver"
+    )
+    return enqueue_watcher_retry(
+        db,
+        account_id=account_id,
+        provider_type=provider_type,
+        mailbox=mailbox,
+        uid=uid,
+        uidvalidity=uidvalidity,
+        gmail_msg_id=gmail_msg_id,
+        o365_msg_id=o365_msg_id,
+        error=err,
+        failure_kind="watch_delivery_failure",
+    )
+
+
 __all__ = [
     "enqueue_watcher_retry",
+    "enqueue_watch_delivery_retry",
+    "WatchDeliveryFailed",
     "_is_auth_revoked",
     "_AUTH_REVOKED_NEEDLES",
 ]

@@ -1,4 +1,4 @@
-"""#161 item 4 — per-account "Messages to mine" override + install default.
+""" item 4 — per-account "Messages to mine" override + install default.
 
 Covers:
 

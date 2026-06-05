@@ -42,8 +42,14 @@ EMBED_MODEL_FIXTURE = "test-embedder-v0"
 
 
 def _make_db() -> sqlite3.Connection:
-    """In-memory DB with email_accounts + sent_mail_index (v12 + v14)."""
-    conn = sqlite3.connect(":memory:")
+    """In-memory DB with email_accounts + sent_mail_index (v12 + v14).
+
+    ``check_same_thread=False`` mirrors production ``init_db``: the
+     /  async-DB path dispatches shared-connection touches to a
+    threadpool worker via ``db_call``, so cross-thread use must be
+    permitted.
+    """
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -146,7 +152,7 @@ def _make_index(conn: sqlite3.Connection, account_id: int) -> SentMailIndex:
 class TestMigrationV14:
     def test_v14_applies_cleanly(self):
         """v14 runs against a DB that already has v12's sent_mail_index."""
-        conn = sqlite3.connect(":memory:")
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)")
         from email_triage.web.migrations import MIGRATIONS
@@ -160,7 +166,7 @@ class TestMigrationV14:
         assert "is_captured_pair" in cols
 
     def test_v14_idempotent(self):
-        conn = sqlite3.connect(":memory:")
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)")
         from email_triage.web.migrations import MIGRATIONS
@@ -484,9 +490,17 @@ class TestBackgroundLoop:
         """
         from email_triage.web import app as app_mod
 
-        # Build a mock app.state with three accounts:
-        #   1. opted-in non-HIPAA active   -> scanned
-        #   2. HIPAA flagged               -> skipped (skipped_hipaa)
+        # Build a mock app.state with four accounts:
+        #   1. opted-in non-HIPAA active   -> scanned by SentMailCaptureLoop
+        #   2. HIPAA flagged + empty cfg   ->  dispatches to the
+        #                                     HIPAA counter loop branch,
+        #                                     which checks
+        #                                     is_auto_scan_enabled_for_account
+        #                                     first. HIPAA default is OFF
+        #                                     (opt-in-everywhere posture),
+        #                                     so this bumps
+        #                                     skipped_auto_scan_off — NOT
+        #                                     skipped_hipaa anymore.
         #   3. disabled                    -> skipped (skipped_disabled)
         #   4. non-HIPAA but opt-out       -> skipped (silent)
         accts = [
@@ -531,7 +545,7 @@ class TestBackgroundLoop:
             db_mod, "list_email_accounts",
             lambda conn, **_kw: list(accts),
         )
-        # #157 — is_rag_sent_index_enabled grew an ``account`` kwarg
+        #  — is_rag_sent_index_enabled grew an ``account`` kwarg
         # for HIPAA-aware default; mock signature must accept it.
         monkeypatch.setattr(
             db_mod, "is_rag_sent_index_enabled",
@@ -550,7 +564,7 @@ class TestBackgroundLoop:
         # Build a minimal app.state stub.
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
         app.state.db.row_factory = sqlite3.Row
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
@@ -579,10 +593,19 @@ class TestBackgroundLoop:
         # Exactly one account scanned (account 1).
         assert scanned_account_ids == [1]
         assert counters["considered"] == 4
-        assert counters["skipped_hipaa"] == 1
+        #  — HIPAA branch no longer bumps skipped_hipaa in the
+        # auto-scan-off path; it bumps skipped_auto_scan_off instead so
+        # the HIPAA account 2 falls in there. skipped_hipaa stays at 0
+        # in normal operation (kept on the dict for back-compat with
+        # external readers).
+        assert counters["skipped_hipaa"] == 0
+        assert counters["skipped_auto_scan_off"] == 1
         assert counters["skipped_disabled"] == 1
-        # Account 4 (opt-out) doesn't bump skipped_disabled or
-        # skipped_hipaa; it just silently doesn't run.
+        assert counters["hipaa_counter_recorded"] == 0
+        # Account 4 (opt-out) doesn't bump skipped_disabled,
+        # skipped_hipaa, or skipped_auto_scan_off; it just silently
+        # doesn't run (no-op via is_rag_sent_index_enabled returning
+        # False).
 
     async def test_loop_no_op_when_master_toggle_off(self, monkeypatch):
         from email_triage.web import app as app_mod
@@ -600,7 +623,7 @@ class TestBackgroundLoop:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
         app.state.embedding_model = EMBED_MODEL_FIXTURE
@@ -625,7 +648,7 @@ class TestBackgroundLoop:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
         app.state.secrets = object()
         app.state.embedding_backend = None  # not wired
 
@@ -694,7 +717,7 @@ class TestAuditRow:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
         app.state.db.row_factory = sqlite3.Row
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
@@ -741,7 +764,7 @@ class TestCronAnchor:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
 
         noon = datetime(2026, 5, 8, 12, 0, 0, tzinfo=timezone.utc)
         # No setting row -> default 6h interval.
@@ -755,7 +778,7 @@ class TestCronAnchor:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:")
+        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
 
         # Choose a moment 0.001s before a boundary -- next tick is
         # almost immediate.
@@ -766,3 +789,126 @@ class TestCronAnchor:
         # Either we land just before this boundary (tiny window) or
         # we roll to the next interval; either way >= 1s.
         assert seconds >= 1.0
+
+
+# ---------------------------------------------------------------------------
+#  — connection-holding-class write-lock guard
+# ---------------------------------------------------------------------------
+
+def _lock_held_by_other_thread() -> bool:
+    """Return True if ``get_write_lock()`` is currently held by a thread
+    OTHER than the caller.
+
+    ``get_write_lock()`` is a reentrant ``RLock`` — the calling thread
+    can always re-acquire it, so a same-thread ``acquire(blocking=False)``
+    tells us nothing. To probe whether the lock is genuinely held we ask
+    a SEPARATE thread to attempt a non-blocking acquire: an RLock held by
+    any thread rejects a non-blocking acquire from every other thread.
+    """
+    import threading
+
+    from email_triage.web.db_writelock import get_write_lock
+
+    lock = get_write_lock()
+    result: dict[str, bool] = {}
+
+    def _probe() -> None:
+        got = lock.acquire(blocking=False)
+        result["held"] = not got
+        if got:
+            lock.release()
+
+    t = threading.Thread(target=_probe)
+    t.start()
+    t.join()
+    return result["held"]
+
+
+class _LockProbeConn:
+    """Proxy around a ``sqlite3.Connection`` that records whether the
+    process-wide DB write lock is held whenever ``execute`` is called.
+
+    ``sqlite3.Connection.execute`` is a read-only C-level slot, so it
+    cannot be monkeypatched in place. The connection-holding classes
+    only reach the DB through ``self._db`` — handing them this proxy as
+    the connection lets the test observe every touch. Every other
+    attribute / method delegates straight to the real connection.
+    """
+
+    def __init__(self, real, *, execute_match=None):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_execute_match", execute_match)
+        object.__setattr__(self, "execute_observed", [])
+
+    def execute(self, sql, *args, **kwargs):
+        match = self._execute_match
+        if match is not None and match(sql):
+            self.execute_observed.append(_lock_held_by_other_thread())
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.mark.asyncio
+class TestWriteLockHeldDuringDbTouch:
+    """ — ``SentMailCaptureLoop._account_row`` and
+    ``_captured_row_count`` must hold the process-wide DB write lock for
+    the duration of their shared-connection ``execute``. The 
+    connection-holding-class ratchet enforces the lexical
+    ``with get_write_lock()`` wrap; this test enforces it at RUNTIME — it
+    observes each SELECT through a proxy connection and asserts the lock
+    is genuinely held by the executing thread.
+    """
+
+    async def test_account_row_holds_write_lock_during_execute(self):
+        conn = _make_db()
+        acct_id = _seed_account(conn)
+        probe = _LockProbeConn(
+            conn, execute_match=lambda s: "FROM email_accounts" in s,
+        )
+        idx = _make_index(conn, acct_id)
+        loop = SentMailCaptureLoop(
+            probe, acct_id, provider=None, sent_mail_index=idx,
+        )
+        # _account_row runs inside _hipaa_short_circuit, dispatched
+        # off-loop by scan_recent via db_call.
+        await loop.scan_recent()
+
+        assert probe.execute_observed, "_account_row's SELECT never executed"
+        assert all(probe.execute_observed), (
+            "write lock was NOT held during _account_row's execute"
+        )
+
+    async def test_captured_row_count_holds_write_lock_during_execute(self):
+        conn = _make_db()
+        acct_id = _seed_account(conn)
+        probe = _LockProbeConn(
+            conn,
+            execute_match=lambda s: (
+                "FROM sent_mail_index" in s and "is_captured_pair = 1" in s
+            ),
+        )
+        idx = _make_index(conn, acct_id)
+
+        class _EmptyProvider:
+            async def search(self, query, limit):
+                return []
+
+            async def fetch_message(self, mid, **_kw):
+                raise AssertionError("no messages to fetch")
+
+        loop = SentMailCaptureLoop(
+            probe, acct_id, provider=_EmptyProvider(),
+            sent_mail_index=idx,
+        )
+        # _captured_row_count runs twice in scan_recent (before / after
+        # the capture pass), each dispatched off-loop by db_call.
+        await loop.scan_recent()
+
+        assert probe.execute_observed, (
+            "_captured_row_count's SELECT never executed"
+        )
+        assert all(probe.execute_observed), (
+            "write lock was NOT held during _captured_row_count's execute"
+        )

@@ -1,4 +1,4 @@
-"""Admin retry-queue page (#175 R-B).
+"""Admin retry-queue page.
 
 Per-message retry rows that R-A's sweeper drains live in the
 ``watcher_retry_queue`` table. This router gives the admin three
@@ -34,10 +34,12 @@ from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from email_triage.web.app import get_db, get_templates
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 from email_triage._errfmt import fmt_exc
 
 
+# async-db: handlers route SQLite through db_call
 _log = logging.getLogger("email_triage.web.ui.retry_queue")
 
 router = APIRouter()
@@ -200,7 +202,7 @@ def _load_rows(
 @router.get("/admin/retry-queue", response_class=HTMLResponse)
 async def retry_queue_index(request: Request):
     """List the retry queue. Default filter shows pending+dead."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = get_db(request)
@@ -212,16 +214,20 @@ async def retry_queue_index(request: Request):
     if state_filter not in _STATE_FILTERS:
         state_filter = "pending_and_dead"
 
-    rows, error_note = _load_rows(db, state_filter=state_filter)
+    def _index_db_work() -> tuple[list[dict[str, Any]], str | None]:
+        """/ — list load + audit write in one threadpool hop."""
+        rows_, error_note_ = _load_rows(db, state_filter=state_filter)
+        # Audit the read (HIPAA — admin viewing a list that names
+        # accounts is a §164.312(b) auditable event).
+        _audit(
+            db, user=user, route="/admin/retry-queue", method="GET",
+            status_code=200,
+            outcome="ok" if error_note_ is None else "degraded",
+            detail=f"state={state_filter} rows={len(rows_)}",
+        )
+        return rows_, error_note_
 
-    # Audit the read (HIPAA — admin viewing a list that names
-    # accounts is a §164.312(b) auditable event).
-    _audit(
-        db, user=user, route="/admin/retry-queue", method="GET",
-        status_code=200,
-        outcome="ok" if error_note is None else "degraded",
-        detail=f"state={state_filter} rows={len(rows)}",
-    )
+    rows, error_note = await db_call(_index_db_work)
 
     # Defer to _shared._render for the BAA-banner injection +
     # hipaa_mode ctx + retry_queue_banner ctx (used by base.html
@@ -229,7 +235,7 @@ async def retry_queue_index(request: Request):
     # _shared at module load would create a circular dep with the
     # __init__.py's globals().update; defer to call time.
     from email_triage.web.routers.ui import _shared
-    return _shared._render(
+    return await _shared._render(
         templates, request, "admin/retry_queue/_index.html",
         {
             "user": user,
@@ -249,76 +255,82 @@ async def retry_queue_retry_now(
     up on the next tick. R-A doesn't expose a dedicated "bump"
     helper, so we touch the column directly inside this handler.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = get_db(request)
 
-    # Look up the row first so the audit detail can carry useful
-    # context. ``get_retry`` is R-A's helper — fall back to a
-    # direct SELECT if it isn't on the import path.
-    row: dict[str, Any] | None = None
-    helpers_present = True
-    try:
-        from email_triage.web.db import get_retry  # noqa: F401
-    except ImportError:
-        helpers_present = False
-    if helpers_present:
+    def _retry_now_db_work() -> tuple[int, str]:
+        """/ — lookup + UPDATE + audit in one threadpool hop.
+        Returns ``(status_code, body)``; status 303 means redirect.
+        """
+        # Look up the row first so the audit detail can carry useful
+        # context. ``get_retry`` is R-A's helper — fall back to a
+        # direct SELECT if it isn't on the import path.
+        row: dict[str, Any] | None = None
+        helpers_present = True
         try:
-            r = get_retry(db, int(retry_id))
-            row = dict(r) if r is not None else None
-        except Exception:
-            row = None
+            from email_triage.web.db import get_retry  # noqa: F401
+        except ImportError:
+            helpers_present = False
+        if helpers_present:
+            try:
+                r = get_retry(db, int(retry_id))
+                row = dict(r) if r is not None else None
+            except Exception:
+                row = None
 
-    if row is None and helpers_present:
+        if row is None and helpers_present:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/retry-now",
+                method="POST", status_code=404, outcome="not_found",
+                detail=f"retry_id={retry_id}",
+            )
+            return 404, "Not Found"
+
+        if not helpers_present:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/retry-now",
+                method="POST", status_code=503, outcome="degraded",
+                detail="retry queue helpers not present (R-A not merged)",
+            )
+            return 503, "Retry queue is not yet active on this install."
+
+        # Direct UPDATE on the column. This bypasses R-A's "compute next
+        # attempt" backoff math intentionally — the operator-driven
+        # retry-now bypasses the schedule by design.
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            db.execute(
+                "UPDATE watcher_retry_queue SET next_attempt_at = ? "
+                "WHERE id = ?",
+                (now_iso, int(retry_id)),
+            )
+            db.commit()
+        except Exception as exc:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/retry-now",
+                method="POST", status_code=500, outcome="error",
+                detail=fmt_exc(exc),
+            )
+            return 500, "Internal error"
+
         _audit(
             db, user=user,
             route=f"/admin/retry-queue/{retry_id}/retry-now",
-            method="POST", status_code=404, outcome="not_found",
-            detail=f"retry_id={retry_id}",
+            method="POST", status_code=303, outcome="ok",
+            detail=f"retry_id={retry_id} account_id={row.get('account_id')}",
         )
-        return HTMLResponse("Not Found", status_code=404)
+        return 303, ""
 
-    if not helpers_present:
-        _audit(
-            db, user=user,
-            route=f"/admin/retry-queue/{retry_id}/retry-now",
-            method="POST", status_code=503, outcome="degraded",
-            detail="retry queue helpers not present (R-A not merged)",
-        )
-        return HTMLResponse(
-            "Retry queue is not yet active on this install.",
-            status_code=503,
-        )
-
-    # Direct UPDATE on the column. This bypasses R-A's "compute next
-    # attempt" backoff math intentionally — the operator-driven
-    # retry-now bypasses the schedule by design.
-    from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).isoformat()
-    try:
-        db.execute(
-            "UPDATE watcher_retry_queue SET next_attempt_at = ? "
-            "WHERE id = ?",
-            (now_iso, int(retry_id)),
-        )
-        db.commit()
-    except Exception as exc:
-        _audit(
-            db, user=user,
-            route=f"/admin/retry-queue/{retry_id}/retry-now",
-            method="POST", status_code=500, outcome="error",
-            detail=fmt_exc(exc),
-        )
-        return HTMLResponse("Internal error", status_code=500)
-
-    _audit(
-        db, user=user,
-        route=f"/admin/retry-queue/{retry_id}/retry-now",
-        method="POST", status_code=303, outcome="ok",
-        detail=f"retry_id={retry_id} account_id={row.get('account_id')}",
-    )
-    return RedirectResponse("/admin/retry-queue", status_code=303)
+    status_code, body = await db_call(_retry_now_db_work)
+    if status_code == 303:
+        return RedirectResponse("/admin/retry-queue", status_code=303)
+    return HTMLResponse(body, status_code=status_code)
 
 
 @router.post("/admin/retry-queue/{retry_id}/abandon")
@@ -327,58 +339,64 @@ async def retry_queue_abandon(
 ):
     """Mark the row dead with ``reason='operator_abandoned'``.
     The sweeper will not pick it up again."""
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = get_db(request)
 
-    try:
-        from email_triage.web.db import (
-            mark_retry_dead, get_retry,
-        )
-    except ImportError:
-        _audit(
-            db, user=user,
-            route=f"/admin/retry-queue/{retry_id}/abandon",
-            method="POST", status_code=503, outcome="degraded",
-            detail="retry queue helpers not present (R-A not merged)",
-        )
-        return HTMLResponse(
-            "Retry queue is not yet active on this install.",
-            status_code=503,
-        )
+    def _abandon_db_work() -> tuple[int, str]:
+        """/ — lookup + mark_retry_dead + audit in one
+        threadpool hop. Returns ``(status_code, body)``; 303 = redirect.
+        """
+        try:
+            from email_triage.web.db import (
+                mark_retry_dead, get_retry,
+            )
+        except ImportError:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/abandon",
+                method="POST", status_code=503, outcome="degraded",
+                detail="retry queue helpers not present (R-A not merged)",
+            )
+            return 503, "Retry queue is not yet active on this install."
 
-    row = None
-    try:
-        r = get_retry(db, int(retry_id))
-        row = dict(r) if r is not None else None
-    except Exception:
         row = None
+        try:
+            r = get_retry(db, int(retry_id))
+            row = dict(r) if r is not None else None
+        except Exception:
+            row = None
 
-    if row is None:
+        if row is None:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/abandon",
+                method="POST", status_code=404, outcome="not_found",
+                detail=f"retry_id={retry_id}",
+            )
+            return 404, "Not Found"
+
+        try:
+            mark_retry_dead(db, int(retry_id), reason="operator_abandoned")
+        except Exception as exc:
+            _audit(
+                db, user=user,
+                route=f"/admin/retry-queue/{retry_id}/abandon",
+                method="POST", status_code=500, outcome="error",
+                detail=fmt_exc(exc),
+            )
+            return 500, "Internal error"
+
         _audit(
             db, user=user,
             route=f"/admin/retry-queue/{retry_id}/abandon",
-            method="POST", status_code=404, outcome="not_found",
-            detail=f"retry_id={retry_id}",
+            method="POST", status_code=303, outcome="ok",
+            detail=f"retry_id={retry_id} account_id={row.get('account_id')}",
         )
-        return HTMLResponse("Not Found", status_code=404)
+        return 303, ""
 
-    try:
-        mark_retry_dead(db, int(retry_id), reason="operator_abandoned")
-    except Exception as exc:
-        _audit(
-            db, user=user,
-            route=f"/admin/retry-queue/{retry_id}/abandon",
-            method="POST", status_code=500, outcome="error",
-            detail=fmt_exc(exc),
-        )
-        return HTMLResponse("Internal error", status_code=500)
-
-    _audit(
-        db, user=user,
-        route=f"/admin/retry-queue/{retry_id}/abandon",
-        method="POST", status_code=303, outcome="ok",
-        detail=f"retry_id={retry_id} account_id={row.get('account_id')}",
-    )
-    return RedirectResponse("/admin/retry-queue", status_code=303)
+    status_code, body = await db_call(_abandon_db_work)
+    if status_code == 303:
+        return RedirectResponse("/admin/retry-queue", status_code=303)
+    return HTMLResponse(body, status_code=status_code)

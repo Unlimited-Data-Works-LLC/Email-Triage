@@ -1,4 +1,4 @@
-"""Triage entry points enforce self-skip at SEARCH + FETCH stages (#117).
+"""Triage entry points enforce self-skip at SEARCH + FETCH stages.
 
 Three guarantees pinned here:
 

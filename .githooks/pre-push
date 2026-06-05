@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# pre-push: run pip-audit BEFORE the push lands on origin so CI
+# never has to fail on a CVE you could have caught locally.
+#
+# Bypass with `git push --no-verify` ONLY in genuine emergencies
+# (the hook prints how when it fires). Bypassing is logged in the
+# user's local shell history; intentional bypass is auditable.
+#
+# Activated by `scripts/install-git-hooks.sh` (runs `git config
+# core.hooksPath .githooks` so the repo-tracked hooks become live).
+set -euo pipefail
+
+# Only run if pip-audit is installed; nudge if not. We don't want to
+# auto-install via the hook — operator opts in via the install script.
+if ! command -v pip-audit >/dev/null 2>&1; then
+    echo "pre-push: pip-audit not installed; skipping vuln scan."
+    echo "         Install with: pip install pip-audit"
+    exit 0
+fi
+
+ROOT=$(git rev-parse --show-toplevel)
+SCRIPT="$ROOT/scripts/run-pip-audit.sh"
+if [ ! -x "$SCRIPT" ]; then
+    echo "pre-push: $SCRIPT missing or not executable; skipping."
+    exit 0
+fi
+
+echo "pre-push: pip-audit (use --no-verify to bypass)"
+if ! "$SCRIPT"; then
+    cat >&2 <<'EOF'
+
+pre-push BLOCKED: pip-audit found a vulnerability.
+
+Options:
+  1. Upgrade the offending package and retry.
+  2. If the CVE has no fix and is acceptable risk, add a waiver to
+     scripts/run-pip-audit.sh with a reason + expected resolution
+     (single source of truth — same waiver covers CI).
+  3. EMERGENCY ONLY: git push --no-verify  (and tell yourself why).
+
+EOF
+    exit 1
+fi
+
+# Lockfile-freshness guard. If pyproject.toml has dependency edits
+# that haven't been baked into requirements.lock, the Containerfile +
+# CI installs would silently fall back to whatever the resolver
+# picks today. Catch the drift before push so CI doesn't have to.
+# Skipped when pip-compile isn't available (operator-side optional).
+if command -v pip-compile >/dev/null 2>&1; then
+    TMP_LOCK="$(mktemp)"
+    # Extras MUST match the ones the Containerfile installs; otherwise
+    # the lock excludes deps the runtime needs (aioimaplib, msal, etc.)
+    # and the container build silently ships a broken image.
+    # Run pip-compile from $ROOT with a relative pyproject path. When
+    # an absolute path is passed, pip-compile annotates each # via
+    # comment with the full path, which then drifts vs the committed
+    # lockfile (which is generated with relative paths). Same TMP file
+    # path either way; only the annotation source differs.
+    if (cd "$ROOT" && pip-compile --quiet \
+            --extra=keyfile --extra=imap \
+            --extra=office365 --extra=openai \
+            --output-file="$TMP_LOCK" pyproject.toml) >/dev/null 2>&1; then
+        # Strip the auto-comment header (mentions the output filename
+        # which differs between the canonical lock and the tmp file)
+        # AND strip the pywin32 marker block we add manually post-
+        # regeneration (Windows-only dep that pip-compile doesn't tag).
+        #
+        # The strip needs to be SYMMETRIC: HEAD has the marker block
+        # AFTER pywin32==; TMP has only the bare pywin32== line. An
+        # earlier `/^pywin32==/,/Re-add this marker/d` filter ran
+        # unbounded on TMP (no anchor line found) and deleted from
+        # pywin32 to EOF, while bounded on HEAD. Diff fired even on
+        # a fresh lock.
+        #
+        # Fix: strip from the pywin32== line through the next
+        # NON-comment, NON-indented line (the next package), keeping
+        # that next package line. Works the same regardless of
+        # whether the marker block is present.
+        FILTER='/^pywin32==/,/^[a-zA-Z]/{ /^[a-zA-Z]/!d; /^pywin32==/d; }'
+        if ! diff \
+                <(tail -n +6 "$ROOT/requirements.lock" | sed -e "$FILTER") \
+                <(tail -n +6 "$TMP_LOCK" | sed -e "$FILTER") \
+                >/dev/null 2>&1; then
+            cat >&2 <<EOF
+
+pre-push BLOCKED: requirements.lock is stale vs pyproject.toml.
+
+Refresh:
+  pip-compile --extra=keyfile --extra=imap \\
+              --extra=office365 --extra=openai \\
+              --output-file=requirements.lock pyproject.toml
+  # then re-add the pywin32 marker (see existing comment in lock)
+  git add requirements.lock
+  git commit -m "chore(deps): refresh lockfile"
+
+Bypass (rarely correct): git push --no-verify
+
+EOF
+            rm -f "$TMP_LOCK"
+            exit 1
+        fi
+    fi
+    rm -f "$TMP_LOCK"
+fi

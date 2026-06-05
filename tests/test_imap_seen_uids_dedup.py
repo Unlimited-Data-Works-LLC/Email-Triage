@@ -1,4 +1,4 @@
-"""Tests for #143 — IMAP IDLE seen-UID dedup uses a bounded FIFO.
+"""Tests for  — IMAP IDLE seen-UID dedup uses a bounded FIFO.
 
 The previous implementation kept ``seen_uids`` as a ``set`` and
 pruned via ``set(list(seen_uids)[-500:])``. ``set`` has no insertion
@@ -36,7 +36,7 @@ def test_oldest_uid_dropped_on_overflow():
 
     # Add "4" — the oldest, "1", must drop. Both structures must
     # stay in lockstep; the set drifting behind the deque is the
-    # bug shape #143 was filed for.
+    # bug shape  was filed for.
     _seen_uids_remember("4", q, s)
     assert list(q) == ["2", "3", "4"]
     assert s == {"2", "3", "4"}, "set must drop the same UID as the deque"

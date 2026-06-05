@@ -11,7 +11,7 @@
      code identifiers — admins read them; not user-facing copy.
    * No "Ask your administrator" — the operator IS the
      administrator on this page.
-   * "Explain" buttons next to error rows (#121-A) call the AI
+   * "Explain" buttons next to error rows call the AI
      backend for a plain-English explanation. The macro-emitted
      tooltip carries a concrete example; the button label is
      descriptive text, never just an icon.
@@ -19,7 +19,7 @@
 <h2>System Logs</h2>
 <p>Recent log entries from the email triage system. <small style="color:var(--pico-muted-color);">Admin only.</small></p>
 
-{# Priority keys for inline pills (#10.3). Order matters: first match wins
+{# Priority keys for inline pills. Order matters: first match wins
    and we cap rendering at 3 pills per row. ``account_id`` is handled
    specially below because #11 resolves it to a linked name chip.
 
@@ -35,7 +35,7 @@
 ] %}
 
 <style>
-/* Sticky header (#10.6) — keeps column labels in view on long log pages. */
+/* Sticky header — keeps column labels in view on long log pages. */
 .logs-table thead th {
     position: sticky;
     top: 0;
@@ -43,7 +43,7 @@
     z-index: 2;
 }
 
-/* Row-density pass (#10.4). */
+/* Row-density pass. */
 .logs-table td,
 .logs-table th {
     padding-top: 0.25rem;
@@ -51,7 +51,7 @@
     vertical-align: top;
 }
 
-/* Inline priority pills (#10.3). */
+/* Inline priority pills. */
 .log-pill {
     display: inline-block;
     font-size: 0.7rem;
@@ -72,7 +72,7 @@
     margin-right: 0.15rem;
 }
 
-/* Level-coloured filter buttons (#10.5). */
+/* Level-coloured filter buttons. */
 .logs-filter-btn { padding: 0.25rem 0.75rem; font-size: 0.85rem; }
 .logs-filter-btn.level-ERROR.outline { --pico-color: var(--pico-del-color); --pico-border-color: var(--pico-del-color); color: var(--pico-del-color); }
 .logs-filter-btn.level-ERROR.contrast { background: var(--pico-del-color); border-color: var(--pico-del-color); color: white; }
@@ -81,7 +81,7 @@
 .logs-filter-btn.level-DEBUG.outline { --pico-color: var(--pico-muted-color); --pico-border-color: var(--pico-muted-color); color: var(--pico-muted-color); }
 
 /* Narrow viewport — stack time/level on one line, logger/message on
-   the next, so message column doesn't get crushed (#10.4). */
+   the next, so message column doesn't get crushed. */
 @media (max-width: 640px) {
     .logs-table thead { display: none; }
     .logs-table tr.log-row { display: block; padding: 0.35rem 0; border-bottom: 1px solid var(--pico-muted-border-color); }
@@ -196,7 +196,7 @@
                 <td class="log-col-logger"><code style="font-size:0.75rem;">{{ e.logger | replace('email_triage.', '') }}</code></td>
                 <td class="log-col-message" colspan="1">
                     {{ e.message }}
-                    {# Inline priority pills (#10.3) — pull 1-3 most useful
+                    {# Inline priority pills — pull 1-3 most useful
                        fields out of the extras so triage doesn't require
                        expanding the details row. Cap at 3. #}
                     {% if e.extra %}
@@ -309,7 +309,7 @@ document.querySelectorAll('.local-datetime').forEach(function(el) {
     } catch(e) {}
 });
 
-// Expand-all toggle (#10.1) — persist to localStorage so the admin's
+// Expand-all toggle — persist to localStorage so the admin's
 // preferred density sticks across page loads.
 (function() {
     var box = document.getElementById('logs-expand-all');

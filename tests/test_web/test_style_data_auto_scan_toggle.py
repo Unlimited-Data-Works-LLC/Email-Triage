@@ -1,4 +1,4 @@
-"""#161 item 2 — per-account "Auto-scan on schedule" toggle.
+""" item 2 — per-account "Auto-scan on schedule" toggle.
 
 Covers:
 

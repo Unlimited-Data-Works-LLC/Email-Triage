@@ -1,4 +1,4 @@
-"""Tests for the manual Save-All mode on the routes table (#116).
+"""Tests for the manual Save-All mode on the routes table.
 
 Covers:
   * POST /accounts/{id}/routes/save-all writes every row in one

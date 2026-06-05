@@ -1,6 +1,6 @@
-"""Tests for #42 — log_entries tamper-evidence hash chain.
+"""Tests for  — log_entries tamper-evidence hash chain.
 
-Includes #131 hardening tests: pruner-side anchor + chain-aware
+Includes  hardening tests: pruner-side anchor + chain-aware
 ``insert_log_entry`` + watermark cache + handler last-hash cache.
 """
 
@@ -211,7 +211,7 @@ class TestVerifier:
 
 
 # ---------------------------------------------------------------------------
-# #131 — pruner-side chain anchor
+#  — pruner-side chain anchor
 # ---------------------------------------------------------------------------
 
 class TestPruneAnchor:
@@ -263,7 +263,7 @@ class TestPruneAnchor:
         assert anchor["head_id"] is not None
 
     def test_verify_after_prune_no_spurious_break(self, db):
-        """The original #131 motivating bug: emit a long chain, prune
+        """The original  motivating bug: emit a long chain, prune
         the oldest rows, ``verify_log_chain`` must NOT report a break.
         """
         handler = SQLiteLogHandler(db, flush_interval=1)
@@ -318,7 +318,7 @@ class TestPruneAnchor:
 
 
 # ---------------------------------------------------------------------------
-# #131 — chain-aware insert_log_entry
+#  — chain-aware insert_log_entry
 # ---------------------------------------------------------------------------
 
 class TestInsertLogEntryChainAware:
@@ -363,7 +363,7 @@ class TestInsertLogEntryChainAware:
 
 
 # ---------------------------------------------------------------------------
-# #131 — handler last-hash cache (single SELECT for N emits)
+#  — handler last-hash cache (single SELECT for N emits)
 # ---------------------------------------------------------------------------
 
 class TestHandlerLastHashCache:
@@ -415,7 +415,7 @@ class TestHandlerLastHashCache:
 
 
 # ---------------------------------------------------------------------------
-# #131 — verify_log_chain watermark cache (incremental verify)
+#  — verify_log_chain watermark cache (incremental verify)
 # ---------------------------------------------------------------------------
 
 class _StateBag:
@@ -513,3 +513,387 @@ class TestVerifyWatermarkCache:
         # Limit-bounded verify must not consume the cache shape.
         bounded = verify_log_chain(db, limit=3, app_state=state)
         assert bounded["rows_checked"] == 3
+
+
+# ---------------------------------------------------------------------------
+# H-02a (Cycle 6, 2026-05-23) — HMAC-SHA256 migration tests
+# ---------------------------------------------------------------------------
+#
+# These tests validate the new keyed-HMAC chain primitive + the R1-plumbing-IN
+# rotation preservation per hipaa-sme-2 + DA-3 verdicts. The autouse
+# fixture in tests/conftest.py provisions a deterministic HMAC key for
+# every test; tests that specifically need to verify D1-fail-closed
+# behavior call _clear_hmac_keys_for_test() inside the test body.
+
+import pytest
+
+from email_triage.db.audit import (
+    _clear_hmac_keys_for_test,
+    _compute_log_row_hash_sha256,
+    _set_hmac_key_for_test,
+)
+from email_triage.secrets import (
+    DbSecrets,
+    derive_audit_chain_hmac_key,
+    enforce_master_key_at_rest_for_hipaa,
+    wire_audit_chain_hmac_keys,
+)
+
+
+class _MockConfig:
+    """Minimal config shim for the helper signatures."""
+    class secrets:
+        backend = "container"
+        keyfile_path = None
+        master_key_name = "ET_MASTER_KEY"
+
+
+class TestH02aHmacChainEndToEnd:
+    """HMAC chain end-to-end: insert + verify under the autouse test key."""
+
+    def test_hmac_chain_inserts_and_verifies(self, db):
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "m1")
+        insert_log_entry(db, "2026-05-23T00:00:01Z", "INFO", "t", "m2")
+        insert_log_entry(db, "2026-05-23T00:00:02Z", "INFO", "t", "m3")
+        db.commit()
+        v = verify_log_chain(db)
+        assert v["chain_length"] == 3
+        assert v["hmac_chain_length"] == 3
+        assert v["legacy_chain_length"] == 0
+        assert v["first_break_id"] is None
+
+    def test_hmac_rows_carry_hash_alg_and_master_key_version(self, db):
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "m1")
+        db.commit()
+        row = db.execute(
+            "SELECT hash_alg, master_key_version FROM log_entries LIMIT 1"
+        ).fetchone()
+        assert row["hash_alg"] == "hmac-sha256-v1"
+        assert int(row["master_key_version"]) == 0
+
+    def test_handler_emit_stamps_hash_alg_and_version(self, db):
+        handler = SQLiteLogHandler(db, flush_interval=1)
+        log = logging.getLogger("test.h02a.emit.hashalg")
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        try:
+            log.info("hello from handler")
+        finally:
+            log.removeHandler(handler)
+        row = db.execute(
+            "SELECT hash_alg, master_key_version FROM log_entries "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row["hash_alg"] == "hmac-sha256-v1"
+        assert int(row["master_key_version"]) == 0
+
+
+class TestH02aLegacyForwardCompat:
+    """Pre-H-02a SHA-256 rows must remain verifiable forever (per
+    §164.316(b)(2)(i) 6-year retention)."""
+
+    def test_legacy_sha256_row_verifies_via_dispatch(self, db):
+        # Simulate a pre-H-02a row: hash_alg='sha256', computed via
+        # the legacy SHA-256 helper (not HMAC).
+        prev = ""
+        h = _compute_log_row_hash_sha256(prev, "2026-01-01T00:00:00Z", "INFO", "t", "legacy", "{}")
+        db.execute(
+            "INSERT INTO log_entries (ts, level, logger, message, extra_json, "
+            "created_at, prev_hash, row_hash, hash_alg, master_key_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("2026-01-01T00:00:00Z", "INFO", "t", "legacy", "{}",
+             "2026-01-01T00:00:00Z", prev, h, "sha256", 0),
+        )
+        db.commit()
+        v = verify_log_chain(db)
+        assert v["chain_length"] == 1
+        assert v["legacy_chain_length"] == 1
+        assert v["hmac_chain_length"] == 0
+        assert v["first_break_id"] is None
+        assert v["hash_alg_boundary_id"] is None
+
+
+class TestH02aMixedChain:
+    """Mixed chain: legacy SHA-256 rows + new HMAC rows verify across
+    the boundary."""
+
+    def test_mixed_legacy_then_hmac_verifies(self, db):
+        # Two legacy rows
+        prev = ""
+        for i, ts in enumerate(["2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z"]):
+            h = _compute_log_row_hash_sha256(prev, ts, "INFO", "t", f"legacy{i}", "{}")
+            db.execute(
+                "INSERT INTO log_entries (ts, level, logger, message, extra_json, "
+                "created_at, prev_hash, row_hash, hash_alg, master_key_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "INFO", "t", f"legacy{i}", "{}", ts, prev, h, "sha256", 0),
+            )
+            prev = h
+        db.commit()
+        # Then three HMAC rows via insert_log_entry
+        for i in range(3):
+            insert_log_entry(db, f"2026-05-23T00:00:0{i}Z", "INFO", "t", f"hmac{i}")
+        db.commit()
+        v = verify_log_chain(db)
+        assert v["chain_length"] == 5
+        assert v["legacy_chain_length"] == 2
+        assert v["hmac_chain_length"] == 3
+        assert v["hash_alg_boundary_id"] == 3  # first HMAC row id
+        assert v["first_break_id"] is None
+
+
+class TestH02aTamperDetection:
+    """The whole point of HMAC: an insider with DB write cannot forge
+    the chain even with full row contents in hand."""
+
+    def test_tampered_hmac_row_detected(self, db):
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "original")
+        db.commit()
+        # Insider edit: change message + recompute SHA-256 (the attacker
+        # doesn't have the HMAC key).
+        row = db.execute("SELECT * FROM log_entries LIMIT 1").fetchone()
+        forged_msg = "FORGED"
+        forged_hash = _compute_log_row_hash_sha256(
+            row["prev_hash"], row["ts"], row["level"], row["logger"],
+            forged_msg, row["extra_json"],
+        )
+        db.execute(
+            "UPDATE log_entries SET message = ?, row_hash = ? WHERE id = ?",
+            (forged_msg, forged_hash, row["id"]),
+        )
+        db.commit()
+        v = verify_log_chain(db)
+        assert v["first_break_id"] == row["id"]
+        assert "row_hash mismatch" in v["first_break_reason"]
+        assert "hmac-sha256-v1" in v["first_break_reason"]
+
+
+class TestH02aFailClosed:
+    """D1 fail-closed per hipaa-sme-2 + DA-3 verdict: no HMAC key ⇒
+    RuntimeError, NOT silent SHA-256 fallback."""
+
+    def test_compute_raises_when_key_absent(self):
+        _clear_hmac_keys_for_test()
+        with pytest.raises(RuntimeError) as exc:
+            compute_log_row_hash("", "ts", "INFO", "l", "m", "{}")
+        assert "H-02a" in str(exc.value)
+        assert "no HMAC key has been provisioned" in str(exc.value)
+
+    def test_insert_raises_when_key_absent(self, db):
+        _clear_hmac_keys_for_test()
+        with pytest.raises(RuntimeError) as exc:
+            insert_log_entry(db, "ts", "INFO", "l", "m")
+        assert "H-02a" in str(exc.value)
+
+    def test_verify_surfaces_missing_version_as_chain_break(self, db):
+        # Insert a row with master_key_version=99 referencing a key
+        # that's not in the registry (the autouse fixture only
+        # installs version 0).
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "row1")
+        db.commit()
+        # Pollute the row with master_key_version=99 (no key for it).
+        db.execute(
+            "UPDATE log_entries SET master_key_version = 99 WHERE id = 1"
+        )
+        db.commit()
+        v = verify_log_chain(db)
+        # The recompute attempt should bubble up RuntimeError, which
+        # verify_log_chain catches and reports as a chain break with
+        # the offending version named.
+        assert v["first_break_id"] == 1
+        assert "master_key_version=99" in v["first_break_reason"]
+
+
+class TestH02aRotationPreservation:
+    """R1-plumbing-IN: rotation preserves legacy HMAC chain
+    verifiability per §164.316(b)(2)(i) 6-year retention."""
+
+    def _make_provider(self, db):
+        master = DbSecrets.generate_master_key()
+        return DbSecrets(db, master)
+
+    def test_rotation_preserves_v0_chain(self, db):
+        provider = self._make_provider(db)
+        # Wire HMAC keys for current state (version 0, master from this provider).
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        # Insert a v0 row.
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "before-rotate")
+        db.commit()
+        # Rotate the master key.
+        new_master = DbSecrets.generate_master_key()
+        provider.rotate_master_key(new_master)
+        assert provider.current_master_version() == 1
+        # Re-wire (lifespan-equivalent): load v0 (preserved via KEK) + v1 (current).
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        # Insert a v1 row.
+        insert_log_entry(db, "2026-05-23T00:00:01Z", "INFO", "t", "after-rotate")
+        db.commit()
+        # Chain validates across the boundary.
+        v = verify_log_chain(db)
+        assert v["chain_length"] == 2
+        assert v["hmac_chain_length"] == 2
+        assert v["first_break_id"] is None
+        # Master-key versions stamped correctly.
+        rows = db.execute(
+            "SELECT id, master_key_version FROM log_entries ORDER BY id"
+        ).fetchall()
+        assert int(rows[0]["master_key_version"]) == 0
+        assert int(rows[1]["master_key_version"]) == 1
+
+    def test_two_rotations_chain_validates_across_three_versions(self, db):
+        provider = self._make_provider(db)
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "v0")
+        db.commit()
+        # Rotation 1: v0 -> v1
+        provider.rotate_master_key(DbSecrets.generate_master_key())
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        insert_log_entry(db, "2026-05-23T00:00:01Z", "INFO", "t", "v1")
+        db.commit()
+        # Rotation 2: v1 -> v2
+        provider.rotate_master_key(DbSecrets.generate_master_key())
+        assert provider.current_master_version() == 2
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        insert_log_entry(db, "2026-05-23T00:00:02Z", "INFO", "t", "v2")
+        db.commit()
+        v = verify_log_chain(db)
+        assert v["chain_length"] == 3
+        assert v["hmac_chain_length"] == 3
+        assert v["first_break_id"] is None
+        rows = db.execute(
+            "SELECT master_key_version FROM log_entries ORDER BY id"
+        ).fetchall()
+        assert [int(r["master_key_version"]) for r in rows] == [0, 1, 2]
+
+    def test_missing_history_row_surfaces_as_break(self, db):
+        provider = self._make_provider(db)
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        insert_log_entry(db, "2026-05-23T00:00:00Z", "INFO", "t", "v0")
+        db.commit()
+        provider.rotate_master_key(DbSecrets.generate_master_key())
+        # Operator deletes the history row — destructive, but exactly
+        # the scenario hipaa-sme-2 wanted operator-detectable.
+        provider.delete("master_key_history:v0")
+        _clear_hmac_keys_for_test()
+        wire_audit_chain_hmac_keys(provider, _MockConfig())
+        # Insert a v1 row.
+        insert_log_entry(db, "2026-05-23T00:00:01Z", "INFO", "t", "v1")
+        db.commit()
+        # Verifier hits the v0 row; its master_key_version=0 has no key
+        # in the registry (the v0 history was deleted). Should surface
+        # as a named break, not a silent pass.
+        v = verify_log_chain(db)
+        assert v["first_break_id"] == 1
+        assert (
+            "master_key_version=0" in v["first_break_reason"]
+            or "v0" in v["first_break_reason"]
+            or "version=0" in v["first_break_reason"]
+        )
+
+
+class TestH02aHkdfDerivation:
+    """Sanity checks on the HKDF helper itself."""
+
+    def test_derive_yields_32_bytes(self):
+        key = derive_audit_chain_hmac_key("any-master-string")
+        assert isinstance(key, bytes)
+        assert len(key) == 32
+
+    def test_derive_is_deterministic_for_same_master(self):
+        k1 = derive_audit_chain_hmac_key("master-A")
+        k2 = derive_audit_chain_hmac_key("master-A")
+        assert k1 == k2
+
+    def test_derive_differs_per_master(self):
+        k1 = derive_audit_chain_hmac_key("master-A")
+        k2 = derive_audit_chain_hmac_key("master-B")
+        assert k1 != k2
+
+    def test_accepts_bytes_input(self):
+        kstr = derive_audit_chain_hmac_key("master-A")
+        kbytes = derive_audit_chain_hmac_key(b"master-A")
+        assert kstr == kbytes
+
+
+class TestH02aBootEnforcementG1Prime:
+    """G1' boot-time enforcement: HIPAA mode + env backend → RuntimeError;
+    HIPAA mode + non-0600 keyfile → RuntimeError."""
+
+    def test_env_backend_allowed_outside_hipaa_mode(self, monkeypatch):
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        cfg = _MockConfig()
+        cfg.secrets.backend = "env"
+        # Should be a no-op outside HIPAA mode.
+        enforce_master_key_at_rest_for_hipaa(cfg)
+
+    def test_env_backend_blocks_in_hipaa_mode(self, monkeypatch):
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        cfg = _MockConfig()
+        cfg.secrets.backend = "env"
+        with pytest.raises(RuntimeError) as exc:
+            enforce_master_key_at_rest_for_hipaa(cfg)
+        assert "H-02a" in str(exc.value)
+        assert "env" in str(exc.value)
+        assert "164.312(a)(2)(iv)" in str(exc.value)
+
+    def test_container_backend_allowed_in_hipaa_mode(self, monkeypatch):
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        cfg = _MockConfig()
+        cfg.secrets.backend = "container"
+        enforce_master_key_at_rest_for_hipaa(cfg)  # no raise
+
+    def test_keyring_backend_allowed_in_hipaa_mode(self, monkeypatch):
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        cfg = _MockConfig()
+        cfg.secrets.backend = "keyring"
+        enforce_master_key_at_rest_for_hipaa(cfg)  # no raise
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "geteuid"),
+        reason="POSIX permission bits required for keyfile mode check",
+    )
+    def test_keyfile_0600_allowed_in_hipaa_mode(self, monkeypatch, tmp_path):
+        # POSIX-only — Windows's chmod doesn't honor 0o600 the way the
+        # check expects, so the keyfile-mode check is semantically a
+        # POSIX-permission concern. Real deploys are container/Linux.
+        import os
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        kf = tmp_path / "key"
+        kf.write_text("dummy")
+        os.chmod(kf, 0o600)
+        cfg = _MockConfig()
+        cfg.secrets.backend = "keyfile"
+        cfg.secrets.keyfile_path = str(kf)
+        enforce_master_key_at_rest_for_hipaa(cfg)  # no raise
+
+    @pytest.mark.skipif(
+        not hasattr(__import__("os"), "geteuid"),
+        reason="POSIX permission bits required for non-0600 keyfile check",
+    )
+    def test_keyfile_world_readable_blocks_in_hipaa_mode(
+        self, monkeypatch, tmp_path,
+    ):
+        import os
+        import email_triage.triage_logging as _tl
+        monkeypatch.setattr(_tl, "_hipaa_mode", True)
+        kf = tmp_path / "key"
+        kf.write_text("dummy")
+        os.chmod(kf, 0o644)  # group+world readable
+        cfg = _MockConfig()
+        cfg.secrets.backend = "keyfile"
+        cfg.secrets.keyfile_path = str(kf)
+        with pytest.raises(RuntimeError) as exc:
+            enforce_master_key_at_rest_for_hipaa(cfg)
+        assert "H-02a" in str(exc.value)
+        assert "0600" in str(exc.value)

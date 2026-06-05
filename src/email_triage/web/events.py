@@ -80,7 +80,7 @@ class EventDispatcher:
         self._targets = targets or []
         self._secrets = secrets_provider
         self._timeout = timeout
-        # #60 — external webhook URLs are deny-by-default. The
+        #  — external webhook URLs are deny-by-default. The
         # operator must explicitly set webhooks_allow_external: true
         # in YAML (mapped through to here) to ship events off-host.
         # All targets are still HMAC-signed + carry only metadata
@@ -92,7 +92,7 @@ class EventDispatcher:
         # an internal homelab domain). Source tree carries no
         # operator-specific suffix; this list is the seam.
         self._extra_local_suffixes = list(local_url_suffixes or [])
-        # Long-lived httpx client (#139). Webhook fan-out previously
+        # Long-lived httpx client. Webhook fan-out previously
         # opened + closed a fresh client per ``fire()`` call, eating
         # a TLS handshake for every triage-completed event. The
         # dispatcher is a per-process singleton (one on
@@ -340,7 +340,12 @@ async def fire_triage_completed(
         return False
 
     # Per-account pause + quiet hours.
-    settings = get_openclaw_quiet_settings(db, acct["id"])
+    #  — get_openclaw_quiet_settings does a sync DB read
+    # (get_setting) on the shared connection; dispatch it through
+    # db_call so the read runs off the event loop under the
+    # process-wide DB lock.
+    from email_triage.web.db_threadpool import db_call
+    settings = await db_call(get_openclaw_quiet_settings, db, acct["id"])
     if not settings["enabled"] or settings["paused"]:
         return False
     if settings["start_utc"] and settings["end_utc"]:

@@ -1,4 +1,4 @@
-"""Tests for the ``email-triage restore`` CLI subcommand (#65)."""
+"""Tests for the ``email-triage restore`` CLI subcommand."""
 
 from __future__ import annotations
 

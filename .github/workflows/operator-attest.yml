@@ -149,7 +149,7 @@ jobs:
         # Schema is INTENTIONALLY small + stable: customer-side
         # verifier parses it to decide whether to allow pull in
         # HIPAA mode. Don't extend without coordinating with
-        # docs/release-process.md verifier section.
+        # internal documentation verifier section.
         run: |
           ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           # jq builds the JSON to avoid shell-quoting hazards on the
@@ -244,5 +244,5 @@ jobs:
             echo "- Validated by: \`${{ github.actor }}\`"
             echo "- Validated at: \`${{ steps.predicate.outputs.validated_at }}\`"
             echo
-            echo "Customer-side verification: see \`docs/release-process.md\`."
+            echo "Customer-side verification: see \`internal documentation\`."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -9,7 +9,7 @@
      - "schema_version" / "csrf_rejects" / "audit_failures" /
        "classification_cache" stay verbatim — these mirror the
        /health/detail JSON payload keys 1:1 so the JSON consumer
-       (Nagios scrape) + admin UI never drift.
+       (the monitoring system scrape) + admin UI never drift.
      - No PHI — counters + status flags only.
    ─────────────────────────────────────────────────────────── #}
 {% block title %}Admin Stats - Email Triage{% endblock %}

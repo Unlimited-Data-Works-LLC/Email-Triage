@@ -358,7 +358,7 @@ class TestClassifyUI:
         assert "raw_email" in resp.text
 
     def test_classify_page_open_to_regular_users(self, client, user_cookies):
-        """#95 sub-E — Test Classify is no longer admin-only.
+        """ sub-E — Test Classify is no longer admin-only.
         Useful to any authenticated user investigating a
         misclassification. Categories pulled from DB are still
         user-scoped (system + the user's personal), so no

@@ -1,8 +1,8 @@
-"""UI routes for the multi-label feature (#129).
+"""UI routes for the multi-label feature.
 
 Labels are operator-curated tags applied independently of the LLM
 category. The catalog lives at ``/labels`` (install-wide; any
-authenticated user can manage it — the punch-list spec calls for
+authenticated user can manage it — the backlog spec calls for
 "operator-only, not restricted to admin"). Manual apply lives on
 the message endpoints below; bulk-tag on triage results swaps in
 through the triage_classify router.
@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from email_triage.web.app import get_db, get_templates
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web.dependencies import RequireUser, RequireUserFragment
 from email_triage.triage_logging import is_account_hipaa
 from email_triage._errfmt import fmt_exc
 from email_triage.triage_logging import get_logger
@@ -43,6 +43,7 @@ globals().update({
     if not _n.startswith("__")
 })
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.labels")
 
 router = APIRouter()
@@ -85,17 +86,13 @@ def _labels_page_snapshot(db) -> dict:
 
 
 @router.get("/labels", response_class=HTMLResponse)
-async def labels_page(request: Request):
+async def labels_page(request: Request, user: RequireUser):
     """CRUD page for the label catalog. Any authenticated user."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     snap = await db_call(_labels_page_snapshot, db)
 
-    return _render(templates, request, "labels/manage.html", {
+    return await _render(templates, request, "labels/manage.html", {
         "user": user,
         **snap,
     })
@@ -104,14 +101,11 @@ async def labels_page(request: Request):
 @router.post("/labels/create", response_class=HTMLResponse)
 async def labels_create(
     request: Request,
+    user: RequireUserFragment,
     slug: str = Form(...),
     name: str = Form(...),
     color: str = Form("#6c757d"),
 ):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -135,7 +129,7 @@ async def labels_create(
             error = f"Could not create label: {fmt_exc(e)}"
 
     snap = await db_call(_labels_page_snapshot, db)
-    return _render(templates, request, "labels/manage.html", {
+    return await _render(templates, request, "labels/manage.html", {
         "user": user,
         **snap,
         "error": error,
@@ -144,11 +138,9 @@ async def labels_create(
 
 
 @router.post("/labels/{slug}/delete", response_class=HTMLResponse)
-async def labels_delete(request: Request, slug: str):
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
+async def labels_delete(
+    request: Request, slug: str, user: RequireUserFragment,
+):
     db = get_db(request)
     templates = get_templates(request)
 
@@ -156,7 +148,7 @@ async def labels_delete(request: Request, slug: str):
     await db_call(delete_label, db, slug)
 
     snap = await db_call(_labels_page_snapshot, db)
-    return _render(templates, request, "labels/manage.html", {
+    return await _render(templates, request, "labels/manage.html", {
         "user": user,
         **snap,
         "success": f"Label '{slug}' removed.",
@@ -183,6 +175,7 @@ async def message_label_add(
     request: Request,
     account_id: int,
     message_id: str,
+    user: RequireUserFragment,
     label_slug: str = Form(...),
 ):
     """Attach one label to one message.
@@ -191,10 +184,6 @@ async def message_label_add(
     is HIPAA-flagged, write a hipaa_access_event row
     (operation=label_apply). Same parity rule as the triage paths.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     label_slug = (label_slug or "").strip().lower()
     if not label_slug:
@@ -204,34 +193,42 @@ async def message_label_add(
         get_email_account, apply_labels_to_message,
     )
 
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None:
-        return HTMLResponse("Account not found", status_code=404)
-    if not _shared.can_manage_account(db, user, acct):
-        return HTMLResponse("Forbidden", status_code=403)
+    def _label_add_db_work() -> tuple[int, str, bool]:
+        """/ — fetch + auth check + (HIPAA audit) + apply in
+        one threadpool hop. Returns ``(status, body, inserted)``;
+        status 200 means the apply ran, ``inserted`` is then valid.
+        """
+        acct = get_email_account(db, account_id)
+        if acct is None:
+            return 404, "Account not found", False
+        if not _shared.can_manage_account(db, user, acct):
+            return 403, "Forbidden", False
 
-    # HIPAA audit — actor != owner on HIPAA account.
-    if (
-        is_account_hipaa(acct)
-        and user.get("id") != acct.get("user_id")
-    ):
-        try:
-            from email_triage.web.db import record_hipaa_access_event
-            await db_call(
-                record_hipaa_access_event,
-                db, user["id"], account_id, "label_apply",
-                "ok", f"slug={label_slug}",
-            )
-        except Exception as e:
-            _log.warning(
-                "HIPAA label_apply audit row write failed",
-                error=fmt_exc(e),
-            )
+        # HIPAA audit — actor != owner on HIPAA account.
+        if (
+            is_account_hipaa(acct)
+            and user.get("id") != acct.get("user_id")
+        ):
+            try:
+                from email_triage.web.db import record_hipaa_access_event
+                record_hipaa_access_event(
+                    db, user["id"], account_id, "label_apply",
+                    "ok", f"slug={label_slug}",
+                )
+            except Exception as e:
+                _log.warning(
+                    "HIPAA label_apply audit row write failed",
+                    error=fmt_exc(e),
+                )
 
-    inserted = await db_call(
-        apply_labels_to_message,
-        db, message_id, account_id, [label_slug], user["id"],
-    )
+        inserted = apply_labels_to_message(
+            db, message_id, account_id, [label_slug], user["id"],
+        )
+        return 200, "", bool(inserted)
+
+    status, body, inserted = await db_call(_label_add_db_work)
+    if status != 200:
+        return HTMLResponse(body, status_code=status)
 
     return HTMLResponse(
         f'<span style="color:var(--pico-ins-color);">'
@@ -247,27 +244,58 @@ async def message_label_remove(
     request: Request,
     account_id: int,
     message_id: str,
+    user: RequireUserFragment,
     label_slug: str = Form(...),
 ):
-    """Remove one label from one message."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
+    """Remove one label from one message.
 
+    HIPAA: when the actor is NOT the account owner AND the account
+    is HIPAA-flagged, write a hipaa_access_event row
+    (operation=label_remove). Same actor!=owner parity rule as the
+    sibling ``message_label_add`` path — owner self-access is exempt.
+    """
     db = get_db(request)
     label_slug = (label_slug or "").strip().lower()
 
     from email_triage.web.db import get_email_account, remove_label_from_message
 
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None:
-        return HTMLResponse("Account not found", status_code=404)
-    if not _shared.can_manage_account(db, user, acct):
-        return HTMLResponse("Forbidden", status_code=403)
+    def _label_remove_db_work() -> tuple[int, str]:
+        """/ — fetch + auth check + (HIPAA audit) + remove in
+        one threadpool hop. Returns ``(status, body)``; 200 means the
+        remove ran.
+        """
+        acct = get_email_account(db, account_id)
+        if acct is None:
+            return 404, "Account not found"
+        if not _shared.can_manage_account(db, user, acct):
+            return 403, "Forbidden"
 
-    await db_call(
-        remove_label_from_message, db, message_id, label_slug,
-    )
+        # HIPAA audit — actor != owner on HIPAA account. Mirrors the
+        # sibling message_label_add path; the audit row fires ONLY
+        # when the actor is not the account owner (owner self-access
+        # is exempt).
+        if (
+            is_account_hipaa(acct)
+            and user.get("id") != acct.get("user_id")
+        ):
+            try:
+                from email_triage.web.db import record_hipaa_access_event
+                record_hipaa_access_event(
+                    db, user["id"], account_id, "label_remove",
+                    "ok", f"slug={label_slug}",
+                )
+            except Exception as e:
+                _log.warning(
+                    "HIPAA label_remove audit row write failed",
+                    error=fmt_exc(e),
+                )
+
+        remove_label_from_message(db, message_id, label_slug)
+        return 200, ""
+
+    status, body = await db_call(_label_remove_db_work)
+    if status != 200:
+        return HTMLResponse(body, status_code=status)
     return HTMLResponse("")
 
 
@@ -278,6 +306,7 @@ async def message_label_remove(
 async def messages_bulk_label_add(
     request: Request,
     account_id: int,
+    user: RequireUserFragment,
 ):
     """Bulk-tag handler — attach one or more labels to every selected
     message in the triage results.
@@ -289,10 +318,6 @@ async def messages_bulk_label_add(
     Body:
       {"applied": <N>, "label": <slug>}
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     form = await request.form()
     label_slug = (form.get("label_slug") or "").strip().lower()
@@ -310,18 +335,52 @@ async def messages_bulk_label_add(
         get_email_account, apply_labels_to_message,
     )
 
-    acct = await db_call(get_email_account, db, account_id)
-    if acct is None:
-        return HTMLResponse("Account not found", status_code=404)
-    if not _shared.can_manage_account(db, user, acct):
-        return HTMLResponse("Forbidden", status_code=403)
+    def _bulk_label_db_work() -> tuple[int, str, int]:
+        """/ — fetch + auth check + (HIPAA audit) + bulk apply
+        in ONE threadpool hop. The per-message apply loop runs inside
+        the single hop so a 50-message bulk tag is one thread crossing,
+        not 50. Returns ``(status, body, total)``.
+        """
+        acct = get_email_account(db, account_id)
+        if acct is None:
+            return 404, "Account not found", 0
+        if not _shared.can_manage_account(db, user, acct):
+            return 403, "Forbidden", 0
 
-    total = 0
-    for mid in message_ids:
-        total += await db_call(
-            apply_labels_to_message,
-            db, mid, account_id, [label_slug], user["id"],
-        )
+        # HIPAA audit — actor != owner on HIPAA account. Same
+        # actor!=owner parity rule as the single-message
+        # message_label_add / message_label_remove siblings; the bulk
+        # path previously lacked it, a §164.312(b) audit hole. One row
+        # per bulk operation (a bulk-tag is one operator action) —
+        # ``bulk_n`` records how many messages it touched. Owner
+        # self-access is exempt.
+        if (
+            is_account_hipaa(acct)
+            and user.get("id") != acct.get("user_id")
+        ):
+            try:
+                from email_triage.web.db import record_hipaa_access_event
+                record_hipaa_access_event(
+                    db, user["id"], account_id, "label_apply",
+                    "ok",
+                    f"slug={label_slug} bulk_n={len(message_ids)}",
+                )
+            except Exception as e:
+                _log.warning(
+                    "HIPAA bulk label_apply audit row write failed",
+                    error=fmt_exc(e),
+                )
+
+        total_ = 0
+        for mid in message_ids:
+            total_ += apply_labels_to_message(
+                db, mid, account_id, [label_slug], user["id"],
+            )
+        return 200, "", total_
+
+    status, body, total = await db_call(_bulk_label_db_work)
+    if status != 200:
+        return HTMLResponse(body, status_code=status)
 
     return HTMLResponse(
         f'<span style="color:var(--pico-ins-color);">'

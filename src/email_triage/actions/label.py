@@ -22,6 +22,20 @@ logger = logging.getLogger("email_triage.actions.label")
 class LabelAction(Action):
     """Apply the classification category as a label on the email."""
 
+    #  — provider-level idempotency contract. ``apply_label`` is a
+    # no-op on every supported provider (Gmail/O365 attach the label
+    # only if not already present), so re-running this action on a
+    # crash-recovery rerun produces no duplicate side effect. The class
+    # does not gate on ``check_idempotent_already_done``; only
+    # ``record_idempotent_done`` is called so the /flows surface answers
+    # "did this run?" consistently with helper-based actions.
+    _naturally_idempotent: bool = True
+    _idempotency_rationale: str = (
+        "provider.apply_label is provider-level idempotent (Gmail/O365 "
+        "no-op when the label is already attached); a crash-recovery "
+        "rerun re-issues the same apply with no duplicate effect"
+    )
+
     @property
     def name(self) -> str:
         return "label"
@@ -34,7 +48,7 @@ class LabelAction(Action):
         provider: EmailProvider,
         config: dict[str, Any] | None = None,
     ) -> ActionOutput:
-        # #163 follow-up — config["labels"] is a list of operator-
+        #  follow-up — config["labels"] is a list of operator-
         # picked provider-native labels (Gmail labels, O365
         # categories). When set + non-empty, apply each one. When
         # empty / missing, fall back to the legacy behaviour:
@@ -72,7 +86,7 @@ class LabelAction(Action):
                 # outcome with the same shape other actions use.
                 await provider.apply_label(message.message_id, label)
                 logger.info("Label applied", extra=_extras())
-                record_idempotent_done(
+                await record_idempotent_done(
                     flow, message, self.name, external_id=label,
                 )
                 applied.append(label)

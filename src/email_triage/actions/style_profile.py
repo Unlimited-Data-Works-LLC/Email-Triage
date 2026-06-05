@@ -8,7 +8,7 @@ writes — greeting / sign-off / formality / sentence length / signature
 This module is the foundation for M-5 (profile injection into
 ``DraftReplyAction``). Building/persisting the profile is wired up
 here; consumption by ``draft_reply`` is M-5's job and lives in a
-separate punch-list item.
+separate the backlog item.
 
 Privacy contract
 ================
@@ -24,6 +24,7 @@ distillation primitive.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -32,6 +33,17 @@ from typing import Any, Iterable
 from email_triage.classify.base import Classifier
 from email_triage.engine.models import EmailMessage
 from email_triage.triage_logging import get_logger
+
+#  companion (audit-pattern catch — same fix-class as
+# actions/digest.py::generate_digest sequential extract_articles).
+# Bounded concurrency for ``extract_style_profile`` LLM calls in
+# ``extract_style_profiles_per_alias``. Shares the same conservative
+# cap as digest (single-GPU Ollama / OpenAI / Gemini rate-limit
+# defaults). Imported via constant rather than re-declared so a
+# future per-backend tunable lands at one site, not two.
+from email_triage.actions.digest import (
+    _DIGEST_EXTRACT_CONCURRENCY as _STYLE_PROFILE_CONCURRENCY,
+)
 
 log = get_logger("actions.style_profile")
 
@@ -44,7 +56,7 @@ log = get_logger("actions.style_profile")
 class StyleProfile:
     """Structured per-user reply-style description.
 
-    Mirrors the punch-list M-3 spec. Every field has a sensible empty
+    Mirrors the backlog M-3 spec. Every field has a sensible empty
     default so a partial LLM response can still round-trip.
     """
 
@@ -397,7 +409,7 @@ async def extract_style_profiles_per_alias(
     captured_message_ids: set[str] | None = None,
 ) -> tuple[dict[str, "StyleProfile"], list[tuple[str, int]]]:
     """Partition ``messages`` by ``From:`` address and distil one
-    :class:`StyleProfile` per distinct address (punch list #162).
+    :class:`StyleProfile` per distinct address (punch list ).
 
     Parameters
     ----------
@@ -449,6 +461,9 @@ async def extract_style_profiles_per_alias(
     unknown_counts_dict: dict[str, int] = {}
     descriptors: dict[str, StyleProfile] = {}
     captured_ids = captured_message_ids or set()
+
+    # Tally unknowns synchronously up-front — cheap dict math and the
+    # order is independent of the LLM round-trips below.
     for addr, msgs in buckets.items():
         # Track unknowns by raw bucket count before the distill call.
         # The body may be empty after quote-stripping (the distill
@@ -459,10 +474,30 @@ async def extract_style_profiles_per_alias(
             unknown_counts_dict[addr] = unknown_counts_dict.get(
                 addr, 0,
             ) + len(msgs)
-        prof = await extract_style_profile(
-            msgs, classifier,
-            captured_message_ids=captured_ids,
-        )
+
+    #  companion — pre-fix, each ``extract_style_profile`` call ran
+    # sequentially under ``for addr, msgs in buckets.items()``. With
+    # 10-50 distinct sender aliases at 1-3s per LLM round-trip that's
+    # 10-150s of wall-clock per style-mine. Parallelize under the same
+    # bounded Semaphore cap shared with digest extraction (single
+    # constant in ``actions/digest.py``).
+    sem = asyncio.Semaphore(_STYLE_PROFILE_CONCURRENCY)
+
+    async def _distill_bounded(
+        addr: str, msgs: list[EmailMessage],
+    ) -> tuple[str, "StyleProfile"]:
+        async with sem:
+            prof = await extract_style_profile(
+                msgs, classifier,
+                captured_message_ids=captured_ids,
+            )
+        return addr, prof
+
+    distilled = await asyncio.gather(
+        *(_distill_bounded(addr, msgs) for addr, msgs in buckets.items()),
+    )
+
+    for addr, prof in distilled:
         # Drop empty-corpus descriptors so the per-alias storage
         # doesn't accumulate "we tried and got nothing" rows.
         if prof.sample_count <= 0:
@@ -584,7 +619,7 @@ _KNOB_DEFAULTS = {
 }
 
 
-# Per punch-list #152 Phase 2 (2026-05-11): the M-1+M-2 layer takes
+# Per the backlog  Phase 2 (2026-05-11): the M-1+M-2 layer takes
 # operator-typed strings as input (free-text style guide + tone /
 # length / greeting / signature radios). By §164.502(a) self-disclosure
 # carve-out, operator's own knobs are first-party — not PHI. The
@@ -620,7 +655,7 @@ def format_style_knobs_for_prompt(
       * ``knobs`` is None or empty
       * the user hasn't set anything (all knobs at default + guide empty)
       * ``hipaa`` is True AND ``m1m2_hipaa_allow`` is False (HIPAA
-        default-deny; #152 Phase 2 lift requires the per-account
+        default-deny;  Phase 2 lift requires the per-account
         ``style_knobs_hipaa_allow:<id>`` opt-in flag)
       * ``master_enabled`` is False (install-wide toggle off)
       * ``account_enabled`` is False (per-account toggle off)
@@ -640,7 +675,7 @@ def format_style_knobs_for_prompt(
     who set only the signature gets a one-line block, not a stub
     with three placeholder rows.
 
-    ``m1m2_hipaa_allow`` (#152 Phase 2): per-account opt-in flag. When
+    ``m1m2_hipaa_allow``: per-account opt-in flag. When
     True AND ``hipaa`` is True, the block renders — operator-typed
     knobs are first-party data under §164.502(a) self-disclosure.
     Default False keeps the historical hard-off behaviour. M-3 / M-4 /
@@ -760,7 +795,7 @@ def resolve_alias_profile(
 ) -> "StyleProfile | dict | None":
     """Pick the right descriptor for the From-address the reply will use.
 
-    Implements the punch-list #162 fallback chain:
+    Implements the backlog  fallback chain:
 
       1. alias-specific descriptor matching ``from_address``
       2. primary-address descriptor (if different from ``from_address``)
@@ -972,7 +1007,7 @@ def build_style_prompt_prefix(
     earlier sections might imply.
 
     Master toggle + per-account toggle gate the entire prefix. The
-    HIPAA gate is layer-specific (#152 Phase 2): when ``hipaa=True``
+    HIPAA gate is layer-specific: when ``hipaa=True``
     the M-3 profile block is ALWAYS suppressed (M-3 reads sent mail
     bodies that may contain PHI). The M-1+M-2 knob block AND the
     anti-AI guide are suppressed by default, but the per-account
@@ -980,7 +1015,7 @@ def build_style_prompt_prefix(
     operator-typed strings as input, not PHI. M-3 / M-4 / M-7 stay
     hard-off regardless of ``m1m2_hipaa_allow``.
 
-    ``hipaa_contact_overlay`` (#171-C / M-7 draft-time consumer): the
+    ``hipaa_contact_overlay``: the
     HIPAA-safe per-contact descriptor merged across the draft's
     recipients (see
     :func:`email_triage.style_learning.per_contact_hipaa.merge_overlays_for_recipients`).
@@ -1034,7 +1069,7 @@ def build_style_prompt_prefix(
     # The opt-in is scoped to operator-typed knobs only; M-3 reads the
     # operator's sent mail and falls under the derivative-of-PHI
     # category that requires the Phase 3 describe-and-discard
-    # architecture. See ``docs/m-series-hipaa-audit.md`` row M-3.
+    # architecture. See ``internal documentation`` row M-3.
     if hipaa:
         profile_block = ""
     else:
@@ -1048,7 +1083,7 @@ def build_style_prompt_prefix(
         disable_global=anti_ai_disable_global,
     )
 
-    # M-7 per-contact overlay (#171-C). Only renders for HIPAA-flagged
+    # M-7 per-contact overlay. Only renders for HIPAA-flagged
     # accounts -- the caller (draft_reply.build_prompt_messages) is
     # responsible for the HIPAA gate before passing a non-None value
     # here, but we defence-in-depth gate on ``hipaa`` so a misconfigured

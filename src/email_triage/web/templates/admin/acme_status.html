@@ -106,7 +106,7 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
         <h4 style="margin-top:0.75rem;">Listener mode</h4>
         <p><small style="color:var(--pico-muted-color);">
             Off (default) = HTTP listener; useful for backend monitoring
-            (Nagios HTTP probes etc.). On = HTTPS listener using the cert
+            (the monitoring system HTTP probes etc.). On = HTTPS listener using the cert
             in <code>cert_dir</code>. Requires a cert on disk; gated
             until one is present (ACME issuance, manual CSR + import,
             or self-signed via the CSR workflow all qualify).
@@ -335,7 +335,7 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
 
 <section>
     <h3>Current certificate</h3>
-    {% if cert_meta.present %}
+    {% if cert_meta.valid %}
     <table>
         <tbody>
             <tr><th>Subject CN</th><td>{{ cert_meta.subject_cn }}</td></tr>
@@ -359,6 +359,10 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
             </tr>
         </tbody>
     </table>
+    {% elif cert_meta.present %}
+    <p><em>A certificate file is present at <code>{{ cert_dir }}/server.crt</code>
+        but could not be parsed: {{ cert_meta.parse_error }}. Re-issue or
+        re-import a valid certificate below.</em></p>
     {% else %}
     <p><em>No certificate present at <code>{{ cert_dir }}/server.crt</code>. Use Issue now below to mint one.</em></p>
     {% endif %}

@@ -2,70 +2,52 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 from email_triage import embedding_bits as eb
 
 
-@pytest.fixture
-def real_is_runtime_ready(monkeypatch):
-    """Undo the autouse ``_stub_pip_install`` fixture's stubbing of
-    ``is_runtime_ready``. The runtime-ready tests in this file exercise
-    the REAL probe, not the stub.
+def test_is_runtime_ready_false_without_install(tmp_path):
+    """Empty runtime-deps dir → is_runtime_ready() is False.
 
-    Implementation: import the module fresh + reassign the attribute
-    that the autouse fixture overwrote. We do this via importlib
-    because ``email_triage.embedding_bits.is_runtime_ready`` was
-    monkeypatched at module level by the autouse fixture; we want to
-    restore the original function reference for the duration of this
-    test only.
+    Runs the probe in a subprocess with site-packages disabled (``-S``)
+    so the result reflects ONLY the (empty) runtime-deps dir, not
+    whatever the ambient dev venv happens to have installed.
+
+    ``is_runtime_ready()`` calls ``find_spec("sentence_transformers")``
+    across the whole ``sys.path`` — without ``-S``, a dev venv that has
+    sentence-transformers installed (e.g. a developer working on the
+    embedding feature, or right after running the embedding-bits
+    install locally) makes this assertion spuriously fail. The
+    subprocess + ``-S`` reconstructs the genuine slim-image "not
+    installed" state regardless of the host venv. .
     """
-    # The autouse fixture's monkeypatch will be torn down at the end
-    # of the test, so we just need to override it for the test body.
-    # Easiest path: reach into the source module's __dict__ and
-    # restore the original function (which the autouse fixture
-    # preserved via monkeypatch.setattr — the original is on the
-    # module class).
-    import inspect
-    # Read the real function from the source code via inspect.
-    # The real definition is still in the module; monkeypatch.setattr
-    # replaced only the module attribute, not the function object.
-    # We can find the real one by re-importing the module.
-    import importlib
-    fresh = importlib.import_module("email_triage.embedding_bits")
-    # The fresh import gives us the same module, with the patched
-    # attribute. Instead, look up the original from the source file
-    # via the function's __wrapped__ or by re-loading.
-    # Simpler approach: just reassign via monkeypatch with the
-    # ORIGINAL function we keep a reference to before the autouse
-    # fixture fires. But the autouse fixture has already run...
-    #
-    # Pragmatic solution: define the real function logic inline here
-    # — it's small enough to mirror.
-    def _real_is_runtime_ready(*, runtime_deps_path=None):
-        eb._runtime_ready_cache = None
-        eb.add_runtime_to_sys_path()
-        try:
-            import importlib.util as _ilu
-            spec = _ilu.find_spec("sentence_transformers")
-            eb._runtime_ready_cache = spec is not None
-        except Exception:
-            eb._runtime_ready_cache = False
-        return eb._runtime_ready_cache
-    monkeypatch.setattr(eb, "is_runtime_ready", _real_is_runtime_ready)
-    return _real_is_runtime_ready
-
-
-def test_is_runtime_ready_false_without_install(
-    monkeypatch, tmp_path, real_is_runtime_ready,
-):
-    """Empty runtime-deps dir → is_runtime_ready=False."""
-    monkeypatch.setenv("EMBEDDING_BITS_RUNTIME_DEPS", str(tmp_path / "absent"))
-    eb.invalidate_runtime_ready_cache()
-    assert eb.is_runtime_ready() is False
+    repo_src = str(Path(__file__).resolve().parents[2] / "src")
+    snippet = (
+        "from email_triage import embedding_bits as eb; "
+        "eb.invalidate_runtime_ready_cache(); "
+        "print(eb.is_runtime_ready())"
+    )
+    env = {
+        **os.environ,
+        "EMBEDDING_BITS_RUNTIME_DEPS": str(tmp_path / "absent"),
+        "PYTHONPATH": repo_src,
+    }
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", snippet],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"subprocess failed: stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert result.stdout.strip() == "False", (
+        f"expected False; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
 
 
 def test_runtime_python_path_empty_when_dir_missing(monkeypatch, tmp_path):

@@ -1,4 +1,4 @@
-"""Operator-defined LLM maintenance windows (#149 Bundle C).
+"""Operator-defined LLM maintenance windows.
 
 When the operator knows their LLM host is going down for scheduled
 maintenance (nightly Ollama upgrade, weekly homelab patch window,

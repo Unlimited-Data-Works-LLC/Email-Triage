@@ -1,4 +1,4 @@
-"""Static guard against logging OAuth/API tokens (#47, #54).
+"""Static guard against logging OAuth/API tokens.
 
 Greps the source tree for log-emit lines that pass token-bearing
 field names as values. Runs in pytest so CI catches regressions.

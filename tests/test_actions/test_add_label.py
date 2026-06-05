@@ -1,4 +1,4 @@
-"""Tests for ``AddLabelAction`` — punch-list item #129 tail.
+"""Tests for ``AddLabelAction`` — the backlog item  tail.
 
 Covers the new route-action that attaches internal labels (via the
 ``message_labels`` junction table) and/or provider-native labels
@@ -51,7 +51,7 @@ def _make_message(
         provider="imap",
         sender="alice@example.com",
         recipients=["bob@example.com"],
-        subject="Receipt for order #42",
+        subject="Receipt for order ",
         body_text="Thanks for shopping.",
         date=datetime(2026, 5, 13, 14, 30, tzinfo=timezone.utc),
     )
@@ -79,9 +79,13 @@ def _make_provider() -> AsyncMock:
 def _db_with_labels(tmp_path):
     """Minimal SQLite DB carrying the labels + message_labels schema
     and one user + email_accounts row so the apply helper can be
-    exercised without spinning up the full web app."""
+    exercised without spinning up the full web app.
+
+    ``check_same_thread=False`` mirrors production ``init_db``: the
+     sweep dispatches ``apply_labels_to_message`` through
+    ``db_call``, which runs it on a threadpool worker."""
     from email_triage.web.migrations import _v18_create_labels
-    db = sqlite3.connect(":memory:")
+    db = sqlite3.connect(":memory:", check_same_thread=False)
     db.row_factory = sqlite3.Row
     # Tables referenced by the schema's foreign keys. Minimal stand-ins
     # for the v1 base schema's users + email_accounts tables.
@@ -371,17 +375,29 @@ class TestAddLabelRegistered:
         assert "from email_triage.actions.add_label import AddLabelAction" in src
 
     def test_registered_in_inline_triage_runner(self):
+        #  — the inline runner builds its registry via the shared
+        # build_default_registry() in triage_one.py. Verify it routes
+        # through that helper AND that the helper registers AddLabel.
         from pathlib import Path
-        src = (
+        base = (
             Path(__file__).parent.parent.parent
-            / "src" / "email_triage" / "web" / "triage_runner.py"
-        ).read_text(encoding="utf-8")
-        assert "AddLabelAction()" in src
+            / "src" / "email_triage" / "web"
+        )
+        runner_src = (base / "triage_runner.py").read_text(encoding="utf-8")
+        assert "build_default_registry(" in runner_src
+        triage_one_src = (base / "triage_one.py").read_text(encoding="utf-8")
+        assert "AddLabelAction()" in triage_one_src
 
     def test_registered_in_bulk_triage_runner(self):
+        #  — same shared registry path for the bulk runner.
         from pathlib import Path
-        src = (
+        base = (
             Path(__file__).parent.parent.parent
-            / "src" / "email_triage" / "web" / "triage_runner_bulk.py"
+            / "src" / "email_triage" / "web"
+        )
+        runner_src = (
+            base / "triage_runner_bulk.py"
         ).read_text(encoding="utf-8")
-        assert "AddLabelAction()" in src
+        assert "build_default_registry(" in runner_src
+        triage_one_src = (base / "triage_one.py").read_text(encoding="utf-8")
+        assert "AddLabelAction()" in triage_one_src

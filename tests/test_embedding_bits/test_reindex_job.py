@@ -1,4 +1,4 @@
-"""Embedding-reindex background job (#180 C)."""
+"""Embedding-reindex background job."""
 
 from __future__ import annotations
 

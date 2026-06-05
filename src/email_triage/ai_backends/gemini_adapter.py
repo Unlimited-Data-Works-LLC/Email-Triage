@@ -1,4 +1,4 @@
-"""Google Gemini adapter (#171-A).
+"""Google Gemini adapter.
 
 Sibling to :class:`email_triage.ai_backends.azure_openai.AzureOpenAIAdapter`
 and :class:`email_triage.ai_backends.openai_direct.OpenAIAdapter`. Talks
@@ -25,8 +25,7 @@ This module mirrors the canonical pattern set by
   can use the adapter without waiting for :func:`load_backend`
   migration.
 * :class:`GeminiError` + :class:`GeminiAuthError` — error classes
-  with defensive :data:`_TOKEN_KEYS` body-scrub at construction time
-  (#168 hardening, identical pattern to :class:`AzureOpenAIError`).
+  with defensive :data:`_TOKEN_KEYS` body-scrub at construction time.
 
 File name
 ---------
@@ -49,7 +48,7 @@ The adapter never logs the api_key, never round-trips it through
 templates, and scrubs token-shape keys out of any error body before
 incorporating it into the exception message. Belt-and-suspenders:
 the api-key query param is stripped from URLs in rendered exception
-messages too (#168 hardening pattern + :func:`_strip_sensitive_query_params`).
+messages too.
 """
 
 from __future__ import annotations
@@ -58,7 +57,8 @@ import logging
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
+from email_triage._http_client import LazyHttpClient
+from email_triage.classify.base import JsonChatClassifier
 
 logger = logging.getLogger("email_triage.ai_backends.gemini_adapter")
 
@@ -83,7 +83,7 @@ class GeminiError(Exception):
 
     Defensive token-shape scrub at construction time. Mirrors the
     :class:`AzureOpenAIError` / :class:`OpenAIError` pattern, which in
-    turn mirrors :class:`GmailApiError` from commit ``2de45ea`` / #168.
+    turn mirrors :class:`GmailApiError` from commit ``2de45ea`` / .
     The fallback ``str(body)`` path is reachable when an upstream
     proxy injects a non-Gemini response or when Google's edge returns
     a token-bearing error body — in either case, if a token-bearing
@@ -242,6 +242,15 @@ class GeminiAdapter(BackendAdapter):
         self._default_temperature = default_temperature
         self._default_max_tokens = default_max_tokens
         self._timeout = timeout
+        #  — one long-lived pooled httpx client per adapter
+        # instance, reused across every chat_complete() call instead of
+        # a fresh AsyncClient (TLS handshake) per call. Mirrors the
+        # classify/* cloud classifiers and OllamaClassifier.
+        self._http = LazyHttpClient(timeout=timeout)
+
+    async def close(self) -> None:
+        """Drain the pooled HTTP client (BackendAdapter.close override)."""
+        await self._http.aclose()
 
     # ------------------------------------------------------------------
     # Canonical W1-A method
@@ -360,7 +369,21 @@ class GeminiAdapter(BackendAdapter):
         if system_instruction is not None:
             body["systemInstruction"] = system_instruction
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        #  — wrap the POST in the shared circuit-breaker helper, the
+        # same translation  added to classify/gemini.py. A dead
+        # Gemini endpoint (connection refused / network blip) now trips
+        # the breaker and re-raises a typed LLMBackendUnreachableError
+        # instead of a raw httpx.ConnectError. Keyed "gemini" to match
+        # the configured classifier.backend the is_healthy gate resolves
+        # ("ollama"/"openai"/"gemini") — a key the gate never sees can
+        # never gate. A 4xx/5xx is NOT a connect failure, so the status
+        # check below stays OUTSIDE the wrapper: those mean the backend
+        # is up but misbehaving and must not flip the breaker.
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "gemini", self._endpoint, default_port=443,
+        ):
+            client = await self._http.get()
             resp = await client.post(
                 url, params=params, headers=headers, json=body,
             )
@@ -560,39 +583,31 @@ def _extract_gemini_text(body: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_gemini_classifier_imports():
-    """Local import helper (lazy — keeps ai_backends import cheap)."""
-    from email_triage.classify.base import Classifier
-    from email_triage.classify.ollama import _parse_llm_json
-    from email_triage.classify.prompts import (
-        build_system_prompt, build_user_prompt,
-    )
-    from email_triage.engine.models import (
-        Classification, EmailMessage, ListHint,
-    )
-    return (
-        Classifier, _parse_llm_json, build_system_prompt,
-        build_user_prompt, Classification, EmailMessage, ListHint,
-    )
-
-
-class GeminiClassifierShim:
-    """:class:`Classifier`-ABC-compatible wrapper around :class:`GeminiAdapter`.
+class GeminiClassifierShim(JsonChatClassifier):
+    """:class:`JsonChatClassifier` subclass wrapping :class:`GeminiAdapter`.
 
     Suffix ``Shim`` to disambiguate from the pre-existing
     :class:`email_triage.classify.gemini.GeminiClassifier`, which is
-    the legacy ABC-direct subclass. The W1-A pattern wraps the adapter
-    rather than re-implementing HTTP — same prompt builders + same
-    response parser as the existing classifier, but the HTTP-call seam
-    routes through the adapter.
+    the legacy ABC-direct subclass.
 
-    The class is built without inheriting from :class:`Classifier`
-    because the ABC + prompt helpers are imported lazily (see
-    :func:`_build_gemini_classifier_imports`). This costs one extra
-    method call but keeps ``import email_triage.ai_backends`` cheap.
+    The existing flow engine calls ``classifier.classify(message, ...)``;
+    that whole body — prompt build, two-level classification-cache
+    lookup, sender-history hint, JSON parse, out-of-taxonomy
+    :class:`ValueError`, cache store — lives once on
+    :class:`JsonChatClassifier`. This shim implements only the two
+    per-backend hooks:
+
+    * :meth:`_resolve_model` — the cache key + request model name.
+    * :meth:`_chat` — issue one chat request via the W1-A adapter.
+
+    Subclassing the shared base (rather than re-implementing
+    ``classify``) means the out-of-taxonomy guard fires here too: a
+    model returning a category no route matches raises instead of
+    silently producing a no-op :class:`Classification`.
     """
 
-    # Mirrors :attr:`GeminiAdapter.is_local`.
+    # Mirrors :attr:`GeminiAdapter.is_local` — Gemini is always
+    # external; the BAA gate opens HIPAA traffic once a BAA is on file.
     is_local: bool = False
 
     def __init__(
@@ -613,83 +628,34 @@ class GeminiClassifierShim:
             default_max_tokens=default_max_tokens,
             timeout=timeout,
         )
+        # ``_model`` is the classification-cache key the shared base
+        # passes to the cache + to :meth:`_chat`. GeminiAdapter always
+        # carries a non-empty model (defaults to DEFAULT_GEMINI_MODEL).
+        self._model = self._adapter.model
 
-    async def classify(self, message, categories, list_hints=None):
-        # Lazy import — keeps cold-import path light.
-        (
-            _Classifier, _parse_llm_json, build_system_prompt,
-            build_user_prompt, Classification, _EmailMessage, _ListHint,
-        ) = _build_gemini_classifier_imports()
+    async def _chat(
+        self, system_prompt: str, user_prompt: str, model: str,
+    ) -> str:
+        """Issue one chat request via the W1-A adapter; return raw text.
 
-        system_prompt = build_system_prompt(categories, list_hints)
-        user_prompt = build_user_prompt(message)
-
-        # 2026-05-13 two-level cache lookup. Best-effort; any cache
-        # failure falls through to a live call.
-        outer_key: str | None = None
-        inner_field: str | None = None
-        hint_text: str | None = None
-        try:
-            from email_triage.cache.classification import (
-                cache_lookup_for_message,
-            )
-            outer_key, inner_field, cache_entry, hint_text = (
-                cache_lookup_for_message(
-                    message, self._adapter.model, categories,
-                )
-            )
-            if cache_entry is not None:
-                logger.info("Classification cache hit (cache_hit=True)")
-                return cache_entry
-        except Exception as e:
-            logger.debug("Classification cache lookup error: %s", e)
-
-        if hint_text:
-            system_prompt = (
-                f"[SENDER HISTORY HINT] {hint_text}\n\n{system_prompt}"
-            )
-
-        raw = await self._adapter.chat_complete(
+        ``model`` is the cache key from :meth:`_resolve_model`; the
+        adapter interpolates its own configured model into the
+        ``generateContent`` endpoint path.
+        """
+        return await self._adapter.chat_complete(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
         )
-        parsed = _parse_llm_json(raw)
-
-        category = parsed.get("category", "")
-        if category not in categories:
-            logger.warning(
-                "LLM returned unknown category '%s', treating as low confidence",
-                category,
-            )
-        confidence = float(parsed.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-        reason = parsed.get("reason", "")
-        result = Classification(
-            category=category,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
-        )
-
-        try:
-            from email_triage.cache.classification import (
-                cache_store_for_message,
-            )
-            cache_store_for_message(
-                outer_key, inner_field,
-                self._adapter.model, result, categories,
-                is_hipaa=bool(getattr(message, "hipaa", False)),
-            )
-        except Exception as e:
-            logger.debug("Classification cache store error: %s", e)
-
-        return result
 
     async def complete(self, prompt: str) -> str:
         """Raw completion via the underlying adapter."""
         return await self._adapter.complete(
             prompt, max_tokens=2048,
         )
+
+    async def close(self) -> None:
+        """Drain the adapter's pooled HTTP client. Idempotent."""
+        await self._adapter.close()

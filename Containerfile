@@ -24,7 +24,7 @@ RUN apt-get update && \
 # day deploys. After fix, source-only edits pay only the small
 # ``pip install . --no-deps`` layer at the end.
 #
-# 2026-05-17 (#180) — torch + sentence-transformers + the HuggingFace
+# 2026-05-17 — torch + sentence-transformers + the HuggingFace
 # all-MiniLM-L6-v2 model are NO LONGER baked into the image. Pre-fix
 # those three items added ~600 MB compressed (~2 GiB uncompressed) to
 # the runtime stage, which pushed the air-gap release tarball over
@@ -48,6 +48,19 @@ COPY requirements.lock .
 #    deps/site-packages on the operator's persistent volume.
 RUN pip install --no-cache-dir --prefix=/install \
     -r requirements.lock
+
+# 2b. v0.1.2 single-file encryption: SQLCipher encryption-at-rest binding.
+# ``sqlcipher3-binary`` ships prebuilt wheels (CPython 3.11+) but is
+# Linux-ONLY (no Windows wheels), so it lives here in the container build
+# rather than the cross-platform ``requirements.lock``. The pyproject
+# ``encryption`` extra pins the same range (sqlcipher3-binary>=0.5.4,<0.6).
+# Without this layer the encryption boot-contract fail-closes with a
+# RuntimeError when ``EMAIL_TRIAGE_DB_ENCRYPTION=true`` /
+# ``persistence.encryption_enabled`` is set (db/_engine.py
+# enforce_db_encryption_boot_contract, §164.312(a)(2)(iv) — never a silent
+# plaintext fallback). Own cached layer: only re-pulls if the pin changes.
+RUN pip install --no-cache-dir --prefix=/install \
+    "sqlcipher3-binary>=0.5.4,<0.6"
 
 # 3. Strip ``__pycache__`` directories from the installed packages.
 #    pip auto-compiles every .py to .pyc on install (cuts first-
@@ -80,15 +93,27 @@ RUN pip install --no-cache-dir --no-deps --prefix=/install \
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
-LABEL maintainer="Alex Maintainer"
-LABEL description="Portable email triage with LLM classification"
+# The canonical authorship + description for this image lives on
+# the OCI labels declared in .github/workflows/release.yml's
+# metadata-action (`org.opencontainers.image.{title,description,
+# authors,source,licenses}`). Those are what GHCR + cosign + any
+# OCI-spec-aware tool surface. The two LABEL lines below are the
+# legacy single-name fields that `docker inspect` still reads
+# back via the top-level `Config.Labels.maintainer` / `description`
+# keys — kept here so a customer running `docker inspect` against
+# the v0.1.0 image sees attribution to the LLC rather than the
+# operator-internal name that historically lived here (scrubbed at
+# publish time via publish-fresh-start.py SCRUB_RE, but cleaner to
+# carry the public-facing value as the canonical source).
+LABEL maintainer="Unlimited Data Works LLC <https://github.com/Unlimited-Data-Works-LLC>"
+LABEL description="Privacy-first, HIPAA-aware email classification and reply drafting; local LLM via Ollama"
 
 WORKDIR /app
 
 # Copy installed packages from builder.
 COPY --from=builder /install /usr/local
 
-# 2026-05-17 (#180) — runtime-deps directory layout. The lazy
+# 2026-05-17 — runtime-deps directory layout. The lazy
 # embedding installer writes torch + sentence-transformers + the
 # embedding model into the data volume (not into the image layer).
 # HF_HOME points at the same volume so the model cache survives
@@ -107,11 +132,13 @@ COPY src/ src/
 # trusting the operator's environment.
 COPY scripts/embedding-bits-manifest.json /app/scripts/embedding-bits-manifest.json
 
-# Bake the build-time commit SHA into the image. The repo ships a
-# placeholder ``COMMIT`` file containing "dev"; the deploy script
-# (docs/deploy-deployhost.md step 3) overwrites it in the build context
-# with ``git rev-parse HEAD`` before ``podman build``. The /health
-# endpoint reads this file via ``_resolve_version()``.
+# Bake the build-time commit SHA into the image. ``COMMIT`` carries the
+# git ``export-subst`` placeholder ``$Format:%H$`` (.gitattributes), so
+# ``git archive HEAD`` substitutes the real 40-char SHA at archive time —
+# EVERY archive-based build bakes the right value, both ``scripts/deploy.sh``
+# (which also overwrites COMMIT with ``git rev-parse HEAD``) and any manual
+# ``git archive HEAD | podman build``. The /health endpoint reads this file
+# via ``_resolve_version()`` (which treats an unsubstituted literal as dev).
 COPY COMMIT /app/VERSION
 
 # Re-install in editable-like mode so the entry point works.
@@ -148,8 +175,8 @@ EXPOSE 8080
 # the prior HEALTHCHECK that required exactly 200 would have flagged
 # the container unhealthy on legitimate degraded states. Uses
 # CMD-exec form (JSON array) so newlines in the python source survive.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import httpx\nr=None\ntry:\n  r=httpx.get('https://localhost:8080/health',verify=False,timeout=4)\nexcept Exception:\n  try:\n    r=httpx.get('http://localhost:8080/health',timeout=4)\n  except Exception:\n    pass\nexit(0 if r is not None and r.status_code in (200,503) else 1)"]
+HEALTHCHECK --interval=30s --timeout=15s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import httpx\nr=None\ntry:\n  r=httpx.get('https://localhost:8080/health',verify=False,timeout=12)\nexcept Exception:\n  try:\n    r=httpx.get('http://localhost:8080/health',timeout=12)\n  except Exception:\n    pass\nexit(0 if r is not None and r.status_code in (200,503) else 1)"]
 
 # Default: start the web UI server.
 # Override with any email-triage subcommand:

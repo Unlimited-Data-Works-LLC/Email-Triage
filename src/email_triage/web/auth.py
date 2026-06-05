@@ -24,6 +24,7 @@ from typing import Any
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from email_triage.triage_logging import get_logger
+from email_triage.web.db_writelock import db_write, get_write_lock
 
 log = get_logger("web.auth")
 
@@ -61,6 +62,34 @@ def effective_session_ttl(config: Any) -> int:
 SESSION_MAX_AGE = 86400 * 7  # 7 days
 
 
+def set_session_cookie(response: Any, token: str, config: Any) -> None:
+    """Attach the session cookie to ``response`` — the single place
+    its flags are defined.
+
+    Was copy-pasted at four login sites (OTP, dev-keypair, WebAuthn,
+    passkey). The drift cost a missing ``Secure`` flag: on a TLS
+    install the session token — the highest-value credential — could
+    ride a plaintext request. ``Secure`` is now gated on
+    ``config.tls.enabled``, the same signal the CSRF and challenge
+    cookies already use, so a fifth login path cannot silently forget
+    it.
+
+    HttpOnly (JS cannot read the token) and SameSite=lax (the session
+    must survive a top-level cross-site navigation back into the app,
+    unlike the SameSite=strict CSRF cookie) are the established
+    posture — unchanged; only the absent Secure flag is fixed.
+    """
+    secure = bool(getattr(getattr(config, "tls", None), "enabled", False))
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=effective_session_ttl(config),
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+    )
+
+
 def _hash_code(code: str) -> str:
     """SHA-256 hash of an OTP code."""
     return hashlib.sha256(code.encode()).hexdigest()
@@ -75,10 +104,15 @@ def generate_otp() -> str:
     return "".join(str(secrets.randbelow(10)) for _ in range(OTP_LENGTH))
 
 
+@db_write
 def store_otp(conn: sqlite3.Connection, email: str, code: str) -> None:
     """Store a hashed OTP code in the database.
 
     Invalidates any existing unused codes for the same email first.
+
+     — ``@db_write`` serialises the UPDATE + INSERT + commit on the
+    process-wide write lock so the two statements commit atomically
+    with respect to every other writer on the shared connection.
     """
     now = datetime.now(timezone.utc)
     expires = now + timedelta(minutes=OTP_EXPIRY_MINUTES)
@@ -96,10 +130,15 @@ def store_otp(conn: sqlite3.Connection, email: str, code: str) -> None:
     conn.commit()
 
 
+@db_write
 def verify_otp(conn: sqlite3.Connection, email: str, code: str) -> bool:
     """Verify an OTP code.  Returns True on success, False otherwise.
 
     On success the code is marked as used.
+
+     — ``@db_write`` serialises the SELECT + UPDATE + commit so the
+    mark-as-used write cannot race another writer on the shared
+    connection.
     """
     now = datetime.now(timezone.utc)
     code_hash = _hash_code(code)
@@ -130,8 +169,13 @@ def verify_otp(conn: sqlite3.Connection, email: str, code: str) -> bool:
     return True
 
 
+@db_write
 def cleanup_expired_otps(conn: sqlite3.Connection) -> int:
-    """Remove expired OTP codes.  Returns count deleted."""
+    """Remove expired OTP codes.  Returns count deleted.
+
+     — ``@db_write`` serialises the DELETE + commit on the shared
+    connection's write lock.
+    """
     now = datetime.now(timezone.utc).isoformat()
     cursor = conn.execute(
         "DELETE FROM otp_codes WHERE expires_at < ? OR used = 1",
@@ -156,19 +200,37 @@ def create_session_token(
     *,
     auth_source: str = "otp",
     auth_key_id: int | None = None,
+    session_epoch: int = 0,
+    mfa_verified_at: int | None = None,
 ) -> str:
     """Create a signed session token.
 
-    ``auth_source`` ∈ {``otp``, ``dev_keypair``, ``webauthn``} stamps
-    the auth path that minted this session into the cookie payload.
-    Echoed into ``access_log`` on every authenticated request so an
-    auditor can answer "how did this session get in?" without
-    consulting external state. Old tokens (pre-#67) without this
-    field decode as ``auth_source="otp"`` for back-compat.
+    ``auth_source`` ∈ {``otp``, ``dev_keypair``, ``webauthn``,
+    ``recovery_code``, ``operator_recovery``} stamps the auth path
+    that minted this session into the cookie payload. Echoed into
+    ``access_log`` on every authenticated request so an auditor can
+    answer "how did this session get in?" without consulting external
+    state. Old tokens (pre-#67) without this field decode as
+    ``auth_source="otp"`` for back-compat.
 
     ``auth_key_id`` is the corresponding ``dev_keys.id`` or
     ``hardware_keys.id`` (or None for OTP). Lets the audit trail
     name the specific credential used, not just the path.
+
+    ``session_epoch`` is the user's ``users.session_epoch`` at
+    sign-in time. :func:`dependencies.get_current_user` rejects a
+    token whose stamped epoch is older than the user's current epoch,
+    so bumping the epoch (disable-user, "sign out all sessions")
+    revokes every outstanding session for that user.
+
+    ``mfa_verified_at`` (H-05, Cycle 7) is the epoch-seconds at which
+    a multi-factor verification (WebAuthn / recovery_code /
+    operator_recovery) succeeded for this session. Sessions minted
+    via OTP / dev_keypair leave this field None. The HIPAA-mode
+    hard-cutover middleware (``mfa.session_needs_mfa_step_up``)
+    rejects any session lacking this claim when HIPAA mode is on —
+    forcing pre-cutover sessions through an MFA step-up. Per Q6
+    design: hard cutover, no grandfather.
     """
     s = _get_serializer(secret_key)
     payload: dict[str, Any] = {"email": email, "role": role}
@@ -179,6 +241,10 @@ def create_session_token(
         payload["auth_source"] = auth_source
     if auth_key_id is not None:
         payload["auth_key_id"] = int(auth_key_id)
+    if session_epoch:
+        payload["epoch"] = int(session_epoch)
+    if mfa_verified_at is not None:
+        payload["mfa_verified_at"] = int(mfa_verified_at)
     return s.dumps(payload)
 
 
@@ -189,11 +255,14 @@ def verify_session_token(
 ) -> dict[str, Any] | None:
     """Verify a session token.
 
-    Returns ``{"email", "role", "auth_source", "auth_key_id"}`` on
-    success or None on failure. ``auth_source`` defaults to
-    ``"otp"`` for tokens minted before #67 (back-compat —
-    pre-existing sessions remain valid; the new fields populate
-    only on next sign-in via a new auth path).
+    Returns ``{"email", "role", "auth_source", "auth_key_id", "epoch",
+    "mfa_verified_at"}`` on success or None on failure.
+    ``auth_source`` defaults to ``"otp"`` for tokens minted before
+    ; ``epoch`` defaults to ``0`` for tokens minted before ;
+    ``mfa_verified_at`` defaults to ``None`` for tokens minted before
+    H-05 (back-compat — pre-existing sessions remain valid; the new
+    fields populate only on next sign-in. The HIPAA-mode hard-cutover
+    middleware fires step-up on None for these).
     """
     s = _get_serializer(secret_key)
     try:
@@ -204,6 +273,8 @@ def verify_session_token(
         return None
     data.setdefault("auth_source", "otp")
     data.setdefault("auth_key_id", None)
+    data.setdefault("epoch", 0)
+    data.setdefault("mfa_verified_at", None)
     return data
 
 
@@ -215,21 +286,39 @@ def get_user_by_email(conn: sqlite3.Connection, email: str) -> dict[str, Any] | 
     """Look up a user by email.  Returns a dict or None.
 
     Includes ``disabled`` / ``disabled_at`` so every auth path can
-    enforce the fail-closed kill-switch without a second query.
+    enforce the fail-closed kill-switch without a second query, and
+    ``session_epoch`` so the user-loader can reject a session
+    token whose stamped epoch is stale.
+
+     — this read runs on the *shared* ``app.state.db`` connection
+    from ``get_current_user`` on the event-loop thread for every
+    authenticated request, i.e. OUTSIDE ``db_call``. The shared
+    connection cannot be touched by two threads at once, so the
+    SELECT is serialised through the process-wide DB lock. The lock is
+    an ``RLock``: callers already inside ``db_call`` (which holds the
+    same lock) re-acquire it on the same thread without deadlock.
     """
-    row = conn.execute(
-        "SELECT id, email, name, role, notify_email, created_at, last_login, "
-        "disabled, disabled_at FROM users WHERE email = ?",
-        (email,),
-    )
-    result = row.fetchone()
+    with get_write_lock():
+        row = conn.execute(
+            "SELECT id, email, name, role, notify_email, created_at, last_login, "
+            "disabled, disabled_at, session_epoch FROM users WHERE email = ?",
+            (email,),
+        )
+        result = row.fetchone()
     if result is None:
         return None
     return dict(result)
 
 
+@db_write
 def update_last_login(conn: sqlite3.Connection, email: str) -> None:
-    """Update the user's last_login timestamp."""
+    """Update the user's last_login timestamp.
+
+     — runs on the shared connection (the OTP-login path calls it
+    directly, and ``@db_write`` also covers it when it lands on a
+    threadpool worker via ``db_call``). The decorator serialises the
+    UPDATE + commit on the process-wide write lock.
+    """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("UPDATE users SET last_login = ? WHERE email = ?", (now, email))
     conn.commit()
@@ -365,6 +454,7 @@ def hash_api_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+@db_write
 def store_api_key(
     conn: sqlite3.Connection,
     key_hash: str,
@@ -377,6 +467,10 @@ def store_api_key(
     source: str = "unknown",
 ) -> int:
     """Store a hashed API key and emit a lifecycle audit entry.
+
+     — ``@db_write`` serialises the INSERT + commit + the nested
+    ``record_api_key_event`` audit write as one unit on the shared
+    connection's write lock.
 
     Returns the key ID. The raw token is NEVER logged or persisted in
     the audit trail — only ``key_id`` is recorded as the correlation
@@ -427,9 +521,10 @@ def store_api_key(
 
     # Persist to the audit table. A failure here is logged but does
     # NOT block the mint — the key is already in api_keys.
-    try:
-        from email_triage.web.db import record_api_key_event
-        record_api_key_event(
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.db import record_api_key_event
+    safe_audit_write(
+        lambda: record_api_key_event(
             conn,
             event="api_key_created",
             key_id=new_id,
@@ -438,18 +533,14 @@ def store_api_key(
             name=name,
             expires_at=expires_at,
             source=source,
-        )
-    except Exception as exc:
-        log.warning(
-            "api_key_event_audit_insert_failed",
-            event="api_key_created",
-            key_id=new_id,
-            error=str(exc),
-        )
+        ),
+        description=f"api_key_created key_id={new_id}",
+    )
 
     return new_id
 
 
+@db_write
 def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
     """Verify an API key and return the associated user, or None.
 
@@ -457,6 +548,16 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
     keys whose owning user is ``disabled`` — the disable flag is a
     fail-closed kill-switch that must block API access even if the key
     is otherwise valid.  Blocked attempts are logged for audit.
+
+     — this helper both READS (the JOIN lookup) and WRITES (the
+    ``last_used_at`` UPDATE) on the *shared* ``app.state.db``
+    connection, and runs on the event-loop thread for every Bearer-
+    authenticated request via ``get_current_user`` → ``_check_bearer_token``
+    — i.e. OUTSIDE ``db_call``. ``@db_write`` serialises the whole
+    SELECT + UPDATE + commit on the process-wide write lock so it
+    cannot race a ``db_call`` worker on the same connection. The lock
+    is reentrant, so calls dispatched through ``db_call`` (which also
+    holds it) do not self-deadlock.
     """
     key_hash = hash_api_key(key)
     row = conn.execute(
@@ -521,6 +622,7 @@ def list_api_keys(conn: sqlite3.Connection, user_id: int | None = None) -> list[
     return [dict(r) for r in rows]
 
 
+@db_write
 def delete_api_key(
     conn: sqlite3.Connection,
     key_id: int,
@@ -530,6 +632,10 @@ def delete_api_key(
     source: str = "unknown",
 ) -> bool:
     """Delete an API key by ID and emit a lifecycle audit entry.
+
+     — ``@db_write`` serialises the SELECT + DELETE + commit + the
+    nested ``record_api_key_event`` audit write as one unit on the
+    shared connection's write lock.
 
     Returns True if a row was deleted. Audit context is keyword-only;
     see ``store_api_key`` for the schema rationale.
@@ -576,9 +682,10 @@ def delete_api_key(
         source=source,
     )
 
-    try:
-        from email_triage.web.db import record_api_key_event
-        record_api_key_event(
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.db import record_api_key_event
+    safe_audit_write(
+        lambda: record_api_key_event(
             conn,
             event="api_key_revoked",
             key_id=key_id,
@@ -587,13 +694,8 @@ def delete_api_key(
             name=name,
             expires_at=expires_at,
             source=source,
-        )
-    except Exception as exc:
-        log.warning(
-            "api_key_event_audit_insert_failed",
-            event="api_key_revoked",
-            key_id=key_id,
-            error=str(exc),
-        )
+        ),
+        description=f"api_key_revoked key_id={key_id}",
+    )
 
     return True

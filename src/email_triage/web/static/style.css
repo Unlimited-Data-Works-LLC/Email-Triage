@@ -322,7 +322,7 @@ body.nav-sidebar footer.container {
     display: none !important;
 }
 
-/* ─── Multi-select widget (#163 follow-up) ─────────────────────
+/* ─── Multi-select widget ─────────────────────
    Closed-state chip pill control + dropdown popup. Wraps a native
    <select multiple data-multiselect>; JS in static/multiselect.js
    injects the host elements + keeps the underlying <select>

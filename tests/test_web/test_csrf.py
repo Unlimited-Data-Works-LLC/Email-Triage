@@ -209,7 +209,7 @@ def test_csrf_token_endpoint_401_without_session(client, db, app):
 
 
 # ---------------------------------------------------------------------------
-# Form-body validation (#83.2 — close the form-POST gap)
+# Form-body validation
 # ---------------------------------------------------------------------------
 
 def test_form_body_csrf_token_field_validates(
@@ -311,7 +311,7 @@ def test_form_body_replays_to_handler_unchanged(
 
 
 # ---------------------------------------------------------------------------
-# #82 item 3 — access_log audit row written on every rejection
+#  item 3 — access_log audit row written on every rejection
 # ---------------------------------------------------------------------------
 
 def test_rejection_writes_access_log_row(
@@ -388,7 +388,7 @@ def test_enforce_rejection_writes_audit_with_403(
 
 
 # ---------------------------------------------------------------------------
-# #82 item 4 — operator-defined exempt prefixes
+#  item 4 — operator-defined exempt prefixes
 # ---------------------------------------------------------------------------
 
 def test_extra_exempt_prefix_skips_check(
@@ -468,7 +468,7 @@ def test_csrf_exempt_prefixes_yaml_roundtrip(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #82 item 2 — admin UI surfaces 24h / 7d rejects rates
+#  item 2 — admin UI surfaces 24h / 7d rejects rates
 # ---------------------------------------------------------------------------
 
 def test_admin_security_page_shows_rates(
@@ -504,13 +504,13 @@ def test_admin_security_page_shows_rates(
 
 
 # ---------------------------------------------------------------------------
-# #133 — oversize form body without CSRF token short-circuits to 413
+#  — oversize form body without CSRF token short-circuits to 413
 # ---------------------------------------------------------------------------
 
 def test_oversize_form_body_without_token_returns_413(
     client, db, app, admin_user,
 ):
-    """#133 — A form-urlencoded POST whose body exceeds
+    """ — A form-urlencoded POST whose body exceeds
     ``_BODY_BUFFER_CAP`` and carries no X-CSRF-Token header used to
     drain the receive callable then forward to the downstream handler
     with an empty body. The handler hung / processed nothing.
@@ -546,7 +546,7 @@ def test_oversize_form_body_without_token_returns_413(
 def test_oversize_form_body_with_valid_header_token_does_not_413(
     client, db, app, admin_user,
 ):
-    """#133 boundary — oversize body WITH a valid X-CSRF-Token header
+    """ boundary — oversize body WITH a valid X-CSRF-Token header
     skips the form-buffer path entirely (header check happens before
     body buffer), so the 413 short-circuit doesn't fire. Downstream
     handler runs as before. (FastAPI may still reject the request
@@ -583,7 +583,7 @@ def test_oversize_form_body_with_valid_header_token_does_not_413(
 def test_oversize_form_body_does_not_invoke_downstream_handler(
     client, db, app, admin_user,
 ):
-    """#133 — assert via a sentinel on app.state that downstream
+    """ — assert via a sentinel on app.state that downstream
     code never ran. Inserts a request middleware-side counter
     bumped by the test target route's first line, ensures it
     stayed flat for the oversize-no-token request."""
@@ -624,7 +624,7 @@ def test_oversize_form_body_does_not_invoke_downstream_handler(
 
 
 # ---------------------------------------------------------------------------
-# #82 item 1 — flip csrf_enforce default from False to True
+#  item 1 — flip csrf_enforce default from False to True
 # ---------------------------------------------------------------------------
 
 def test_default_config_csrf_enforce_is_true():
@@ -632,7 +632,7 @@ def test_default_config_csrf_enforce_is_true():
 
     The install-wide default flipped from soft-launch (False) to
     enforce (True) once the soft-launch window proved the rejects
-    counter stays flat across normal traffic + the #133 oversize-body
+    counter stays flat across normal traffic + the  oversize-body
     fix landed.
     """
     from email_triage.config import TriageConfig
@@ -643,7 +643,7 @@ def test_default_config_csrf_enforce_is_true():
 def test_default_config_yaml_loader_csrf_enforce_is_true(tmp_path):
     """A YAML file with ``tls:`` present but no ``csrf_enforce`` key
     falls through to the new True default — operator-side YAML written
-    before #82 inherits the secure posture without an edit.
+    before  inherits the secure posture without an edit.
     """
     from email_triage.config import load_config
     p = tmp_path / "et.yaml"

@@ -1,4 +1,4 @@
-"""Tests for the ``email-triage audit verify`` CLI subcommand (#93).
+"""Tests for the ``email-triage audit verify`` CLI subcommand.
 
 Covers the hash-chain integrity verifier surface — HIPAA §164.312(c)(1)
 Integrity addressable spec. The handler wraps
@@ -14,6 +14,12 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+
+# Full-tree `-n auto` hardening: these file-DB / audit-global suites flake when
+# co-resident on a worker (SQLite file-lock contention + load-amplified async-audit
+# timing). Each passes in isolation. Pin them to one xdist worker so they run
+# serially, not concurrently — the project-sanctioned facet-2 fix (testinfra drawer).
+pytestmark = pytest.mark.xdist_group("file_db_audit_serial")
 
 from email_triage.cli import build_parser, cmd_audit_verify
 from email_triage.triage_logging import SQLiteLogHandler
@@ -301,3 +307,462 @@ class TestVerifyDbOverride:
         # break. Operator scripts can disambiguate.
         assert rc == 2
         assert "not found" in captured.err.lower()
+
+
+# ===========================================================================
+# H-03-auto — CLI audit auto-emit (defense-in-depth, §164.312(b))
+# ===========================================================================
+#
+# Tests the auto-emission of log_entries chain rows at every DB-mutating CLI
+# admin op. Covers:
+#   - happy-path: HIPAA mode ON → row emits with correct structured fields
+#   - error-path: handler raises → row still emits with error context
+#   - HIPAA-OFF gating: no rows emit (matches H-03 procedural-mechanism scope)
+#   - fail-soft: emission failure logs WARNING but does NOT block the CLI op
+#   - audit-pattern: every DB-mutating handler carries the @_cli_audit
+#     decorator (catches regression: a new admin op added without the
+#     wrapper)
+#
+# Per dispatch H-03-auto + operator policy `project_hipaa_asap_policy.md`:
+# HIPAA findings ship ASAP + audit-trail; defense-in-depth upgrade lands
+# in Cycle 6.
+
+import contextlib
+
+from email_triage.config import (
+    LoggingConfig,
+    PersistenceConfig,
+    SecretsConfig,
+    TriageConfig,
+)
+
+
+@contextlib.contextmanager
+def _hipaa_install(tmp_path, *, hipaa: bool = True):
+    """Stand up a minimal HIPAA-mode install with a master key + DbSecrets.
+
+    Yields a ``TriageConfig`` whose ``persistence.db_path`` points at a
+    fresh tmp_path SQLite DB and whose ``secrets`` are bootstrapped via a
+    keyfile backend (deterministic + side-effect-free; no container
+    secret, no env var).
+
+    Mirrors the cmd_secrets bootstrap pattern at cli.py:431-436 so the
+    HMAC registry is wired identically to a real CLI run. Tears down by
+    clearing the HMAC registry (autouse conftest fixture restores the
+    test key).
+    """
+    import sqlite3
+
+    from email_triage.secrets import (
+        DbSecrets,
+        bootstrap_secrets_from_config,
+        create_secrets_provider,
+        wire_audit_chain_hmac_keys,
+    )
+    from email_triage.web.db import init_db
+
+    from cryptography.fernet import Fernet
+    keyfile = tmp_path / "wrap.key"
+    db_path = tmp_path / "triage.db"
+
+    # Keyfile backend uses the FILE as the Fernet-wrapping key for an
+    # encrypted store on disk. Write a wrap key first, then `bootstrap.set()`
+    # serialises the master key into the store. This mirrors the operator
+    # workflow: generate a wrap key, then `email-triage secrets
+    # init-master-key` populates the master inside the wrapped store.
+    keyfile.write_text(Fernet.generate_key().decode())
+
+    cfg = TriageConfig()
+    cfg.logging = LoggingConfig(level="INFO", format="json", hipaa=hipaa)
+    cfg.persistence = PersistenceConfig(db_path=str(db_path))
+    cfg.secrets = SecretsConfig(
+        backend="keyfile",
+        keyfile_path=str(keyfile),
+        master_key_name="ET_MASTER_KEY",
+        external={},
+    )
+
+    # Generate + save the master key into the wrapped keyfile store
+    # (mirrors `email-triage secrets init-master-key`).
+    bootstrap = create_secrets_provider(
+        cfg.secrets.backend,
+        keyfile_path=cfg.secrets.keyfile_path,
+        external_config=cfg.secrets.external,
+        master_key_name=cfg.secrets.master_key_name,
+    )
+    bootstrap.set(cfg.secrets.master_key_name, DbSecrets.generate_master_key())
+
+    # Init the DB schema so log_entries exists for the emitter.
+    conn = init_db(db_path)
+    provider = bootstrap_secrets_from_config(conn, cfg)
+    wire_audit_chain_hmac_keys(provider, cfg)
+    conn.close()
+
+    yield cfg
+
+
+def _read_audit_rows(db_path) -> list[dict]:
+    """Pull every cli.audit log_entries row from disk, oldest-first."""
+    import json as _json
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT id, ts, level, logger, message, extra_json "
+            "FROM log_entries WHERE logger = 'email_triage.cli.audit' "
+            "ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["extra"] = _json.loads(d["extra_json"]) if d["extra_json"] else {}
+        except Exception:
+            d["extra"] = {}
+        out.append(d)
+    return out
+
+
+@pytest.fixture
+def _hipaa_config_file(tmp_path):
+    """Build a HIPAA-mode install + write a YAML pointing at it.
+
+    Returns (yaml_path, db_path, cfg). The yaml_path can be passed via
+    ``--config`` to any CLI handler; the inner _cli_audit decorator
+    re-loads from disk so the config must be on disk, not just an
+    in-memory TriageConfig.
+    """
+    with _hipaa_install(tmp_path) as cfg:
+        yaml_path = tmp_path / "email-triage.yaml"
+        # Minimal YAML mirroring the SecretsConfig + PersistenceConfig +
+        # LoggingConfig fields the decorator reads.
+        yaml_path.write_text(
+            f"""\
+logging:
+  level: INFO
+  format: json
+  hipaa: true
+
+secrets:
+  backend: keyfile
+  keyfile_path: {cfg.secrets.keyfile_path}
+  master_key_name: ET_MASTER_KEY
+
+persistence:
+  db_path: {cfg.persistence.db_path}
+"""
+        )
+        yield yaml_path, Path(cfg.persistence.db_path), cfg
+
+
+# ---------------------------------------------------------------------------
+# Happy path — HIPAA mode ON
+# ---------------------------------------------------------------------------
+
+class TestCliAuditAutoEmit:
+    def test_user_create_emits_start_and_end_rows(
+        self, _hipaa_config_file, capsys,
+    ):
+        from email_triage.cli import cmd_user
+
+        yaml_path, db_path, _cfg = _hipaa_config_file
+        args = _parse([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "alice@example.com",
+            "--name", "Alice",
+            "--role", "admin",
+        ])
+        rc = cmd_user(args)
+        # Drain stdout — handler prints the create-success block.
+        capsys.readouterr()
+        assert rc == 0
+
+        rows = _read_audit_rows(db_path)
+        # Exactly two rows: start + end.
+        assert len(rows) == 2, [r["message"] for r in rows]
+        start, end = rows
+        assert start["extra"]["cli_phase"] == "start"
+        assert start["extra"]["cli_command"] == "user"
+        assert end["extra"]["cli_phase"] == "end"
+        assert end["extra"]["exit_code"] == 0
+        # Subcommand surfaces via args.user_cmd in the allowlisted args.
+        assert start["extra"]["args"].get("user_cmd") == "create"
+        assert start["extra"]["args"].get("email") == "alice@example.com"
+        assert start["extra"]["args"].get("role") == "admin"
+        # Actor format matches the existing cmd_apikey pattern.
+        assert start["extra"]["actor"].startswith("cli:")
+        # Duration recorded on end row.
+        assert isinstance(end["extra"]["duration_ms"], int)
+        assert end["extra"]["duration_ms"] >= 0
+
+    def test_audit_rows_are_chained_with_hmac(
+        self, _hipaa_config_file, capsys,
+    ):
+        """Auto-emitted rows must participate in the H-02a HMAC chain —
+        verify_log_chain over the resulting rows must PASS."""
+        from email_triage.cli import cmd_user
+        from email_triage.web.db import verify_log_chain
+
+        yaml_path, db_path, _cfg = _hipaa_config_file
+        args = _parse([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "bob@example.com",
+        ])
+        cmd_user(args)
+        capsys.readouterr()
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            result = verify_log_chain(conn)
+        finally:
+            conn.close()
+        assert result["first_break_id"] is None, (
+            f"chain break at id={result['first_break_id']} "
+            f"ts={result['first_break_ts']}"
+        )
+        # At least the two auto-emit rows are present.
+        assert result["rows_checked"] >= 2
+
+
+class TestCliAuditAutoEmitErrorPath:
+    def test_handler_raise_still_emits_end_row_with_error_fields(
+        self, _hipaa_config_file, capsys, monkeypatch,
+    ):
+        """If the wrapped handler raises, the decorator must still emit
+        an 'end' row carrying error_class + error fields, then re-raise.
+        This preserves the forensic context of CLI failures (a silent
+        drop would hide the very evidence §164.312(b) audit controls
+        exist to preserve)."""
+        from email_triage import cli as cli_mod
+
+        yaml_path, db_path, _cfg = _hipaa_config_file
+
+        # Monkeypatch the inner work to raise a known exception.
+        class _Boom(RuntimeError):
+            pass
+
+        def _explode(*a, **kw):
+            raise _Boom("synthetic failure under test")
+
+        # cmd_apikey reads init_db then dispatches; patch init_db so the
+        # handler raises BEFORE doing any work.
+        monkeypatch.setattr(
+            "email_triage.web.auth.get_user_by_email", _explode,
+        )
+
+        args = _parse([
+            "--config", str(yaml_path),
+            "apikey", "create",
+            "--name", "ci-key",
+            "--user", "nobody@example.com",
+        ])
+        with pytest.raises(_Boom):
+            cli_mod.cmd_apikey(args)
+        capsys.readouterr()
+
+        rows = _read_audit_rows(db_path)
+        assert len(rows) == 2
+        start, end = rows
+        assert start["extra"]["cli_phase"] == "start"
+        assert end["extra"]["cli_phase"] == "end"
+        assert end["extra"]["error_class"] == "_Boom"
+        assert "synthetic failure under test" in end["extra"]["error"]
+        # exit_code is absent (handler never returned).
+        assert "exit_code" not in end["extra"]
+        # Duration still recorded.
+        assert isinstance(end["extra"]["duration_ms"], int)
+
+    def test_handler_returns_nonzero_emits_end_row_with_that_code(
+        self, _hipaa_config_file, capsys,
+    ):
+        """When a handler returns 1 (e.g., user-already-exists), the
+        end row records exit_code=1 so operators can grep for failed
+        CLI ops."""
+        from email_triage.cli import cmd_user
+
+        yaml_path, db_path, _cfg = _hipaa_config_file
+
+        # First create succeeds.
+        args = _parse([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "dupe@example.com",
+        ])
+        assert cmd_user(args) == 0
+        capsys.readouterr()
+
+        # Second create returns 1 ("user already exists").
+        args = _parse([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "dupe@example.com",
+        ])
+        assert cmd_user(args) == 1
+        capsys.readouterr()
+
+        rows = _read_audit_rows(db_path)
+        # Two ops × two rows = four; the LAST row carries the rc=1.
+        assert len(rows) == 4
+        assert rows[-1]["extra"]["cli_phase"] == "end"
+        assert rows[-1]["extra"]["exit_code"] == 1
+
+
+class TestCliAuditAutoEmitHipaaGating:
+    def test_non_hipaa_mode_emits_no_audit_rows(self, tmp_path, capsys):
+        """HIPAA-mode-gated design Q decision: non-HIPAA installs
+        produce ZERO auto-emit rows. Rationale (per cli.py H-03-auto
+        design block): §164.312(b) only applies in HIPAA mode; H-02a
+        D1 fail-closed RuntimeErrors on log_entries write without HMAC
+        wiring, which non-HIPAA installs may not have; the non-HIPAA
+        posture matches the H-03 procedural-mechanism scope."""
+        from email_triage.cli import cmd_user
+
+        with _hipaa_install(tmp_path, hipaa=False) as cfg:
+            yaml_path = tmp_path / "email-triage.yaml"
+            yaml_path.write_text(
+                f"""\
+logging:
+  level: INFO
+  format: json
+  hipaa: false
+
+secrets:
+  backend: keyfile
+  keyfile_path: {cfg.secrets.keyfile_path}
+  master_key_name: ET_MASTER_KEY
+
+persistence:
+  db_path: {cfg.persistence.db_path}
+"""
+            )
+
+            args = _parse([
+                "--config", str(yaml_path),
+                "user", "create",
+                "--email", "noaudit@example.com",
+            ])
+            rc = cmd_user(args)
+            capsys.readouterr()
+            assert rc == 0
+
+            # No cli.audit rows landed.
+            rows = _read_audit_rows(Path(cfg.persistence.db_path))
+            assert rows == [], (
+                f"non-HIPAA mode must not emit CLI audit rows; got "
+                f"{len(rows)} rows: {[r['message'] for r in rows]}"
+            )
+
+
+class TestCliAuditAutoEmitFailSoft:
+    def test_emission_failure_logs_warning_but_does_not_block_handler(
+        self, _hipaa_config_file, capsys, caplog, monkeypatch,
+    ):
+        """The defense-in-depth audit MUST NOT block the underlying CLI
+        op. The procedural H-03 closure (break-glass actions_taken in
+        INCIDENT_RESPONSE.md) remains the fallback per §164.312(b)'s
+        'and/or procedural' reading."""
+        import logging as _logging
+        from email_triage import cli as cli_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+
+        # Sabotage the emit path. Patch insert_log_entry at the import
+        # site the decorator uses (it imports lazily inside the helper).
+        from email_triage.db import audit as _audit_mod
+
+        def _explode(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        monkeypatch.setattr(_audit_mod, "insert_log_entry", _explode)
+
+        args = _parse([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "soft@example.com",
+        ])
+
+        with caplog.at_level(_logging.WARNING, logger="email_triage.cli"):
+            rc = cli_mod.cmd_user(args)
+        capsys.readouterr()
+
+        # CLI op succeeded despite emit failure.
+        assert rc == 0
+        # WARNING was logged surfacing the auto-emit failure (operator
+        # can investigate; procedural fallback covers compliance posture).
+        warn_msgs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= _logging.WARNING
+        ]
+        assert any("H-03-auto" in m for m in warn_msgs), (
+            f"expected H-03-auto warning, got: {warn_msgs}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Audit-pattern test — every DB-mutating CLI handler carries the wrapper
+# ---------------------------------------------------------------------------
+
+class TestCliAuditPattern:
+    """Regression guard: if a new DB-mutating CLI subcommand lands
+    without ``@_cli_audit(...)``, this test fails so the operator
+    notices the H-03-auto coverage gap in the same PR.
+
+    Per dispatch §4 principle 3 (audit the pattern before fixing): the
+    enumeration below is the authoritative list of admin CLI handlers
+    that must be wrapped. Read-only handlers (status, config validate,
+    audit verify, version-check, embedding-bits {verify,status}) are
+    intentionally EXCLUDED — they do not mutate persistent state and
+    fall outside the §164.312(b) audit-control surface.
+
+    Adding a new admin CLI handler? Add the wrapper AND extend the list
+    below (the test is the schelling-point that ensures both halves of
+    the change land in the same commit).
+    """
+
+    REQUIRED_WRAPPED_HANDLERS = {
+        "cmd_secrets": "secrets",
+        "cmd_apikey": "apikey",
+        "cmd_user": "user",
+        "cmd_restore": "restore",
+        "cmd_style_profile": "style-profile",
+        "cmd_sent_mail_index": "sent-mail-index",
+        "cmd_embedding_bits_install": "embedding-bits.install",
+        "cmd_embedding_bits_sideload": "embedding-bits.sideload",
+        "cmd_tls_bootstrap": "tls.bootstrap",
+        "cmd_tls_fetch_tailscale": "tls.fetch-tailscale",
+        "cmd_auth_dev_login": "auth.dev-login",
+    }
+
+    def test_every_admin_handler_carries_cli_audit_decorator(self):
+        from email_triage import cli as cli_mod
+
+        missing = []
+        wrong_label = []
+        for handler_name, expected_command in (
+            self.REQUIRED_WRAPPED_HANDLERS.items()
+        ):
+            fn = getattr(cli_mod, handler_name, None)
+            assert fn is not None, (
+                f"handler not found in cli module: {handler_name}"
+            )
+            label = getattr(fn, "_h03_auto_command", None)
+            if label is None:
+                missing.append(handler_name)
+            elif label != expected_command:
+                wrong_label.append((handler_name, label, expected_command))
+        assert not missing, (
+            "H-03-auto coverage gap — admin CLI handlers missing the "
+            "@_cli_audit decorator:\n  " + "\n  ".join(missing)
+        )
+        assert not wrong_label, (
+            "H-03-auto label mismatch — fix the decorator argument:\n  "
+            + "\n  ".join(
+                f"{h}: got {got!r}, expected {exp!r}"
+                for h, got, exp in wrong_label
+            )
+        )

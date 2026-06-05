@@ -1,4 +1,4 @@
-"""Shared OAuth-HTTP requester for Gmail + O365 providers (#138.4).
+"""Shared OAuth-HTTP requester for Gmail + O365 providers.
 
 Both providers carried a near-identical 30-line ``_request`` method:
 look up the cached httpx client, attach the bearer token, fire the
@@ -11,7 +11,7 @@ specific error class on >=400. The two methods diverged on:
 * the error class shape (``GmailApiError(status, body, path)`` vs.
   ``GraphError(status, body, path)``).
 
-Phase 2 (#138 phase 2) lifts both ``_request`` bodies onto
+Phase 2 lifts both ``_request`` bodies onto
 :func:`oauth_request`. The auth-attach divergence is solved by a
 caller-supplied ``attach_auth(headers, token) -> dict`` callable
 that returns the per-request ``headers`` dict — so each provider
@@ -20,7 +20,7 @@ reimplement the 401-refresh-retry loop.
 
 Companion :func:`refresh_lock_for` returns a per-instance
 ``asyncio.Lock`` used by the providers' refresh paths to prevent
-concurrent-refresh thundering herd (#142). The lock lives on the
+concurrent-refresh thundering herd. The lock lives on the
 provider instance; this module only formalises the access pattern.
 """
 
@@ -78,7 +78,7 @@ async def oauth_request(
             ``Authorization: Bearer <token>``. Gmail + O365 both use
             the default — the historical "mutate client default
             headers" path on O365 was load-bearing nowhere and is
-            collapsed in #138 phase 2.
+            collapsed in  phase 2.
         refresh_token: Callable returning a fresh token (awaitable).
         initial_token: Token to try on the first attempt.
         error_factory: Callable returning the provider-specific

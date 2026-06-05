@@ -1,4 +1,4 @@
-"""Concurrent triage on the same UID short-circuits at the in-flight gate (#114).
+"""Concurrent triage on the same UID short-circuits at the in-flight gate.
 
 When two triage paths fire on the same (account, UID) within a few
 seconds — push delivery + IMAP poll cycle being the canonical case —

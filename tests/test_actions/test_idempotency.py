@@ -75,29 +75,32 @@ def test_compute_idempotency_key_is_stable():
     assert a != _compute_idempotency_key("f1", "draft_reply", "m2")
 
 
-def test_check_returns_none_on_first_run():
+@pytest.mark.asyncio
+async def test_check_returns_none_on_first_run():
     flow = _make_flow()
     msg = _make_message()
-    assert check_idempotent_already_done(flow, msg, "draft_reply") is None
+    assert await check_idempotent_already_done(flow, msg, "draft_reply") is None
 
 
-def test_record_then_check_returns_skipped():
+@pytest.mark.asyncio
+async def test_record_then_check_returns_skipped():
     flow = _make_flow()
     msg = _make_message()
-    record_idempotent_done(
+    await record_idempotent_done(
         flow, msg, "draft_reply", external_id="draft-123",
     )
-    out = check_idempotent_already_done(flow, msg, "draft_reply")
+    out = await check_idempotent_already_done(flow, msg, "draft_reply")
     assert out is not None
     assert out.result == ActionResult.SKIPPED
     assert out.data["skipped_idempotent"] is True
     assert out.data["previous_external_id"] == "draft-123"
 
 
-def test_record_action_results_structure():
+@pytest.mark.asyncio
+async def test_record_action_results_structure():
     flow = _make_flow()
     msg = _make_message()
-    record_idempotent_done(
+    await record_idempotent_done(
         flow, msg, "move", external_id="Archive",
     )
     bag = flow.state_bag
@@ -111,7 +114,8 @@ def test_record_action_results_structure():
     assert entry["completed_at"]
 
 
-def test_check_with_stale_key_returns_none():
+@pytest.mark.asyncio
+async def test_check_with_stale_key_returns_none():
     """If the recorded key was for a DIFFERENT flow/action/message,
     the check returns None so the action runs fresh."""
     flow = _make_flow("f1")
@@ -125,7 +129,7 @@ def test_check_with_stale_key_returns_none():
             }
         }
     }
-    assert check_idempotent_already_done(flow, msg, "draft_reply") is None
+    assert await check_idempotent_already_done(flow, msg, "draft_reply") is None
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +291,113 @@ async def test_label_records_audit_entry():
     assert "label" in flow.state_bag.get("action_results", {})
     entry = flow.state_bag["action_results"]["label"]
     assert entry["external_id"] == "invoices"
+
+
+# ---------------------------------------------------------------------------
+# Durable store — action_idempotency table
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def idem_db(tmp_path):
+    """A fully-migrated DB connection (carries the v34 action_idempotency
+    table) for the durable-idempotency tests. Seeds user 1 so
+    create_email_account satisfies the email_accounts.user_id FK."""
+    from email_triage.web.db import init_db
+    conn = init_db(tmp_path / "idem.db")
+    conn.execute(
+        "INSERT INTO users (email, name, role, created_at) "
+        "VALUES ('pi@example.com', 'PI', 'admin', ?)",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.commit()
+    yield conn
+    conn.close()
+
+
+def _make_account(conn) -> int:
+    from email_triage.web.db import create_email_account
+    return create_email_account(
+        conn, user_id=1, name="acct", provider_type="imap",
+        config={"host": "imap.example.com"},
+    )
+
+
+def _durable_flow(conn, account_id: int, flow_id: str = "f1") -> FlowState:
+    """A flow whose state_bag carries db + account_id — so the
+    idempotency helpers take the durable action_idempotency path."""
+    return FlowState(
+        flow_id=flow_id,
+        provider="imap",
+        message_id="m1",
+        status=FlowStatus.ACTING,
+        state_bag={"db": conn, "account_id": account_id},
+    )
+
+
+def _msg_with_rfc_id(rfc_id: str = "<msg-1@example.com>") -> EmailMessage:
+    m = _make_message()
+    m.headers = {"Message-ID": rfc_id}
+    return m
+
+
+@pytest.mark.asyncio
+async def test_durable_record_then_check_skips(idem_db):
+    acct = _make_account(idem_db)
+    msg = _msg_with_rfc_id()
+    flow = _durable_flow(idem_db, acct)
+    assert await check_idempotent_already_done(flow, msg, "draft_reply") is None
+    await record_idempotent_done(
+        flow, msg, "draft_reply", external_id="draft-99")
+    out = await check_idempotent_already_done(flow, msg, "draft_reply")
+    assert out is not None
+    assert out.result == ActionResult.SKIPPED
+    assert out.data["skipped_idempotent"] is True
+    assert out.data["previous_external_id"] == "draft-99"
+
+
+@pytest.mark.asyncio
+async def test_durable_skip_survives_new_flow_id(idem_db):
+    """The  fix: a fresh FlowState with a DIFFERENT flow_id — as the
+    watcher / runner / bulk paths build per action, and as a
+    retry-queue re-run or container restart produces — still sees the
+    prior action as done. The old per-flow state_bag mechanism could
+    not (the flow_id was in the key and the bag was never persisted)."""
+    acct = _make_account(idem_db)
+    msg = _msg_with_rfc_id()
+    await record_idempotent_done(
+        _durable_flow(idem_db, acct, flow_id="flowA"), msg, "draft_reply",
+    )
+    out = await check_idempotent_already_done(
+        _durable_flow(idem_db, acct, flow_id="flowB"), msg, "draft_reply",
+    )
+    assert out is not None
+    assert out.result == ActionResult.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_durable_isolated_by_account_and_action(idem_db):
+    acct1 = _make_account(idem_db)
+    acct2 = _make_account(idem_db)
+    msg = _msg_with_rfc_id()
+    await record_idempotent_done(_durable_flow(idem_db, acct1), msg, "move")
+    # Different account — must NOT skip.
+    assert await check_idempotent_already_done(
+        _durable_flow(idem_db, acct2), msg, "move") is None
+    # Same account, different action — must NOT skip.
+    assert await check_idempotent_already_done(
+        _durable_flow(idem_db, acct1), msg, "label") is None
+
+
+@pytest.mark.asyncio
+async def test_no_rfc_id_falls_back_to_state_bag(idem_db):
+    """A message with no Message-ID can't key the durable store — the
+    helpers fall back to the per-flow state_bag record."""
+    acct = _make_account(idem_db)
+    msg = _make_message()  # headers={} — no Message-ID
+    flow = _durable_flow(idem_db, acct)
+    await record_idempotent_done(flow, msg, "notify")
+    assert "notify" in flow.state_bag.get("action_results", {})
+    out = await check_idempotent_already_done(flow, msg, "notify")
+    assert out is not None
+    assert out.result == ActionResult.SKIPPED

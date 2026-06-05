@@ -29,6 +29,7 @@ from email_triage.web.db import (
     set_setting,
     upsert_gmail_watch,
 )
+from email_triage.web.triage_one import TriageMessageResult
 
 
 TEST_SECRET = "test-session-secret-for-signing"
@@ -301,6 +302,140 @@ class TestUnifiedPollLoop:
         assert args.args[1] == 100
 
     @pytest.mark.asyncio
+    async def test_poll_hwm_holds_back_on_unrecoverable_error(
+        self, client, db, admin_user,
+    ):
+        """ — a poll batch [uid 1, 2, 3] where message 2 errors AND
+        its retry-enqueue fails must advance the mailbox HWM only to
+        uid 1, not uid 3. Without the contiguous-safe-run discipline,
+        uid 2 would be left below the HWM forever — never re-walked,
+        never retried."""
+        from email_triage.web.app import _poll_once_imap
+        from email_triage.web.db import (
+            get_email_account, get_mailbox_hwm, set_mailbox_hwm,
+        )
+        from email_triage.engine.models import EmailMessage
+
+        aid = _make_imap_account(db, admin_user["id"], config={
+            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+        })
+        set_mailbox_hwm(db, aid, "INBOX", {"uid": 0, "updated_at": "x"})
+
+        def _m(uid: int) -> EmailMessage:
+            return EmailMessage(
+                message_id=str(uid), provider="imap",
+                sender="a@x.com", recipients=["op@x.com"],
+                subject="s", body_text="b",
+                date=datetime.now(timezone.utc),
+                headers={"Message-ID": f"<{uid}@x.com>"},
+            )
+
+        fake_provider = MagicMock()
+        fake_provider.poll_once = AsyncMock(
+            return_value=[_m(1), _m(2), _m(3)],
+        )
+        fake_provider.get_uidvalidity = AsyncMock(return_value=55)
+        fake_provider.get_latest_uid = AsyncMock(return_value=3)
+        fake_provider.close = AsyncMock(return_value=None)
+
+        # triage_single_message: uid 1 + 3 process OK, uid 2 errors.
+        async def _fake_triage(ctx, message, msg_id, **kw):
+            if msg_id == "2":
+                return TriageMessageResult(
+                    status="e", entry={"error": "fetch blew up"},
+                )
+            return TriageMessageResult(status="p", entry={"message_id": msg_id})
+
+        # enqueue_watcher_retry FAILS for uid 2 (returns None) — the
+        # message could NOT be durably parked, so the HWM must hold.
+        def _fake_enqueue(*a, **kw):
+            return None
+
+        from unittest.mock import patch as _patch
+        with _patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), _patch(
+            "email_triage.web.triage_one.triage_single_message",
+            new=_fake_triage,
+        ), _patch(
+            "email_triage.web.watcher_retry.enqueue_watcher_retry",
+            new=_fake_enqueue,
+        ):
+            acct = get_email_account(db, aid)
+            await _poll_once_imap(client.app, acct)
+
+        hwm = get_mailbox_hwm(db, aid, "INBOX") or {}
+        # HWM advanced past uid 1 only — uid 2 (errored + un-enqueued)
+        # caps the contiguous safe run; uid 3 is NOT counted because
+        # the run already froze at uid 2.
+        assert int(hwm.get("uid", 0)) == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_hwm_advances_when_retry_enqueued(
+        self, client, db, admin_user,
+    ):
+        """ — counterpart: when message 2 errors but its retry IS
+        durably enqueued, the HWM may advance past it (the drainer owns
+        the re-walk). The run stays open through uid 3."""
+        from email_triage.web.app import _poll_once_imap
+        from email_triage.web.db import (
+            get_email_account, get_mailbox_hwm, set_mailbox_hwm,
+        )
+        from email_triage.engine.models import EmailMessage
+
+        aid = _make_imap_account(db, admin_user["id"], config={
+            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+        })
+        set_mailbox_hwm(db, aid, "INBOX", {"uid": 0, "updated_at": "x"})
+
+        def _m(uid: int) -> EmailMessage:
+            return EmailMessage(
+                message_id=str(uid), provider="imap",
+                sender="a@x.com", recipients=["op@x.com"],
+                subject="s", body_text="b",
+                date=datetime.now(timezone.utc),
+                headers={"Message-ID": f"<{uid}@x.com>"},
+            )
+
+        fake_provider = MagicMock()
+        fake_provider.poll_once = AsyncMock(
+            return_value=[_m(1), _m(2), _m(3)],
+        )
+        fake_provider.get_uidvalidity = AsyncMock(return_value=55)
+        fake_provider.get_latest_uid = AsyncMock(return_value=3)
+        fake_provider.close = AsyncMock(return_value=None)
+
+        async def _fake_triage(ctx, message, msg_id, **kw):
+            if msg_id == "2":
+                return TriageMessageResult(
+                    status="e", entry={"error": "fetch blew up"},
+                )
+            return TriageMessageResult(status="p", entry={"message_id": msg_id})
+
+        # enqueue SUCCEEDS (returns a row id) for uid 2.
+        def _fake_enqueue(*a, **kw):
+            return 4242
+
+        from unittest.mock import patch as _patch
+        with _patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), _patch(
+            "email_triage.web.triage_one.triage_single_message",
+            new=_fake_triage,
+        ), _patch(
+            "email_triage.web.watcher_retry.enqueue_watcher_retry",
+            new=_fake_enqueue,
+        ):
+            acct = get_email_account(db, aid)
+            await _poll_once_imap(client.app, acct)
+
+        hwm = get_mailbox_hwm(db, aid, "INBOX") or {}
+        # uid 2 was durably enqueued → "safe" → run continues → HWM at 3.
+        assert int(hwm.get("uid", 0)) == 3
+
+    @pytest.mark.asyncio
     async def test_unified_poll_o365_is_noop_without_crash(
         self, client, db, admin_user,
     ):
@@ -336,14 +471,29 @@ class TestImapPollOnce:
     """Direct tests against ``ImapProvider.poll_once``. The aioimaplib
     client is mocked."""
 
-    def _make_provider_with_client(self, client_mock):
+    def _make_provider_with_client(self, client_mock, monkeypatch):
         import sys as _sys
         _mock_aioimaplib = MagicMock()
         _mock_aioimaplib.IMAP4_SSL = MagicMock
         _mock_aioimaplib.IMAP4 = MagicMock
-        _sys.modules["aioimaplib"] = _mock_aioimaplib
+        # Abort must be a real exception class — poll_once's
+        # _ensure_authenticated pre-flight does `raise
+        # aioimaplib.Abort(...)` / `except aioimaplib.Abort`, which a
+        # bare MagicMock attribute cannot satisfy.
+        _mock_aioimaplib.Abort = type("Abort", (Exception,), {})
+        # monkeypatch (not a raw assignment) so the mocked module is
+        # reverted at test teardown. A leaked sys.modules["aioimaplib"]
+        # MagicMock corrupts later watcher-reconnect tests in this file
+        # (they create real IMAP watchers whose reconnect path then
+        # races on SQLite — "bad parameter or other API misuse").
+        monkeypatch.setitem(_sys.modules, "aioimaplib", _mock_aioimaplib)
         import email_triage.providers.imap as imap_mod
-        imap_mod.HAS_AIOIMAPLIB = True
+        monkeypatch.setattr(imap_mod, "HAS_AIOIMAPLIB", True)
+        # A real connected aioimaplib client reports a string protocol
+        # state from get_state() ("AUTH"/"SELECTED"). The poll_once
+        # pre-flight auth check reads it; a bare MagicMock would
+        # return a MagicMock and fall through to the NONAUTH branch.
+        client_mock.get_state.return_value = "AUTH"
         p = imap_mod.ImapProvider(
             host="m", username="u", password="p", mailbox="INBOX",
         )
@@ -351,11 +501,13 @@ class TestImapPollOnce:
         return p
 
     @pytest.mark.asyncio
-    async def test_poll_once_empty_result_when_no_new_messages(self):
+    async def test_poll_once_empty_result_when_no_new_messages(
+        self, monkeypatch,
+    ):
         client = MagicMock()
         client.select = AsyncMock(return_value=("OK", [b""]))
         client.search = AsyncMock(return_value=("OK", [b""]))
-        p = self._make_provider_with_client(client)
+        p = self._make_provider_with_client(client, monkeypatch)
         result = await p.poll_once("INBOX", since_uid=1000)
         assert result == []
         # Plain SEARCH was invoked (NOT uid("search", ...) — aioimaplib
@@ -365,12 +517,14 @@ class TestImapPollOnce:
         assert "UID 1001:*" in " ".join(str(a) for a in call.args)
 
     @pytest.mark.asyncio
-    async def test_poll_once_seeds_from_zero_returns_empty(self):
+    async def test_poll_once_seeds_from_zero_returns_empty(
+        self, monkeypatch,
+    ):
         """since_uid=0 means fresh HWM — return [] and let the caller
         seed the HWM from get_latest_uid. Prevents the poll from
         dumping the entire backlog."""
         client = MagicMock()
-        p = self._make_provider_with_client(client)
+        p = self._make_provider_with_client(client, monkeypatch)
         result = await p.poll_once("INBOX", since_uid=0)
         assert result == []
         # No IMAP call was even issued.
@@ -379,7 +533,9 @@ class TestImapPollOnce:
         ) else None
 
     @pytest.mark.asyncio
-    async def test_poll_once_returns_new_messages_since_hwm(self):
+    async def test_poll_once_returns_new_messages_since_hwm(
+        self, monkeypatch,
+    ):
         """SEARCH returns seq numbers; FETCH maps to UIDs; each is
         parsed into an EmailMessage."""
         from email_triage.engine.models import EmailMessage
@@ -392,7 +548,7 @@ class TestImapPollOnce:
             "OK",
             [b"5 FETCH (UID 101)", b"6 FETCH (UID 102)"],
         ))
-        p = self._make_provider_with_client(client)
+        p = self._make_provider_with_client(client, monkeypatch)
 
         fake_msg = EmailMessage(
             message_id="101", provider="imap",
@@ -409,7 +565,9 @@ class TestImapPollOnce:
         assert len(messages) == 2
 
     @pytest.mark.asyncio
-    async def test_poll_once_uses_plain_search_not_uid_search(self):
+    async def test_poll_once_uses_plain_search_not_uid_search(
+        self, monkeypatch,
+    ):
         """Regression for the Apr 22 live error:
             command UID only possible with COPY, FETCH, EXPUNGE
             (w/UIDPLUS) or STORE (was SEARCH)
@@ -420,7 +578,7 @@ class TestImapPollOnce:
         client.select = AsyncMock(return_value=("OK", [b""]))
         client.search = AsyncMock(return_value=("OK", [b""]))
         client.uid = AsyncMock(return_value=("OK", [b""]))
-        p = self._make_provider_with_client(client)
+        p = self._make_provider_with_client(client, monkeypatch)
         await p.poll_once("INBOX", since_uid=1000)
         # Plain SEARCH must be used.
         client.search.assert_awaited_once()

@@ -84,7 +84,7 @@ class GmailApiError(Exception):
         self.body = body
         self.url = url
         if isinstance(body, dict):
-            # Defensive scrub (#168 hardening): before any str(body)
+            # Defensive scrub: before any str(body)
             # fallback can fire, drop any key whose name matches the
             # canonical _TOKEN_KEYS frozenset. No call site triggers a
             # success-shape body today — Google's 4xx bodies always
@@ -185,7 +185,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
         instead of letting Google's generic "client_secret is missing"
         surface on the first API call of a triage run.
 
-        Wrapped in a per-instance ``asyncio.Lock`` (#142) to prevent
+        Wrapped in a per-instance ``asyncio.Lock`` to prevent
         the thundering-herd refresh + orphan httpx-client problem when
         N concurrent API calls all hit a 401 simultaneously. The lock
         check inside the critical section short-circuits the second
@@ -248,7 +248,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
     async def _get_client(self) -> httpx.AsyncClient:
         """Lazy-init the httpx.AsyncClient.
 
-        Wrapped in the per-instance lock (#142) so two concurrent
+        Wrapped in the per-instance lock so two concurrent
         coroutines can't both observe ``self._http is None`` and each
         construct their own client — the second would overwrite the
         first and orphan a live httpx connection pool.
@@ -275,7 +275,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
     ) -> Any:
         """Authenticated Gmail API request with 401 retry.
 
-        Body lifted onto :func:`oauth_request` in #138 phase 2; the
+        Body lifted onto :func:`oauth_request` in  phase 2; the
         dialect-specific bits (per-request ``Authorization`` header
         + the typed :class:`GmailApiError` factory) ride into the
         shared helper as callbacks.
@@ -346,7 +346,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
         from that page directly. pageTokens have a TTL on Google's
         side (typically days, not hours, but undocumented) — if the
         token has expired, Gmail rejects the request and the runner
-        falls back to a fresh walk while the dedup table (#101 step
+        falls back to a fresh walk while the dedup table ( step
         8) catches duplicates from already-processed UIDs.
         """
         page_size = min(int(batch_size), 500)
@@ -381,8 +381,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
     def _translate_imap_query(q: str) -> str:
         """Best-effort IMAP SEARCH → Gmail q= translation.
 
-        Delegates to :func:`engine.query_lang.translate_imap_query_to_gmail`
-        (#138.3). Recognises the tokens the digest + triage handlers
+        Delegates to :func:`engine.query_lang.translate_imap_query_to_gmail`. Recognises the tokens the digest + triage handlers
         currently emit: ``UNSEEN`` / ``SEEN`` / ``ALL`` / ``SINCE`` /
         ``BEFORE``. Tokens already in Gmail shape pass through.
         """
@@ -393,7 +392,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
     def _translate_filter(filt) -> str:
         """MailFilter → Gmail search-operator string.
 
-        Delegates to :func:`engine.query_lang.emit_gmail_filter` (#138.3).
+        Delegates to :func:`engine.query_lang.emit_gmail_filter`.
         """
         from email_triage.engine.query_lang import emit_gmail_filter
         return emit_gmail_filter(filt)
@@ -486,7 +485,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
 
     def _normalise(self, data: dict[str, Any], message_id: str) -> EmailMessage:
         """Extract Gmail-dialect fields and hand off to the shared
-        :func:`providers._normalize.build_email_message` helper (#145.8).
+        :func:`providers._normalize.build_email_message` helper.
 
         Provider-specific work — header dict construction, internalDate
         parsing, MIME tree walk for body / html / attachments — stays
@@ -582,11 +581,19 @@ class GmailApiProvider(EmailProvider, PushCapable):
                         if "filename=" in v:
                             filename = v.split("filename=", 1)[1].strip(' ";')
                             break
+                #  / N-03 — drop raw bytes after parse_ics has
+                # consumed them. The `parsed` dict is the only
+                # downstream consumer (actions/invite.py reads
+                # att.parsed; nothing reads att.data anywhere in src/).
+                # Keeping the blob would extend in-memory PHI residency
+                # on the Attachment for the rest of the flow lifetime,
+                # widening §164.308(a)(1)(ii)(B) Risk Management
+                # (availability axis) surface for no consumer benefit.
                 out.append(Attachment(
                     filename=filename or "invite.ics",
                     content_type="text/calendar",
                     size_bytes=int(body.get("size") or len(blob)),
-                    data=blob or None,
+                    data=None,
                     parsed=parsed,
                 ))
                 return

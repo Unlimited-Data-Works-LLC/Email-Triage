@@ -1,6 +1,6 @@
 """Privacy invariant — embedding-bits installer makes NO telemetry calls.
 
-The lazy-install path (#180) downloads wheels + model files over
+The lazy-install path downloads wheels + model files over
 HTTPS. The only URLs the installer is permitted to contact are the
 ones listed in scripts/embedding-bits-manifest.json (resolved via
 PyPI JSON API for placeholder PyPI URLs at build time, baked into

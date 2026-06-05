@@ -316,7 +316,7 @@ class TestListsAPI:
 
 
 class TestInlineFirstRuleAndEmptyBanner:
-    """Bundle L / #146 — Classification-list create form leaves list inert.
+    """Bundle L /  — Classification-list create form leaves list inert.
 
     Two halves of one fix:
     1. /rules/create accepts an optional first rule (rule_type, pattern,

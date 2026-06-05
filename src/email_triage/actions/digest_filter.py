@@ -35,6 +35,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from email_triage._isotime import parse_iso
 from email_triage.actions.digest_configs import (
     DigestConfig, DigestFilter, DigestWindow,
 )
@@ -147,13 +148,13 @@ def resolve_window(
 
 
 def _parse_iso(raw: str | None) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if dt.tzinfo is None:
+    """Parse an ISO timestamp, defaulting a naive result to UTC.
+
+    Thin wrapper over :func:`email_triage._isotime.parse_iso` — adds
+    only the UTC default this module's time-window math relies on.
+    """
+    dt = parse_iso(raw)
+    if dt is not None and dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 

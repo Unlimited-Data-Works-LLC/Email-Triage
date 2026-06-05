@@ -1,4 +1,4 @@
-"""Help / how-to runbook surface (#128).
+"""Help / how-to runbook surface.
 
 Static, anonymous-accessible task walkthroughs for end users + medical
 researchers. The page is intentionally non-PHI: every example is generic
@@ -37,10 +37,13 @@ async def help_tasks(request: Request):
     """
     from email_triage.web.routers.ui import _render
     from email_triage.web.dependencies import get_current_user
+    from email_triage.web.db_threadpool import db_call
 
     templates = get_templates(request)
-    user = get_current_user(request)
-    return _render(
+    #  — get_current_user takes the DB write lock (verify_api_key
+    # is @db_write); run it off the event-loop thread.
+    user = await db_call(get_current_user, request)
+    return await _render(
         templates, request, "help/tasks.html",
         {"user": user},
     )
@@ -67,10 +70,13 @@ async def help_integrations(request: Request):
     """
     from email_triage.web.routers.ui import _render
     from email_triage.web.dependencies import get_current_user
+    from email_triage.web.db_threadpool import db_call
 
     templates = get_templates(request)
-    user = get_current_user(request)
-    return _render(
+    #  — get_current_user takes the DB write lock (verify_api_key
+    # is @db_write); run it off the event-loop thread.
+    user = await db_call(get_current_user, request)
+    return await _render(
         templates, request, "help/integrations.html",
         {"user": user},
     )

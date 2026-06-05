@@ -1,4 +1,4 @@
-"""Tests for punch list #162 — alias-aware writing-style learning.
+"""Tests for punch list  — alias-aware writing-style learning.
 
 When an operator has multiple addresses on the same account (primary +
 aliases), the per-alias toggle on ``/profile/style-data`` partitions the
@@ -661,8 +661,8 @@ class TestPrivacyInvariantPin:
         )
 
         forbidden = (
-            "Alex", "Maintainer", "friend", "family-member",
-            "therealms", "agents-host", "deploy-host", "redis-host",
+            "bob", "Doe", "exampleuser", "exampleuser",
+            "examplerealm", "the gateway host", "the deploy host", "the filter host",
         )
         sources = [
             inspect.getsource(fn)

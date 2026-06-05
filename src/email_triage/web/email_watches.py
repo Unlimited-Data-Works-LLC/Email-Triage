@@ -1,6 +1,6 @@
 """Email watches — operator-defined match-and-fire on incoming mail.
 
-Punch-list #100. A watch is a lightweight rule that fires action(s)
+the backlog . A watch is a lightweight rule that fires action(s)
 when a freshly-classified message matches a filter. Use cases:
 
     * "Text me when my boss writes." → escalate (SMS gateway)
@@ -375,7 +375,7 @@ def upsert_watch(db: sqlite3.Connection, w: EmailWatch) -> EmailWatch:
 
 
 # ---------------------------------------------------------------------------
-# Group helpers — #154 (/profile/watches uses these to render N rows
+# Group helpers —  (/profile/watches uses these to render N rows
 # that share a watch_group_id as one logical row for editing).
 # ---------------------------------------------------------------------------
 

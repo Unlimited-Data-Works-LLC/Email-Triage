@@ -48,9 +48,9 @@ from __future__ import annotations
 
 import html
 from collections import OrderedDict
-from datetime import datetime
 from typing import Any, Callable
 
+from email_triage._isotime import parse_iso
 from email_triage.actions.digest_configs import DigestConfig
 from email_triage.actions.recipient_digest import (
     HIPAA_REASON_BY_SOURCE, HIPAA_REASON_DEFAULT, REASON_TRUNCATE,
@@ -78,11 +78,10 @@ def _render_reason(entry: dict[str, Any], hipaa: bool) -> str:
 
 def _format_datetime(entry: dict[str, Any], fallback_iso: str) -> str:
     raw = entry.get("date") or fallback_iso or ""
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
+    dt = parse_iso(raw)
+    if dt is None:
         return str(raw)[:16]
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _preview(entry: dict[str, Any], hipaa: bool) -> str:
@@ -180,11 +179,10 @@ def _group_key(entry: dict[str, Any], group_by: str, fallback_iso: str) -> str:
         return str(headers.get("X-Email-Triage-Folder") or "INBOX")
     if group_by == "day":
         raw = entry.get("date") or fallback_iso or ""
-        try:
-            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d")
-        except (TypeError, ValueError):
+        dt = parse_iso(raw)
+        if dt is None:
             return "unknown"
+        return dt.strftime("%Y-%m-%d")
     if group_by == "sender":
         # Use the From header verbatim. Display-name extraction
         # (e.g. "Stratechery <ben@stratechery.com>" → "Stratechery")

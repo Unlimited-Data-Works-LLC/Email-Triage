@@ -253,7 +253,7 @@ class TestMailBulk:
 
 
 # ---------------------------------------------------------------------------
-# Bulk namespace migration (item #31) — legacy vs canonical mail/calendar
+# Bulk namespace migration (item ) — legacy vs canonical mail/calendar
 # bulk-write paths. Both resolve to the same handler; legacy stamps
 # Deprecation + Sunset + Link headers, canonical does not.
 # ---------------------------------------------------------------------------

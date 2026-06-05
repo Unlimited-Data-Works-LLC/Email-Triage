@@ -1,6 +1,6 @@
 """Routes for the triage_classify concern.
 
-Split out of the legacy `web/routers/ui.py` (#144). Helpers
+Split out of the legacy `web/routers/ui.py`. Helpers
 live in `_shared`; this file holds only the @router-decorated
 handlers + handler-local helpers for this URL surface.
 No behavior changes from pre-split — every handler body is
@@ -42,7 +42,8 @@ from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
-    get_current_user,
+    RequireUser,
+    RequireUserFragment,
     get_session_secret,
     require_auth,
     require_role,
@@ -50,6 +51,7 @@ from email_triage.web.dependencies import (
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
 
+# async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.triage_classify")
 
 router = APIRouter()
@@ -58,7 +60,7 @@ router = APIRouter()
 def __getattr__(name):
     """Route reads of legacy install-singleton names through the factory.
 
-    The factory module (#138.1) now owns ``_install_google_oauth`` and
+    The factory module now owns ``_install_google_oauth`` and
     ``_install_ingestion_config``. Code that did
     ``from email_triage.web.routers.ui import _install_ingestion_config``
     (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
@@ -99,8 +101,8 @@ def __getattr__(name):
 
 
 @router.get("/classify", response_class=HTMLResponse)
-async def classify_page(request: Request):
-    """Test-classify page — open to any authenticated user (#95 sub-E).
+async def classify_page(request: Request, user: RequireUser):
+    """Test-classify page — open to any authenticated user.
 
     Useful to investigate why a specific message classified the way
     it did, regardless of admin role. Categories shown to the user
@@ -108,26 +110,21 @@ async def classify_page(request: Request):
     case in classify_run); no admin-only data leaks via the test
     surface.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     templates = get_templates(request)
-    return _render(templates, request, "classify.html", {"user": user})
+    return await _render(templates, request, "classify.html", {"user": user})
 
 
 @router.post("/classify/run", response_class=HTMLResponse)
-async def classify_run(request: Request, raw_email: str = Form(...)):
+async def classify_run(
+    request: Request, user: RequireUserFragment,
+    raw_email: str = Form(...),
+):
     """Parse a raw email and classify it via the configured LLM.
 
-    #95 sub-E: open to any authenticated user. The categories pulled
+     sub-E: open to any authenticated user. The categories pulled
     from the DB are user-scoped (system + the user's personal),
     not admin-global; no privilege escalation via this endpoint.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     templates = get_templates(request)
     db = get_db(request)
     config = get_config(request)
@@ -142,7 +139,9 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
         )
 
     # Get categories from DB (user-scoped: system + current user's personal).
-    categories = _get_categories_from_db(db, user_id=user["id"])
+    categories = await db_call(
+        _get_categories_from_db, db, user_id=user["id"],
+    )
     if not categories:
         return HTMLResponse(
             '<article style="border-left:3px solid var(--pico-color-red-500);padding:0.5rem 1rem;">'
@@ -152,7 +151,7 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
     # Collect list hints (from all lists in DB).
     list_hints = _collect_list_hints_for_message(db, parsed)
 
-    # #163-followup — Test Classify must mirror the production
+    # -followup — Test Classify must mirror the production
     # engine/flow.py:classify() short-circuit on skip_ai=True hints,
     # otherwise operator's "test what would happen" preview lies. A
     # rule with Skip AI ON forces the category WITHOUT calling the
@@ -174,7 +173,7 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
             ),
             source="list_rule",
         )
-        return _render(templates, request, "classify/_result.html", {
+        return await _render(templates, request, "classify/_result.html", {
             "classification": classification,
             "parsed": parsed,
             "timing": 0.0,
@@ -200,10 +199,12 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
                 local_url_suffixes=_local_suffixes,
             )
         elif backend == "openai":
-            from email_triage.classify.openai_compat import OpenAIClassifier
-            classifier = OpenAIClassifier(
-                model=config.classifier.openai_model,
+            from email_triage.classify.openai_compat import (
+                OpenAICompatClassifier,
+            )
+            classifier = OpenAICompatClassifier(
                 base_url=config.classifier.openai_base_url,
+                model=config.classifier.openai_model,
                 local_url_suffixes=_local_suffixes,
             )
         elif backend == "gemini":
@@ -220,7 +221,7 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
         try:
             classification = await classifier.classify(parsed, categories, list_hints or None)
         finally:
-            # #139 — drain the long-lived httpx pool the classifier
+            #  — drain the long-lived httpx pool the classifier
             # opened for /api/chat. The per-request handler discards
             # the classifier on return; without close() the pool sits
             # open until GC.
@@ -238,12 +239,12 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
         )
 
     model_label = config.classifier.model if backend == "ollama" else backend
-    return _render(templates, request, "classify/_result.html", {
+    return await _render(templates, request, "classify/_result.html", {
         "classification": classification,
         "parsed": parsed,
         "timing": elapsed,
         "model": model_label,
-        # #163-followup — pass advisory hints through so the result
+        # -followup — pass advisory hints through so the result
         # page can surface "rule matched but AI overrode" cases.
         # Operator caught this discrepancy on a CTOx rule that the
         # AI legitimately overrode (rule was advisory, not Force).
@@ -253,7 +254,7 @@ async def classify_run(request: Request, raw_email: str = Form(...)):
 
 
 @router.get("/triage", response_class=HTMLResponse)
-async def triage_page(request: Request):
+async def triage_page(request: Request, user: RequireUser):
     """Run Triage page — select account, limit, and run.
 
     When the current user can see accounts owned by more than one
@@ -261,10 +262,6 @@ async def triage_page(request: Request):
     account), surface an "Owner" filter dropdown that defaults to
     the current user. Accounts list filters to the selected owner.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -273,7 +270,7 @@ async def triage_page(request: Request):
         request.query_params.get("owner_filter"),
     )
 
-    # #151 — surface whether the optional classification cache is
+    #  — surface whether the optional classification cache is
     # configured so the template can hide / show the force-reclassify
     # debug toggle. Defensive default (False) on any import error so
     # an install without the optional ``redis`` extra renders cleanly.
@@ -287,7 +284,7 @@ async def triage_page(request: Request):
     except Exception:
         classification_cache_enabled = False
 
-    return _render(templates, request, "triage/run.html", {
+    return await _render(templates, request, "triage/run.html", {
         "user": user,
         "classification_cache_enabled": classification_cache_enabled,
         **snap,
@@ -295,17 +292,13 @@ async def triage_page(request: Request):
 
 
 @router.post("/triage/run", response_class=HTMLResponse)
-async def triage_run(request: Request):
+async def triage_run(request: Request, user: RequireUserFragment):
     """Execute a triage cycle on the selected account.
 
     Thin wrapper over :func:`email_triage.web.triage_runner.run_triage` —
     parses the form, enforces ownership, calls the runner, then fires
     the ``triage.completed`` event and renders the results template.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     secrets = get_secrets(request)
     config = get_config(request)
@@ -313,27 +306,27 @@ async def triage_run(request: Request):
     is_admin = user["role"] == "admin"
 
     form = await request.form()
-    account_id = int(form.get("account_id", 0))
+    account_id = _safe_int(form.get("account_id"), 0)
     # Mode: "inline" (default; bounded sync run) or "all" (background
-    # whole-mailbox sweep, #101). The form field is the radio button
+    # whole-mailbox sweep, ). The form field is the radio button
     # added on triage/run.html in step 6.
     mode = (form.get("mode") or "inline").strip()
-    limit = int(form.get("limit", 5))
+    limit = _safe_int(form.get("limit"), 5)
 
-    # #61 — preset dropdown + Other/freeform. Preset maps to IMAP SEARCH
+    #  — preset dropdown + Other/freeform. Preset maps to IMAP SEARCH
     # syntax; the Gmail provider's translator converts at search time.
     preset = (form.get("search_preset") or "").strip()
     freeform = form.get("query", "").strip()
     query = _triage_preset_to_query(preset, freeform)
 
-    # #129 — "Has label" filter. When set, intersect the provider's
+    #  — "Has label" filter. When set, intersect the provider's
     # search results with the set of message_ids tagged with this
     # slug on this account. The intersection lives in
     # triage_runner.run_triage's caller flow — we read the labeled
     # ids here, then pass via a label_filter_ids set.
     has_label = (form.get("has_label") or "").strip().lower()
 
-    # #151 — force re-classify checkbox. Bypasses the optional Redis
+    #  — force re-classify checkbox. Bypasses the optional Redis
     # classification cache for this run (every message hits the LLM).
     # Result still gets written back so the next non-force run hits.
     # Default unchecked — operator opts in to spend tokens.
@@ -344,17 +337,23 @@ async def triage_run(request: Request):
 
     from email_triage.web.db import get_email_account
 
-    # #135 phase 3 — DB-before-network: triage runs hit the provider next.
-    acct = await db_call(get_email_account, db, account_id)
+    # / — DB-before-network: fetch + can-manage in one hop.
+    def _triage_run_gate() -> tuple[dict | None, bool]:
+        acct_ = get_email_account(db, account_id)
+        if acct_ is None:
+            return None, False
+        return acct_, can_manage_account(db, user, acct_)
+
+    acct, _can_manage = await db_call(_triage_run_gate)
     if acct is None:
         return HTMLResponse(
             '<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
             '<p>Account not found.</p></article>'
         )
-    if not can_manage_account(db, user, acct):
+    if not _can_manage:
         return HTMLResponse("Forbidden", status_code=403)
 
-    # ── Bulk-mode branch (#101) ──
+    # ── Bulk-mode branch ──
     # "All matches (background)" — create a triage_jobs row + 303 to
     # the progress page. The supervised bulk runner picks it up
     # within POLL_INTERVAL_SECS. Refuses a second concurrent submit
@@ -363,24 +362,34 @@ async def triage_run(request: Request):
         from email_triage.web.db import (
             create_triage_job, count_active_triage_jobs_for_account,
         )
-        if count_active_triage_jobs_for_account(db, account_id) > 0:
+
+        def _bulk_job_db_work() -> str | None:
+            """/ — active-job check + runtime read + job create
+            in one threadpool hop. Returns the new job id, or ``None``
+            when a bulk run is already active on this account.
+            """
+            if count_active_triage_jobs_for_account(db, account_id) > 0:
+                return None
+            runtime = _get_runtime_settings(db)
+            rate = int(runtime.get(
+                "bulk_triage_rate_msg_per_min",
+                _RUNTIME_DEFAULTS["bulk_triage_rate_msg_per_min"],
+            ))
+            conc = int(runtime.get(
+                "bulk_triage_concurrency",
+                _RUNTIME_DEFAULTS["bulk_triage_concurrency"],
+            ))
+            return create_triage_job(
+                db, account_id=account_id, actor_user_id=user["id"],
+                query=query, rate_msg_per_min=rate, concurrency=conc,
+            )
+
+        job_id = await db_call(_bulk_job_db_work)
+        if job_id is None:
             return HTMLResponse(
                 '<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 1rem;">'
                 '<p><strong>A bulk run is already active on this account.</strong> Wait for it to finish or cancel it from its progress page.</p></article>'
             )
-        runtime = _get_runtime_settings(db)
-        rate = int(runtime.get(
-            "bulk_triage_rate_msg_per_min",
-            _RUNTIME_DEFAULTS["bulk_triage_rate_msg_per_min"],
-        ))
-        conc = int(runtime.get(
-            "bulk_triage_concurrency",
-            _RUNTIME_DEFAULTS["bulk_triage_concurrency"],
-        ))
-        job_id = create_triage_job(
-            db, account_id=account_id, actor_user_id=user["id"],
-            query=query, rate_msg_per_min=rate, concurrency=conc,
-        )
         # The submit form is HTMX-driven (it swaps inline results
         # into #triage-results for inline mode). For bulk mode we
         # need a full-page navigation to the progress page, NOT an
@@ -413,7 +422,7 @@ async def triage_run(request: Request):
         force_reclassify=force_reclassify,
     )
 
-    # #129 — "Has label" filter. Apply post-runner: keep only result
+    #  — "Has label" filter. Apply post-runner: keep only result
     # rows whose message_id is tagged with the chosen slug on this
     # account. v1 trade-off: the runner classifies + acts on every
     # match first, then we filter the view; integrating this into
@@ -461,13 +470,13 @@ async def triage_run(request: Request):
         except Exception as e:
             _log.warning("triage.completed dispatch failed", error=fmt_exc(e))
 
-    # #129 — labels catalog drives the bulk-tag toolbar on the
+    #  — labels catalog drives the bulk-tag toolbar on the
     # results table. Pass even when empty so the template's
     # `{% if all_labels %}` gate stays consistent across renders.
     from email_triage.web.db import list_labels
     all_labels = await db_call(list_labels, db)
 
-    return _render(templates, request, "triage/_results.html", {
+    return await _render(templates, request, "triage/_results.html", {
         "results": run["results"],
         "errors": run["errors"],
         "total": run["total_messages"],
@@ -484,7 +493,7 @@ async def triage_run(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.post("/triage/preview", response_class=HTMLResponse)
-async def triage_preview(request: Request):
+async def triage_preview(request: Request, user: RequireUserFragment):
     """Return up to 20 message headers matching the supplied query.
 
     Read-only — no classifier call, no actions executed, no
@@ -504,70 +513,86 @@ async def triage_preview(request: Request):
     cheap (1 search + 20 headers-only fetches) but a button-spam
     chain would still hammer the provider's API.
     """
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     secrets = get_secrets(request)
     templates = get_templates(request)
 
     form = await request.form()
-    account_id = int(form.get("account_id", 0))
+    account_id = _safe_int(form.get("account_id"), 0)
     preset = (form.get("search_preset") or "").strip()
     freeform = form.get("query", "").strip()
     query = _triage_preset_to_query(preset, freeform)
 
     from email_triage.web.db import get_email_account
 
-    # #135 phase 3 — DB-before-network: provider preview hits IMAP/Gmail.
+    #  phase 3 — DB-before-network: provider preview hits IMAP/Gmail.
     acct = await db_call(get_email_account, db, account_id)
     if acct is None:
         return HTMLResponse(
             '<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
             '<p>Account not found.</p></article>'
         )
-    if not can_manage_account(db, user, acct):
-        return HTMLResponse("Forbidden", status_code=403)
 
-    # Cheap rate-limit: 1 preview / account / 10 s. Stored in a
-    # ratelimit:* setting key with a wall-clock timestamp + bucketed
-    # window. Overkill to plumb a per-account redis-like primitive
-    # for this; the existing get_setting / set_setting pattern works.
     import time as _time
-    from email_triage.web.db import get_setting, set_setting
-    rl_key = f"ratelimit:triage_preview:{account_id}"
-    last = get_setting(db, rl_key) or 0.0
-    now = _time.time()
-    if now - float(last) < 10.0:
-        wait = int(10 - (now - float(last)))
+    from email_triage.triage_logging import is_account_hipaa
+
+    def _preview_gate_db_work() -> tuple[str, dict]:
+        """/ — can-manage check + rate-limit read/write +
+        HIPAA audit, all in one threadpool hop. Returns
+        ``(kind, payload)``:
+          - ("forbidden", {})        → 403
+          - ("cooldown", {wait})     → amber cool-down chip
+          - ("ok", {})               → handler proceeds to provider
+        """
+        if not can_manage_account(db, user, acct):
+            return "forbidden", {}
+
+        # Cheap rate-limit: 1 preview / account / 10 s. Stored in a
+        # ratelimit:* setting key with a wall-clock timestamp +
+        # bucketed window. Overkill to plumb a per-account redis-like
+        # primitive for this; the get_setting / set_setting pair works.
+        from email_triage.web.db import get_setting, set_setting
+        rl_key = f"ratelimit:triage_preview:{account_id}"
+        last = get_setting(db, rl_key) or 0.0
+        now = _time.time()
+        if now - float(last) < 10.0:
+            wait = int(10 - (now - float(last)))
+            return "cooldown", {"wait": wait}
+        set_setting(db, rl_key, now)
+
+        # HIPAA audit row — actor != owner on HIPAA account.
+        if (
+            is_account_hipaa(acct)
+            and user.get("id") != acct.get("user_id")
+        ):
+            try:
+                from email_triage.web.db import record_hipaa_access_event
+                record_hipaa_access_event(
+                    db, user["id"], account_id, "triage_preview",
+                    outcome="success",
+                )
+            except Exception as e:
+                _log.warning(
+                    "HIPAA preview audit row write failed",
+                    error=fmt_exc(e),
+                )
+        return "ok", {}
+
+    kind, payload = await db_call(_preview_gate_db_work)
+    if kind == "forbidden":
+        return HTMLResponse("Forbidden", status_code=403)
+    if kind == "cooldown":
+        wait = payload["wait"]
         return HTMLResponse(
             f'<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.5rem 1rem;">'
             f'<p>Preview cooling down — wait ~{wait}s and try again.</p></article>'
         )
-    set_setting(db, rl_key, now)
-
-    # HIPAA audit row — actor != owner on HIPAA account.
-    from email_triage.triage_logging import is_account_hipaa
-    if (
-        is_account_hipaa(acct)
-        and user.get("id") != acct.get("user_id")
-    ):
-        try:
-            from email_triage.web.db import record_hipaa_access_event
-            record_hipaa_access_event(
-                db, user["id"], account_id, "triage_preview",
-                outcome="success",
-            )
-        except Exception as e:
-            _log.warning(
-                "HIPAA preview audit row write failed",
-                error=fmt_exc(e),
-            )
 
     # Provider lookup + fetch.
     try:
-        provider = _create_provider_from_account(acct, secrets)
+        provider = await db_call(
+            _create_provider_from_account, acct, secrets,
+        )
     except Exception as e:
         return HTMLResponse(
             f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
@@ -609,7 +634,7 @@ async def triage_preview(request: Request):
         except Exception:
             pass
 
-    return _render(templates, request, "triage/_preview.html", {
+    return await _render(templates, request, "triage/_preview.html", {
         "rows": rows,
         "total": len(rows),
         "limit": PREVIEW_LIMIT,
@@ -620,13 +645,13 @@ async def triage_preview(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Bulk triage jobs (#101) — /triage/jobs index + /triage/jobs/<job_id> per-job
+# Bulk triage jobs — /triage/jobs index + /triage/jobs/<job_id> per-job
 # ---------------------------------------------------------------------------
 
 @router.get(
     "/triage/jobs", response_class=HTMLResponse,
 )
-async def triage_jobs_index(request: Request):
+async def triage_jobs_index(request: Request, user: RequireUser):
     """Index of bulk runs across every account the user can manage.
 
     Filed because the per-job page (``/triage/jobs/<id>``) was the
@@ -638,10 +663,6 @@ async def triage_jobs_index(request: Request):
     failed / cancelled (history). Cap at 50 across both, newest
     first.
     """
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -673,7 +694,7 @@ async def triage_jobs_index(request: Request):
     active = [j for j in jobs if j.get("status") in ("queued", "running")]
     done = [j for j in jobs if j.get("status") not in ("queued", "running")]
 
-    return _render(templates, request, "triage/jobs_index.html", {
+    return await _render(templates, request, "triage/jobs_index.html", {
         "user": user,
         "active_jobs": active,
         "done_jobs": done,
@@ -684,12 +705,10 @@ async def triage_jobs_index(request: Request):
 @router.get(
     "/triage/jobs/{job_id}", response_class=HTMLResponse,
 )
-async def triage_job_page(request: Request, job_id: str):
+async def triage_job_page(
+    request: Request, job_id: str, user: RequireUser,
+):
     """Full-page progress view for a bulk-triage job."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -697,23 +716,29 @@ async def triage_job_page(request: Request, job_id: str):
         get_email_account, get_triage_job, list_triage_runs,
     )
 
-    # #135 phase 3 — every read in this handler hops via threadpool;
-    # the page is polled every 2s so this matters at scale.
+    # / — every read in this handler hops via threadpool;
+    # the page is polled every 2s so this matters at scale. The
+    # can-manage check folds into the same hop.
     def _triage_job_page_reads(db, job_id):
         job = get_triage_job(db, job_id)
         if job is None:
-            return None, None, []
+            return None, None, [], False
         acct = get_email_account(db, job["account_id"])
+        if acct is None:
+            return job, None, [], False
+        can_manage = can_manage_account(db, user, acct)
         feed = list_triage_runs(db, account_id=job["account_id"], limit=20)
-        return job, acct, feed
+        return job, acct, feed, can_manage
 
-    job, acct, feed = await db_call(_triage_job_page_reads, db, job_id)
+    job, acct, feed, _can_manage = await db_call(
+        _triage_job_page_reads, db, job_id,
+    )
     if job is None:
         return HTMLResponse("Job not found", status_code=404)
 
     if acct is None:
         return HTMLResponse("Account not found", status_code=404)
-    if not can_manage_account(db, user, acct):
+    if not _can_manage:
         return HTMLResponse("Forbidden", status_code=403)
 
     # Recent per-message rows for the live feed. Filter to runs
@@ -723,7 +748,7 @@ async def triage_job_page(request: Request, job_id: str):
     # but limiting to recent rows keeps the read cheap.
     feed = [r for r in feed if r.get("query") == f"bulk:{job_id}"]
 
-    return _render(templates, request, "triage/job_progress.html", {
+    return await _render(templates, request, "triage/job_progress.html", {
         "user": user,
         "acct": acct,
         "job": job,
@@ -737,17 +762,13 @@ async def triage_job_page(request: Request, job_id: str):
     response_class=HTMLResponse,
 )
 async def triage_job_progress_fragment(
-    request: Request, job_id: str,
+    request: Request, job_id: str, user: RequireUserFragment,
 ):
     """HTMX-poll fragment — the live progress block.
 
     Returned every 2s by the page's hx-trigger. Renders just the
     progress bar + counters + recent feed; the surrounding
     page chrome stays put."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     templates = get_templates(request)
 
@@ -755,26 +776,31 @@ async def triage_job_progress_fragment(
         get_email_account, get_triage_job, list_triage_runs,
     )
 
-    # #135 phase 3 — same hot-poll fragment as triage_job_page; bundle
-    # the three reads into a single threadpool hop.
+    # / — same hot-poll fragment as triage_job_page; bundle
+    # the three reads + the can-manage check into a single hop.
     def _triage_job_progress_reads(db, job_id):
         job = get_triage_job(db, job_id)
         if job is None:
-            return None, None, []
+            return None, None, [], False
         acct = get_email_account(db, job["account_id"])
+        can_manage = (
+            acct is not None and can_manage_account(db, user, acct)
+        )
         feed = list_triage_runs(db, account_id=job["account_id"], limit=20)
-        return job, acct, feed
+        return job, acct, feed, can_manage
 
-    job, acct, feed = await db_call(_triage_job_progress_reads, db, job_id)
+    job, acct, feed, _can_manage = await db_call(
+        _triage_job_progress_reads, db, job_id,
+    )
     if job is None:
         return HTMLResponse("Job not found", status_code=404)
 
-    if acct is None or not can_manage_account(db, user, acct):
+    if not _can_manage:
         return HTMLResponse("Forbidden", status_code=403)
 
     feed = [r for r in feed if r.get("query") == f"bulk:{job_id}"]
 
-    return _render(
+    return await _render(
         templates, request, "triage/_job_progress_fragment.html",
         {
             "job": job,
@@ -787,16 +813,15 @@ async def triage_job_progress_fragment(
 @router.post(
     "/triage/jobs/{job_id}/cancel", response_class=HTMLResponse,
 )
-async def triage_job_cancel(request: Request, job_id: str):
+async def triage_job_cancel(
+    request: Request, job_id: str, user: RequireUser,
+):
     """Operator-driven cancel button.
 
     Flips the row's status to 'cancelled'. The supervised runner
     notices at the next batch boundary and exits cleanly. Returns
     a 303 back to the progress page so the operator sees the
     cancelled state on the next render."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
 
     db = get_db(request)
 
@@ -804,29 +829,26 @@ async def triage_job_cancel(request: Request, job_id: str):
         get_email_account, get_triage_job, request_triage_job_cancel,
     )
 
-    # #135 phase 3 — fold the three sync hops into one threadpool call.
-    def _triage_job_cancel_apply(db, job_id, user_id, is_admin):
+    # / — job fetch + account fetch + can-manage check +
+    # the cancel write, ALL in one threadpool call.
+    def _triage_job_cancel_apply() -> str:
+        """Returns ``not_found`` / ``forbidden`` / ``ok``; on ``ok``
+        the cancel has already been written.
+        """
         job = get_triage_job(db, job_id)
         if job is None:
-            return None, None, "not_found"
+            return "not_found"
         acct = get_email_account(db, job["account_id"])
-        if acct is None:
-            return job, None, "forbidden"
-        # Mirror can_manage_account's logic without re-importing in the
-        # nested helper: owner-or-admin OR explicit delegate. Defer the
-        # delegate check to the outer caller via the acct return.
-        return job, acct, "ok"
+        if acct is None or not can_manage_account(db, user, acct):
+            return "forbidden"
+        request_triage_job_cancel(db, job_id)
+        return "ok"
 
-    is_admin = user["role"] == "admin"
-    job, acct, status = await db_call(
-        _triage_job_cancel_apply, db, job_id, user["id"], is_admin,
-    )
+    status = await db_call(_triage_job_cancel_apply)
     if status == "not_found":
         return HTMLResponse("Job not found", status_code=404)
-    if acct is None or not can_manage_account(db, user, acct):
+    if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
-
-    await db_call(request_triage_job_cancel, db, job_id)
     return RedirectResponse(
         f"/triage/jobs/{job_id}", status_code=303,
     )
@@ -837,12 +859,8 @@ async def triage_job_cancel(request: Request, job_id: str):
 # ---------------------------------------------------------------------------
 
 @router.get("/triage/discover", response_class=HTMLResponse)
-async def discover_page(request: Request):
+async def discover_page(request: Request, user: RequireUser):
     """Discover Categories page -- scan a mailbox and suggest categories."""
-    user = get_current_user(request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-
     db = get_db(request)
     templates = get_templates(request)
     snap = await db_call(
@@ -850,66 +868,67 @@ async def discover_page(request: Request):
         request.query_params.get("owner_filter"),
     )
 
-    return _render(templates, request, "triage/discover.html", {
+    return await _render(templates, request, "triage/discover.html", {
         "user": user,
         **snap,
     })
 
 
 @router.get("/triage/discover/folders", response_class=HTMLResponse)
-async def discover_folders(request: Request):
+async def discover_folders(request: Request, user: RequireUserFragment):
     """HTMX endpoint to load folder list for an account."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     secrets = get_secrets(request)
     templates = get_templates(request)
     is_admin = user["role"] == "admin"
 
-    account_id = int(request.query_params.get("account_id", 0))
+    account_id = _safe_int(request.query_params.get("account_id"), 0)
 
     from email_triage.web.db import get_email_account
-    # #135 phase 3 — DB-before-network: provider.list_folders() below.
-    acct = await db_call(get_email_account, db, account_id)
+
+    # / — DB-before-network: fetch + can-manage in one hop.
+    def _discover_folders_gate() -> tuple[dict | None, bool]:
+        acct_ = get_email_account(db, account_id)
+        if acct_ is None:
+            return None, False
+        return acct_, can_manage_account(db, user, acct_)
+
+    acct, _can_manage = await db_call(_discover_folders_gate)
     if acct is None:
-        return _render(templates, request, "triage/_discover_folders.html", {
+        return await _render(templates, request, "triage/_discover_folders.html", {
             "folders": [], "error": "Account not found.",
         })
-    if not can_manage_account(db, user, acct):
-        return _render(templates, request, "triage/_discover_folders.html", {
+    if not _can_manage:
+        return await _render(templates, request, "triage/_discover_folders.html", {
             "folders": [], "error": "Access denied.",
         })
 
     try:
-        provider = _create_provider_from_account(acct, secrets)
+        provider = await db_call(
+            _create_provider_from_account, acct, secrets,
+        )
         folders = await provider.list_folders()
         await provider.close()
     except Exception as e:
-        return _render(templates, request, "triage/_discover_folders.html", {
+        return await _render(templates, request, "triage/_discover_folders.html", {
             "folders": [], "visible": set(), "error": f"Could not load folders: {e}",
         })
 
     # Default checkboxes to the visible (included) folders from the routes
     # page prefs.  Folders with no pref entry are included by default.
-    # #135 phase 3 — read happens after the network round-trip; threadpool
+    #  phase 3 — read happens after the network round-trip; threadpool
     # hop here lets a concurrent discover request progress while we wait.
     from email_triage.web.db import get_visible_folders
     visible = set(await db_call(get_visible_folders, db, account_id, folders))
 
-    return _render(templates, request, "triage/_discover_folders.html", {
+    return await _render(templates, request, "triage/_discover_folders.html", {
         "folders": folders, "visible": visible, "error": None,
     })
 
 
 @router.post("/triage/discover/run", response_class=HTMLResponse)
-async def discover_run(request: Request):
+async def discover_run(request: Request, user: RequireUserFragment):
     """Execute a category discovery scan on the selected account."""
-    user = get_current_user(request)
-    if user is None:
-        return HTMLResponse("Unauthorized", status_code=401)
-
     db = get_db(request)
     secrets = get_secrets(request)
     config = get_config(request)
@@ -917,8 +936,8 @@ async def discover_run(request: Request):
     is_admin = user["role"] == "admin"
 
     form = await request.form()
-    account_id = int(form.get("account_id", 0))
-    limit = int(form.get("limit", 25))
+    account_id = _safe_int(form.get("account_id"), 0)
+    limit = _safe_int(form.get("limit"), 25)
     query = form.get("query", "ALL").strip()
     scan_scope = form.get("scan_scope", "inbox").strip()
     selected_folders = form.getlist("folders")  # For "selected" scope.
@@ -927,15 +946,44 @@ async def discover_run(request: Request):
         limit = 25
 
     from email_triage.web.db import get_email_account
+    from email_triage.triage_logging import is_account_hipaa
 
-    # #135 phase 3 — DB-before-network: discover scan hits IMAP/Gmail.
-    acct = await db_call(get_email_account, db, account_id)
+    #  phase 3 — DB-before-network: discover scan hits IMAP/Gmail.
+    def _discover_gate_db_work() -> tuple[dict | None, bool, int | None]:
+        """/ — fetch + can-manage check + (HIPAA) in-progress
+        audit row, all in one threadpool hop. Returns
+        ``(acct, can_manage, audit_event_id)``.
+        """
+        acct_ = get_email_account(db, account_id)
+        if acct_ is None:
+            return None, False, None
+        if not can_manage_account(db, user, acct_):
+            return acct_, False, None
+        # HIPAA access-audit event (§164.312(b)).
+        audit_id: int | None = None
+        if is_account_hipaa(acct_):
+            from email_triage.web.db import record_hipaa_access_event
+            try:
+                audit_id = record_hipaa_access_event(
+                    db, user["id"], account_id, "discover",
+                    outcome="in_progress",
+                )
+            except Exception as e:
+                _log.warning(
+                    "Failed to record HIPAA access event",
+                    error=fmt_exc(e),
+                )
+        return acct_, True, audit_id
+
+    acct, _can_manage, _audit_event_id = await db_call(
+        _discover_gate_db_work,
+    )
     if acct is None:
         return HTMLResponse(
             '<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
             '<p>Account not found.</p></article>'
         )
-    if not can_manage_account(db, user, acct):
+    if not _can_manage:
         return HTMLResponse("Forbidden", status_code=403)
 
     if not acct.get("is_active", True):
@@ -945,51 +993,57 @@ async def discover_run(request: Request):
             '<a href="/accounts">account settings</a> first.</p></article>'
         )
 
-    # HIPAA access-audit event (§164.312(b)).
-    from email_triage.triage_logging import is_account_hipaa
-    _audit_event_id: int | None = None
-    if is_account_hipaa(acct):
-        from email_triage.web.db import record_hipaa_access_event
-        try:
-            _audit_event_id = record_hipaa_access_event(
-                db, user["id"], account_id, "discover", outcome="in_progress",
-            )
-        except Exception as e:
-            _log.warning("Failed to record HIPAA access event", error=fmt_exc(e))
-
     # Helper: record the universal discover-run audit row. Called from
     # every exit path that represents a run attempt (success, partial-
     # failure, provider/classifier setup failure). Wrapped in try/except
     # so an audit insert failure never breaks the user-visible response.
-    def _record_discover_audit(
+    # / — async so the SQLite write runs off the event loop.
+    async def _record_discover_audit(
         *, scanned: int, err_count: int, elapsed: float,
         folders: list[str] | None = None,
     ) -> None:
-        try:
-            from email_triage.web.db import record_discover_run
-            record_discover_run(
-                db,
-                account_id=account_id,
-                account_name=acct.get("name", ""),
-                actor_user_id=user["id"],
-                scanned_count=scanned,
-                errors_count=err_count,
-                folders=folders or [],
-                elapsed_secs=elapsed,
-            )
-        except Exception as audit_err:
-            _log.warning(
-                "Failed to record discover_run audit", error=str(audit_err),
-            )
+        def _work() -> None:
+            try:
+                from email_triage.web.db import record_discover_run
+                record_discover_run(
+                    db,
+                    account_id=account_id,
+                    account_name=acct.get("name", ""),
+                    actor_user_id=user["id"],
+                    scanned_count=scanned,
+                    errors_count=err_count,
+                    folders=folders or [],
+                    elapsed_secs=elapsed,
+                )
+            except Exception as audit_err:
+                _log.warning(
+                    "Failed to record discover_run audit",
+                    error=str(audit_err),
+                )
+
+        await db_call(_work)
+
+    async def _update_discover_hipaa_audit(outcome: str, detail: str) -> None:
+        """/ — patch the HIPAA in-progress row off the loop."""
+        if _audit_event_id is None:
+            return
+
+        def _work() -> None:
+            from email_triage.web.db import update_hipaa_access_event
+            update_hipaa_access_event(db, _audit_event_id, outcome, detail)
+
+        await db_call(_work)
 
     # Create provider and classifier.
     try:
-        provider = _create_provider_from_account(acct, secrets)
+        provider = await db_call(
+            _create_provider_from_account, acct, secrets,
+        )
     except Exception as e:
-        if _audit_event_id is not None:
-            from email_triage.web.db import update_hipaa_access_event
-            update_hipaa_access_event(db, _audit_event_id, "error", f"provider: {type(e).__name__}")
-        _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
+        await _update_discover_hipaa_audit(
+            "error", f"provider: {type(e).__name__}",
+        )
+        await _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
         return HTMLResponse(
             f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
             f'<p>Provider error: {e}</p></article>'
@@ -998,10 +1052,10 @@ async def discover_run(request: Request):
     try:
         classifier = _build_classifier_from_config(config)
     except Exception as e:
-        if _audit_event_id is not None:
-            from email_triage.web.db import update_hipaa_access_event
-            update_hipaa_access_event(db, _audit_event_id, "error", f"classifier: {type(e).__name__}")
-        _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
+        await _update_discover_hipaa_audit(
+            "error", f"classifier: {type(e).__name__}",
+        )
+        await _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
         return HTMLResponse(
             f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
             f'<p>Classifier error: {e}</p></article>'
@@ -1010,7 +1064,9 @@ async def discover_run(request: Request):
     # Get existing categories for comparison (account-scoped when an
     # account is bound to this discovery run, else user-scoped).
     _disc_user_id = acct.get("user_id") if isinstance(acct, dict) else user["id"]
-    existing_categories = _get_categories_from_db(db, user_id=_disc_user_id)
+    existing_categories = await db_call(
+        _get_categories_from_db, db, user_id=_disc_user_id,
+    )
 
     from email_triage.classify.discover import (
         build_consolidation_prompt,
@@ -1088,7 +1144,7 @@ async def discover_run(request: Request):
             # Single folder (or provider without peek support): simple search.
             if can_peek and folders_to_scan[0] != "INBOX":
                 await provider.select_folder(folders_to_scan[0])
-            # Query-stage self-skip (#117): exclude install's own outbound
+            # Query-stage self-skip: exclude install's own outbound
             # from the discover scan too. Discover doesn't action; it
             # builds a category-discovery prompt — but it still spends
             # an LLM call per scanned message, so dropping self-mail at
@@ -1108,13 +1164,13 @@ async def discover_run(request: Request):
         if not targets:
             await provider.close()
             # Universal audit row: record even when no messages matched.
-            _record_discover_audit(
+            await _record_discover_audit(
                 scanned=0,
                 err_count=len(errors),
                 elapsed=time.time() - t0,
                 folders=folders_to_scan,
             )
-            return _render(templates, request, "triage/_discover_results.html", {
+            return await _render(templates, request, "triage/_discover_results.html", {
                 "consolidated": [],
                 "raw_results": [],
                 "errors": errors,
@@ -1151,7 +1207,7 @@ async def discover_run(request: Request):
                 try:
                     message = await provider.fetch_message(msg_id)
                     message.hipaa = _account_hipaa
-                    # Self-skip (#117): even with the SEARCH-stage filter
+                    # Self-skip: even with the SEARCH-stage filter
                     # multi-folder peek paths skip the rewrite, so a
                     # secondary fetch-stage check is cheap insurance.
                     from email_triage.mail_headers import (
@@ -1202,7 +1258,7 @@ async def discover_run(request: Request):
             await provider.close()
         except Exception:
             pass
-        # #139 — drain the classifier's long-lived httpx pool. The
+        #  — drain the classifier's long-lived httpx pool. The
         # discover-scan endpoint's classifier is built once at
         # function entry and reused across N messages; close on exit.
         if "classifier" in locals() and hasattr(classifier, "close"):
@@ -1211,15 +1267,25 @@ async def discover_run(request: Request):
             except Exception:
                 pass
         if _audit_event_id is not None:
-            from email_triage.web.db import update_hipaa_access_event
             outcome = "error" if errors else "ok"
             detail = f"scanned={len(raw_results)}"
             if errors:
                 detail += f"; errors={len(errors)}"
-            try:
-                update_hipaa_access_event(db, _audit_event_id, outcome, detail)
-            except Exception as e:
-                _log.warning("Failed to finalize HIPAA access event", error=fmt_exc(e))
+
+            def _finalize_hipaa_audit() -> None:
+                """/ — finalize the HIPAA row off the loop."""
+                from email_triage.web.db import update_hipaa_access_event
+                try:
+                    update_hipaa_access_event(
+                        db, _audit_event_id, outcome, detail,
+                    )
+                except Exception as e:
+                    _log.warning(
+                        "Failed to finalize HIPAA access event",
+                        error=fmt_exc(e),
+                    )
+
+            await db_call(_finalize_hipaa_audit)
 
     # Phase 2: Aggregate raw suggestions.
     aggregated: dict[str, dict] = {}
@@ -1289,14 +1355,14 @@ async def discover_run(request: Request):
     # Universal discover-run audit row — runs for every account (HIPAA and
     # non-HIPAA alike). Independent of the HIPAA access event above; HIPAA
     # accounts intentionally land in both trails.
-    _record_discover_audit(
+    await _record_discover_audit(
         scanned=len(raw_results),
         err_count=len(errors),
         elapsed=elapsed,
         folders=folders_to_scan,
     )
 
-    return _render(templates, request, "triage/_discover_results.html", {
+    return await _render(templates, request, "triage/_discover_results.html", {
         "consolidated": clean_consolidated,
         "raw_results": raw_results,
         "errors": errors,

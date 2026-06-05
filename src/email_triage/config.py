@@ -42,13 +42,13 @@ class ProviderConfig:
 @dataclass
 class ClassifierConfig:
     backend: str = "ollama"
-    model: str = "[local-llm-model]
+    model: str = "qwen3.5:35b"
     ollama_url: str = "http://localhost:11434"
     # Ollama: if True, classify() probes /api/ps and uses whatever
     # model is already resident in VRAM (falls back to ``model`` when
     # nothing is loaded). Prevents a "GPU full, configured model
     # can't load" 500 in homelab setups where a different model is
-    # already warm — and sidesteps version drift ([local-llm-model] → [local-llm-model])
+    # already warm — and sidesteps version drift (qwen3.5 → qwen3.6)
     # without requiring a config chase. Cached for 30 s per process.
     prefer_loaded: bool = True
     openai_base_url: str = ""
@@ -96,8 +96,15 @@ class SecretsConfig:
     Use ``backend: "external:<name>"`` to delegate to a plugin-registered
     provider (KeePass, Vault, etc.) — see ``register_external_provider``
     in ``email_triage.secrets``.
+
+    The default ``"auto"`` is deployment-aware: it resolves to
+    ``container`` when the master key is present as a container secret
+    (``/run/secrets/<master_key_name>``), else to ``env`` with a loud
+    startup WARNING. This keeps the Fernet master key out of the process
+    environment in the podman/docker deployment without breaking a
+    bare-metal / dev first run. Set the backend explicitly to override.
     """
-    backend: str = "env"
+    backend: str = "auto"
     keyfile_path: str = "~/.config/email-triage/key"
     master_key_name: str = "ET_MASTER_KEY"
     external: dict[str, Any] = field(default_factory=dict)
@@ -115,10 +122,72 @@ class LoggingConfig:
     retention_days: int = 30
     max_rows: int = 50000
 
+    # H-04-flag (Cycle 7, 2026-05-24) — defense-in-depth Transmission
+    # Security boot-enforcement. Closes EQM-03 GAP g3 (operator-deployment-
+    # discipline assumption) per `internal documentation` H-04-flag
+    # row. Two-axis design:
+    #
+    #   • Attestation (HIPAA-mode default, always-on when HIPAA is on):
+    #     operator declares the perimeter-TLS posture in
+    #     ``perimeter_tls_attestation``; startup audit-log entry captures
+    #     the declaration as §164.316(b)(2) audit-trail evidence.
+    #     Recognized shapes match the EQM-03 catalog: "none" | "nginx" |
+    #     "caddy" | "haproxy" | "traefik" | "wireguard" | "tailscale" |
+    #     "headscale" | "nebula" | "container-ingress". Unknown values
+    #     pass through (operator-extensibility) but the audit-log entry
+    #     captures the raw string so downstream review can flag novel
+    #     postures.
+    #   • Strict enforcement (HIPAA-mode + ``require_https_app_layer=True``):
+    #     boot-time RuntimeError if the listener is bound to a
+    #     public-internet-routable address AND ``tls.enabled=False`` AND
+    #     ``perimeter_tls_attestation="none"``. Fail-closed at boot per
+    #     the H-02a G1' precedent (``secrets.enforce_master_key_at_rest_
+    #     for_hipaa``).
+    #
+    # The flag is HIPAA-scope: non-HIPAA installs are no-ops regardless
+    # of value. Lives on ``LoggingConfig`` alongside ``hipaa`` for tight
+    # coupling without a 200+ refcount migration to a separate
+    # ``HipaaConfig`` dataclass (a justifiable Cycle 7+ tidy-up, NOT
+    # required for the defense-in-depth flag deliverable).
+    #
+    # Default of ``perimeter_tls_attestation="none"`` is honest fail-
+    # closed: operator who deploys without thought gets boot-OK if bound
+    # to loopback (dev default) but boot-FAIL on public-routable bind +
+    # ``tls.enabled=False`` + flag-set. ``"unspecified"`` was considered
+    # and rejected: would force every dev/CI install to opt in
+    # explicitly even when no TLS posture exists by design (ephemeral
+    # fixture, in-memory DB, 127.0.0.1 bind only) — friction without
+    # safety gain. The flag itself being opt-in IS the operator's
+    # "yes I thought about this" gesture.
+    require_https_app_layer: bool = False
+    perimeter_tls_attestation: str = "none"
+
 
 @dataclass
 class PersistenceConfig:
     db_path: str = "./data/triage.db"
+
+    # v0.1.2 single-file encryption — SQLCipher single-file encryption-
+    # at-rest gate (§164.312(a)(2)(iv) Encryption). Default OFF so every
+    # existing plaintext install keeps booting unchanged on upgrade.
+    #
+    # When True, ``init_db`` is routed through the SQLCipher engine
+    # (``db/_engine.py`` ``_make_encrypted_conn``) instead of stdlib
+    # ``sqlite3.connect``. Requires the ``encryption`` extra
+    # (``sqlcipher3-binary``) installed AND a reachable master key.
+    #
+    # Operator opts in via YAML ``persistence: { encryption_enabled: true }``
+    # or by exporting ``EMAIL_TRIAGE_DB_ENCRYPTION=1`` for a one-shot run
+    # (mirrors the ``tls.csrf_enforce`` / ``EMAIL_TRIAGE_CSRF_ENFORCE``
+    # YAML-plus-env idiom). The env var, when set to a recognized value,
+    # OVERRIDES the YAML field at boot.
+    #
+    # FAIL-CLOSED in HIPAA mode (per ``docs/v0.1.2-single-file-encryption-
+    # plan.md`` §4.3): once the flag resolves ON, a missing
+    # ``sqlcipher3`` import or an unavailable master key raises a boot
+    # ``RuntimeError`` — NEVER a silent plaintext fallback. Resolution +
+    # enforcement live in ``email_triage.db._engine.resolve_db_encryption``.
+    encryption_enabled: bool = False
 
 
 @dataclass
@@ -212,7 +281,7 @@ class AcmeConfig:
     pre_validation_grace_secs: int = 30
     validation_retries: int = 5
     validation_retry_delay_secs: int = 60
-    # #77 -- retry-loop polish. ``validation_retry_backoff`` shapes the
+    #  -- retry-loop polish. ``validation_retry_backoff`` shapes the
     # delay sequence between retries:
     #   "fixed"       -> always validation_retry_delay_secs
     #   "exponential" -> 15s, 30s, 60s, 120s, 300s, ... capped at the
@@ -259,18 +328,320 @@ class TLSConfig:
 
     ``cert_dir`` defaults to ``<data_dir>/certs/``. Override here
     when the external ACME tool writes elsewhere on the host.
+
+    §164.312(e)(1)/(e)(2)(ii) Transmission Security — Equivalent
+    Measure for LAN-perimeter / operator-managed-TLS deployments
+    (H-04-doc finding, EQM-03 — Cycle 6, 2026-05-23)
+    ──────────────────────────────────────────────────────────────────
+
+    The HIPAA Security Rule §164.312(e) Transmission Security is a
+    REQUIRED Standard. Its two implementation specifications are:
+
+      (e)(2)(i)  Integrity controls — Addressable
+      (e)(2)(ii) Encryption           — Addressable
+
+    The four deploy postures above implement (e)(2)(ii) strictly at
+    the app layer when ``enabled=True``. When ``enabled=False`` (the
+    on-disk default; see comment on ``enabled`` below for the
+    backward-compatibility reason), the app-layer TLS termination is
+    SUPPRESSED and ePHI traverses the listener on cleartext HTTP. In
+    that posture the project relies on a §164.306(d)(3)(ii)(B)
+    EQUIVALENT ALTERNATIVE MEASURE rather than strict (e)(2)(ii)
+    implementation at the app layer.
+
+    The (e)(2)(ii) Addressable spec permits this under
+    §164.306(d)(3)(ii)(B) provided the project (1) documents why
+    strict implementation is not reasonable and appropriate for the
+    target deployment, AND (2) implements an equivalent alternative
+    measure. The deployment-assumption-based equivalent measure is:
+
+    EQUIVALENT MEASURE (EQM-03):
+
+      The deployment is operator-controlled end-to-end between the
+      ePHI source/sink and the app's HTTP listener. The encryption-
+      in-transit requirement is satisfied at the deployment perimeter
+      via one of:
+
+        (a) **Operator-managed reverse proxy** terminating TLS
+            (nginx / Caddy / haproxy / Traefik) with the cleartext
+            hop being a short loopback or process-local socket the
+            operator controls.
+        (b) **VPN / overlay network** (WireGuard / Tailscale /
+            Headscale / Nebula / Tinc) carrying all listener traffic
+            inside an encrypted tunnel; the cleartext-from-app's-
+            perspective hop never traverses an uncontrolled network
+            segment.
+        (c) **Container-network isolation** where the app is bound to
+            a loopback or container-private interface and only an
+            operator-managed TLS-terminating ingress (Kubernetes
+            ingress controller, podman pod-internal proxy, equivalent)
+            exposes it externally — and the only external-facing
+            interface is HTTPS-only.
+
+      All three (a/b/c) shapes share the property that the network
+      segment carrying cleartext between the TLS termination point and
+      the app's HTTP listener is operator-controlled at the physical /
+      virtual-network layer and is not shared with non-trust-boundary
+      tenants.
+
+    The single-tenant medical-researcher reuse pattern documented in
+    ``memory/project_medical_researcher.md`` matches shape (a) or (b)
+    in practice; the homelab reference install on the deploy host matches shape
+    (b) — Tailscale-only ingress with cleartext loopback to the
+    container's exposed port. (See ``CLAUDE.md`` "Container deployment"
+    + ``memory/deployment-notes.md`` for the deploy host-specific deployment
+    record.)
+
+    THREAT-MODEL COVERAGE the EM PROVIDES:
+
+      (i)   On-path passive eavesdropper outside the deployment
+            perimeter — covered: any external network segment is
+            HTTPS-only via the operator-managed termination point.
+      (ii)  Active MITM outside the deployment perimeter — covered
+            equivalent to strict (e)(2)(ii) provided the operator's
+            TLS termination uses a CA-validated certificate; the
+            in-tree ``TLSConfig`` already supports the four postures
+            for the operator-managed termination layer when the
+            operator chooses to terminate at the app rather than
+            upstream.
+      (iii) DNS hijacking / certificate-substitution attacks at the
+            perimeter — covered to the same extent as the operator's
+            perimeter TLS posture (CA-validated cert + CAA records
+            + HSTS at the perimeter are the operator's responsibility
+            outside the app's enforcement scope).
+      (iv)  Tenant-isolation breaches at the cloud provider level
+            (cross-VM traffic interception, hypervisor-escape, etc.) —
+            covered to the same extent as the operator's choice of
+            hosting layer; for a single-tenant on-prem deployment
+            (the deploy host reference install), not in scope of the threat
+            model.
+
+    THREAT-MODEL GAPS the EM does NOT cover (explicit):
+
+      (g1) **Lateral-movement-after-breach inside the deployment
+           perimeter.** If an attacker establishes any
+           perimeter-interior foothold (compromised internal host,
+           rogue device on the LAN segment, malicious container peer
+           on the same pod network), they can observe cleartext PHI
+           on the wire between the TLS termination point and the
+           app. Strict app-layer TLS would limit this to TLS-protected
+           traffic; the EM does not. **Mitigation requires the
+           operator to either (1) deploy app-level TLS by setting
+           ``tls.enabled = True`` and configuring one of the four
+           postures above, OR (2) ensure the cleartext segment is
+           loopback-only / pod-internal-only so no other host can
+           observe it.** This gap is operationally-real for any
+           deployment where the cleartext hop crosses a multi-host
+           network segment.
+
+      (g2) **Multi-tenant deployment.** The EM scopes to single-tenant
+           operator-controlled deployments (per ``memory/project_
+           medical_researcher.md`` single-tenant assumption). If the
+           install grows beyond single-tenant — multiple HIPAA-scope
+           customer organizations sharing one instance, multiple BAAs,
+           multiple compliance jurisdictions — strict app-layer TLS
+           becomes REQUIRED rather than Addressable, because the
+           multi-tenant deployment shape collapses the operator-
+           controlled-perimeter assumption: tenant A's perimeter is no
+           longer co-extensive with tenant B's. **Multi-tenant
+           deployments are explicitly OUT OF SCOPE of this EM.** The
+           sunset / upgrade path (below) names the multi-tenancy
+           threshold as one of the EM's sunset triggers.
+
+      (g3) **Operator-deployment-discipline assumption — H-04-flag
+           landed Cycle 7.** This EM remains DOCUMENTATION at its
+           regulatory core (§164.306(d)(3)(ii)(B) Addressable mechanism-
+           EXISTS test satisfied by the operator-deployment contract),
+           but Cycle 7 added an OPTIONAL DEFENSE-IN-DEPTH ENFORCEMENT
+           layer via ``H-04-flag`` (closed at Cycle 7 per the
+           findings register). Operator opts in via two
+           ``LoggingConfig`` fields:
+
+             • ``logging.perimeter_tls_attestation`` — operator
+               declares the perimeter-TLS posture; HIPAA-mode startup
+               emits a structured audit-log entry capturing the
+               declaration as §164.316(b)(2) audit-trail evidence.
+               Recognized shapes: ``"none"`` (default — no declared
+               posture) | ``"nginx"`` | ``"caddy"`` | ``"haproxy"`` |
+               ``"traefik"`` | ``"wireguard"`` | ``"tailscale"`` |
+               ``"headscale"`` | ``"nebula"`` | ``"container-ingress"``.
+               Operator-supplied custom strings pass through (the
+               audit-log captures the raw value so review can flag
+               novel postures).
+             • ``logging.require_https_app_layer`` — defense-in-depth
+               strict-axis enforcement. When ``True`` AND HIPAA mode
+               is on, boot-time ``RuntimeError`` fires if the listener
+               is bound to a public-internet-routable address AND
+               ``tls.enabled=False`` AND
+               ``perimeter_tls_attestation="none"``. Any one of those
+               conditions being False suppresses the enforcement
+               (``tls.enabled=True`` satisfies (e)(2)(ii) directly;
+               loopback / RFC1918 bind matches shape (a)/(b)/(c); a
+               non-``"none"`` attestation = operator declared a known
+               EQM-03 perimeter posture).
+
+           The enforcement mechanism lives in
+           ``src/email_triage/web/transmission_security.py``
+           (``enforce_transmission_security_for_hipaa``), called from
+           the web/app.py lifespan startup immediately after the
+           H-02a G1' master-key-at-rest gate. Mirrors the G1'
+           fail-closed shape (RuntimeError + named §-anchor +
+           remediation guidance) for operator-discoverability
+           consistency.
+
+           Per hipaa-sme-2 calibration: NOT REQUIRED per literal
+           §164.312(e)(2)(ii) Addressable doctrine; IS
+           OCR-posture-aligned (NIST SP 800-66 R2 §4.7 +
+           future HHS NPRM trajectory toward enforcement-at-startup
+           patterns parallel to MFA NPRM on §164.312(d)) + closes
+           EQM-03 gap g3. Disposition shape:
+           "regulatorily-defensible-but-defense-in-depth-tier"
+           per ``project_hipaa_asap_policy.md`` §"Disposition shapes
+           catalog" (same shape family as H-11 reconciliation
+           tooling Cycle 7 close).
+
+      (g4) **OAuth secret rotation in transit.** §164.312(a)(2)(iv)
+           Encryption-at-rest covers stored OAuth refresh tokens
+           via ``DbSecrets`` Fernet-wrap; their rotation involves
+           transmitting NEW tokens over the same listener surface.
+           Under cleartext HTTP at the app listener, a perimeter-
+           interior observer (per g1) sees rotated OAuth tokens on
+           the wire. The EM's threat-model overlap with
+           §164.312(a)(2)(iv) is acknowledged here for completeness:
+           the encryption-AT-REST control (EQM-05's key-management
+           surface) is NOT undermined by this EM, but the
+           encryption-IN-TRANSIT-during-rotation surface inherits
+           gap g1's coverage limit. This is the standard composition
+           shape — a rotation event's transit-time exposure is
+           bounded by the transmission-security posture in effect at
+           rotation time.
+
+    Rationale for the EQUIVALENT MEASURE choice over strict
+    app-layer TLS (the WHY for §164.306(d)(3)(ii)(B)):
+
+      (a) **Deployment-pattern fit.** The single-tenant medical-
+          researcher reuse target operates an operator-controlled
+          install on a homelab / small-clinic / single-org network.
+          The operator universally has SOME perimeter TLS already
+          deployed for the other services on the same network
+          (mail server, calendar, VPN, etc.); reusing that
+          termination for email-triage is operationally simpler
+          AND structurally identical from a transmission-security
+          standpoint. Forcing app-layer TLS would duplicate the
+          termination surface without improving the threat-model
+          posture for shape (a)/(b)/(c) deployments.
+      (b) **Certificate-management surface.** App-layer TLS adds a
+          second certificate to manage (the four postures above)
+          on top of the operator's existing perimeter cert. The
+          deduplication is a §164.308(a)(1)(ii)(A) risk-analysis
+          improvement (fewer certs = fewer rotation failure modes =
+          fewer outage surfaces) when the perimeter cert already
+          exists. The cost is reciprocally OWNED by the operator,
+          not by the application — the EM is not the project
+          telling the operator they don't need TLS; it is the
+          project documenting that the operator's existing
+          perimeter TLS is the §164.306(d)(3)(ii)(B) equivalent
+          measure.
+      (c) **Threat-model coverage parity with strict (e)(2)(ii) at
+          the app layer.** For an operator-controlled deployment
+          matching shape (a)/(b)/(c) above, the threat-model
+          coverage of perimeter-terminated TLS + cleartext-on-
+          controlled-segment IS equivalent to app-terminated TLS +
+          cleartext-on-loopback-after-decrypt. The decryption-to-
+          cleartext transition happens SOMEWHERE in the stack
+          regardless of where TLS terminates; the EM merely
+          documents that the operator's termination point is
+          regulatorily equivalent to the app's would-be termination
+          point under the deployment assumption.
+      (d) **Non-disabling of app-layer TLS.** Unlike a "remove
+          encryption" decision, this EM does NOT remove the
+          four-posture app-layer TLS support; it preserves
+          ``tls.enabled = True`` as a fully-supported strict
+          implementation path. The EM applies ONLY to deployments
+          that choose the perimeter-managed shape. Operators who
+          want belt-and-suspenders deploy BOTH (perimeter TLS +
+          app-layer TLS) — fully supported, zero conflict.
+
+    SUNSET / UPGRADE PATH (when app-level TLS becomes REQUIRED rather
+    than Addressable via this EM):
+
+      (s1) Multi-tenancy (per g2 above) — the deployment-perimeter
+           assumption collapses; this EM no longer applies.
+      (s2) Public-internet listener exposure without operator-
+           managed perimeter TLS — operationally a configuration
+           mistake; H-04-flag's defense-in-depth surface catches
+           this at startup when enabled.
+      (s3) OCR enforcement posture shift on §164.312(e)(2)(ii) —
+           if NIST SP 800-66 R3 or a future HHS NPRM elevates
+           Encryption from Addressable to Required (parallel to the
+           MFA NPRM trajectory on §164.312(d)), this EM's regulatory
+           basis dissolves; v0.x.y release that adopts the new
+           posture defaults ``tls.enabled = True`` and removes the
+           backward-compat reason for the False default.
+      (s4) Deployment-architecture review (per
+           ``internal documentation`` §6.1 release-
+           cut review) flagging that the operator's actual
+           deployment no longer matches shape (a)/(b)/(c) — the
+           EM is operator-deployment-specific; if the operator's
+           install diverges, the EM's regulatory basis diverges
+           too.
+
+    Documented per 45 CFR §164.306(d)(3)(ii)(B). The EQM-03 row in
+    ``internal documentation`` §5 is the central index;
+    this docstring block is the AUTHORITATIVE TEXT per medical-scope
+    drawer §2.6 (rationale-travels-with-code). Source: 45 CFR §164.312
+    + §164.306 via Cornell LII, retrieved 2026-05-23
+    (https://www.law.cornell.edu/cfr/text/45/164.312 +
+    https://www.law.cornell.edu/cfr/text/45/164.306). NIST SP 800-66
+    Rev. 2 §4.7 (Transmission Security) discusses operator-controlled-
+    deployment-perimeter as one acceptable §164.312(e)(2)(ii)
+    implementation pattern; retrieved 2026-05-23 from
+    https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-66r2.pdf.
+
+    Periodic-review cadence: per ``internal documentation``
+    §6.1 (release-aligned + quarterly-minimum), this EM's continued
+    adequacy is re-verified at every release-cut. As a durable
+    Addressable EM (no sunset milestone — unlike EQM-05's v0.2.0/v0.3.0
+    legacy-SHA-256 sunset), the periodic-review cadence IS the
+    §164.316(b)(2)(iii) "review documentation periodically" surface for
+    EQM-03. Triggers for re-verification:
+      - Any change to the four-posture TLS support architecture above
+        (new posture added, posture deprecated, default flipped).
+      - Operator-reported perimeter-TLS-failure outcome (a confirmed
+        gap g1 exposure event re-opens H-04 immediately).
+      - H-04-flag LANDED Cycle 7 (2026-05-24) via
+        ``src/email_triage/web/transmission_security.py``. Next
+        periodic-review trigger on this surface: any change to the
+        attestation shape catalog, the bind-host classification
+        rules in ``_is_public_internet_routable``, or the strict-axis
+        gate composition.
+      - OCR posture shift on §164.312(e)(2)(ii) (per drawer §2.2
+        calibration; NIST SP 800-66 R2 + HHS NPRM monitoring).
+      - Deployment-architecture review per release-cut catches any
+        operator deployment that no longer matches shape (a)/(b)/(c).
+
+    CROSS-REFERENCE: H-04-flag (LANDED Cycle 7, 2026-05-24) is the
+    defense-in-depth enforcement companion to this documentation-EM.
+    H-04-doc closes the §164.306(d)(3)(ii)(B) documentation
+    requirement; H-04-flag closes the operator-discipline-assumption
+    gap g3 above by adding optional startup-enforcement (HIPAA-mode +
+    ``logging.require_https_app_layer=True``) via the helper in
+    ``src/email_triage/web/transmission_security.py``. H-04-flag is
+    regulatorily-optional (operator-discretionary defense-in-depth)
+    per the same "regulatorily-defensible-but-defense-in-depth-tier"
+    disposition shape established by H-11 in EQM-04.
     """
     cert_dir: str = ""  # empty = default: <data_dir>/certs
     # Default OFF so existing deployments don't flip to HTTPS-only on
-    # upgrade and surprise an external Nagios check / monitor that
+    # upgrade and surprise an external the monitoring system check / monitor that
     # was hard-coded to HTTP. Operator opts in via YAML
-    # ``tls: { enabled: true }``. See docs/deploy-deployhost.md for the
+    # ``tls: { enabled: true }``. See docs/deploy-the deploy host.md for the
     # rollout sequence (update monitors first, then enable here).
     enabled: bool = False
     acme: AcmeConfig = field(default_factory=AcmeConfig)
     # PR 8 / D1 follow-up: CSRF enforcement gate. Default ON
-    # (#82 — flipped 2026-05-10 after the soft-launch window proved
-    # rejects stay flat at zero across normal traffic + the #133
+    # ( — flipped 2026-05-10 after the soft-launch window proved
+    # rejects stay flat at zero across normal traffic + the 
     # oversize-body fix landed). Violations now return HTTP 403.
     # Operator can opt out by setting ``tls: { csrf_enforce: false }``
     # in YAML, or by exporting ``EMAIL_TRIAGE_CSRF_ENFORCE=0`` for a
@@ -281,7 +652,7 @@ class TLSConfig:
     # only)).
     csrf_enforce: bool = True
 
-    # #82 item 4 — operator-defined CSRF exempt path prefixes. Adds
+    #  item 4 — operator-defined CSRF exempt path prefixes. Adds
     # to the always-on set baked into ``web/csrf.py`` (``/health``,
     # ``/webhooks/``, ``/api/oauth/``, ``/login``). Useful when the
     # operator has a custom integration that legitimately can't
@@ -352,7 +723,7 @@ class SmtpConfig:
 
 @dataclass
 class HealthEmailConfig:
-    """Admin-configurable daily health digest (#27).
+    """Admin-configurable daily health digest.
 
     The digest is a push-signal for admins so "dead gateway / silent
     failure" surfaces without anyone opening the UI.  All toggles live
@@ -401,7 +772,7 @@ class AdminEmailConfig:
     The daily health digest used to own its own ``recipients`` list. As
     of the managed-deployment build the same destination handles:
 
-    * daily health digest (#27 — :class:`HealthEmailConfig`)
+    * daily health digest
     * update-failed alerts (CR-2d — fired by ``scripts/deploy.sh`` when
       a post-apply health check fails and a snapshot-restore rollback
       runs)
@@ -426,7 +797,7 @@ class AdminEmailConfig:
 
 @dataclass
 class SummaryEmailConfig:
-    """Decoration for the outbound summary / digest family of emails (#33).
+    """Decoration for the outbound summary / digest family of emails.
 
     ``signature`` supports ``{category}`` placeholder substitution now;
     ``{account}`` / ``{date}`` are reserved for later.
@@ -539,7 +910,7 @@ class WebAuthnConfig:
     rp_name: str = "Email Triage"
     origin: str = ""       # e.g. "https://auth.example.com"
     # Future: enforce userVerification=required for admin role
-    # (PIN/biometric on touch). Punch-list #69.
+    # (PIN/biometric on touch). the backlog .
     require_user_verification_for_admin: bool = False
 
 
@@ -578,7 +949,7 @@ class AuthConfig:
     session_ttl_secs: int = 86400  # 1 day
     hipaa_session_ttl_secs: int = 900  # 15 min
 
-    # #92 login-rate-limit knobs. Per-email + per-IP rolling-window
+    #  login-rate-limit knobs. Per-email + per-IP rolling-window
     # failure counters guarding the login surfaces (OTP, WebAuthn,
     # dev-keypair) against brute-force / credential-stuffing. Source
     # of truth is the auth_events table — the guard reads
@@ -603,7 +974,7 @@ class AuthConfig:
 
 @dataclass
 class LLMMaintenanceWindow:
-    """One operator-defined LLM maintenance window (#149 Bundle C).
+    """One operator-defined LLM maintenance window.
 
     See ``email_triage.llm_maintenance.MaintenanceWindow`` — this
     dataclass mirrors the runtime shape so YAML round-trips cleanly
@@ -618,7 +989,7 @@ class LLMMaintenanceWindow:
 
 @dataclass
 class RedisCacheConfig:
-    """Optional Redis-backed classification cache (#151).
+    """Optional Redis-backed classification cache.
 
     Skip the LLM call when the same email subject+sender+body has
     already been classified by the same model. Big token savings on
@@ -668,7 +1039,7 @@ class RedisCacheConfig:
     # evicted before the new field is added. Bounds growth on
     # heavy-traffic senders. Operator-configurable on
     # /config?tab=ai_backends.
-    inner_cap_per_sender: int = 250
+    inner_cap_per_sender: int = 128
     # Hint strategy for Branch 2 (outer hit, inner miss):
     #   "top_k_with_freq" — pass full category distribution
     #     ("12 notifications / 8 to-respond / 3 newsletters") to
@@ -741,7 +1112,7 @@ class TriageConfig:
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
     push: PushConfig = field(default_factory=PushConfig)
     webhooks: list[WebhookTarget] = field(default_factory=list)
-    # #60 — outbound webhook URLs default to local-only. Operators
+    #  — outbound webhook URLs default to local-only. Operators
     # must set webhooks_allow_external: true in YAML to ship events
     # to public-internet hosts. Even when allowed, payloads remain
     # metadata-only + HMAC-signed; this flag is the deny-by-default
@@ -761,11 +1132,11 @@ class TriageConfig:
     admin_email: AdminEmailConfig = field(default_factory=AdminEmailConfig)
     summary_email: SummaryEmailConfig = field(default_factory=SummaryEmailConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
-    # #151 — optional Redis-backed classification cache.
+    #  — optional Redis-backed classification cache.
     # Default empty URL = OFF (no behaviour change). Operator opts in
     # via /admin/integrations.
     redis_cache: RedisCacheConfig = field(default_factory=RedisCacheConfig)
-    # #149 Bundle C — operator-defined LLM maintenance windows.
+    #  Bundle C — operator-defined LLM maintenance windows.
     # Empty list = no scheduled maintenance windows configured;
     # every LLM-unreachable error follows the default circuit-breaker
     # path (Bundle B) without the "scheduled maintenance" log /
@@ -902,7 +1273,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
     if "secrets" in raw:
         s = raw["secrets"]
         cfg.secrets = SecretsConfig(
-            backend=s.get("backend", "env"),
+            backend=s.get("backend", "auto"),
             keyfile_path=s.get("keyfile_path", "~/.config/email-triage/key"),
             master_key_name=s.get("master_key_name", "ET_MASTER_KEY"),
             external=s.get("external", {}) or {},
@@ -916,10 +1287,19 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             file=lg.get("file"),
             retention_days=int(lg.get("retention_days", 30)),
             max_rows=int(lg.get("max_rows", 50000)),
+            require_https_app_layer=bool(
+                lg.get("require_https_app_layer", False)
+            ),
+            perimeter_tls_attestation=str(
+                lg.get("perimeter_tls_attestation", "none") or "none"
+            ),
         )
     if "persistence" in raw:
         cfg.persistence = PersistenceConfig(
             db_path=raw["persistence"].get("db_path", "./data/triage.db"),
+            encryption_enabled=bool(
+                raw["persistence"].get("encryption_enabled", False)
+            ),
         )
     if "tls" in raw:
         t = raw["tls"] or {}
@@ -983,7 +1363,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         local_suffixes = [
             str(s).strip() for s in local_suffixes_raw if str(s).strip()
         ] if isinstance(local_suffixes_raw, list) else []
-        # #82 item 4 — operator-defined CSRF exempt path prefixes.
+        #  item 4 — operator-defined CSRF exempt path prefixes.
         # Drop entries that don't start with '/' (operator-side typo
         # like ``api/foo``) so they don't silently match nothing —
         # the config validator surfaces the rejected entries instead.
@@ -1113,7 +1493,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             fallback=fb,
         )
 
-    # #151 — optional Redis-backed classification cache.
+    #  — optional Redis-backed classification cache.
     # Default empty URL = OFF. Operator opts in via /admin/integrations.
     if "redis_cache" in raw:
         rc = raw["redis_cache"] or {}
@@ -1124,11 +1504,11 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         from email_triage.cache.classification import clamp_ttl_secs
         # New 2026-05-13 cache tuning knobs. Defaults sane; YAML
         # round-trips when operator changes them via /config?tab=ai_backends.
-        raw_cap = rc.get("inner_cap_per_sender", 250)
+        raw_cap = rc.get("inner_cap_per_sender", 128)
         try:
             cap_int = max(1, min(10000, int(raw_cap)))
         except (TypeError, ValueError):
-            cap_int = 250
+            cap_int = 128
         raw_strategy = str(
             rc.get("hint_strategy", "top_k_with_freq") or "top_k_with_freq",
         ).strip().lower()
@@ -1147,7 +1527,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             dominant_threshold_pct=thresh_int,
         )
 
-    # #149 Bundle C — LLM maintenance windows. List of dicts; bad
+    #  Bundle C — LLM maintenance windows. List of dicts; bad
     # entries silently skipped here (the runtime parser logs WARNING
     # — kept the YAML loader strict-but-graceful so a typo in one
     # entry doesn't block startup with a hard ConfigError).
@@ -1207,7 +1587,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
                 int(a.get("hipaa_session_ttl_secs", 900)),
                 AuthConfig.HIPAA_TTL_HARD_CEILING_SECS,
             ),
-            # #92 login rate-limit tunables. Clamped to sane ranges
+            #  login rate-limit tunables. Clamped to sane ranges
             # at LOAD so a typo'd YAML can't silently disable the
             # guard (max < 0) or pin a 30-day window.
             login_per_email_max=max(
@@ -1245,7 +1625,7 @@ def validate_config(config: TriageConfig) -> list[str]:
             f"Expected one of: {', '.join(sorted(valid_providers))}"
         )
 
-    valid_secrets = {"keyring", "keyfile", "container", "env"}
+    valid_secrets = {"auto", "keyring", "keyfile", "container", "env"}
     if config.secrets.backend not in valid_secrets:
         issues.append(
             f"Unknown secrets backend '{config.secrets.backend}'. "

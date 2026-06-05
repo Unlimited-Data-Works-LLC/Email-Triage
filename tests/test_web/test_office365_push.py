@@ -1,4 +1,4 @@
-"""Tests for the Office 365 / Microsoft Graph push pipeline (#53 + #66).
+"""Tests for the Office 365 / Microsoft Graph push pipeline.
 
 Covers:
 
@@ -288,7 +288,7 @@ class TestO365WebhookReceiver:
         assert row["last_notification_at"] is not None
 
     def test_client_state_mismatch_returns_401(self, push_app, client, db):
-        """#132 — wrong clientState fails closed with HTTP 401, not a
+        """ — wrong clientState fails closed with HTTP 401, not a
         silent 200+drop. Bumps the mismatch counter and writes an
         ``o365_webhook_auth`` audit row so a flood of forged
         notifications is visible."""
@@ -332,7 +332,7 @@ class TestO365WebhookReceiver:
     def test_missing_client_state_returns_401_when_secret_stored(
         self, push_app, client, db,
     ):
-        """#132 — empty/missing clientState field on a delivery for an
+        """ — empty/missing clientState field on a delivery for an
         account that DOES have a stored secret is the unauthorized
         case. 401, not 200."""
         _seed_account(db, account_id=42)
@@ -363,7 +363,7 @@ class TestO365WebhookReceiver:
     def test_no_secret_configured_returns_401(
         self, push_app, client, db,
     ):
-        """#132 — pre-fix subscriptions registered before auto-generate
+        """ — pre-fix subscriptions registered before auto-generate
         landed have no stored clientState. Receiver MUST fail closed
         rather than skipping the compare; operator re-registers via
         Stop+Start to mint a fresh secret."""
@@ -609,7 +609,7 @@ class TestO365SubscriptionRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# /health surfacing (#66)
+# /health surfacing
 # ---------------------------------------------------------------------------
 
 
@@ -712,7 +712,7 @@ class TestHealthSurfaceO365Push:
 
 
 # ---------------------------------------------------------------------------
-# Daily-briefing digest line (#66)
+# Daily-briefing digest line
 # ---------------------------------------------------------------------------
 
 
@@ -778,7 +778,7 @@ class TestDailyDigestO365Line:
 
 
 # ---------------------------------------------------------------------------
-# Dashboard chip (#66)
+# Dashboard chip
 # ---------------------------------------------------------------------------
 
 

@@ -15,7 +15,6 @@ are deferred to a later phase.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from datetime import date, datetime, time as dt_time, timezone
@@ -23,10 +22,11 @@ from typing import Any
 
 import httpx
 
+from email_triage._isotime import parse_iso
 from email_triage.engine.models import CalendarEvent
 from email_triage.providers.calendar_base import (
     CalendarProvider,
-    CalendarScopeError,
+    _CalendarHttpMixin,
 )
 from email_triage.providers._oauth_http import refresh_lock_for
 from email_triage.providers.gmail_api import (
@@ -40,13 +40,20 @@ logger = logging.getLogger("email_triage.providers.gmail_calendar")
 CAL_BASE = "https://www.googleapis.com/calendar/v3"
 
 
-class GoogleCalendarProvider(CalendarProvider):
+class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
     """Google Calendar API client.
 
     Constructed with the same OAuth material as ``GmailApiProvider`` —
     the calendar scope must already be on the refresh token, which the
     ``/accounts/{id}/calendar/enable`` UI flow takes care of.
+
+    HTTP plumbing (``_get_client`` / ``_request`` / ``close``) comes
+    from :class:`_CalendarHttpMixin`; this class supplies the Google-
+    specific hooks below.
     """
+
+    _scope_error_keywords = ("insufficient", "scope", "permission")
+    _provider_label = "google_calendar"
 
     def __init__(
         self,
@@ -79,7 +86,7 @@ class GoogleCalendarProvider(CalendarProvider):
         """Same shape as GmailApiProvider._refresh_access_token —
         client_secret is required for both Web and Desktop clients.
 
-        Wrapped in the per-instance refresh lock (#142 / #139) so
+        Wrapped in the per-instance refresh lock so
         concurrent 401-retry callers don't fire N parallel token
         exchanges at Google. The cached-token re-check inside the
         critical section short-circuits the second through Nth
@@ -136,68 +143,23 @@ class GoogleCalendarProvider(CalendarProvider):
             return self._access_token
         return await self._refresh_access_token()
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Lazy-init the long-lived httpx client.
+    # -- _CalendarHttpMixin hooks --------------------------------------
 
-        Wrapped in the per-instance refresh lock (#139 / #142) so two
-        concurrent cold-path callers don't both observe ``self._http
-        is None`` and each construct their own client — the second
-        would overwrite the first and orphan a live connection pool.
-        Mirrors :meth:`GmailApiProvider._get_client`.
-        """
-        if self._http is not None:
-            return self._http
-        async with refresh_lock_for(self):
-            if self._http is None:
-                self._http = httpx.AsyncClient(
-                    base_url=CAL_BASE, timeout=self._timeout,
-                )
-            return self._http
+    async def _build_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=CAL_BASE, timeout=self._timeout)
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        json_data: Any = None,
-    ) -> Any:
-        client = await self._get_client()
-        token = await self._ensure_token()
-        for attempt in range(2):
-            headers = {"Authorization": f"Bearer {token}"}
-            resp = await client.request(
-                method, path, params=params, json=json_data, headers=headers,
-            )
-            if resp.status_code == 401 and attempt == 0:
-                token = await self._refresh_access_token()
-                continue
+    async def _auth_headers(self) -> dict[str, str]:
+        # Google's access token rotates; apply it per request rather
+        # than baking a soon-stale value onto the long-lived client.
+        return {"Authorization": f"Bearer {await self._ensure_token()}"}
 
-            if resp.status_code >= 400:
-                try:
-                    body = resp.json()
-                except Exception:
-                    body = resp.text
-                # Map insufficient-scope errors so the UI can prompt re-auth.
-                body_str = (
-                    json.dumps(body) if isinstance(body, dict) else str(body)
-                ).lower()
-                if resp.status_code in (401, 403) and (
-                    "insufficient" in body_str
-                    or "scope" in body_str
-                    or "permission" in body_str
-                ):
-                    raise CalendarScopeError("google_calendar", str(body))
-                raise GmailApiError(resp.status_code, body, path)
+    async def _on_unauthorized(self, client: httpx.AsyncClient) -> None:
+        # Refresh the token; the retry's _auth_headers() call picks up
+        # the freshly-cached value.
+        await self._refresh_access_token()
 
-            if resp.status_code == 204 or not resp.content:
-                return None
-            try:
-                return resp.json()
-            except Exception:
-                return resp.text
-
-        raise GmailApiError(401, "Auth failed after refresh", path)
+    def _http_error(self, status: int, body: Any, path: str) -> Exception:
+        return GmailApiError(status, body, path)
 
     # ------------------------------------------------------------------
     # Normalisation
@@ -208,13 +170,12 @@ class GoogleCalendarProvider(CalendarProvider):
         if not raw:
             return None, False
         if "dateTime" in raw:
-            try:
-                dt = datetime.fromisoformat(raw["dateTime"].replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc), False
-            except Exception:
+            dt = parse_iso(raw.get("dateTime"))
+            if dt is None:
                 return None, False
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc), False
         if "date" in raw:
             try:
                 d = date.fromisoformat(raw["date"])
@@ -243,7 +204,7 @@ class GoogleCalendarProvider(CalendarProvider):
                 "response_status": a.get("responseStatus", "needsAction"),
             })
         # When a per-call calendar_id override was used (multi-
-        # calendar listing under #105), tag the event with the
+        # calendar listing under ), tag the event with the
         # actual queried calendar id so consumers can group /
         # filter by calendar. Default falls back to the
         # constructor's _calendar_id for legacy single-calendar
@@ -350,7 +311,7 @@ class GoogleCalendarProvider(CalendarProvider):
         *,
         calendar_id: str | None = None,
     ) -> list[CalendarEvent]:
-        # Per-call override lets multi-calendar consumers (#105
+        # Per-call override lets multi-calendar consumers (
         # ``api`` / ``listings`` roles) iterate the operator's
         # opted-in calendars without instantiating a new provider
         # per ID. Default falls back to the constructor value so
@@ -393,7 +354,7 @@ class GoogleCalendarProvider(CalendarProvider):
         """Return Google Calendar events flagged as out-of-office.
 
         Filters server-side via ``eventTypes=outOfOffice``.
-        ``calendar_id`` override per #105.
+        ``calendar_id`` override per .
         """
         cid = calendar_id or self._calendar_id
         path = f"/calendars/{cid}/events"
@@ -478,8 +439,8 @@ class GoogleCalendarProvider(CalendarProvider):
         self, event: CalendarEvent,
         *, calendar_id: str | None = None,
     ) -> str:
-        # Per-call override mirrors list_events / get_event under #105.
-        # Self-sent event triage path (#107) writes to the
+        # Per-call override mirrors list_events / get_event under .
+        # Self-sent event triage path writes to the
         # operator-picked self_schedule calendar via this kwarg.
         cid = calendar_id or self._calendar_id
         data = await self._request(
@@ -512,7 +473,10 @@ class GoogleCalendarProvider(CalendarProvider):
             f"/calendars/{cid}/events/{event_id}",
         )
 
-    async def respond_to_invite(self, event_id: str, response: str) -> None:
+    async def respond_to_invite(
+        self, event_id: str, response: str,
+        *, calendar_id: str | None = None,
+    ) -> None:
         """Update our attendee record on an event.
 
         Google Calendar doesn't have a dedicated "respond" endpoint —
@@ -520,7 +484,14 @@ class GoogleCalendarProvider(CalendarProvider):
         flipped, and ``sendUpdates=externalOnly`` tells Google to
         notify the organizer (and external attendees) but not loop
         the change back to us.
+
+        ``calendar_id`` — the calendar the invite actually
+        lives on. Without it both the read and the PATCH fell back to
+        the constructor's default calendar, so an invite on a
+        non-primary calendar (the  multi-calendar path) was
+        operated on the wrong calendar — or 404'd outright.
         """
+        cid = calendar_id or self._calendar_id
         status_map = {
             "accepted": "accepted",
             "declined": "declined",
@@ -530,7 +501,7 @@ class GoogleCalendarProvider(CalendarProvider):
         if not new_status:
             raise ValueError(f"Unsupported response: {response!r}")
         # Read the event so we can find our attendee row.
-        event = await self.get_event(event_id)
+        event = await self.get_event(event_id, calendar_id=cid)
         my_email = (self._account or "").lower()
         attendees: list[dict[str, Any]] = []
         found = False
@@ -551,12 +522,7 @@ class GoogleCalendarProvider(CalendarProvider):
             attendees.append({"email": my_email, "responseStatus": new_status})
         await self._request(
             "PATCH",
-            f"/calendars/{self._calendar_id}/events/{event_id}",
+            f"/calendars/{cid}/events/{event_id}",
             params={"sendUpdates": "externalOnly"},
             json_data={"attendees": attendees},
         )
-
-    async def close(self) -> None:
-        if self._http is not None:
-            await self._http.aclose()
-            self._http = None

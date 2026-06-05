@@ -48,8 +48,13 @@ def _make_db() -> sqlite3.Connection:
     fast (no full schema bring-up) and so we control which migrations
     have run. Verifying that migration v12 applies cleanly is the
     job of ``test_v12_applies_cleanly`` below.
+
+    ``check_same_thread=False`` mirrors production ``init_db``: the
+     /  async-DB path dispatches every shared-connection touch
+    to a threadpool worker via ``db_call``, so the connection must
+    permit cross-thread use.
     """
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -60,7 +65,7 @@ def _make_db() -> sqlite3.Connection:
         )
     """)
     # Apply v12 (creates sent_mail_index) + v14 (adds the M-6
-    # is_captured_pair column) + v15 (#136 embedding_norm column).
+    # is_captured_pair column) + v15.
     from email_triage.web.migrations import MIGRATIONS
     for ver in (12, 14, 15):
         for m in MIGRATIONS:
@@ -675,7 +680,7 @@ class TestSqliteVecFallback:
 
 
 # ---------------------------------------------------------------------------
-# Migration v15 -- precomputed embedding_norm column (#136)
+# Migration v15 -- precomputed embedding_norm column
 # ---------------------------------------------------------------------------
 
 class TestMigrationV15:
@@ -871,7 +876,7 @@ class TestMigrationV15:
 
 
 # ---------------------------------------------------------------------------
-# index_message writes the precomputed norm (#136)
+# index_message writes the precomputed norm
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -919,7 +924,7 @@ class TestIndexMessageWritesNorm:
 
 
 # ---------------------------------------------------------------------------
-# Numpy retrieve_similar ordering matches pre-numpy implementation (#136)
+# Numpy retrieve_similar ordering matches pre-numpy implementation
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -1013,7 +1018,7 @@ class TestNumpyRetrievalOrderingEquivalence:
         """The ``similarity`` field on each entry surfaces the raw
         unboosted cosine -- the captured-pair boost is a ranking
         detail, not the canonical similarity score. Locks the M-7+M-6
-        merge contract from 2026-05-09.
+        merge contract from @skip=tests/*.
         """
         conn = _make_db()
         acct_id = _seed_account(conn)
@@ -1045,3 +1050,171 @@ class TestNumpyRetrievalOrderingEquivalence:
         # ...but its surfaced similarity is the raw 1.0, not 1.3.
         assert hits[0]["similarity"] == pytest.approx(1.0, rel=1e-5)
         assert hits[1]["similarity"] == pytest.approx(1.0, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+#  — connection-holding-class write-lock guard
+# ---------------------------------------------------------------------------
+
+def _lock_held_by_other_thread() -> bool:
+    """Return True if ``get_write_lock()`` is currently held by a thread
+    OTHER than the caller.
+
+    ``get_write_lock()`` is a reentrant ``RLock`` — the calling thread
+    can always re-acquire it, so a same-thread ``acquire(blocking=False)``
+    tells us nothing. To probe whether the lock is genuinely held we ask
+    a SEPARATE thread to attempt a non-blocking acquire: an RLock held by
+    any thread rejects a non-blocking acquire from every other thread.
+    """
+    import threading
+
+    from email_triage.web.db_writelock import get_write_lock
+
+    lock = get_write_lock()
+    result: dict[str, bool] = {}
+
+    def _probe() -> None:
+        got = lock.acquire(blocking=False)
+        result["held"] = not got
+        if got:
+            lock.release()
+
+    t = threading.Thread(target=_probe)
+    t.start()
+    t.join()
+    return result["held"]
+
+
+class _LockProbeConn:
+    """Proxy around a ``sqlite3.Connection`` that records whether the
+    process-wide DB write lock is held whenever ``execute`` / ``commit``
+    is called.
+
+    ``sqlite3.Connection.execute`` is a read-only C-level slot, so it
+    cannot be monkeypatched in place. The connection-holding classes
+    only ever reach the DB through ``self._db`` — handing them this
+    proxy as the connection lets the test observe every touch. Every
+    other attribute / method delegates straight to the real connection.
+    """
+
+    def __init__(self, real, *, execute_match=None, record_commit=False):
+        # __dict__ assignment avoids recursing through __setattr__.
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_execute_match", execute_match)
+        object.__setattr__(self, "_record_commit", record_commit)
+        object.__setattr__(self, "execute_observed", [])
+        object.__setattr__(self, "commit_observed", [])
+
+    def execute(self, sql, *args, **kwargs):
+        match = self._execute_match
+        if match is not None and match(sql):
+            self.execute_observed.append(_lock_held_by_other_thread())
+        return self._real.execute(sql, *args, **kwargs)
+
+    def commit(self, *args, **kwargs):
+        if self._record_commit:
+            self.commit_observed.append(_lock_held_by_other_thread())
+        return self._real.commit(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestWriteLockHeldDuringDbTouch:
+    """ — ``SentMailIndex``'s sync DB methods (``_account_row``,
+    ``_row_count``, ``delete_account_index``) must hold the process-wide
+    DB write lock for the duration of their shared-connection
+    ``execute``/``commit``. The  connection-holding-class ratchet
+    enforces the lexical ``with get_write_lock()`` wrap; these tests
+    enforce it at RUNTIME by instrumenting ``conn.execute`` and asserting
+    the lock is genuinely held by the executing thread.
+
+    ``delete_account_index`` is the genuine hole the  fix closes: it
+    is a plain sync method called DIRECTLY (CLI, /profile delete path,
+    tests) with no ``db_call`` dispatch, so before  it touched the
+    shared connection entirely off the write lock.
+    """
+
+    @pytest.mark.asyncio
+    async def test_account_row_holds_write_lock_during_execute(self):
+        conn = _make_db()
+        acct_id = _seed_account(conn)
+        probe = _LockProbeConn(
+            conn, execute_match=lambda s: "FROM email_accounts" in s,
+        )
+        idx = SentMailIndex(
+            probe, acct_id,
+            embedding_backend=_FakeBackend(),
+            embedding_model=EMBED_MODEL_FIXTURE,
+        )
+        # _account_row runs inside _hipaa_short_circuit, dispatched
+        # off-loop by retrieve_similar via db_call.
+        await idx.retrieve_similar("anything")
+
+        assert probe.execute_observed, "_account_row's SELECT never executed"
+        assert all(probe.execute_observed), (
+            "write lock was NOT held during _account_row's execute"
+        )
+
+    @pytest.mark.asyncio
+    async def test_row_count_holds_write_lock_during_execute(self):
+        conn = _make_db()
+        acct_id = _seed_account(conn)
+        probe = _LockProbeConn(
+            conn,
+            execute_match=lambda s: (
+                "COUNT(*)" in s and "FROM sent_mail_index" in s
+            ),
+        )
+
+        class _EmptyProvider:
+            async def search(self, query, limit):
+                return []
+
+            async def fetch_message(self, mid, **_kw):
+                raise AssertionError("no messages to fetch")
+
+        idx = SentMailIndex(
+            probe, acct_id,
+            embedding_backend=_FakeBackend(),
+            embedding_model=EMBED_MODEL_FIXTURE,
+            provider=_EmptyProvider(),
+        )
+        # _row_count runs twice in index_recent (before / after the
+        # index pass), each dispatched off-loop by db_call.
+        await idx.index_recent(limit=10)
+
+        assert probe.execute_observed, "_row_count's SELECT never executed"
+        assert all(probe.execute_observed), (
+            "write lock was NOT held during _row_count's execute"
+        )
+
+    def test_delete_account_index_holds_write_lock(self):
+        """``delete_account_index`` is a SYNC method called directly with
+        no ``db_call`` wrap — the genuine off-lock hole  closes. Its
+        DELETE + commit must both run under the write lock as one
+        atomic unit.
+        """
+        conn = _make_db()
+        acct_id = _seed_account(conn)
+        probe = _LockProbeConn(
+            conn,
+            execute_match=lambda s: "DELETE FROM sent_mail_index" in s,
+            record_commit=True,
+        )
+        idx = SentMailIndex(
+            probe, acct_id,
+            embedding_backend=_FakeBackend(),
+            embedding_model=EMBED_MODEL_FIXTURE,
+        )
+        idx.delete_account_index()
+
+        assert probe.execute_observed, "delete's DELETE never executed"
+        assert all(probe.execute_observed), (
+            "write lock was NOT held during the DELETE"
+        )
+        assert probe.commit_observed, "delete's commit never ran"
+        assert all(probe.commit_observed), (
+            "write lock was NOT held during the commit — DELETE + commit "
+            "must be one atomic block under the lock"
+        )

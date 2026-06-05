@@ -32,6 +32,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from email_triage.triage_logging import get_logger
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 from email_triage._errfmt import fmt_exc
 
@@ -59,11 +60,15 @@ def _get_templates(request: Request):
     return request.app.state.templates
 
 
-def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
+async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None):
     """Match the ui.py / auth_keys.py render wrapper so base-template
-    globals (user, hipaa_mode) get injected consistently."""
+    globals (user, hipaa_mode) get injected consistently.
+
+     / Option B — ``async`` because the shared ``_render`` is async
+    (auto-injected admin banners read the shared connection off-loop);
+    callers ``await`` the wrapper."""
     from email_triage.web.routers.ui import _render as _render_ui
-    return _render_ui(_get_templates(request), request, name, ctx or {})
+    return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
 def _require_admin(request: Request):
@@ -248,7 +253,7 @@ async def admin_integrations_legacy(request: Request):
     and non-admin users still get 403 — preserves the pre-refactor
     contract that ``follow_redirects=False`` tests pin against.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     qs = request.url.query
@@ -401,7 +406,7 @@ def build_integrations_context(request: Request) -> dict:
         "saved": request.query_params.get("saved") == "1",
         "renewed": request.query_params.get("renewed") or "",
         "err": request.query_params.get("err") or "",
-        # #151 — flush button result. ``flushed`` is the int count
+        #  — flush button result. ``flushed`` is the int count
         # when the previous POST succeeded; ``flush_err`` is the
         # human-readable error string when it failed.
         "flushed": (
@@ -435,12 +440,19 @@ async def admin_integrations_save(request: Request):
     ``config.push.gmail_topic_name`` on every sweep, so values picked
     up on next sweep without restart.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
     config = _get_config(request)
     form = await request.form()
+
+    # ASYNC-DB: this handler's persistence is YAML write +
+    # ``secrets.set()`` calls. ``secrets`` is a ``DbSecrets`` wrapper,
+    # NOT a ``web/db.py`` helper or a raw ``db.execute`` — it is out of
+    # the  (web/db.py + db.execute) migration boundary and is left
+    # on the loop deliberately. A follow-up could route DbSecrets
+    # through ``db_call`` if its connection-sharing is confirmed.
 
     def _clean_url(s: str) -> str:
         s = (s or "").strip().rstrip("/")
@@ -535,7 +547,7 @@ async def admin_integrations_save(request: Request):
     if posted_secret:
         secrets.set(secret_key_name, posted_secret)
 
-    # ── #151 — Classification cache (optional Redis) ──
+    # ──  — Classification cache (optional Redis) ──
     # URL empty = OFF (default). TTL clamped to the supported window
     # [3600, 7_776_000] = 1 hour to 90 days; anything outside snaps
     # to the nearest bound rather than rejecting the save.
@@ -641,7 +653,7 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
 
     Returns JSON for the UI's inline button (no full-page navigation).
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         if isinstance(err, RedirectResponse):
             return JSONResponse({"error": "auth_required"}, status_code=401)
@@ -663,7 +675,8 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     from email_triage.providers.gmail_api import GmailApiProvider
     from email_triage.web.routers.ui import _create_provider_from_account
 
-    acct = get_email_account(db, account_id)
+    # ASYNC-DB: account read off the loop.
+    acct = await db_call(get_email_account, db, account_id)
     if acct is None:
         return JSONResponse(
             {"error": "account_not_found"}, status_code=404,
@@ -731,7 +744,8 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     # transiently fails AND the account row was saved before the
     # email/account field migration.
     from email_triage.web.db import get_gmail_watch
-    existing = get_gmail_watch(db, account_id)
+    # ASYNC-DB: existing-watch read off the loop.
+    existing = await db_call(get_gmail_watch, db, account_id)
     existing_email = (existing or {}).get("email_address") or ""
     email_address = profile_email or cfg_email or existing_email
     if not email_address:
@@ -742,7 +756,9 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
             status_code=400,
         )
 
-    upsert_gmail_watch(
+    # ASYNC-DB: gmail_watches upsert off the loop.
+    await db_call(
+        upsert_gmail_watch,
         db,
         account_id=account_id,
         email_address=email_address,
@@ -764,7 +780,7 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# #151 — Classification cache flush
+#  — Classification cache flush
 # ---------------------------------------------------------------------------
 
 @router.post(
@@ -782,7 +798,7 @@ async def admin_integrations_cache_flush(request: Request):
     (or error string) in the querystring; the page renders a small
     confirmation block on the next GET.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 
@@ -797,7 +813,10 @@ async def admin_integrations_cache_flush(request: Request):
                 "Cache+is+not+configured.",
                 status_code=303,
             )
-        deleted = cache.flush_all()
+        #  — flush_all does a SCAN cursor loop + batched DELETEs
+        # on the sync Redis client; dispatched off the event loop so
+        # an admin flush doesn't stall every other in-flight request.
+        deleted = await cache.aflush_all()
     except Exception as e:
         log.error("Classification cache flush failed", error=fmt_exc(e))
         msg = str(e)[:120].replace(" ", "+")
@@ -835,7 +854,7 @@ async def admin_integrations_counters_reset(request: Request):
 
     Admin-only + CSRF-protected.
     """
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
 

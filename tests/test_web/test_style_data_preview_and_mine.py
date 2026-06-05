@@ -1,4 +1,4 @@
-"""Tests for #157 — preview + mine-now on /profile/style-data.
+"""Tests for  — preview + mine-now on /profile/style-data.
 
 Covers two new POST handlers + the surrounding UX:
 
@@ -7,7 +7,7 @@ Covers two new POST handlers + the surrounding UX:
 
 Both share an HTMX fragment surface so the result swaps inline into
 ``#mine-result-<account_id>``. Both honour the same HIPAA gate as
-the M-1+M-2 layer per #152 phase 2: HIPAA-flagged accounts without
+the M-1+M-2 layer per  phase 2: HIPAA-flagged accounts without
 the ``style_knobs_hipaa_allow:<id>`` opt-in render disabled with a
 reason chip on GET + refuse on POST.
 

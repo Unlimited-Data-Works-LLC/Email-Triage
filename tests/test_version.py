@@ -1,4 +1,4 @@
-"""Tests for the version + schema-compatibility helper (#125 partial).
+"""Tests for the version + schema-compatibility helper.
 
 Covers ``compute_version_status`` exhaustively across:
 
@@ -100,7 +100,7 @@ class TestComputeVersionStatusRollbackEscalation:
     -> incompatible_rollback if the live DB is past `:previous`."""
 
     def test_previous_below_db_escalates_to_incompat(self):
-        # The 2026-05-09 scenario: live DB at 14, target at 15,
+        # The @skip=tests/* scenario: live DB at 14, target at 15,
         # previous image only knows up to 13.
         s = compute_version_status(
             db_schema_version=14,

@@ -1,4 +1,4 @@
-"""Tests for the admin /admin/retry-queue page (#175 R-B).
+"""Tests for the admin /admin/retry-queue page.
 
 R-A ships the migration + db helpers in parallel; this test
 synthesises the expected R-A schema (v30) inside the fixture so

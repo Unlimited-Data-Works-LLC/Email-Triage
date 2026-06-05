@@ -4,18 +4,18 @@ What Email Triage does — and does not — do with the mail flowing through it.
 
 ## Verdict line
 
-**No mail content, message metadata, or PHI leaves your install unless you've explicitly opted-in to a cloud-LLM backend with a Business Associate Agreement on file.** Every classification, draft, embedding, and audit-trail row is computed locally and stored encrypted at rest on your hardware. The only outbound network calls are to mail providers you've configured (Gmail / Outlook / your IMAP server) and the LLM backend you've selected (default: local Ollama on the same host).
+**No mail content, message metadata, or PHI leaves your install unless you've explicitly opted-in to a cloud-LLM backend with a Business Associate Agreement on file.** Every classification, draft, embedding, and audit-trail row is computed locally and stored on your hardware — with SQLCipher (AES-256) database encryption at rest — on by default for new installs (v0.1.2). The only outbound network calls are to mail providers you've configured (Gmail / Outlook / your IMAP server) and the LLM backend you've selected (default: local Ollama on the same host).
 
 ## What stays on your install
 
 | Data class | Storage |
 |---|---|
 | Mail bodies, headers, attachments (in-memory only during triage) | Not persisted by default; admin can opt-in to `sent_mail_index` for RAG draft assistance |
-| Classification decisions + reasoning | `triage_runs` table, SQLite, encrypted at rest via filesystem encryption (operator-managed) |
+| Classification decisions + reasoning | `triage_runs` in `triage.db`; SQLCipher (AES-256) encrypted at rest by default for new installs (v0.1.2), else operator-managed filesystem encryption |
 | Per-account credentials (IMAP password, OAuth refresh tokens) | `secrets_store` table, Fernet-encrypted with the install master key |
 | Audit trail (every PHI-touch request, every admin action) | `log_entries` (hash-chained for tamper-evidence) + `access_log` + `auth_events` |
 | Style-learning descriptors | `hipaa_style_descriptors` (closed-vocabulary, no free text); per-contact descriptors keyed by salted hash of recipient address |
-| Configuration (routes, watches, categories) | `triage.db`, plain SQLite |
+| Configuration (routes, watches, categories) | `triage.db` — SQLCipher-encrypted at rest by default for new installs (v0.1.2) |
 
 The database is a single file. Off-host backup is the operator's responsibility; the in-app `email-triage backup export` command produces an encrypted tarball for that purpose.
 

@@ -32,6 +32,13 @@ from email_triage._errfmt import fmt_exc
 
 log = get_logger("providers.imap")
 
+# Extra seconds to wait for an IMAP IDLE server push beyond the
+# negotiated idle_timeout before declaring the socket half-open.
+# aioimaplib issues its own DONE at idle_timeout, so a healthy server
+# resolves the wait well within this window; a longer silence means the
+# TCP connection died (NAT/firewall idle eviction) and must be rebuilt.
+_IDLE_PUSH_GRACE_SECS = 60
+
 
 def _seen_uids_remember(
     uid: str,
@@ -40,7 +47,7 @@ def _seen_uids_remember(
 ) -> None:
     """Append ``uid`` to a bounded-FIFO seen-tracker pair.
 
-    #143 — the original IDLE seen-tracker was a single ``set`` pruned
+     — the original IDLE seen-tracker was a single ``set`` pruned
     via ``set(list(seen)[-500:])``. ``set`` has no insertion order, so
     the slice picked an arbitrary subset, not the most recent. After
     a prune the dropped-but-still-recent UIDs would re-yield as
@@ -108,14 +115,14 @@ try:
     HAS_AIOIMAPLIB = True
     # Apply the upstream-bug parser patch before ANY IMAP4ClientProtocol
     # instance is created in the process. See _aioimaplib_patch.py for
-    # rationale (upstream issue #118: large-response recursion).
+    # rationale (upstream issue : large-response recursion).
     from email_triage.providers import _aioimaplib_patch  # noqa: F401
 except ImportError:
     HAS_AIOIMAPLIB = False
 
 
 # ---------------------------------------------------------------------------
-# #147 — IMAP connection-state diagnostics + pre-flight auth check
+#  — IMAP connection-state diagnostics + pre-flight auth check
 # ---------------------------------------------------------------------------
 
 class IMAPClientLogoutError(RuntimeError):
@@ -134,7 +141,7 @@ def _capture_imap_state(client: Any) -> dict[str, Any]:
     """Snapshot the IMAP client's connection state for an error log.
 
     Used on every IMAP error path that touches SELECT so the
-    next #147-shaped occurrence is diagnosable without enabling
+    next -shaped occurrence is diagnosable without enabling
     debug-level traces. Returns a dict suitable for splatting as
     ``**_capture_imap_state(client)`` into a structured ``log.error``
     call.
@@ -304,7 +311,7 @@ class ImapProvider(EmailProvider, PushCapable):
         # legacy accounts whose IMAP LOGIN already includes the
         # @domain). Used as the default From: in create_draft so
         # drafts don't ship with the bare LOGIN username
-        # (``user``) as the From header.
+        # (``exampleuser``) as the From header.
         self._email_address = email_address
         # 2026-05-13 — operator override for the Drafts folder name.
         # When non-empty, create_draft APPENDs straight to this folder
@@ -315,6 +322,10 @@ class ImapProvider(EmailProvider, PushCapable):
         # operator just wants to pin a different target).
         self._drafts_folder = drafts_folder
         self._client: Any = None
+        # UIDVALIDITY of the currently-selected mailbox, captured on
+        # SELECT. A change means the server reset the UID space, so any
+        # stored high-water mark for this mailbox is meaningless.
+        self._uidvalidity: int | None = None
 
     @property
     def name(self) -> str:
@@ -339,7 +350,7 @@ class ImapProvider(EmailProvider, PushCapable):
         await self._client.wait_hello_from_server()
         await self._client.login(self._username, self._password)
         # Stamp the client with its birth-time so ``_capture_imap_state``
-        # can report connection age on the next #147-shaped error. The
+        # can report connection age on the next -shaped error. The
         # custom attribute is namespaced (``_et_*``) to avoid colliding
         # with anything aioimaplib might add in a future release.
         try:
@@ -356,14 +367,17 @@ class ImapProvider(EmailProvider, PushCapable):
         # whose IMAP server had both ``Sent`` AND ``Sent Items`` — the
         # mis-SELECT returned UIDs from the wrong folder, downstream
         # fetches against the correctly-quoted name found nothing.
-        await self._client.select(self._quote_mailbox(self._mailbox))
+        _sel_result, _sel_data = await self._client.select(
+            self._quote_mailbox(self._mailbox)
+        )
+        self._uidvalidity = self._parse_uidvalidity(_sel_data)
         log.info("IMAP connected", host=self._host, mailbox=self._mailbox)
         return self._client
 
     async def _ensure_authenticated(self) -> str:
         """Bound wrapper around the module-level ``_ensure_authenticated``.
 
-        #147 — Wired into the digest path (``fetch_messages_in_folder``
+         — Wired into the digest path (``fetch_messages_in_folder``
         equivalent: :meth:`select_folder` + :meth:`search` + the
         in-folder fetch sequence) before each IMAP operation that
         issues a SELECT. The triage runner has its own reconnect
@@ -481,7 +495,7 @@ class ImapProvider(EmailProvider, PushCapable):
         folder back (e.g. to fetch with the correct mailbox), call
         :meth:`search_all_folders` directly.
 
-        #147 — Pre-flight :meth:`_ensure_authenticated` covers both
+         — Pre-flight :meth:`_ensure_authenticated` covers both
         the explicit ``filter.folder`` SELECT branch below AND the
         no-folder-switch path (whose underlying SEARCH still requires
         AUTH/SELECTED state). A stale connection that drifted to
@@ -540,7 +554,7 @@ class ImapProvider(EmailProvider, PushCapable):
 
         IMAP has no native pagination — RFC 3501 SEARCH returns
         every matching UID in a single response. For whole-mailbox
-        triage (#101) the runner wants those UIDs in operator-
+        triage the runner wants those UIDs in operator-
         controllable chunks (so per-batch progress + cancel checks
         work), not as one giant list.
 
@@ -630,7 +644,7 @@ class ImapProvider(EmailProvider, PushCapable):
         replies cascading from a single connection's state drift
         after LIST + per-folder SELECT). stdlib imaplib doesn't try
         to parse FETCH-shaped responses, so the parens-counting and
-        recursion bugs (upstream issue #118) don't apply.
+        recursion bugs (upstream issue ) don't apply.
 
         Returns ``[(folder, uid), ...]`` capped at ``limit``. UIDs
         are scoped per mailbox in IMAP (RFC 3501 § 2.3.1.1) so the
@@ -751,8 +765,7 @@ class ImapProvider(EmailProvider, PushCapable):
     def _translate_query(query: str) -> str:
         """Translate common query shortcuts to IMAP SEARCH syntax.
 
-        Delegates to :func:`engine.query_lang.translate_imap_query_to_imap`
-        (#138.3).
+        Delegates to :func:`engine.query_lang.translate_imap_query_to_imap`.
         """
         from email_triage.engine.query_lang import translate_imap_query_to_imap
         return translate_imap_query_to_imap(query)
@@ -761,7 +774,7 @@ class ImapProvider(EmailProvider, PushCapable):
     def _translate_filter(filt) -> str:
         """MailFilter → RFC 3501 IMAP SEARCH criteria.
 
-        Delegates to :func:`engine.query_lang.emit_imap_filter` (#138.3).
+        Delegates to :func:`engine.query_lang.emit_imap_filter`.
         ``folder`` is handled by the caller (it switches mailboxes
         before issuing SEARCH).
         """
@@ -843,6 +856,31 @@ class ImapProvider(EmailProvider, PushCapable):
             await self._reset_client_after_parser_error()
             raw_bytes, labels = await _fetch_via_stdlib()
 
+        return self._raw_to_email_message(
+            message_id=message_id,
+            raw_bytes=raw_bytes,
+            labels=labels,
+            headers_only=headers_only,
+        )
+
+    def _raw_to_email_message(
+        self,
+        *,
+        message_id: str,
+        raw_bytes: bytes,
+        labels: list[str],
+        headers_only: bool,
+    ) -> EmailMessage:
+        """Parse stdlib-imaplib FETCH result bytes into an EmailMessage.
+
+        Extracted from :meth:`fetch_message` so the new batch
+        path :meth:`fetch_messages_batch` reuses the same parse +
+        normalise + diagnostic logic. The IMAP transport layer is the
+        only thing that differs between single-fetch and batch; the
+        downstream MIME-walk + body extract + attachment surface +
+        header preservation are identical, so this single helper is
+        the SSOT for the post-fetch shape.
+        """
         msg = email.message_from_bytes(raw_bytes, policy=email.policy.default)
 
         sender = msg.get("From", "")
@@ -897,7 +935,7 @@ class ImapProvider(EmailProvider, PushCapable):
         headers = {name: value for name, value in msg.items()}
 
         # Final assembly — link extraction handled by the shared helper
-        # (#145.8) so it's not duplicated across the three providers.
+        # so it's not duplicated across the three providers.
         from email_triage.providers._normalize import build_email_message
         return build_email_message(
             message_id=message_id,
@@ -912,6 +950,101 @@ class ImapProvider(EmailProvider, PushCapable):
             attachments=attachments,
             headers=headers,
         )
+
+    async def fetch_messages_batch(
+        self,
+        uids: list[str],
+        *,
+        headers_only: bool = False,
+        folder: str | None = None,
+    ) -> list[EmailMessage]:
+        """Fetch N UIDs from one mailbox on ONE IMAP connection.
+
+        Where :meth:`fetch_message` pays the ~150 ms TLS+LOGIN cost
+        per call, this batch path opens ONE
+        ``imap_blocking._blocking_fetch_batch`` connection and
+        FETCHes every UID on it. A 50-UID poll cycle drops from
+        ~5-10 s of pure transport overhead to ~150 ms + N × FETCH
+        — ~95 % latency reduction on bulk paths.
+
+        Single-UID input is delegated to :meth:`fetch_message` to
+        keep the connection-per-fetch path unchanged for the only
+        callers that genuinely want per-UID error isolation (web
+        single-message fetch, push consumer).
+
+        A UID that the server can't return (deleted between SEARCH
+        and FETCH, wrong mailbox) yields an EmailMessage built from
+        empty bytes — same shape stdlib emits for an empty FETCH
+        response on the single-fetch path. Caller can filter by
+        ``msg.subject == "" and msg.sender == ""`` if they need to
+        drop the empty slots; the operator-facing pattern (digest
+        actions, sent-mail index) treats empty messages as a skip.
+
+        Parser-bug + credential-residency guarantees match
+        single-fetch — the batch primitive is on the stdlib path
+        (parser-bug-free per ``bug_aioimaplib_recursion.md``) and
+        tears the connection down at function return (no extension
+        of credential-in-memory residency vs single-fetch). See
+        ``imap_blocking.fetch_messages_batch_blocking`` for the
+        transport-layer rationale.
+        """
+        if not uids:
+            return []
+        if len(uids) == 1:
+            return [await self.fetch_message(
+                uids[0], headers_only=headers_only, folder=folder,
+            )]
+
+        from email_triage.providers.imap_blocking import (
+            fetch_messages_batch_blocking,
+        )
+
+        target_mailbox = folder or self._mailbox
+
+        try:
+            results = await fetch_messages_batch_blocking(
+                host=self._host,
+                port=self._port,
+                use_ssl=self._use_ssl,
+                username=self._username,
+                password=self._password,
+                mailbox=target_mailbox,
+                uids=list(uids),
+                headers_only=headers_only,
+            )
+        except (aioimaplib.Abort, aioimaplib.CommandTimeout) as e:
+            # Path C parity with :meth:`fetch_message`: a residual
+            # parser-shaped error from the stdlib path triggers a
+            # single retry on a fresh client. Whole batch retries
+            # together (the alternative — per-UID retry within the
+            # batch — would re-introduce per-UID TLS+LOGIN cost and
+            # defeat the optimisation).
+            log.warning(
+                "IMAP stdlib batch fetch hit aioimaplib-shaped error "
+                "— retrying once on a fresh connection",
+                batch_size=len(uids), error=fmt_exc(e),
+            )
+            await self._reset_client_after_parser_error()
+            results = await fetch_messages_batch_blocking(
+                host=self._host,
+                port=self._port,
+                use_ssl=self._use_ssl,
+                username=self._username,
+                password=self._password,
+                mailbox=target_mailbox,
+                uids=list(uids),
+                headers_only=headers_only,
+            )
+
+        return [
+            self._raw_to_email_message(
+                message_id=uid,
+                raw_bytes=raw_bytes,
+                labels=labels,
+                headers_only=headers_only,
+            )
+            for uid, (raw_bytes, labels) in zip(uids, results)
+        ]
 
     @staticmethod
     def _extract_attachments(msg) -> list:
@@ -933,11 +1066,14 @@ class ImapProvider(EmailProvider, PushCapable):
             except Exception:
                 blob = b""
             parsed = parse_ics(blob) if blob else None
+            #  / N-03 — drop raw bytes after parse_ics; see the
+            # matching comment in providers/gmail_api.py. Narrower-
+            # residency mitigation under §164.308(a)(1)(ii)(B).
             out.append(Attachment(
                 filename=part.get_filename() or "invite.ics",
                 content_type="text/calendar",
                 size_bytes=len(blob),
-                data=blob or None,
+                data=None,
                 parsed=parsed,
             ))
         return out
@@ -1195,7 +1331,7 @@ class ImapProvider(EmailProvider, PushCapable):
         Folder names containing spaces or special characters must be
         quoted per IMAP RFC 3501.  Names already quoted are left alone.
 
-        #147 — Pre-flight :meth:`_ensure_authenticated` ahead of the
+         — Pre-flight :meth:`_ensure_authenticated` ahead of the
         SELECT. A stale cached client whose auth state drifted to
         NONAUTH (server-side IDLE timeout, IMAP-LOGOUT race with the
         watcher, etc.) is the failure mode that produced
@@ -1231,6 +1367,7 @@ class ImapProvider(EmailProvider, PushCapable):
                 **_capture_imap_state(client),
             )
             raise RuntimeError(f"Failed to select folder '{folder}'")
+        self._uidvalidity = self._parse_uidvalidity(data)
         log.info("Selected folder", folder=folder)
 
     @staticmethod
@@ -1244,6 +1381,35 @@ class ImapProvider(EmailProvider, PushCapable):
             escaped = folder.replace("\\", "\\\\").replace('"', '\\"')
             return f'"{escaped}"'
         return folder
+
+    @staticmethod
+    def _parse_uidvalidity(data: Any) -> int | None:
+        """Extract UIDVALIDITY from a SELECT response, or None if absent.
+
+        The server reports it as an untagged ``* OK [UIDVALIDITY n]``
+        response line. A change between sessions means the UID space
+        was reset.
+        """
+        import re as _re
+        if not data:
+            return None
+        for line in data:
+            if isinstance(line, bytes):
+                line = line.decode(errors="replace")
+            m = _re.search(r"UIDVALIDITY\s+(\d+)", str(line))
+            if m:
+                return int(m.group(1))
+        return None
+
+    async def get_uidvalidity(self) -> int | None:
+        """UIDVALIDITY of the watched mailbox (connects + selects first).
+
+        Returns ``None`` if the server did not report one. Callers
+        compare this against a stored value to detect a UID-space
+        reset before trusting a high-water mark.
+        """
+        await self._connect()
+        return self._uidvalidity
 
     async def create_draft(
         self,
@@ -1277,7 +1443,7 @@ class ImapProvider(EmailProvider, PushCapable):
             # over IMAP LOGIN username for the default From header.
             # Falls back to username for legacy accounts whose IMAP
             # username already carries the @domain. Pre-fix drafts
-            # shipped with bare LOGIN (e.g. ``user``), which mail
+            # shipped with bare LOGIN (e.g. ``exampleuser``), which mail
             # servers reject or rewrite.
             msg["From"] = self._email_address or self._username
         msg["To"] = ", ".join(to)
@@ -1590,6 +1756,17 @@ class ImapProvider(EmailProvider, PushCapable):
         import re as _re
 
         client = await self._connect()
+        #  /  — pre-flight :meth:`_ensure_authenticated`, the
+        # same guard ``search`` and ``select_folder`` already run. The
+        # unified poll loop holds one provider instance for the life of
+        # the account; a connection that drifted to NONAUTH between the
+        # constructor's :meth:`_connect` and a poll tick N minutes later
+        # would otherwise surface as ``command SELECT illegal in state
+        # NONAUTH``. Re-connect on a confirmed server-side logout.
+        try:
+            await self._ensure_authenticated()
+        except IMAPClientLogoutError:
+            client = await self._connect()
         # Select the mailbox — we allow the caller to pass a mailbox
         # that differs from the constructor's default so the unified
         # poll loop can walk every configured folder on one provider
@@ -1665,23 +1842,39 @@ class ImapProvider(EmailProvider, PushCapable):
         if not uids:
             return []
 
-        messages: list[EmailMessage] = []
-        # Fetch one UID at a time — the existing fetch_message helper
-        # handles the response-parsing differences across aioimaplib
-        # versions. The typical poll brings in a handful of UIDs at
-        # most; if cadence falls far behind we'd want to batch, but
-        # that's a future optimisation.
-        for uid in uids:
-            try:
-                msg = await self.fetch_message(uid)
-                messages.append(msg)
-            except Exception as e:
-                log.warning(
-                    "IMAP poll_once: fetch failed, skipping",
-                    mailbox=mailbox, uid=uid, error=fmt_exc(e),
-                )
-
-        return messages
+        #  — batch FETCH on one stdlib-imaplib connection. A
+        # 50-UID poll cycle drops from 50 × ~150 ms TLS+LOGIN to 1 ×
+        # ~150 ms + 50 × FETCH (~95 % transport-overhead reduction).
+        # ``fetch_messages_batch`` delegates to single-fetch when N
+        # == 1, so the cheap-path is preserved. Whole-batch failure
+        # is rare (per-UID FETCH failure inside the batch yields an
+        # empty slot rather than aborting); a protocol-level failure
+        # raises and is caught by the outer except.
+        try:
+            return await self.fetch_messages_batch(uids, folder=mailbox)
+        except Exception as e:
+            # Whole-batch failure (LOGIN refused, SELECT refused,
+            # connection drop after the Path-C retry) → fall back to
+            # per-UID single-fetch for partial coverage. Operator
+            # symptom moves from "no messages this tick" to "best-
+            # effort partial fetch", matching the prior loop's
+            # error-tolerance posture exactly.
+            log.warning(
+                "IMAP poll_once: batch fetch failed, falling back to "
+                "per-UID single fetches",
+                mailbox=mailbox, count=len(uids), error=fmt_exc(e),
+            )
+            messages: list[EmailMessage] = []
+            for uid in uids:
+                try:
+                    msg = await self.fetch_message(uid)
+                    messages.append(msg)
+                except Exception as e2:
+                    log.warning(
+                        "IMAP poll_once: fetch failed, skipping",
+                        mailbox=mailbox, uid=uid, error=fmt_exc(e2),
+                    )
+            return messages
 
     async def get_latest_uid(self) -> int:
         """Return the UID of the most recent message in the current mailbox.
@@ -1703,11 +1896,26 @@ class ImapProvider(EmailProvider, PushCapable):
                     return int(match.group(1))
         return 0
 
-    async def watch(self) -> AsyncIterator[str]:
+    async def watch(self, since_uid: int = 0) -> AsyncIterator[str]:
         """Watch for new messages using IMAP IDLE.
 
         Yields UIDs of new messages as they arrive.  Refreshes the IDLE
         connection every ``idle_timeout`` seconds to comply with RFC 2177.
+
+         — the post-IDLE scan is a UID-range search
+        (``SEARCH UID <floor+1>:*``), not ``SEARCH UNSEEN``. ``UNSEEN``
+        missed a genuinely-new message that arrived already-\\Seen — a
+        second client opened it, or a server-side rule marked it read —
+        because it filters on read state, not recency. A UID-range
+        search picks up every new message regardless of \\Seen.
+
+        ``floor`` starts at ``since_uid`` — the caller's high-water
+        mark, so a restarted watcher resumes exactly where it left off
+        — and advances to the highest UID yielded so each cycle's
+        search range stays bounded. When ``since_uid`` is 0 (no resume
+        point — e.g. the CLI ``watch`` command) the floor is seeded to
+        the mailbox's current latest UID, so ``watch`` means "mail
+        arriving from now" rather than replaying the backlog.
 
         Uses ``client.search()`` + ``client.fetch(seq, "(UID)")`` instead
         of ``client.uid("search", ...)`` because aioimaplib 2.0 restricts
@@ -1718,9 +1926,23 @@ class ImapProvider(EmailProvider, PushCapable):
         client = await self._connect()
         log.info("Starting IMAP IDLE watch", mailbox=self._mailbox)
 
+        floor = int(since_uid)
+        if floor <= 0:
+            # No resume point — watch for mail from now on. Seed the
+            # floor to the current latest UID so the first IDLE cycle
+            # does not replay the pre-existing mailbox.
+            try:
+                floor = int(await self.get_latest_uid())
+            except Exception:
+                floor = 0
+        log.info(
+            "IMAP IDLE watch UID floor",
+            mailbox=self._mailbox, uid_floor=floor,
+        )
+
         # Track UIDs we've already yielded to avoid duplicates across
         # IDLE cycles (a UID might stay UNSEEN if triage doesn't flag
-        # it). #143 — see ``_seen_uids_remember`` for the design
+        # it).  — see ``_seen_uids_remember`` for the design
         # rationale (was a single ``set`` with an order-undefined
         # prune; now a bounded deque + parallel set for FIFO).
         seen_uids_q: collections.deque[str] = collections.deque(maxlen=1000)
@@ -1729,8 +1951,33 @@ class ImapProvider(EmailProvider, PushCapable):
         while True:
             idle_task = await client.idle_start(timeout=self._idle_timeout)
 
-            # Wait for the IDLE response or timeout.
-            msg = await client.wait_server_push()
+            # Wait for the IDLE response or timeout. aioimaplib issues
+            # its own DONE at ``_idle_timeout``, so a healthy connection
+            # resolves this wait within that window. A longer silence
+            # means the TCP socket is half-open (NAT/firewall idle
+            # eviction) — no push will ever arrive. Bound the wait so a
+            # dead socket cannot hang the watcher forever.
+            try:
+                msg = await asyncio.wait_for(
+                    client.wait_server_push(),
+                    timeout=self._idle_timeout + _IDLE_PUSH_GRACE_SECS,
+                )
+            except TimeoutError:
+                log.warning(
+                    "IMAP IDLE: no server push within timeout — socket "
+                    "presumed half-open, forcing reconnect",
+                    mailbox=self._mailbox,
+                    idle_timeout=self._idle_timeout,
+                )
+                idle_task.cancel()
+                try:
+                    client.idle_done()
+                except Exception:
+                    pass
+                await self.close()
+                raise ConnectionError(
+                    "IMAP IDLE timed out waiting for a server push"
+                )
 
             client.idle_done()
             await asyncio.wait_for(idle_task, timeout=10)
@@ -1748,8 +1995,11 @@ class ImapProvider(EmailProvider, PushCapable):
                 # Timeout or non-EXISTS push — just re-enter IDLE.
                 continue
 
-            # Search for unseen messages using non-UID SEARCH.
-            result, data = await client.search("UNSEEN")
+            #  — UID-range search (not UNSEEN): a new message that
+            # arrived already-\Seen must still be picked up. Plain
+            # SEARCH returns sequence numbers; the FETCH below maps
+            # them back to UIDs.
+            result, data = await client.search(f"UID {floor + 1}:*")
             if result != "OK":
                 log.warning("IMAP SEARCH after IDLE failed", result=result)
                 continue
@@ -1789,6 +2039,15 @@ class ImapProvider(EmailProvider, PushCapable):
 
             for uid in new_uids:
                 yield uid
+
+            #  — advance the search floor past everything yielded
+            # so the next IDLE cycle's UID-range search stays bounded
+            # rather than re-scanning from the original floor forever.
+            for _u in new_uids:
+                try:
+                    floor = max(floor, int(_u))
+                except ValueError:
+                    pass
 
             # No manual prune needed — the deque's ``maxlen`` handles
             # FIFO eviction inside ``_remember_uid``.

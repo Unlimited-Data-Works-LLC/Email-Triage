@@ -1,4 +1,4 @@
-"""Tests for the ProviderDispatcher registry (#138 phase 2).
+"""Tests for the ProviderDispatcher registry.
 
 Covers the functional-dispatch sites that survived Bundle G:
 - ``poll_once`` per ptype dispatches to the right underlying function
@@ -88,10 +88,31 @@ async def test_poll_once_gmail_routes_to_poll_once_gmail(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_poll_once_o365_no_op():
-    """O365 poll is not yet wired — returns silently without raising."""
-    result = await get_dispatch("office365").poll_once(object(), {"id": 1})
-    assert result is None
+async def test_poll_once_o365_routes_to_poll_once_office365(monkeypatch):
+    """ — the O365 dispatcher's poll_once delegates to
+    web.app._poll_once_office365 (was a no-op stub before)."""
+    called = {}
+
+    async def fake_poll_once_office365(app, acct):
+        called["app"] = app
+        called["acct"] = acct
+
+    monkeypatch.setattr(
+        "email_triage.web.app._poll_once_office365",
+        fake_poll_once_office365,
+    )
+    sentinel_app = object()
+    sentinel_acct = {"id": 11, "provider_type": "office365"}
+    await get_dispatch("office365").poll_once(sentinel_app, sentinel_acct)
+    assert called == {"app": sentinel_app, "acct": sentinel_acct}
+
+
+def test_office365_poll_is_marked_implemented():
+    """ — O365 poll is now genuinely implemented; the honest-signal
+    flag must reflect that so the unified poll loop counts it healthy."""
+    assert get_dispatch("office365").poll_implemented is True
+    assert get_dispatch("imap").poll_implemented is True
+    assert get_dispatch("gmail_api").poll_implemented is True
 
 
 # ---------------------------------------------------------------------------

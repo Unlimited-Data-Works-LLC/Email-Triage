@@ -1,4 +1,4 @@
-"""US cell-carrier email-to-SMS gateway helpers (#73).
+"""US cell-carrier email-to-SMS gateway helpers.
 
 Operator picks a carrier from a dropdown on ``/profile`` and types a
 cell number; the system computes the matching gateway address (e.g.

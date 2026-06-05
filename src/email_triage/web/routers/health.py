@@ -29,6 +29,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from email_triage._isotime import parse_iso
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user as _get_current_user
 
@@ -39,6 +40,20 @@ router = APIRouter()
 
 _STALE_WATCHER_SECONDS = 15 * 60   # 15 minutes
 _STALE_TRIAGE_SECONDS = 24 * 60 * 60  # 24 hours
+
+#  — "sustained" threshold for the HIPAA style-distill failure
+# count. A handful of transient distill backend failures over a 24h
+# window is ordinary noise (a backend blip self-heals); ``degraded``
+# fires only once the 24h failure count is high enough to mean the
+# distill pipeline is genuinely broken. Matches the install-wide
+# retry-deads threshold in daily_health.py for consistency.
+_STYLE_DISTILL_FAILURE_DEGRADE_THRESHOLD = 5
+
+#  — degrade /health when a present TLS cert is at or within this
+# many days of expiry. The ACME auto-renewer rolls well before this,
+# so reaching it means the renewer failed — surface it before the
+# listener serves a dead cert.
+_TLS_CERT_DEGRADE_DAYS = 7
 
 
 def _db_ok(db) -> bool:
@@ -58,10 +73,10 @@ def _last_triage_iso(db) -> str | None:
     The DB column stores UTC (written via ``datetime.now(timezone.utc)``).
     We convert to the container's effective local tz via ``.astimezone()``
     — which honors the ``TZ`` env var the container sets at boot (quadlet
-    sets ``TZ=America/Detroit``). Result shape is the same ISO-with-offset
+    sets ``TZ=America/New_York``). Result shape is the same ISO-with-offset
     format Python's ``isoformat()`` produces, just with a real offset like
     ``-04:00`` / ``-05:00`` instead of ``+00:00``. Matches operator
-    expectation and the TZ-aware log formatter shipped in wave 1 (#3).
+    expectation and the TZ-aware log formatter shipped in wave 1.
     """
     try:
         row = db.execute(
@@ -77,25 +92,15 @@ def _last_triage_iso(db) -> str | None:
         if not val:
             return None
         # Convert stored UTC string to the container's local tz.
-        try:
-            dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone().isoformat()
-        except (TypeError, ValueError):
+        dt = parse_iso(val)
+        if dt is None:
             # Unparseable — fall back to raw string so the endpoint
             # still reports something rather than None.
             return val
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().isoformat()
     except Exception:
-        return None
-
-
-def _parse_iso(val: str | None) -> datetime | None:
-    if not val:
-        return None
-    try:
-        return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
         return None
 
 
@@ -126,7 +131,7 @@ def _watcher_counts(watcher_mgr) -> tuple[int, int, bool]:
         if status == "watching":
             connected += 1
             continue
-        started_at = _parse_iso((state or {}).get("started_at"))
+        started_at = parse_iso((state or {}).get("started_at"))
         if started_at is None:
             continue
         if (now - started_at).total_seconds() <= _STALE_WATCHER_SECONDS:
@@ -168,7 +173,7 @@ def _gmail_push_counts(db, watcher_mgr) -> tuple[int, int, bool]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=_STALE_WATCHER_SECONDS)
     for r in rows:
-        exp = _parse_iso(r.get("expires_at"))
+        exp = parse_iso(r.get("expires_at"))
         is_healthy = exp is not None and exp > now
         if is_healthy:
             healthy += 1
@@ -216,7 +221,7 @@ def _office365_push_counts(db, watcher_mgr) -> dict[str, int]:
     soon = now + timedelta(hours=24)
     for r in rows:
         status = (r.get("status") or "").strip()
-        exp = _parse_iso(r.get("expiration_at"))
+        exp = parse_iso(r.get("expiration_at"))
         if status == "errored":
             out["errored"] += 1
             continue
@@ -311,7 +316,7 @@ def _aggregate_account_states(account_states: list[dict]) -> dict:
 def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]:
     """Synchronous body of the health snapshot computation.
 
-    #135: the entire health-detail computation is a sequence of blocking
+    : the entire health-detail computation is a sequence of blocking
     SQLite reads + watcher-manager rollups (which themselves hit the
     DB). Wrapping the whole thing in a single ``db_call`` keeps the
     event loop free for the duration of one /health probe instead of
@@ -348,7 +353,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     mb_total, mb_watching = _mailbox_counts(watcher_mgr)
     poll_registered, poll_fresh = _poll_counts(watcher_mgr)
 
-    # O365 Graph subscription rollup (#66) — same shape as gmail_push,
+    # O365 Graph subscription rollup — same shape as gmail_push,
     # plus the expiring-in-24h + errored counts the operator surface
     # consumes. Read straight from ``office365_subscriptions``; the
     # account-state fold above already covers per-account active/poll,
@@ -368,7 +373,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
             for b in ingestion["providers"].values())
     )
     last_triage_iso = _last_triage_iso(db) if db is not None else None
-    last_triage_dt = _parse_iso(last_triage_iso)
+    last_triage_dt = parse_iso(last_triage_iso)
     triage_stale = _last_triage_stale(last_triage_dt, any_ingesting)
 
     # PR 5 / C1 — supervisor + watcher rollups.
@@ -396,7 +401,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     audit_failures = int(getattr(app.state, "audit_failures", 0))
     csrf_rejects = int(getattr(app.state, "csrf_rejects", 0))
 
-    # #151 — classification-cache counters (per-process). Empty / safe
+    #  — classification-cache counters (per-process). Empty / safe
     # defaults when the cache module isn't loaded yet (early lifespan
     # tick) so the snapshot stays robust.
     try:
@@ -530,8 +535,8 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         except Exception:
             schema_version_value = None
 
-    # #125 partial follow-up — surface the same schema-compat verdict
-    # the admin /config banner shows, in machine-readable form. Nagios
+    #  partial follow-up — surface the same schema-compat verdict
+    # the admin /config banner shows, in machine-readable form. the monitoring system
     # polls /health/detail and fires when ``state`` advances past
     # ``up_to_date`` (warn on ``update_available``, critical on
     # ``incompatible_rollback`` / ``downgrade_not_supported``).
@@ -544,7 +549,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     #
     # The success-path JSON renames the dataclass's ``status`` field
     # to ``state`` so the failure sentinel + success rows share a key
-    # for downstream consumers (Nagios scrape, deploy.sh pre-flight).
+    # for downstream consumers (the monitoring system scrape, deploy.sh pre-flight).
     version_status_block: dict[str, Any]
     try:
         from email_triage.version import gather_version_status
@@ -574,7 +579,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
             "error": f"{type(exc).__name__}: {exc}",
         }
 
-    # #152 phases 3-4 S4 follow-up — 24h counters for the HIPAA distill
+    #  phases 3-4 S4 follow-up — 24h counters for the HIPAA distill
     # pipeline. Sibling to ``version_status`` (and to W2-α's
     # ``baa_status`` if that lands first). Failure-safe: a missing
     # table (pre-v27 schema) returns zeros so the rest of /health/detail
@@ -602,7 +607,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
             "error": f"{type(exc).__name__}: {exc}",
         }
 
-    # #175 R-B — per-message retry-queue rollup for Nagios polling.
+    #  R-B — per-message retry-queue rollup for the monitoring system polling.
     # Shape:
     #   {"pending": int, "dead_24h": int,
     #    "oldest_pending_age_sec": int|None,
@@ -626,26 +631,129 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
             "error": f"{type(exc).__name__}: {exc}",
         }
 
-    # An errored O365 subscription is degraded only when the account
-    # isn't covered by the poll safety net. ``any_alert`` from
-    # account_states already handles the per-account verdict
-    # (push_dropped_no_poll / no_ingestion); _office365_push_counts
-    # is purely the additional renewer-visibility surface so we don't
-    # double-degrade here. Kept variable around for readability.
-    _ = o365_push_block
+    #  — every failure signal /health/detail already computes
+    # folds into ``degraded``. Previously the boolean read only five
+    # terms (db, any_alert, triage_stale, any_quarantined,
+    # watchers_failing) and silently dropped the rest — most starkly
+    # ``office365_push.errored``, which had an explicit ``_ =
+    # o365_push_block`` discard. A subsystem the operator surface
+    # flags red but /health still calls "ok" is exactly the silent-
+    # failure class this product cannot afford.
+    #
+    # Each added term reads a block computed above:
+    #   - tasks.any_crashed_recently — a supervised task in the
+    #     ``crashed`` state (mid-backoff, not yet quarantined).
+    #   - tasks.any_loop_tick_failing — : a supervised_interval_
+    #     loop whose ticks have failed N times running while the loop
+    #     itself stays nominally ``running``.
+    #   - tasks.any_loop_tick_stale — : a supervised_interval_loop
+    #     whose last tick is older than a generous multiple of its
+    #     interval — the only signal a tick that HANGS forever leaves
+    #     (a hung tick never reaches the failure counter at all).
+    #   - retry_queue dead-count > 0 — any per-message retry that gave
+    #     up in the last 24h. ``state == "unknown"`` is the failure-
+    #     safe sentinel (pre-migration / read error) — not degraded.
+    #   - audit_failures > 0 — a HIPAA/audit write that did not land.
+    #   - version_status.state in the two hard-incompatible states.
+    #   - office365_push.errored > 0 — a Graph subscription errored
+    #     or expired.
+    #   - style_distill.failures_24h sustained past the threshold.
+    #   - baa_status.expired > 0 — a BAA past its expiry date.
+    #   - tls_cert at/near expiry — : the ACME renewer failed to
+    #     roll the cert before the listener would serve a dead one.
+    tasks_crashed = bool(tasks_block.get("any_crashed_recently"))
+    tasks_tick_failing = bool(tasks_block.get("any_loop_tick_failing"))
+    tasks_tick_stale = bool(tasks_block.get("any_loop_tick_stale"))
+
+    retry_dead = 0
+    if retry_queue_block.get("state") != "unknown":
+        try:
+            retry_dead = int(retry_queue_block.get("dead_24h", 0) or 0)
+        except (TypeError, ValueError):
+            retry_dead = 0
+
+    version_state = version_status_block.get("state")
+    version_incompatible = version_state in {
+        "incompatible_rollback", "downgrade_not_supported",
+    }
+
+    try:
+        o365_errored = int(o365_push_block.get("errored", 0) or 0)
+    except (TypeError, ValueError):
+        o365_errored = 0
+
+    try:
+        distill_failures = int(
+            style_distill_block.get("failures_24h", 0) or 0,
+        )
+    except (TypeError, ValueError):
+        distill_failures = 0
+    distill_failing = (
+        distill_failures >= _STYLE_DISTILL_FAILURE_DEGRADE_THRESHOLD
+    )
+
+    # Computed once here; reused in the body payload below so the BAA
+    # bucket query runs a single time per /health probe.
+    baa_status_block = _compute_baa_status_block(request)
+    try:
+        baa_expired = int(baa_status_block.get("expired", 0) or 0)
+    except (TypeError, ValueError):
+        baa_expired = 0
+
+    #  — on-disk TLS cert expiry surface. Pure file read (no ACME
+    # directory call) so a healthy probe doesn't depend on network.
+    # Lets the monitoring system fire on an expiring cert before the listener serves a
+    # dead one. ``read_tls_cert_health`` is itself failure-safe; the
+    # extra try/except here is belt-and-braces so an import error can't
+    # take /health/detail down.
+    tls_cert_block: dict[str, Any]
+    try:
+        from email_triage.web.acme_renewer import read_tls_cert_health
+        tls_cert_block = read_tls_cert_health(app)
+    except Exception as exc:  # pragma: no cover - failure-safe
+        logger.warning(
+            "tls_cert read failed for /health/detail: %s",
+            exc, exc_info=True,
+        )
+        tls_cert_block = {
+            "present": False,
+            "not_after": None,
+            "days_remaining": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    # / — a present cert at/near expiry degrades /health: the
+    # auto-renewer should have rolled it well before this point.
+    cert_degraded = False
+    if tls_cert_block.get("present"):
+        _cert_days = tls_cert_block.get("days_remaining")
+        if (
+            isinstance(_cert_days, (int, float))
+            and _cert_days <= _TLS_CERT_DEGRADE_DAYS
+        ):
+            cert_degraded = True
 
     degraded = (
         (not db_ok)
         or any_alert
         or triage_stale
         or bool(tasks_block.get("any_quarantined"))
+        or tasks_crashed
+        or tasks_tick_failing
+        or tasks_tick_stale
         or bool(watchers_failing)
+        or retry_dead > 0
+        or audit_failures > 0
+        or version_incompatible
+        or o365_errored > 0
+        or distill_failing
+        or baa_expired > 0
+        or cert_degraded
     )
     status = "degraded" if degraded else "ok"
 
     version = getattr(app.state, "version", "unknown")
 
-    # Legacy IMAP-IDLE-account roll-up (kept for Nagios / deploy script
+    # Legacy IMAP-IDLE-account roll-up (kept for the monitoring system / deploy script
     # compatibility). New consumers should read ``ingestion`` instead.
     legacy_total = imap_b.get("total", 0)
     legacy_connected = imap_b.get("push", 0)
@@ -683,7 +791,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         # Process-level counters.
         "mailboxes": {"total": mb_total, "connected": mb_watching},
         "poll":      {"registered": poll_registered, "fresh": poll_fresh},
-        # Backward-compat keys. Existing consumers (Nagios probe, deploy
+        # Backward-compat keys. Existing consumers (the monitoring system probe, deploy
         # script grep) read these; will be removed one release after
         # callers migrate to ``ingestion``.
         "watchers": {
@@ -709,28 +817,32 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         "classification_cache": classification_cache_block,
         "embedding": embedding_block,
         "webhooks": webhooks_block,
-        # #125 partial follow-up — schema-compat verdict in
-        # machine-readable form so Nagios can poll without scraping
+        #  partial follow-up — schema-compat verdict in
+        # machine-readable form so the monitoring system can poll without scraping
         # /config. Shape mirrors ``VersionStatus.to_dict()`` plus the
         # rename ``status`` -> ``state`` (consistent with the
         # ``{"state": "unknown"}`` sentinel on the failure-safe path).
         "version_status": version_status_block,
-        # #169 Wave 2-α I7 — BAA expiry surfacing for Nagios polling.
+        #  Wave 2-α I7 — BAA expiry surfacing for the monitoring system polling.
         # Shape: {"expiring_soon": int, "expired": int,
         # "expired_hipaa_accounts_disabled": int}. ``expiring_soon``
         # rolls the 8-30d + 1-7d buckets together; the three-bucket
         # distinction is exposed in the admin UI instead. The
         # ``_disabled`` counter is the lifetime-of-process tally
         # captured on app.state by the daily-sweep loop.
-        "baa_status": _compute_baa_status_block(request),
-        # #152 phases 3-4 S4 — 24h counters for the HIPAA describe-and-
+        "baa_status": baa_status_block,
+        #  phases 3-4 S4 — 24h counters for the HIPAA describe-and-
         # discard distill pipeline. Sibling field to ``version_status``
         # + ``baa_status``. Shape: {local_24h, cloud_24h, failures_24h,
         # scrubber_rejects_24h, total_24h}.
         "style_distill": style_distill_block,
-        # #175 R-B — per-message retry-queue rollup. Nagios polls this
+        #  R-B — per-message retry-queue rollup. the monitoring system polls this
         # block to fire on a pending backlog or 24h-deads spike.
         "retry_queue": retry_queue_block,
+        #  — on-disk TLS cert expiry. Shape: {present, not_after,
+        # days_remaining}. Pure file read; lets a monitor fire before
+        # the cert actually expires under the listener.
+        "tls_cert": tls_cert_block,
     }
     return body, degraded
 
@@ -802,16 +914,14 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
             )
             if oldest_iso:
                 from datetime import datetime, timezone
-                try:
-                    dt = datetime.fromisoformat(
-                        str(oldest_iso).replace("Z", "+00:00")
-                    )
+                dt = parse_iso(oldest_iso)
+                if dt is None:
+                    oldest_age = None
+                else:
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
                     delta = datetime.now(timezone.utc) - dt
                     oldest_age = int(delta.total_seconds())
-                except (TypeError, ValueError):
-                    oldest_age = None
     except Exception:
         # Older schema may not have ``state`` column; treat as 0.
         pending = 0
@@ -824,7 +934,7 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
         ).isoformat()
         row = db.execute(
             "SELECT COUNT(*) AS c FROM watcher_retry_queue "
-            "WHERE state = 'dead' AND updated_at >= ?",
+            "WHERE state = 'dead' AND resolved_at >= ?",
             (since,),
         ).fetchone()
         if row is not None:
@@ -832,7 +942,7 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
         # Breakdown by dead_reason.
         rows = db.execute(
             "SELECT dead_reason, COUNT(*) AS c FROM watcher_retry_queue "
-            "WHERE state = 'dead' AND updated_at >= ? "
+            "WHERE state = 'dead' AND resolved_at >= ? "
             "GROUP BY dead_reason",
             (since,),
         ).fetchall()
@@ -886,7 +996,7 @@ def _compute_baa_status_block(request: Request) -> dict[str, int]:
 async def _compute_health_detail(request: Request) -> tuple[dict[str, Any], bool]:
     """Async wrapper: run the blocking snapshot off the event loop.
 
-    #135: the underlying computation is pure-blocking (SQLite reads,
+    : the underlying computation is pure-blocking (SQLite reads,
     watcher-manager rollups, ``record_access_event`` on /health/detail
     audit). Wrapping at the snapshot boundary — rather than per
     SELECT — minimises threadpool round-trips while still freeing the
@@ -899,7 +1009,7 @@ async def _compute_health_detail(request: Request) -> tuple[dict[str, Any], bool
 async def health(request: Request) -> Any:
     """Minimal unauthenticated liveness probe.
 
-    #89: split from the operator-facing detail in 2026-04-30. Returns
+    : split from the operator-facing detail in 2026-04-30. Returns
     just enough for container HEALTHCHECK + external monitors to
     decide ok-vs-degraded:
 
@@ -932,7 +1042,7 @@ async def health(request: Request) -> Any:
 async def health_detail(request: Request) -> Any:
     """Full operator-facing health snapshot. Admin-only.
 
-    #89: holds the full payload (tasks block, ingestion counts,
+    : holds the full payload (tasks block, ingestion counts,
     watchers, audit_failures, csrf_rejects, schema_version, version).
     Linked from the dashboard chips + admin/stats; CLI consumers go
     through admin auth like every other admin surface.
@@ -942,7 +1052,10 @@ async def health_detail(request: Request) -> Any:
     /health for status-code consistency.
     """
     from fastapi.responses import JSONResponse, RedirectResponse
-    user = _get_current_user(request)
+    #  — get_current_user does a sync DB read; route it off the
+    # event loop so it cannot collide with a db_call worker on the
+    # shared connection.
+    user = await db_call(_get_current_user, request)
     if user is None:
         return RedirectResponse("/login", status_code=303)
     if user.get("role") != "admin":

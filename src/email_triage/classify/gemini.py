@@ -15,23 +15,27 @@ heavy SDK dependency.
 
 from __future__ import annotations
 
-import json
-import logging
 from typing import Any
 
-import httpx
-
-from email_triage.classify.base import Classifier
-from email_triage.classify.ollama import _parse_llm_json
-from email_triage.classify.prompts import build_system_prompt, build_user_prompt
-from email_triage.engine.models import Classification, EmailMessage, ListHint
-
-logger = logging.getLogger("email_triage.classify.gemini")
+from email_triage._http_client import LazyHttpClient
+from email_triage.classify.base import JsonChatClassifier
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
-class GeminiClassifier(Classifier):
+class GeminiResponseError(RuntimeError):
+    """Gemini returned a response with no usable text content.
+
+    Raised when a ``generateContent`` reply is malformed (no
+    candidates / parts) or the model declined to answer — a safety
+    block, a recitation stop, an empty finish. Previously
+    :meth:`GeminiClassifier._extract_text` returned ``""`` in all of
+    these cases, which surfaced downstream as an opaque JSON
+    parse failure that gave no hint the real cause was a safety block.
+    """
+
+
+class GeminiClassifier(JsonChatClassifier):
     """Classify emails via the Google Gemini API.
 
     Parameters
@@ -57,49 +61,39 @@ class GeminiClassifier(Classifier):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        #  — one long-lived pooled client per classifier instance.
+        # The classifier is rebuilt per triage batch and reused for
+        # every message in that batch, so pooling collapses N
+        # per-message TLS handshakes into one. Mirrors OllamaClassifier.
+        self._http = LazyHttpClient(timeout=timeout)
         # Gemini is always external — Google's hosted endpoint, no
         # local mode. is_local stays False, gating BAA-required for
         # HIPAA accounts at classify time.
         self.is_local = False
 
-    async def classify(
-        self,
-        message: EmailMessage,
-        categories: dict[str, str],
-        list_hints: list[ListHint] | None = None,
-    ) -> Classification:
-        system_prompt = build_system_prompt(categories, list_hints)
-        user_prompt = build_user_prompt(message)
+    async def close(self) -> None:
+        """Drain the pooled HTTP client. Idempotent — safe from a
+        shutdown hook even if no request was ever issued."""
+        await self._http.aclose()
 
-        # #151 — optional Redis cache. HIPAA-flagged accounts already
-        # blocked by the BAA gate before they reach Gemini, but the
-        # helper carries the HIPAA short-circuit anyway as defence-in-
-        # depth. Cache key includes the model so a model upgrade
-        # auto-invalidates.
-        # 2026-05-13 two-level cache lookup.
-        outer_key: str | None = None
-        inner_field: str | None = None
-        hint_text: str | None = None
-        try:
-            from email_triage.cache.classification import (
-                cache_lookup_for_message,
-            )
-            outer_key, inner_field, cache_entry, hint_text = (
-                cache_lookup_for_message(
-                    message, self._model, categories,
-                )
-            )
-            if cache_entry is not None:
-                logger.info("Classification cache hit (cache_hit=True)")
-                return cache_entry
-        except Exception as e:
-            logger.debug("Classification cache lookup error: %s", e)
+    async def _chat(
+        self, system_prompt: str, user_prompt: str, model: str,
+    ) -> str:
+        """Issue a Gemini ``generateContent`` request; return raw text.
 
-        if hint_text:
-            system_prompt = (
-                f"[SENDER HISTORY HINT] {hint_text}\n\n{system_prompt}"
-            )
+        ``model`` is the configured model (Gemini does not override
+        :meth:`_resolve_model`); it is interpolated into the endpoint
+        path. HIPAA-flagged accounts are already blocked by the BAA
+        gate before they reach Gemini.
 
+         — the POST is wrapped in the shared circuit-breaker helper
+        :func:`llm_health.translate_unreachable`. A dead Gemini
+        endpoint (connection refused / network blip) now trips the
+        ``"gemini"`` breaker and re-raises a typed
+        ``LLMBackendUnreachableError`` — same posture Ollama has had
+        since . Keyed ``"gemini"`` to match the configured
+        ``classifier.backend`` the ``is_healthy`` gate resolves.
+        """
         payload: dict[str, Any] = {
             "contents": [
                 {
@@ -117,63 +111,106 @@ class GeminiClassifier(Classifier):
             },
         }
 
+        url = f"{self._base_url}/models/{model}:generateContent"
+        params: dict[str, str] = {}
+        if self._api_key:
+            params["key"] = self._api_key
+
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "gemini", self._base_url, default_port=443,
+        ):
+            client = await self._http.get()
+            resp = await client.post(url, json=payload, params=params)
+            resp.raise_for_status()
+
+        body = resp.json()
+        return self._extract_text(body)
+
+    async def complete(self, prompt: str) -> str:
+        """Raw text completion via the Gemini ``generateContent`` endpoint.
+
+        Mirrors :meth:`OpenAICompatClassifier.complete` — the digest
+        generator and the error-explain feature call ``complete`` for
+        free-form output. Without this override a Gemini install raised
+        ``NotImplementedError`` the moment either feature ran.
+
+        No ``responseMimeType`` is set (raw text, not JSON) and the
+        output budget is raised to 2048 tokens to match the other
+        backends' completion path.
+
+         — the POST is wrapped in the shared circuit-breaker helper
+        :func:`llm_health.translate_unreachable`, matching :meth:`_chat`.
+        Before  only ``_chat`` (the classify path) was wrapped; a
+        dead Gemini endpoint hit through ``complete`` (digest generator,
+        error-explain) raised a raw ``httpx.ConnectError`` and never
+        tripped the breaker. Keyed ``"gemini"`` to match the configured
+        ``classifier.backend`` the ``is_healthy`` gate resolves.
+        """
+        payload: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 2048,
+            },
+        }
+
         url = f"{self._base_url}/models/{self._model}:generateContent"
         params: dict[str, str] = {}
         if self._api_key:
             params["key"] = self._api_key
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        from email_triage.llm_health import translate_unreachable
+        with translate_unreachable(
+            "gemini", self._base_url, default_port=443,
+        ):
+            client = await self._http.get()
             resp = await client.post(url, json=payload, params=params)
             resp.raise_for_status()
 
         body = resp.json()
-        raw_text = self._extract_text(body)
-        logger.debug("Gemini raw response", extra={"raw": raw_text[:500]})
-
-        parsed = _parse_llm_json(raw_text)
-
-        category = parsed.get("category", "")
-        if category not in categories:
-            logger.warning(
-                "LLM returned unknown category '%s', treating as low confidence",
-                category,
-            )
-
-        confidence = float(parsed.get("confidence", 0.5))
-        confidence = max(0.0, min(1.0, confidence))
-
-        reason = parsed.get("reason", "")
-
-        result = Classification(
-            category=category,
-            confidence=confidence,
-            reason=reason,
-            source="llm",
-        )
-
-        # 2026-05-13 — best-effort two-level store; HIPAA strip handled
-        # inside the helper.
-        try:
-            from email_triage.cache.classification import (
-                cache_store_for_message,
-            )
-            cache_store_for_message(
-                outer_key, inner_field, self._model, result, categories,
-                is_hipaa=bool(getattr(message, "hipaa", False)),
-            )
-        except Exception as e:
-            logger.debug("Classification cache store error: %s", e)
-
-        return result
+        return self._extract_text(body).strip()
 
     @staticmethod
     def _extract_text(body: dict[str, Any]) -> str:
-        """Extract the text content from a Gemini generateContent response."""
+        """Extract the text content from a Gemini generateContent response.
+
+        Raises :class:`GeminiResponseError` when the response carries
+        no usable text — a malformed reply, or a safety / recitation
+        block. Surfacing a typed error lets the caller's
+        per-message error path report the real cause instead of an
+        opaque downstream JSON-parse failure on an empty string.
+        """
         candidates = body.get("candidates", [])
         if not candidates:
-            return ""
-        content = candidates[0].get("content", {})
+            # A safety block at the prompt level returns no candidates
+            # but does carry a ``promptFeedback.blockReason``.
+            reason = (
+                body.get("promptFeedback", {}).get("blockReason")
+                or "no candidates in response"
+            )
+            raise GeminiResponseError(
+                f"Gemini returned no usable text: {reason}"
+            )
+        candidate = candidates[0]
+        content = candidate.get("content", {})
         parts = content.get("parts", [])
         if not parts:
-            return ""
-        return parts[0].get("text", "")
+            # A per-candidate block / non-STOP finish (SAFETY,
+            # RECITATION, MAX_TOKENS with no text) lands here.
+            finish = candidate.get("finishReason", "unknown")
+            raise GeminiResponseError(
+                f"Gemini returned no text content (finishReason="
+                f"{finish})"
+            )
+        text = parts[0].get("text", "")
+        if not text:
+            raise GeminiResponseError(
+                "Gemini returned an empty text part"
+            )
+        return text

@@ -7,7 +7,7 @@ Validates:
    without exceeding Python's recursion limit (which the recursive
    upstream version would).
 
-The patch addresses upstream issue #118
+The patch addresses upstream issue 
 (https://github.com/bamthomas/aioimaplib/issues/118) — recursion
 explosion when fetching messages with many CRLF-separated lines.
 """

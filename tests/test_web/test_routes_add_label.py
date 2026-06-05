@@ -1,4 +1,4 @@
-"""Tests for the ``add-label`` route action — punch-list item #129 tail.
+"""Tests for the ``add-label`` route action — the backlog item  tail.
 
 Covers:
   * /accounts/{id}/routes/save persists the add-label config

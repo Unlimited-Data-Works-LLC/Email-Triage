@@ -171,7 +171,7 @@ class TestStyleDataPageGet:
     def test_master_toggle_on_renders_no_banner(
         self, client, user_cookies, db, regular_user,
     ):
-        """#157 — when master is ON (the default-on posture), the
+        """ — when master is ON (the default-on posture), the
         page should NOT carry a noisy 'Style learning is currently
         ON' banner. Absence is the affirmative signal."""
         _make_acct(db, regular_user["id"], "Acct")
@@ -186,7 +186,7 @@ class TestStyleDataPageGet:
     def test_master_toggle_off_renders_chip(
         self, client, user_cookies, db, regular_user,
     ):
-        """#157 — when master is explicitly OFF, the warning chip
+        """ — when master is explicitly OFF, the warning chip
         surfaces with the new copy. The old 'Style learning is
         currently OFF for this install' banner has been replaced
         with the explicit chip header."""

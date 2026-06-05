@@ -1,4 +1,4 @@
-"""Admin CRUD routes for the ``ai_backends`` catalog (#169 Wave 2-α — I3).
+"""Admin CRUD routes for the ``ai_backends`` catalog.
 
 Lives on ``/config/ai-backends/*`` — sibling of the existing
 ``/config?tab=ai_backends`` embedding-backend admin (different concern:
@@ -69,8 +69,10 @@ from email_triage.web.db import (
     record_auth_event,
     update_ai_backend,
 )
+from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user
 
+# async-db: handlers route SQLite through db_call
 _log = logging.getLogger("email_triage.web.ui.ai_backends_crud")
 router = APIRouter()
 
@@ -91,14 +93,20 @@ def _require_admin(request: Request) -> tuple[dict | None, Any]:
     return user, None
 
 
-def _render(request: Request, name: str, ctx: dict) -> HTMLResponse:
+async def _render(request: Request, name: str, ctx: dict) -> HTMLResponse:
     """Delegate to ``_shared._render`` so the auto-injected template
     globals (``baa_banner``, ``hipaa_mode``, OAuth handles) land here
     too. Local wrapper kept for handler-side ergonomics — handlers
     pass (request, name, ctx) not (templates, request, name, ctx).
+
+     / Option B — ``_shared._render`` is now ``async`` itself and
+    routes its banner-ctx DB reads off the event loop internally, so
+    the previous ``db_call`` wrap here is no longer needed —
+    that would double-dispatch. Simply ``await`` the shared async
+    renderer.
     """
     from email_triage.web.routers.ui._shared import _render as _render_shared
-    return _render_shared(get_templates(request), request, name, ctx)
+    return await _render_shared(get_templates(request), request, name, ctx)
 
 
 def _allowed_types() -> list[str]:
@@ -195,13 +203,10 @@ def _validate_row(row: dict[str, Any]) -> str | None:
 # List view + Add button
 # ---------------------------------------------------------------------------
 
-@router.get("/config/ai-backends", response_class=HTMLResponse)
-async def ai_backends_index(request: Request):
-    """List every ``ai_backends`` row + Add-backend button. Admin only."""
-    user, err = _require_admin(request)
-    if err:
-        return err
-    db = get_db(request)
+def _ai_backends_index_snapshot(db: sqlite3.Connection) -> list[dict]:
+    """/ — list every backend + per-row in-use count off the
+    event loop. Pure DB read block extracted from ``ai_backends_index``.
+    """
     rows = list_ai_backends(db)
     # Enrich with the in-use account count + a friendly BAA-bucket
     # label so the table doesn't need to do the math inline.
@@ -218,10 +223,21 @@ async def ai_backends_index(request: Request):
             "bucket": bucket,
             "days_until_expiry": days,
         })
+    return items
+
+
+@router.get("/config/ai-backends", response_class=HTMLResponse)
+async def ai_backends_index(request: Request):
+    """List every ``ai_backends`` row + Add-backend button. Admin only."""
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+    db = get_db(request)
+    items = await db_call(_ai_backends_index_snapshot, db)
     # ``baa_banner`` is auto-injected by ``_shared._render`` for admin
-    # users (see #171-D). Removed from per-handler ctx so the banner
+    # users (see -D). Removed from per-handler ctx so the banner
     # has a single source of truth.
-    return _render(request, "admin/ai_backends/_index.html", {
+    return await _render(request, "admin/ai_backends/_index.html", {
         "user": user,
         "items": items,
         "save_msg": request.query_params.get("save_msg", ""),
@@ -235,10 +251,10 @@ async def ai_backends_index(request: Request):
 
 @router.get("/config/ai-backends/new", response_class=HTMLResponse)
 async def ai_backends_new_form(request: Request):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
-    return _render(request, "admin/ai_backends/_form.html", {
+    return await _render(request, "admin/ai_backends/_form.html", {
         "user": user,
         "mode": "create",
         "row": {
@@ -260,78 +276,37 @@ async def ai_backends_new_form(request: Request):
 # Create (POST)
 # ---------------------------------------------------------------------------
 
-@router.post("/config/ai-backends", response_class=HTMLResponse)
-async def ai_backends_create(request: Request):
-    user, err = _require_admin(request)
-    if err:
-        return err
-    db = get_db(request)
-    secrets = get_secrets(request)
-    form = await request.form()
-    row = _parse_form_row(form)
-    err_msg = _validate_row(row)
-    if err_msg:
-        return _render(request, "admin/ai_backends/_form.html", {
-            "user": user,
-            "mode": "create",
-            "row": {
-                "name": row["name"],
-                "type": row["type_"],
-                "endpoint": row["endpoint"],
-                "api_key_secret_ref": None,
-                "model": row["model"] or "",
-                "baa_certified": int(row["baa_certified"]),
-                "baa_expires_at": row["baa_expires_at"] or "",
-                "enabled": int(row["enabled"]),
-            },
-            "allowed_types": _allowed_types(),
-            "form_error": err_msg,
-        })
-
+def _ai_backends_create_db_work(
+    db: sqlite3.Connection,
+    secrets: Any,
+    user: dict,
+    row: dict[str, Any],
+    api_key_plain: str,
+) -> int:
+    """/ — create + optional key persistence + audit in one
+    threadpool hop. Raises ``sqlite3.IntegrityError`` straight through
+    so the handler can render the form-error path. Returns the new id.
+    """
     # Insert FIRST with a NULL key ref so we know the new id. Then,
     # if a plaintext key was supplied, store it under a stable
     # backend-id-keyed secret name and UPDATE the row's ref column.
     # This sidesteps the chicken-and-egg of "we want the id as part
     # of the secret name, but we don't have the id until after
     # INSERT" without storing the plaintext under a throwaway name.
-    try:
-        new_id = create_ai_backend(
-            db,
-            name=row["name"],
-            type_=row["type_"],
-            endpoint=row["endpoint"],
-            api_key_secret_ref=None,
-            model=row["model"],
-            baa_certified=row["baa_certified"],
-            baa_expires_at=row["baa_expires_at"],
-            enabled=row["enabled"],
-            created_by=user.get("id"),
-        )
-    except sqlite3.IntegrityError as exc:
-        return _render(request, "admin/ai_backends/_form.html", {
-            "user": user,
-            "mode": "create",
-            "row": {
-                "name": row["name"],
-                "type": row["type_"],
-                "endpoint": row["endpoint"],
-                "api_key_secret_ref": None,
-                "model": row["model"] or "",
-                "baa_certified": int(row["baa_certified"]),
-                "baa_expires_at": row["baa_expires_at"] or "",
-                "enabled": int(row["enabled"]),
-            },
-            "allowed_types": _allowed_types(),
-            "form_error": (
-                "Could not save. The name may already be in use, "
-                "or the values failed a schema check: "
-                f"{exc}"
-            ),
-        })
+    new_id = create_ai_backend(
+        db,
+        name=row["name"],
+        type_=row["type_"],
+        endpoint=row["endpoint"],
+        api_key_secret_ref=None,
+        model=row["model"],
+        baa_certified=row["baa_certified"],
+        baa_expires_at=row["baa_expires_at"],
+        enabled=row["enabled"],
+        created_by=user.get("id"),
+    )
 
     # Plaintext key handling (the only place it sees the wire).
-    api_key_plain = (form.get("api_key_plain") or "").strip()
-    secret_ref: str | None = None
     if api_key_plain and secrets is not None:
         secret_ref = _secret_ref_for(new_id)
         try:
@@ -365,6 +340,64 @@ async def ai_backends_create(request: Request):
             f"enabled={row['enabled']}"
         ),
     )
+    return new_id
+
+
+@router.post("/config/ai-backends", response_class=HTMLResponse)
+async def ai_backends_create(request: Request):
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+    db = get_db(request)
+    secrets = get_secrets(request)
+    form = await request.form()
+    row = _parse_form_row(form)
+    err_msg = _validate_row(row)
+    if err_msg:
+        return await _render(request, "admin/ai_backends/_form.html", {
+            "user": user,
+            "mode": "create",
+            "row": {
+                "name": row["name"],
+                "type": row["type_"],
+                "endpoint": row["endpoint"],
+                "api_key_secret_ref": None,
+                "model": row["model"] or "",
+                "baa_certified": int(row["baa_certified"]),
+                "baa_expires_at": row["baa_expires_at"] or "",
+                "enabled": int(row["enabled"]),
+            },
+            "allowed_types": _allowed_types(),
+            "form_error": err_msg,
+        })
+
+    api_key_plain = (form.get("api_key_plain") or "").strip()
+    try:
+        await db_call(
+            _ai_backends_create_db_work, db, secrets, user, row, api_key_plain
+        )
+    except sqlite3.IntegrityError as exc:
+        return await _render(request, "admin/ai_backends/_form.html", {
+            "user": user,
+            "mode": "create",
+            "row": {
+                "name": row["name"],
+                "type": row["type_"],
+                "endpoint": row["endpoint"],
+                "api_key_secret_ref": None,
+                "model": row["model"] or "",
+                "baa_certified": int(row["baa_certified"]),
+                "baa_expires_at": row["baa_expires_at"] or "",
+                "enabled": int(row["enabled"]),
+            },
+            "allowed_types": _allowed_types(),
+            "form_error": (
+                "Could not save. The name may already be in use, "
+                "or the values failed a schema check: "
+                f"{exc}"
+            ),
+        })
+
     return RedirectResponse(
         f"/config/ai-backends?save_msg=Backend+{row['name']}+added.",
         status_code=303,
@@ -388,20 +421,28 @@ async def ai_backends_create(request: Request):
     response_class=HTMLResponse,
 )
 async def ai_backends_edit_form(request: Request, backend_id: int):
-    user, err = _require_admin(request)
+    user, err = await db_call(_require_admin, request)
     if err:
         return err
     db = get_db(request)
-    backend = get_ai_backend(db, backend_id)
+
+    def _edit_form_snapshot() -> tuple[dict | None, int]:
+        """/ — backend fetch + in-use count in one hop."""
+        backend = get_ai_backend(db, backend_id)
+        if backend is None:
+            return None, 0
+        return backend, count_accounts_using_ai_backend(db, backend_id)
+
+    backend, in_use_count = await db_call(_edit_form_snapshot)
     if backend is None:
         return HTMLResponse("Not found", status_code=404)
-    return _render(request, "admin/ai_backends/_form.html", {
+    return await _render(request, "admin/ai_backends/_form.html", {
         "user": user,
         "mode": "edit",
         "row": backend,
         "allowed_types": _allowed_types(),
         "form_error": None,
-        "in_use_count": count_accounts_using_ai_backend(db, backend_id),
+        "in_use_count": in_use_count,
     })
 
 
@@ -409,42 +450,22 @@ async def ai_backends_edit_form(request: Request, backend_id: int):
 # Update (POST)
 # ---------------------------------------------------------------------------
 
-@router.post(
-    # See the comment on the GET .../{backend_id:int}/edit route above
-    # for why `{backend_id:int}` matters. Same converter applied here.
-    "/config/ai-backends/{backend_id:int}",
-    response_class=HTMLResponse,
-)
-async def ai_backends_update(request: Request, backend_id: int):
-    user, err = _require_admin(request)
-    if err:
-        return err
-    db = get_db(request)
-    secrets = get_secrets(request)
-    existing = get_ai_backend(db, backend_id)
-    if existing is None:
-        return HTMLResponse("Not found", status_code=404)
-    form = await request.form()
-    row = _parse_form_row(form)
-    err_msg = _validate_row(row)
-    if err_msg:
-        return _render(request, "admin/ai_backends/_form.html", {
-            "user": user,
-            "mode": "edit",
-            "row": {
-                **existing,
-                "name": row["name"],
-                "type": row["type_"],
-                "endpoint": row["endpoint"],
-                "model": row["model"] or "",
-                "baa_certified": int(row["baa_certified"]),
-                "baa_expires_at": row["baa_expires_at"] or "",
-                "enabled": int(row["enabled"]),
-            },
-            "allowed_types": _allowed_types(),
-            "form_error": err_msg,
-        })
-
+def _ai_backends_update_db_work(
+    db: sqlite3.Connection,
+    secrets: Any,
+    user: dict,
+    backend_id: int,
+    existing: dict,
+    row: dict[str, Any],
+    *,
+    api_key_plain: str,
+    do_replace: bool,
+    do_clear: bool,
+) -> None:
+    """/ — key-store handling + row update + audit in one
+    threadpool hop. Raises ``sqlite3.IntegrityError`` straight through
+    so the handler can render the form-error path.
+    """
     # API-key handling — three operator intents on update:
     #   (a) leave unchanged: form doesn't carry replace_key + no plain
     #       text → preserve existing ref verbatim
@@ -452,9 +473,6 @@ async def ai_backends_update(request: Request, backend_id: int):
     #       → mint / reuse the backend-id-keyed secret name + store new
     #   (c) clear: ``clear_key`` checkbox → drop the ref + delete the
     #       secrets-store row
-    api_key_plain = (form.get("api_key_plain") or "").strip()
-    do_replace = (form.get("replace_key") in ("1", "on", "true"))
-    do_clear = (form.get("clear_key") in ("1", "on", "true"))
     secret_ref: str | None = existing.get("api_key_secret_ref")
     if do_clear:
         old_ref = secret_ref
@@ -484,39 +502,17 @@ async def ai_backends_update(request: Request, backend_id: int):
                 }},
             )
 
-    try:
-        update_ai_backend(
-            db, backend_id,
-            name=row["name"],
-            type_=row["type_"],
-            endpoint=row["endpoint"],
-            api_key_secret_ref=secret_ref,
-            model=row["model"],
-            baa_certified=row["baa_certified"],
-            baa_expires_at=row["baa_expires_at"],
-            enabled=row["enabled"],
-        )
-    except sqlite3.IntegrityError as exc:
-        return _render(request, "admin/ai_backends/_form.html", {
-            "user": user,
-            "mode": "edit",
-            "row": {
-                **existing,
-                "name": row["name"],
-                "type": row["type_"],
-                "endpoint": row["endpoint"],
-                "model": row["model"] or "",
-                "baa_certified": int(row["baa_certified"]),
-                "baa_expires_at": row["baa_expires_at"] or "",
-                "enabled": int(row["enabled"]),
-            },
-            "allowed_types": _allowed_types(),
-            "form_error": (
-                "Could not save. The name may already be in use, "
-                "or the values failed a schema check: "
-                f"{exc}"
-            ),
-        })
+    update_ai_backend(
+        db, backend_id,
+        name=row["name"],
+        type_=row["type_"],
+        endpoint=row["endpoint"],
+        api_key_secret_ref=secret_ref,
+        model=row["model"],
+        baa_certified=row["baa_certified"],
+        baa_expires_at=row["baa_expires_at"],
+        enabled=row["enabled"],
+    )
 
     # Build a compact diff string for the audit row so the operator
     # can read "what changed" off a single line.
@@ -538,6 +534,77 @@ async def ai_backends_update(request: Request, backend_id: int):
         event_type="ai_backend_update",
         detail=", ".join(parts),
     )
+
+
+@router.post(
+    # See the comment on the GET .../{backend_id:int}/edit route above
+    # for why `{backend_id:int}` matters. Same converter applied here.
+    "/config/ai-backends/{backend_id:int}",
+    response_class=HTMLResponse,
+)
+async def ai_backends_update(request: Request, backend_id: int):
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+    db = get_db(request)
+    secrets = get_secrets(request)
+    existing = await db_call(get_ai_backend, db, backend_id)
+    if existing is None:
+        return HTMLResponse("Not found", status_code=404)
+    form = await request.form()
+    row = _parse_form_row(form)
+    err_msg = _validate_row(row)
+    if err_msg:
+        return await _render(request, "admin/ai_backends/_form.html", {
+            "user": user,
+            "mode": "edit",
+            "row": {
+                **existing,
+                "name": row["name"],
+                "type": row["type_"],
+                "endpoint": row["endpoint"],
+                "model": row["model"] or "",
+                "baa_certified": int(row["baa_certified"]),
+                "baa_expires_at": row["baa_expires_at"] or "",
+                "enabled": int(row["enabled"]),
+            },
+            "allowed_types": _allowed_types(),
+            "form_error": err_msg,
+        })
+
+    api_key_plain = (form.get("api_key_plain") or "").strip()
+    do_replace = (form.get("replace_key") in ("1", "on", "true"))
+    do_clear = (form.get("clear_key") in ("1", "on", "true"))
+    try:
+        await db_call(
+            _ai_backends_update_db_work, db, secrets, user, backend_id,
+            existing, row,
+            api_key_plain=api_key_plain,
+            do_replace=do_replace,
+            do_clear=do_clear,
+        )
+    except sqlite3.IntegrityError as exc:
+        return await _render(request, "admin/ai_backends/_form.html", {
+            "user": user,
+            "mode": "edit",
+            "row": {
+                **existing,
+                "name": row["name"],
+                "type": row["type_"],
+                "endpoint": row["endpoint"],
+                "model": row["model"] or "",
+                "baa_certified": int(row["baa_certified"]),
+                "baa_expires_at": row["baa_expires_at"] or "",
+                "enabled": int(row["enabled"]),
+            },
+            "allowed_types": _allowed_types(),
+            "form_error": (
+                "Could not save. The name may already be in use, "
+                "or the values failed a schema check: "
+                f"{exc}"
+            ),
+        })
+
     return RedirectResponse(
         f"/config/ai-backends?save_msg=Backend+{row['name']}+updated.",
         status_code=303,
@@ -548,21 +615,19 @@ async def ai_backends_update(request: Request, backend_id: int):
 # Delete (POST)
 # ---------------------------------------------------------------------------
 
-@router.post(
-    # See the comment on the GET .../{backend_id:int}/edit route above
-    # for why `{backend_id:int}` matters. Same converter applied here.
-    "/config/ai-backends/{backend_id:int}/delete",
-    response_class=HTMLResponse,
-)
-async def ai_backends_delete(request: Request, backend_id: int):
-    user, err = _require_admin(request)
-    if err:
-        return err
-    db = get_db(request)
-    secrets = get_secrets(request)
+def _ai_backends_delete_db_work(
+    db: sqlite3.Connection,
+    secrets: Any,
+    user: dict,
+    backend_id: int,
+) -> tuple[dict | None, int]:
+    """/ — fetch + in-use count + delete + key cleanup + audit
+    in one threadpool hop. Returns ``(backend, in_use_count)``;
+    ``backend`` is ``None`` when the row did not exist (nothing done).
+    """
     backend = get_ai_backend(db, backend_id)
     if backend is None:
-        return HTMLResponse("Not found", status_code=404)
+        return None, 0
 
     # FK on email_accounts is ON DELETE SET NULL — affected accounts
     # fall back to the install default automatically. Capture the
@@ -596,6 +661,27 @@ async def ai_backends_delete(request: Request, backend_id: int):
             f"affected_accounts={in_use_count}"
         ),
     )
+    return backend, in_use_count
+
+
+@router.post(
+    # See the comment on the GET .../{backend_id:int}/edit route above
+    # for why `{backend_id:int}` matters. Same converter applied here.
+    "/config/ai-backends/{backend_id:int}/delete",
+    response_class=HTMLResponse,
+)
+async def ai_backends_delete(request: Request, backend_id: int):
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+    db = get_db(request)
+    secrets = get_secrets(request)
+    backend, in_use_count = await db_call(
+        _ai_backends_delete_db_work, db, secrets, user, backend_id
+    )
+    if backend is None:
+        return HTMLResponse("Not found", status_code=404)
+    name = backend["name"]
     msg = (
         f"Backend+{name}+deleted."
         f"+{in_use_count}+accounts+reverted+to+install+default."

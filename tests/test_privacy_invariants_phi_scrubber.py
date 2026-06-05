@@ -1,4 +1,4 @@
-"""Privacy invariants for the layered PHI scrubber (#152 phases 3-4 S2).
+"""Privacy invariants for the layered PHI scrubber.
 
 This is the CI guard for the HIPAA describe-and-discard scrubber. Every
 assertion below pins a contract that, if loosened by a future commit,

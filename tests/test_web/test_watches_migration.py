@@ -1,4 +1,4 @@
-"""Tests for migration v17 — watches_per_account_fanout (#154).
+"""Tests for migration v17 — watches_per_account_fanout.
 
 Verify the backfill semantics: every pre-v17 ``account_id IS NULL``
 row expands to one new row per non-HIPAA email_account on the
@@ -31,10 +31,15 @@ def _rollback_to_v16(conn: sqlite3.Connection) -> None:
     every later version; each test asserts the v17 effect
     specifically + tolerates the higher schema_version on read.
     """
-    conn.execute(
-        "DELETE FROM schema_migrations "
-        "WHERE version IN (17, 18, 19, 20, 21, 22, 23, 24, 25)"
-    )
+    # The test only exercises v17 specifically; every later version
+    # must come out of ``schema_migrations`` so ``schema_version``
+    # reads 16. ``> 16`` is version-agnostic — no edit needed when a
+    # new migration ships (the old hardcoded version list had to be
+    # extended every time, and a missed bump silently broke this).
+    # The table DROPs below still need per-table extension so the
+    # re-apply via ``run_migrations`` is a clean CREATE — belt-and-
+    # braces, since the migrations themselves use IF NOT EXISTS.
+    conn.execute("DELETE FROM schema_migrations WHERE version > 16")
     # Drop v18 tables so the v18 re-apply via run_migrations is a clean
     # CREATE — IF NOT EXISTS would no-op otherwise but the column-guard
     # ALTER on list_rules is idempotent already.
@@ -49,6 +54,16 @@ def _rollback_to_v16(conn: sqlite3.Connection) -> None:
     # CREATE. Index is dropped as a side effect of the table drop.
     conn.execute("DROP TABLE IF EXISTS hipaa_style_descriptors")
     conn.execute("DROP INDEX IF EXISTS idx_hipaa_style_descriptors_rebuilt")
+    # v29 / v30 / v31 / v33 / v34 — drop the tables they create so
+    # re-apply is a clean CREATE for any test that walks the ladder.
+    conn.execute("DROP TABLE IF EXISTS hipaa_send_counters")
+    conn.execute("DROP INDEX IF EXISTS idx_hipaa_send_counters_account")
+    conn.execute("DROP TABLE IF EXISTS watcher_retry_queue")
+    conn.execute("DROP TABLE IF EXISTS embedding_bits_install_state")
+    conn.execute("DROP TABLE IF EXISTS hipaa_sent_dedup")
+    conn.execute("DROP INDEX IF EXISTS idx_hipaa_sent_dedup_recorded")
+    conn.execute("DROP TABLE IF EXISTS action_idempotency")
+    conn.execute("DROP INDEX IF EXISTS idx_action_idempotency_completed")
     # Drop the v17 index first so the table swap doesn't trip on a
     # stale reference.
     conn.execute("DROP INDEX IF EXISTS idx_email_watches_group")
@@ -265,7 +280,7 @@ class TestV17BackfillSemantics:
 
 class TestV17VerifyLogChain:
     """The migration must not break the access_log hash chain
-    (per #154 — verify_log_chain stays green post-migration)."""
+    (per  — verify_log_chain stays green post-migration)."""
 
     def test_verify_log_chain_passes_after_v17(self, v16_db):
         """Apply v17 on a DB with a NULL watch + some access rows;

@@ -1,5 +1,5 @@
 """ProviderDispatcher registry — functional-dispatch sibling of
-:mod:`email_triage.providers.traits` (#138 phase 2).
+:mod:`email_triage.providers.traits`.
 
 ``traits.py`` carries STATIC per-provider metadata (strings, flags,
 template literals) — fields the call site reads. ``dispatcher.py``
@@ -41,6 +41,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+
+from email_triage.db._helpers import row_get
 
 logger = logging.getLogger("email_triage.providers.dispatcher")
 
@@ -96,6 +98,15 @@ class ProviderDispatch:
             ``manager.start``; Gmail surfaces the poll-mode
             confirmation; O365 returns empty (device-code auth needed
             first).
+
+        poll_implemented:
+            ``bool``. True when ``poll_once`` genuinely ingests mail.
+             — when this is False a caller MUST NOT count the
+            account as a healthy polling account: the unified poll
+            loop records a tick regardless of dispatch outcome, so a
+            no-op stub would otherwise aggregate as "polling fine".
+            Health/aggregation code reads this to surface an honest
+            ``provider_unimplemented`` alert instead.
     """
 
     ptype: str
@@ -104,6 +115,7 @@ class ProviderDispatch:
     infer_push_enabled: Callable[..., bool]
     test_connection: Callable[..., Awaitable[tuple[bool, str]]]
     post_create_start_watch: Callable[..., Awaitable[tuple[str, str]]]
+    poll_implemented: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +162,9 @@ def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> boo
         # should boot with the IDLE watcher armed.
         return default
 
-    raw_val = row["value_json"] if isinstance(row, sqlite3.Row) else row[0]
+    # N-16: row_get duck-types on keys() so a sqlcipher3 Row takes the
+    # keyed branch — isinstance(row, sqlite3.Row) goes False for it.
+    raw_val = row_get(row, "value_json", 0)
     try:
         parsed = _json.loads(raw_val) if raw_val else {}
     except (TypeError, ValueError):
@@ -296,14 +310,19 @@ async def _gmail_start_push(manager, account_id: int, acct: dict) -> str:
     subscription is managed via the Start-watch button on the
     account-edit form, not via the unified WatcherManager path.
 
-    D2 (#145.7) consolidated the ``{"enabled": bool}`` shape behind
+    D2 consolidated the ``{"enabled": bool}`` shape behind
     ``set_bool_setting`` — use it here instead of the raw dict so the
-    settings-cache (D2 #140.2) invalidates correctly.
+    settings-cache (D2 .2) invalidates correctly.
     """
     from email_triage.web.db import set_bool_setting
+    from email_triage.web.db_threadpool import db_call
     from email_triage.web.settings_keys import watch as _watch_key
 
-    set_bool_setting(manager.app.state.db, _watch_key(account_id), True)
+    #  — _gmail_start_push is an async def; route the settings
+    # write off the event-loop thread.
+    await db_call(
+        set_bool_setting, manager.app.state.db, _watch_key(account_id), True,
+    )
     return "Push: Gmail Pub/Sub (manage on edit form)"
 
 
@@ -322,9 +341,8 @@ def _gmail_infer_push_enabled(conn, account_id: int, default: bool = True) -> bo
 
     if row is None:
         return default
-    topic = (row["topic_name"] or "").strip() if isinstance(
-        row, sqlite3.Row,
-    ) else (row[0] or "").strip()
+    # N-16: row_get duck-types on keys() (sqlcipher3 Row supported).
+    topic = (row_get(row, "topic_name", 0) or "").strip()
     # Non-empty topic = push set up. Don't gate on expiry — the
     # renewer recovers expiry; what we want here is operator intent.
     return bool(topic)
@@ -383,9 +401,16 @@ async def _gmail_post_create_start_watch(
 # ---------------------------------------------------------------------------
 
 async def _o365_poll_once(app, acct: dict) -> None:
-    """O365 poll — not yet wired. Returns silently; the caller's
-    debug log entry preserves the visibility."""
-    return None
+    """O365 poll — delegate to ``_poll_once_office365`` in web/app.py.
+
+     — was a ``return None`` stub; an O365 account added via the UI
+    received zero triage while the dashboard still showed it polling.
+    Now walks the Graph Inbox delta feed and triages every changed
+    message, sharing the standard ``triage_single_message`` body with
+    the O365 push consumer.
+    """
+    from email_triage.web.app import _poll_once_office365
+    await _poll_once_office365(app, acct)
 
 
 async def _o365_start_push(manager, account_id: int, acct: dict) -> str:

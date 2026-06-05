@@ -136,9 +136,15 @@ def load_backend(
             local_url_suffixes=local_url_suffixes,
             backend_type=type_name,
         )
-    except TypeError:
+    except TypeError as exc:
         # NotImplementedAdapter subclasses + simple adapters may not
-        # accept every kwarg; retry with the minimal set.
+        # accept every kwarg; retry with the minimal set. But ONLY
+        # when the TypeError is an argument-signature mismatch — a
+        # TypeError raised from *inside* the adapter's __init__ (a
+        # real bug) must not be masked by a silent minimal-kwargs
+        # retry that then constructs a half-configured adapter.
+        if "unexpected keyword argument" not in str(exc):
+            raise
         adapter = adapter_cls(backend_type=type_name)
     return adapter
 

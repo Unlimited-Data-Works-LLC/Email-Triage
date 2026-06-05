@@ -178,6 +178,25 @@ class FlowEngine:
             ]
             flow.actions_completed.append(action.name)
 
+            #  — Persist actions_completed after every successful action
+            # body, not just on terminal exits. A crash mid-loop (between
+            # action N succeeding and action N+1 starting) would otherwise
+            # leave the DB with the segment's actions_completed=[], and a
+            # crash-recovery rerun would re-execute action N. Per-action
+            # idempotency (`record_idempotent_done`, watch-fire , the
+            # naturally-idempotent label/move surfaces) keeps the re-run a
+            # no-op today, but the structural fix is to persist progress
+            # before yielding the loop. The Action-idempotency class
+            # invariant (see tests/test_actions/test_action_idempotency_invariant.py)
+            # is the paired guarantee that holds this rating at MED — without
+            # it a future non-idempotent action silently re-opens HIGH
+            # exposure. The terminal WAITING/FAILED/FINISHED branches below
+            # still persist their status transition; this is just an
+            # additional per-iteration checkpoint of progress.
+            flow = self._store.update_flow(
+                flow, expected_revision=flow.revision,
+            )
+
             if output.result == ActionResult.WAITING:
                 flow.status = FlowStatus.WAITING
                 flow.state_bag.update(output.data)

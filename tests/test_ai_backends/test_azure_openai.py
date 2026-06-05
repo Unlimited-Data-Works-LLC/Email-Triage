@@ -43,14 +43,13 @@ def _azure_response(content: str) -> dict:
 
 
 def _patch_httpx(mock_resp):
-    """Patch the adapter's httpx.AsyncClient to return ``mock_resp``."""
+    """Patch the adapter's pooled LazyHttpClient so .get() yields a
+    mock client returning ``mock_resp`` from .post()."""
     mock_client = AsyncMock()
     mock_client.post.return_value = mock_resp
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
     cls_patch = patch(
-        "email_triage.ai_backends.azure_openai.httpx.AsyncClient",
-        return_value=mock_client,
+        "email_triage._http_client.LazyHttpClient.get",
+        new=AsyncMock(return_value=mock_client),
     )
     return cls_patch, mock_client
 
@@ -215,7 +214,7 @@ class TestChatComplete:
     async def test_response_format_json_schema(self, adapter):
         """Strict schema-mode propagates verbatim.
 
-        #152 phases 3-4 need this for describe-and-discard.
+         phases 3-4 need this for describe-and-discard.
         """
         schema = {
             "type": "json_schema",
@@ -475,7 +474,7 @@ class TestErrorHandling:
 
 # ---------------------------------------------------------------------------
 # Privacy invariants — token-shape scrub at exception construction time.
-# Mirrors the GmailApiError #168 hardening pattern. The exception is the
+# Mirrors the GmailApiError  hardening pattern. The exception is the
 # earliest place a leak can land in a log handler that captures exc_info.
 # ---------------------------------------------------------------------------
 
@@ -722,3 +721,29 @@ class TestClassifierShim:
     def test_shim_marks_is_local_false(self, classifier):
         """HIPAA gate posture — Azure is external, never local."""
         assert classifier.is_local is False
+
+    def test_shim_is_jsonchatclassifier_subclass(self):
+        """ — the shim subclasses the shared JsonChatClassifier
+        base rather than re-implementing classify()."""
+        from email_triage.classify.base import JsonChatClassifier
+        assert issubclass(AzureOpenAIClassifier, JsonChatClassifier)
+
+    async def test_out_of_taxonomy_category_raises(self, classifier):
+        """ — a category outside the supplied taxonomy is a
+        classification FAILURE: the shared base raises ValueError so
+        the per-message error path fires, instead of silently building
+        a no-op Classification no route matches."""
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = _azure_response(json.dumps({
+            "category": "not-a-real-category",
+            "confidence": 0.9,
+            "reason": "model hallucinated a label",
+        }))
+        cls_patch, _ = _patch_httpx(mock_resp)
+        with cls_patch:
+            with pytest.raises(ValueError, match="outside the taxonomy"):
+                await classifier.classify(
+                    self._make_email(),
+                    {"fyi": "info", "to-respond": "needs reply"},
+                )

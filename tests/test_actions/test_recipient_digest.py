@@ -59,13 +59,23 @@ def test_subject_no_categories_no_name_falls_back_to_email():
     assert out == "Your Daily Email Digest — Thursday, May 07, 2026"
 
 
-def test_subject_single_category_pluralizes_singular_slug():
+def test_subject_single_category_titlecased_singular():
+    # Category title used verbatim as a singular attributive noun.
+    # No pluralization — an earlier naive `+ "s"` turned gerund /
+    # uncountable slugs into nonsense ("cooking" -> "Cookings").
     cfg = _cfg(cadence="daily", categories=["newsletter"])
     out = build_custom_digest_subject(cfg, _now())
-    assert out == "Your Daily Newsletters Digest — Thursday, May 07, 2026"
+    assert out == "Your Daily Newsletter Digest — Thursday, May 07, 2026"
 
 
-def test_subject_single_category_already_plural_kept():
+def test_subject_single_category_gerund_slug_not_pluralized():
+    # Regression guard for the operator-reported "Cookings" bug.
+    cfg = _cfg(cadence="daily", categories=["cooking"])
+    out = build_custom_digest_subject(cfg, _now())
+    assert out == "Your Daily Cooking Digest — Thursday, May 07, 2026"
+
+
+def test_subject_single_category_plural_slug_kept_verbatim():
     cfg = _cfg(cadence="daily", categories=["newsletters"])
     out = build_custom_digest_subject(cfg, _now())
     assert out == "Your Daily Newsletters Digest — Thursday, May 07, 2026"
@@ -74,7 +84,7 @@ def test_subject_single_category_already_plural_kept():
 def test_subject_single_category_with_hyphen_slug_titlecased():
     cfg = _cfg(cadence="monthly", categories=["security-alerts"])
     out = build_custom_digest_subject(cfg, _now())
-    # Already ends in "s" → no extra pluralize
+    # Hyphen slug → "Security Alerts"; used verbatim, no pluralize.
     assert out == "Your Monthly Security Alerts Digest — Thursday, May 07, 2026"
 
 
@@ -84,7 +94,7 @@ def test_subject_multiple_categories_first_plus_count():
         categories=["newsletter", "promotions", "alerts"],
     )
     out = build_custom_digest_subject(cfg, _now())
-    assert out == "Your Weekly Newsletters +2 Digest — Thursday, May 07, 2026"
+    assert out == "Your Weekly Newsletter +2 Digest — Thursday, May 07, 2026"
 
 
 def test_subject_cadence_reflects_schedule():

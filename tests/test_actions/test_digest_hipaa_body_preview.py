@@ -1,4 +1,4 @@
-"""HIPAA verification for digest body-preview rendering (#110).
+"""HIPAA verification for digest body-preview rendering.
 
 Two render surfaces touch message body content:
 
@@ -19,7 +19,7 @@ Two render surfaces touch message body content:
    article extractor has body_html. The HIPAA fail-closed gate
    on ``extract_articles`` checks ``message.hipaa`` — which is
    only true if the caller stamped the flag on the fetched
-   message object. The per-digest send path (audit #110) was
+   message object. The per-digest send path (audit ) was
    missing that stamp, leaving the gate dead. This module
    exercises the full ``_render_digest_payload`` path with a
    HIPAA-flagged account + a mocked provider returning a
@@ -206,7 +206,7 @@ async def test_extract_articles_fallback_hipaa_does_not_leak_body():
     when the classifier is non-local; with a local classifier we
     proceed into the LLM call, and a parser failure used to drop
     body_text into the article summary regardless of HIPAA flag.
-    Punch-list #110 (2026-05-08) closed that fallback hole."""
+    the backlog  (2026-05-08) closed that fallback hole."""
     from email_triage.actions.digest import extract_articles
     from email_triage.engine.models import EmailMessage
 
@@ -239,7 +239,7 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
     """End-to-end on the per-digest send path's newsletter branch:
     a HIPAA-flagged account dispatches through
     ``_render_digest_payload`` → fetched messages → newsletter
-    render → ``extract_articles`` gate. The fix at audit #110 is
+    render → ``extract_articles`` gate. The fix at audit  is
     that ``msg.hipaa = hipaa`` is stamped on every fetched
     message; without the stamp the gate is dead. This test
     verifies the stamp survives the ``provider.fetch_message``
@@ -307,7 +307,12 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
             "date": "2026-05-08T08:00:00+00:00",
         }]
 
-    monkeypatch.setattr(app_mod, "_filter_digest_candidates", _fake_filter)
+    # #277d: _filter_digest_candidates moved to web.digest; _render_digest_payload
+    # resolves it from that module's globals, so patch it there (not the web.app
+    # re-export shim, which the renderer no longer reads through).
+    monkeypatch.setattr(
+        "email_triage.web.digest._filter_digest_candidates", _fake_filter,
+    )
 
     dcfg = DigestConfig(
         id="d1", kind="custom", name="Newsletters",
@@ -337,7 +342,7 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
     # Critical: the HIPAA flag was stamped onto the fetched message
     # before it reached the article extractor. Without the stamp
     # the extract_articles gate is dead — this assertion is the
-    # punch-list #110 regression guard.
+    # the backlog  regression guard.
     assert captured_messages[0].hipaa is True
     # Sanity: nothing leaked the sentinel through the rendered
     # body. The stub extractor returned summary="ok" so the

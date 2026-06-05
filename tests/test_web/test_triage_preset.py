@@ -1,4 +1,4 @@
-"""Tests for the Run Triage search-preset dropdown (#61)."""
+"""Tests for the Run Triage search-preset dropdown."""
 
 from datetime import date, timedelta
 

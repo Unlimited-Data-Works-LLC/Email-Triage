@@ -1,4 +1,4 @@
-"""Bundle C — DB N+1 sweep regression coverage (#134, #145.6, #140.3).
+"""Bundle C — DB N+1 sweep regression coverage.
 
 Each test pins the post-fix query count to detect regressions. The
 counter uses ``sqlite3.Connection.set_trace_callback`` — same idiom as
@@ -129,7 +129,7 @@ def _make_message() -> EmailMessage:
 
 
 # ---------------------------------------------------------------------------
-# #134.1 — list-hint loader fanout (1 + N → 2)
+# .1 — list-hint loader fanout (1 + N → 2)
 # ---------------------------------------------------------------------------
 
 
@@ -181,7 +181,7 @@ def test_collect_list_hints_falls_back_when_no_preload_passed():
 
 
 # ---------------------------------------------------------------------------
-# #134.2 — apply_ingestion_back_compat fast-path
+# .2 — apply_ingestion_back_compat fast-path
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,7 @@ def test_apply_ingestion_back_compat_legacy_gmail_with_no_watch_row():
 
 
 # ---------------------------------------------------------------------------
-# #134.3 — latest_hipaa_boundary bulk variant
+# .3 — latest_hipaa_boundary bulk variant
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +256,7 @@ def test_latest_hipaa_boundaries_for_accounts_returns_same_data_one_query():
 
 
 # ---------------------------------------------------------------------------
-# #134.4 — disabled_user_ids set-membership
+# .4 — disabled_user_ids set-membership
 # ---------------------------------------------------------------------------
 
 
@@ -293,7 +293,7 @@ def test_disabled_user_ids_matches_per_call_is_user_disabled():
 
 
 # ---------------------------------------------------------------------------
-# #145.6 — request-scoped list_email_accounts memo
+# .6 — request-scoped list_email_accounts memo
 # ---------------------------------------------------------------------------
 
 
@@ -341,7 +341,7 @@ def test_get_request_accounts_memoises_within_request_state():
 
 
 # ---------------------------------------------------------------------------
-# #140.3 — settings_keys registry
+# .3 — settings_keys registry
 # ---------------------------------------------------------------------------
 
 

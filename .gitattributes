@@ -8,3 +8,23 @@
 # Tolerated by the script's CRLF strip, but pinning LF avoids any
 # surprise.
 scripts/publish-scrub-patterns.txt text eol=lf
+
+# Embedding-bits manifest's hash needs to be stable cross-platform.
+# Pre-fix the file's sha256 differed between Windows-side commits
+# (CRLF after `git add` normalization) and Linux-side checkouts (LF
+# after extraction), which made the install_state.manifest_sha256
+# row's cross-check value drift from the generator's reported hash.
+# Pinning LF means the manifest hash on disk matches the value
+# reported by ``scripts/build-embedding-bits-manifest.py`` regardless
+# of who ran the generator.
+scripts/embedding-bits-manifest.json text eol=lf
+
+# COMMIT carries the build identifier baked into /app/VERSION (Containerfile
+# `COPY COMMIT /app/VERSION`, read by app._resolve_version). `export-subst`
+# makes `git archive HEAD` substitute the real commit hash ($Format:%H$ -> the
+# 40-char SHA) at archive time, so EVERY archive-based build bakes the correct
+# SHA — both `scripts/deploy.sh` (which also overwrites COMMIT) AND any manual
+# `git archive HEAD | podman build`. Without this, manual builds shipped the
+# literal "dev" placeholder and /health reported version "unknown". eol=lf so
+# the substituted SHA is not followed by CRLF on Windows checkouts.
+COMMIT text eol=lf export-subst

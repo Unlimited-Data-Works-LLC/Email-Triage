@@ -1,4 +1,4 @@
-"""Tests for the new /profile/watches editor (#154 + #155).
+"""Tests for the new /profile/watches editor.
 
 Covers:
   * GET as a regular user lands on the new page (200, audience-comment
@@ -133,7 +133,7 @@ class TestWatchesSave:
         mailbox in the cross-account editor. 2026-05-11 fix:
         previously HIPAA accounts were dropped for every actor
         including the owner, leaving the operator with zero surface
-        to bind a watch to their own HIPAA mailbox after #154
+        to bind a watch to their own HIPAA mailbox after 
         removed the per-account Watches tab."""
         a = _make_account(db, regular_user["id"], "acct-a")
         phi = _make_account(
@@ -348,12 +348,12 @@ class TestWatchesEditDelete:
 
 
 # ---------------------------------------------------------------------------
-# #156 — webhook hidden behind disclosure + "Send to" field dropped
+#  — webhook hidden behind disclosure + "Send to" field dropped
 # ---------------------------------------------------------------------------
 
 
 class TestWatchesSimplifiedEditor:
-    """#156: hide webhook config behind an `<details>` disclosure and
+    """: hide webhook config behind an `<details>` disclosure and
     drop the per-watch "Send to" override. Notify resolves to the
     operator's profile notify_email at fire time."""
 
@@ -414,7 +414,7 @@ class TestWatchesSimplifiedEditor:
                 "from_addr": "boss@",
                 "escalate_enabled": "1",
                 # NB: no escalate_notify_email field — field is gone
-                # from the editor per #156.
+                # from the editor per .
             },
             follow_redirects=False,
         )

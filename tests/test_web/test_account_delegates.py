@@ -1,4 +1,4 @@
-"""Tests for #50 — per-account delegation."""
+"""Tests for  — per-account delegation."""
 
 import pytest
 

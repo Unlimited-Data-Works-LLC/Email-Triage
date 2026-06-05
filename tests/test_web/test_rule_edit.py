@@ -1,4 +1,4 @@
-"""Tests for the per-row rule edit affordance (#160).
+"""Tests for the per-row rule edit affordance.
 
 Covers:
   * GET /rules/<list>/rules/<rule>/edit — renders the edit-mode

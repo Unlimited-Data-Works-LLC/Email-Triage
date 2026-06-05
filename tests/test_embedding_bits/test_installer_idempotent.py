@@ -88,7 +88,7 @@ async def test_fast_path_actually_runs_pip(
     fake_manifest_path: Path,
     monkeypatch,
 ):
-    """2026-05-18 regression — operator hit this on deploy-host: first install
+    """2026-05-18 regression — operator hit this on the deploy host: first install
     failed at pip (disk OOM), wheels survived on disk. Second install
     click triggered the fast-path which previously jumped straight to
     ``status="installed"`` WITHOUT re-running pip — leaving

@@ -366,168 +366,6 @@ class TestDigestRoutes:
         db.commit()
         return cursor.lastrowid
 
-    def test_save_config_requires_auth(self, client, db, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(f"/accounts/{acct_id}/digest/save-config",
-                           data={"category": "newsletters", "schedule_time": "07:00"})
-        assert resp.status_code == 401
-
-    def test_save_config_forbidden(self, client, db, user_cookies, regular_user, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(f"/accounts/{acct_id}/digest/save-config",
-                           data={"category": "newsletters"},
-                           cookies=user_cookies)
-        assert resp.status_code == 403
-
-    def test_save_config_success(self, client, db, admin_cookies, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(
-            f"/accounts/{acct_id}/digest/save-config",
-            data={
-                "format_prompt": "custom format",
-                "delete_originals": "1",
-            },
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-        assert "saved" in resp.text.lower()
-
-        # Verify stored in settings.
-        from email_triage.web.db import get_setting
-        config = get_setting(db, f"digest:{acct_id}")
-        assert config is not None
-        assert config["format_prompt"] == "custom format"
-        assert config["delete_originals"] is True
-
-    def test_add_schedule(self, client, db, admin_cookies, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(
-            f"/accounts/{acct_id}/digest/schedule/add",
-            data={
-                "schedule_time": "07:00",
-                "category": "newsletters",
-                "tz_offset": "300",  # EST: UTC-5
-            },
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-
-        # Verify stored — 07:00 EST + 300 min offset = 12:00 UTC.
-        from email_triage.web.db import get_setting
-        schedules = get_setting(db, f"digest_schedules:{acct_id}")
-        assert schedules is not None
-        assert len(schedules) == 1
-        assert schedules[0]["time_utc"] == "12:00"
-        assert schedules[0]["category"] == "newsletters"
-        assert schedules[0]["enabled"] is True
-
-    def test_toggle_schedule(self, client, db, admin_cookies, admin_user):
-        from email_triage.web.db import set_setting
-        acct_id = self._create_account(db, admin_user["id"])
-        set_setting(db, f"digest_schedules:{acct_id}", [
-            {"time_utc": "12:00", "category": "newsletters", "enabled": True},
-        ])
-        resp = client.post(
-            f"/accounts/{acct_id}/digest/toggle/0",
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-        from email_triage.web.db import get_setting
-        schedules = get_setting(db, f"digest_schedules:{acct_id}")
-        assert schedules[0]["enabled"] is False
-
-    def test_delete_schedule(self, client, db, admin_cookies, admin_user):
-        from email_triage.web.db import set_setting
-        acct_id = self._create_account(db, admin_user["id"])
-        set_setting(db, f"digest_schedules:{acct_id}", [
-            {"time_utc": "12:00", "category": "newsletters", "enabled": True},
-            {"time_utc": "18:00", "category": "notifications", "enabled": True},
-        ])
-        resp = client.delete(
-            f"/accounts/{acct_id}/digest/schedule/0",
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-        from email_triage.web.db import get_setting
-        schedules = get_setting(db, f"digest_schedules:{acct_id}")
-        assert len(schedules) == 1
-        assert schedules[0]["category"] == "notifications"
-
-    def test_add_schedule_duplicate_ignored(self, client, db, admin_cookies, admin_user):
-        from email_triage.web.db import set_setting
-        acct_id = self._create_account(db, admin_user["id"])
-        set_setting(db, f"digest_schedules:{acct_id}", [
-            {"time_utc": "12:00", "category": "newsletters", "enabled": True},
-        ])
-        # Try to add the same schedule again (same UTC time + category).
-        resp = client.post(
-            f"/accounts/{acct_id}/digest/schedule/add",
-            data={
-                "schedule_time": "07:00",
-                "category": "newsletters",
-                "tz_offset": "300",  # 07:00 EST = 12:00 UTC — duplicate
-            },
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-        from email_triage.web.db import get_setting
-        schedules = get_setting(db, f"digest_schedules:{acct_id}")
-        assert len(schedules) == 1  # No duplicate added
-
-    def test_legacy_schedule_migration(self, client, db, admin_cookies, admin_user):
-        """Old single-schedule format is migrated to multi-schedule on load."""
-        from email_triage.web.db import set_setting, get_setting
-        acct_id = self._create_account(db, admin_user["id"])
-        # Seed the legacy format.
-        set_setting(db, f"digest:{acct_id}", {
-            "schedule_enabled": True,
-            "schedule_time": "08:30",
-            "category": "newsletters",
-            "format_prompt": "old prompt",
-        })
-        # Hit the toggle endpoint — this triggers _load_digest_schedules
-        # which should migrate the legacy format.
-        resp = client.post(
-            f"/accounts/{acct_id}/digest/toggle/0",
-            cookies=admin_cookies,
-        )
-        assert resp.status_code == 200
-        schedules = get_setting(db, f"digest_schedules:{acct_id}")
-        assert schedules is not None
-        assert len(schedules) == 1
-        assert schedules[0]["time_utc"] == "08:30"
-        # Toggle should have paused it.
-        assert schedules[0]["enabled"] is False
-
-    def test_save_config_not_found(self, client, admin_cookies, admin_user):
-        resp = client.post("/accounts/99999/digest/save-config",
-                           data={"category": "newsletters"},
-                           cookies=admin_cookies)
-        assert resp.status_code == 404
-
-    def test_generate_requires_auth(self, client, db, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(f"/accounts/{acct_id}/digest/generate",
-                           data={"category": "newsletters"})
-        assert resp.status_code == 401
-
-    def test_generate_forbidden(self, client, db, user_cookies, regular_user, admin_user):
-        acct_id = self._create_account(db, admin_user["id"])
-        resp = client.post(f"/accounts/{acct_id}/digest/generate",
-                           data={"category": "newsletters"},
-                           cookies=user_cookies)
-        assert resp.status_code == 403
-
-    def test_generate_not_found(self, client, admin_cookies, admin_user):
-        resp = client.post("/accounts/99999/digest/generate",
-                           data={"category": "newsletters"},
-                           cookies=admin_cookies)
-        assert resp.status_code == 404
-
-
-class TestFolderPrefsDB:
-    """Tests for folder preference DB helpers."""
-
     def test_get_prefs_empty(self, db, admin_user):
         from email_triage.web.db import create_email_account, get_folder_prefs
         acct_id = create_email_account(db, admin_user["id"], "Test", "imap", {})
@@ -1084,12 +922,12 @@ class TestTriageRunsActorUserId:
     def test_list_triage_runs_exposes_actor_name_and_system(
         self, client, db, admin_cookies, admin_user,
     ):
-        """#11 / #15a: ``list_triage_runs`` must surface the actor name
+        """ / #15a: ``list_triage_runs`` must surface the actor name
         for manual runs and leave it NULL for system-initiated rows so
         downstream views (dashboard recent activity, /logs, future
         /runs page) can label each row without a second query.
 
-        Before the #12 dashboard redesign this assertion lived on the
+        Before the  dashboard redesign this assertion lived on the
         dashboard HTML; the data contract is the same, it just lives
         on dedicated pages now, so we assert against the helper.
         """

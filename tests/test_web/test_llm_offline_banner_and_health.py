@@ -1,4 +1,4 @@
-"""Banner + /health adjacent tests for #149.
+"""Banner + /health adjacent tests for .
 
 Covers:
   - dashboard banner renders calm copy when an LLM maintenance

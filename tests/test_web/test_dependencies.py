@@ -161,7 +161,7 @@ class TestRequireRole:
 
 
 # ---------------------------------------------------------------------------
-# #137 — OwnedAccount dep tests.
+#  — OwnedAccount dep tests.
 # ---------------------------------------------------------------------------
 
 
@@ -389,7 +389,7 @@ class TestOwnedAccountForProvider:
 
 
 # ---------------------------------------------------------------------------
-# #137 phase 2 — OwnedAccountOrLogin tests.
+#  phase 2 — OwnedAccountOrLogin tests.
 # ---------------------------------------------------------------------------
 
 
@@ -557,3 +557,57 @@ class TestRequireOwnedAccountOrLogin:
         user, acct, _, _ = result
         assert user["role"] == "admin"
         assert acct["id"] == account_id
+
+
+class TestAuthErrorHandler:
+    """The Accept-aware 401/403/404 handler registered in app.py.
+
+    Before  the ``dependencies.py`` docstrings promised a global
+    error handler that rendered HTML or JSON by ``Accept`` — but none
+    was registered, so a browser hitting an owned-account 403/404 saw
+    FastAPI's bare ``{"detail": ...}`` JSON as plain text.
+    """
+
+    def test_wants_html_for_browser_navigation(self):
+        from email_triage.web.app import _wants_html
+        req = _make_request(
+            url_path="/accounts",
+            headers={"accept": "text/html,application/xhtml+xml,*/*"},
+        )
+        assert _wants_html(req) is True
+
+    def test_wants_html_false_for_api_path(self):
+        from email_triage.web.app import _wants_html
+        req = _make_request(
+            url_path="/api/accounts/5",
+            headers={"accept": "text/html"},
+        )
+        assert _wants_html(req) is False
+
+    def test_wants_html_false_for_json_client(self):
+        from email_triage.web.app import _wants_html
+        req = _make_request(
+            url_path="/accounts",
+            headers={"accept": "application/json"},
+        )
+        assert _wants_html(req) is False
+
+    def test_browser_404_renders_html(self, client):
+        """A browser request for an unknown route → HTML error page."""
+        resp = client.get(
+            "/no-such-page-xyz",
+            headers={"accept": "text/html,*/*"},
+        )
+        assert resp.status_code == 404
+        assert "text/html" in resp.headers.get("content-type", "")
+        assert "<!DOCTYPE html>" in resp.text
+
+    def test_api_404_stays_json(self, client):
+        """An /api/ request keeps FastAPI's JSON error shape."""
+        resp = client.get(
+            "/api/no-such-endpoint-xyz",
+            headers={"accept": "application/json"},
+        )
+        assert resp.status_code == 404
+        assert "application/json" in resp.headers.get("content-type", "")
+        assert "detail" in resp.json()

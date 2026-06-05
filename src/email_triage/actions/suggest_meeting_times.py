@@ -18,7 +18,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from email_triage.actions.base import Action
+from email_triage.actions.base import (
+    Action,
+    check_idempotent_already_done,
+    record_idempotent_done,
+)
 from email_triage._errfmt import fmt_exc
 from email_triage.engine.availability import find_free_slots
 from email_triage.engine.models import (
@@ -134,6 +138,25 @@ class SuggestMeetingTimesAction(Action):
         provider: EmailProvider,
         config: dict[str, Any] | None = None,
     ) -> ActionOutput:
+        #  — guard the provider mutation. This action calls
+        # ``provider.create_draft`` unconditionally; the retry-queue
+        # drainer re-runs the whole triage path, so without this a
+        # re-run would create a SECOND meeting-suggestion draft. The
+        # skip path leaves the prior draft intact.
+        prior = await check_idempotent_already_done(flow, message, self.name)
+        if prior is not None:
+            log.info(
+                "suggest_meeting_times: draft already created for this "
+                "message; skipping",
+                extra={
+                    "flow_id": flow.flow_id,
+                    "previous_draft_id": prior.data.get(
+                        "previous_external_id",
+                    ),
+                },
+            )
+            return prior
+
         state_bag = getattr(flow, "state_bag", None)
         cal: CalendarProvider | None = None
         prefs_raw: dict[str, Any] | None = None
@@ -221,6 +244,12 @@ class SuggestMeetingTimesAction(Action):
                 error=f"draft_error: {e}",
             )
 
+        #  — record the draft id so a retry-queue re-run skips
+        # instead of drafting a duplicate.
+        await record_idempotent_done(
+            flow, message, self.name,
+            external_id=str(draft_id) if draft_id is not None else None,
+        )
         return ActionOutput(
             result=ActionResult.COMPLETED,
             data={

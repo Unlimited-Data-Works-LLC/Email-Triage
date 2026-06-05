@@ -1,4 +1,4 @@
-"""/logs mobile responsive Details column + broadened pill fields (#118).
+"""/logs mobile responsive Details column + broadened pill fields.
 
 Two operator-visible regressions covered here:
 

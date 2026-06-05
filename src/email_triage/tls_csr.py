@@ -1,4 +1,4 @@
-"""Make-CSR / sign / import-cert workflow for institutional CAs (#74).
+"""Make-CSR / sign / import-cert workflow for institutional CAs.
 
 For deployments where the operator gets a 3-year commercial cert from
 the org's PKI (Sectigo, DigiCert, internal CA, etc.) instead of using

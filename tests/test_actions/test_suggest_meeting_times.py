@@ -255,24 +255,24 @@ class TestInjectMeetingIntercept:
 
 class TestFormatTzLabel:
     """``_format_tz_label`` renders the operator's IANA timezone as
-    ``EDT (UTC-4)`` instead of ``America/Detroit``. Must follow DST:
+    ``EDT (UTC-4)`` instead of ``America/New_York``. Must follow DST:
     a slot in May (EDT) and a slot in January (EST) on the same IANA
     zone get DIFFERENT labels."""
 
     def test_eastern_us_summer_is_edt_utc_minus_4(self):
         from email_triage.actions.suggest_meeting_times import _format_tz_label
         from zoneinfo import ZoneInfo
-        # Mid-May = DST in effect on America/Detroit → EDT, UTC-4.
-        local = datetime(2026, 5, 15, 9, 0, tzinfo=ZoneInfo("America/Detroit"))
-        label = _format_tz_label(local, "America/Detroit")
+        # Mid-May = DST in effect on America/New_York → EDT, UTC-4.
+        local = datetime(2026, 5, 15, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+        label = _format_tz_label(local, "America/New_York")
         assert label == "EDT (UTC-4)"
 
     def test_eastern_us_winter_is_est_utc_minus_5(self):
         from email_triage.actions.suggest_meeting_times import _format_tz_label
         from zoneinfo import ZoneInfo
         # Mid-January = no DST → EST, UTC-5.
-        local = datetime(2026, 1, 15, 9, 0, tzinfo=ZoneInfo("America/Detroit"))
-        label = _format_tz_label(local, "America/Detroit")
+        local = datetime(2026, 1, 15, 9, 0, tzinfo=ZoneInfo("America/New_York"))
+        label = _format_tz_label(local, "America/New_York")
         assert label == "EST (UTC-5)"
 
     def test_utc_zone_no_dst(self):
@@ -297,10 +297,10 @@ class TestFormatTzLabel:
         per-slot labels: pre-transition slots = EDT, post = EST."""
         from email_triage.actions.suggest_meeting_times import _format_tz_label
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/Detroit")
+        tz = ZoneInfo("America/New_York")
         # 2026 fall-back: 2 AM on first Sunday of November.
         # Nov 1, 2026 is a Sunday. Before 2 AM = EDT, after = EST.
         pre = datetime(2026, 11, 1, 1, 0, tzinfo=tz)
         post = datetime(2026, 11, 2, 9, 0, tzinfo=tz)
-        assert _format_tz_label(pre, "America/Detroit") == "EDT (UTC-4)"
-        assert _format_tz_label(post, "America/Detroit") == "EST (UTC-5)"
+        assert _format_tz_label(pre, "America/New_York") == "EDT (UTC-4)"
+        assert _format_tz_label(post, "America/New_York") == "EST (UTC-5)"

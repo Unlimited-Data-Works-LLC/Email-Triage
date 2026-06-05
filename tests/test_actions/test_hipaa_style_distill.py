@@ -1,4 +1,4 @@
-"""Tests for ``actions.hipaa_style_distill`` (#152 phase 3 scaffold).
+"""Tests for ``actions.hipaa_style_distill``.
 
 Scope: pipeline shape — gate behaviour, scrubber behaviour, audit-row
 bracketing, descriptor persistence, weekly cadence. The classifier is
@@ -637,5 +637,5 @@ class TestPhase3IsFlagGated:
             "triage_runner_bulk.py imports hipaa_style_distill — the "
             "phase-3 pipeline should stay flag-gated scaffold until "
             "operator signs off on the LLM-backend posture. See "
-            "PUNCH-LIST.md #152 phase 3."
+            "the backlog  phase 3."
         )

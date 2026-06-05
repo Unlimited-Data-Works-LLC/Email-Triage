@@ -237,7 +237,7 @@ class TestGraphAPI:
         p = _make_provider()
         # Pre-set a mock HTTP client to skip auth.
         p._http = AsyncMock()
-        # Phase-2 (#138 phase 2): _request now calls
+        # Phase-2: _request now calls
         # ``acquire_token`` per request and uses
         # ``client.request(method, ...)``. Stub both so verb-keyed
         # mocks attached by tests continue to work.
@@ -277,6 +277,43 @@ class TestGraphAPI:
 
         result = await provider.search("is:unread")
         assert result == []
+
+    async def test_poll_delta_skips_removed_entries(self, provider):
+        """ — a delta page mixes new/changed messages with
+        ``@removed`` entries (deletes / moves-out). ``poll_delta`` must
+        return ONLY the live message ids: an ``@removed`` id names a
+        message that no longer exists in the folder, so a downstream
+        ``fetch_message`` on it would 404 — a wasted Graph round-trip
+        per removal per poll."""
+        provider._http.get = AsyncMock(return_value=_mock_graph_response({
+            "value": [
+                {"id": "live-1"},
+                {"id": "gone-1", "@removed": {"reason": "deleted"}},
+                {"id": "live-2"},
+                {"id": "gone-2", "@removed": {"reason": "changed"}},
+            ],
+            "@odata.deltaLink": "https://graph/delta?$deltatoken=next",
+        }))
+
+        message_ids, cursor = await provider.poll_delta()
+
+        # Only the non-removed ids survive.
+        assert message_ids == ["live-1", "live-2"]
+        assert cursor == "https://graph/delta?$deltatoken=next"
+
+    async def test_poll_delta_all_removed_returns_empty(self, provider):
+        """A delta page of nothing but ``@removed`` entries yields an
+        empty id list — no fetch_message calls are scheduled at all."""
+        provider._http.get = AsyncMock(return_value=_mock_graph_response({
+            "value": [
+                {"id": "gone-1", "@removed": {"reason": "deleted"}},
+                {"id": "gone-2", "@removed": {"reason": "deleted"}},
+            ],
+            "@odata.deltaLink": "https://graph/delta?$deltatoken=next",
+        }))
+
+        message_ids, _cursor = await provider.poll_delta()
+        assert message_ids == []
 
     async def test_fetch_message(self, provider):
         msg_data = {
@@ -505,7 +542,7 @@ class TestGraphAPI:
         result = await provider.search("is:unread")
         assert result == ["m1"]
         assert call_count == 2
-        # Phase-2 (#138 phase 2): acquire_token is invoked per request
+        # Phase-2: acquire_token is invoked per request
         # (warming the bearer for that call) AND again on 401-refresh.
         # Pre-phase-2 only the refresh call counted because the initial
         # bearer rode on the persistent client.headers.

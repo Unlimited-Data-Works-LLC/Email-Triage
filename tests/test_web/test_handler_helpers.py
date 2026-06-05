@@ -1,4 +1,4 @@
-"""Tests for the #137 + adjacent helper-extraction work.
+"""Tests for the  + adjacent helper-extraction work.
 
 Covers:
     * ``web.db.update_account_config_keys`` — atomic read-modify-write
@@ -7,7 +7,7 @@ Covers:
       truth for action log_extras dicts (replacing per-action
       ``def _extras`` closures in label.py / move.py / etc.).
     * Inlined ``is_hipaa_account`` callers in ``web/calendars.py``
-      (#145.5 — wrapper deleted, callers go straight to
+      (.5 — wrapper deleted, callers go straight to
       ``triage_logging.is_account_hipaa``).
 """
 
@@ -297,7 +297,7 @@ class TestBuildActionLogExtras:
 
 
 # ---------------------------------------------------------------------------
-# #145.5 — is_hipaa_account inline (wrapper deleted).
+# .5 — is_hipaa_account inline (wrapper deleted).
 # ---------------------------------------------------------------------------
 
 
@@ -343,7 +343,7 @@ class TestCalendarsHipaaInlinedCallers:
         assert resolve_surrogate_account(db, primary) is None
 
     def test_wrapper_is_gone(self):
-        """#145.5 — ``is_hipaa_account`` was a wrapper around
+        """.5 — ``is_hipaa_account`` was a wrapper around
         ``is_account_hipaa``. Verify it's no longer importable."""
         with pytest.raises(ImportError):
             from email_triage.web.calendars import (  # noqa: F401

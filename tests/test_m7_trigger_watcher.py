@@ -1,4 +1,4 @@
-"""Tests for the M-7 (per-contact) HIPAA-distill trigger watcher (#171-B).
+"""Tests for the M-7 (per-contact) HIPAA-distill trigger watcher.
 
 Sibling of ``test_m3_trigger_watcher.py``. Validates the per-recipient
 trigger plane: threshold (≥20 messages to a single recipient), stale

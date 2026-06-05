@@ -1,4 +1,4 @@
-"""Tests for :mod:`email_triage.baa_expiry` (#169 Wave 2-α — I7).
+"""Tests for :mod:`email_triage.baa_expiry`.
 
 Covers:
 
@@ -381,7 +381,7 @@ class TestSurfaceHelpers:
         )
         block = health_status_block(db, auto_disabled_count=7)
         assert block == {
-            "expiring_soon": 2,  # urgent + soon merge for Nagios.
+            "expiring_soon": 2,  # urgent + soon merge for the monitoring system.
             "expired": 1,
             "expired_hipaa_accounts_disabled": 7,
         }

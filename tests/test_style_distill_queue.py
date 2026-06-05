@@ -1,4 +1,4 @@
-"""Tests for the style_distill_queue retry-with-backoff helpers (#152 S3).
+"""Tests for the style_distill_queue retry-with-backoff helpers.
 
 Validates:
 

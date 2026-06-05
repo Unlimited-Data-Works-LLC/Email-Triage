@@ -1,5 +1,5 @@
 """Generic SMTP send helper, shared between OTP login and escalation
-notifications (#73).
+notifications.
 
 Extracted from ``email_triage.web.auth.send_otp_email`` so the
 ``EscalateAction`` can reuse the same auth envelope + From-quoting +

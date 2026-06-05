@@ -1,4 +1,4 @@
-"""Tests for /admin/tls/csr web surface (#74)."""
+"""Tests for /admin/tls/csr web surface."""
 
 from __future__ import annotations
 

@@ -1,9 +1,9 @@
-"""AI-backed explain-this-error helper (#121-A).
+"""AI-backed explain-this-error helper.
 
 Operators see opaque integration error strings on /logs and the O365
 probe chip (AADSTS / aioimaplib / Graph 4xx / IMAP NONAUTH / OAuth
 ``invalid_grant`` / etc.). Field-scoped tooltips only catch a
-fraction; the static AADSTS translator only knows 7 codes; #128
+fraction; the static AADSTS translator only knows 7 codes; 
 ``/help/tasks`` is generic recipes, not state-grounded prose.
 
 This module asks the configured Ollama backend to render a plain-
@@ -25,11 +25,13 @@ Design rules — locked at build time:
   ``provider`` + account-NAME (never numeric id alone, never message
   body) reach the prompt. The function refuses to splice anything
   outside its declared inputs (see :func:`_build_prompt`).
-* Circuit breaker: when :func:`llm_health.is_healthy("ollama")`
-  returns False we short-circuit to a static fallback message
-  without paying the connect-attempt latency. Mirrors the same gate
-  the watcher / triage path use to skip burning round-trips on a
-  known-unreachable backend.
+* Circuit breaker: when ``llm_health.is_healthy(<configured
+  backend>)`` returns False we short-circuit to a static fallback
+  message without paying the connect-attempt latency. The backend
+  name is resolved from ``config.classifier.backend`` so an
+  openai / gemini install gates on its own breaker key. Mirrors the
+  same gate the watcher / triage path use to skip burning round-
+  trips on a known-unreachable backend.
 * Latency budget: 8 seconds total. The Ollama client already carries
   a 120-second default; we override per-call with ``timeout=8.0`` so
   a stuck backend can't wedge the UI thread. The wider classifier
@@ -53,7 +55,7 @@ _log = logging.getLogger("email_triage.web.error_explain")
 # Public constants
 # ---------------------------------------------------------------------------
 
-#: Returned verbatim when the LLM backend is unhealthy (per #149
+#: Returned verbatim when the LLM backend is unhealthy (per 
 #: circuit breaker) or the operator's classifier config doesn't
 #: include an LLM with a ``complete()`` method. Operator-facing
 #: copy — must not reference admin-only paths. ``/help/tasks`` is
@@ -170,11 +172,21 @@ async def explain_error(
     # Circuit-breaker gate — same in-process registry the classify
     # path uses. When the backend has been marked unreachable in
     # the last 5 min, skip the LLM round-trip entirely.
+    #
+    #  — resolve the configured classifier backend rather than
+    # hardcoding "ollama". The breaker is keyed per backend
+    # (ollama / openai / gemini), and every HTTP classifier now trips
+    # its own key on a connect failure; hardcoding "ollama" would
+    # miss a tripped breaker on an openai / gemini install.
     from email_triage.llm_health import is_healthy
-    if not is_healthy("ollama"):
+    backend_name = getattr(
+        getattr(config, "classifier", None), "backend", "ollama",
+    ) or "ollama"
+    if not is_healthy(backend_name):
         _log.info(
-            "explain_error: ollama unhealthy, returning fallback",
+            "explain_error: LLM backend unhealthy, returning fallback",
             extra={"_extra": {
+                "backend": backend_name,
                 "provider": provider or "",
                 "error_class": error_class or "",
             }},
@@ -188,7 +200,10 @@ async def explain_error(
     if account_id is not None:
         try:
             from email_triage.web.db import get_email_account
-            row = get_email_account(db, account_id)
+            from email_triage.web.db_threadpool import db_call
+            #  — explain_error is an async def; route the account
+            # lookup off the event-loop thread.
+            row = await db_call(get_email_account, db, account_id)
             if row is not None:
                 # Prefer the operator-set display name, fall back to
                 # owner_email + raw name (matches digest/banner rules

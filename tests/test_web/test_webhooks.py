@@ -374,7 +374,7 @@ class TestGmailApiWatchRegistration:
         # The generator path is not how Gmail delivers push; callers
         # must go through register_watch + /webhooks/gmail instead.
         # The error message itself was scrubbed of API-contract jargon
-        # (#24) so it reads cleanly in operator-facing UIs.
+        # so it reads cleanly in operator-facing UIs.
         from email_triage.providers.gmail_api import GmailApiProvider
 
         provider = GmailApiProvider(client_id="cid", refresh_token="rt")

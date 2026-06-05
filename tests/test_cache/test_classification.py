@@ -1,4 +1,4 @@
-"""Tests for the optional Redis-backed classification cache (#151).
+"""Tests for the optional Redis-backed classification cache.
 
 Uses an in-process stub for ``redis.Redis.from_url`` so we don't need
 ``fakeredis`` (not a dev dep) or a live Redis instance. The stub
@@ -106,6 +106,78 @@ class _StubRedis:
         self._ttls[key] = int(ttl)
         return True
 
+    def eval(self, script, numkeys, *args):
+        """Compat-shim for ClassificationCache.store_inner's Lua EVAL.
+
+        The stub can't run Lua; this reproduces _STORE_INNER_LUA's
+        effect in Python so stub-backed tests that store still work.
+        The real script is validated against a live Redis in
+        test_classification_redis.py. store_inner's call shape:
+        numkeys=2, KEYS=(inner_hash, dist_hash),
+        ARGV=(field, payload, cap, ttl_secs).
+        """
+        if self.fail_set:
+            self.fail_count["set"] += 1
+            raise ConnectionError("simulated EVAL failure")
+        import json
+        key, dist_key = args[0], args[1]
+        field, payload = args[2], args[3]
+        cap = int(args[4])
+        ttl = int(args[5])
+
+        def _cat(raw):
+            try:
+                d = json.loads(raw)
+                c = d.get("category") if isinstance(d, dict) else None
+                return str(c) if c else None
+            except Exception:
+                return None
+
+        h = self._hashes.setdefault(key, {})
+        dist = self._hashes.setdefault(dist_key, {})
+
+        def _dec(cat):
+            if not cat:
+                return
+            n = int(dist.get(cat, 0)) - 1
+            if n <= 0:
+                dist.pop(cat, None)
+            else:
+                dist[cat] = n
+
+        def _inc(cat):
+            if not cat:
+                return
+            dist[cat] = int(dist.get(cat, 0)) + 1
+
+        new_cat = _cat(payload)
+        existing = h.get(field)
+        if existing is not None:
+            # Overwrite — size unchanged; adjust dist only on a
+            # category change.
+            old_cat = _cat(existing)
+            if old_cat != new_cat:
+                _dec(old_cat)
+                _inc(new_cat)
+        else:
+            if cap > 0 and len(h) >= cap:
+                oldest_field, oldest_ts, oldest_raw = None, "", None
+                for fld, raw in h.items():
+                    try:
+                        ts = str(json.loads(raw).get("classified_at", ""))
+                    except Exception:
+                        ts = ""
+                    if oldest_field is None or ts < oldest_ts:
+                        oldest_field, oldest_ts, oldest_raw = fld, ts, raw
+                if oldest_field is not None:
+                    del h[oldest_field]
+                    _dec(_cat(oldest_raw))
+            _inc(new_cat)
+        h[field] = payload
+        self._ttls[key] = ttl
+        self._ttls[dist_key] = ttl
+        return 1
+
     def scan(self, cursor=0, match=None, count=100):
         # Return all hash keys matching the pattern (very simple
         # exact-prefix match for the ``et:cls:*`` shape).
@@ -205,11 +277,11 @@ class TestHelpers:
     def test_make_cache_key_deterministic(self):
         k1 = make_cache_key(
             account_id=1, sender="a@b.com", subject="Hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         k2 = make_cache_key(
             account_id=1, sender="a@b.com", subject="Hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         assert k1 == k2
         assert k1.startswith(KEY_PREFIX)
@@ -218,11 +290,11 @@ class TestHelpers:
         """Model upgrade auto-invalidates without manual flush."""
         k_old = make_cache_key(
             account_id=1, sender="a@b.com", subject="Hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         k_new = make_cache_key(
             account_id=1, sender="a@b.com", subject="Hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.6:35b",
         )
         assert k_old != k_new
 
@@ -230,11 +302,11 @@ class TestHelpers:
         """Same sender / subject with different whitespace -> same key."""
         k1 = make_cache_key(
             account_id=1, sender="Alice@Example.com", subject="Hi there",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         k2 = make_cache_key(
             account_id=1, sender="alice@example.com   ", subject="HI THERE",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         assert k1 == k2
 
@@ -271,7 +343,7 @@ class TestClassificationCache:
             "confidence": 0.9,
             "reason": "demo",
             "classified_at": "2026-05-11T00:00:00+00:00",
-            "model": "[local-llm-model]
+            "model": "qwen3.5:35b",
         }
         # First lookup -> miss.
         assert cache.lookup(key) is None
@@ -390,10 +462,10 @@ class TestHipaaGate:
             hipaa=True,  # the HIPAA flag — cache MUST be skipped
         )
 
-        clf = OllamaClassifier(model="[local-llm-model]
+        clf = OllamaClassifier(model="qwen3.5:35b")
 
         async def _stub_resolve_model():
-            return "[local-llm-model]
+            return "qwen3.5:35b"
 
         class _LLMResp:
             status_code = 200
@@ -456,7 +528,8 @@ class TestHipaaGate:
         bh = compute_body_hash("hello")
         outer = make_outer_cache_key(
             account_id=0, sender="alice@example.com",
-            classifier_model="[local-llm-model]
+            classifier_model="qwen3.5:35b",
+            categories={"fyi": "info"},
         )
         inner = make_inner_cache_field(subject="hi", body_hash=bh)
         stub.hset(outer, inner, json.dumps({
@@ -464,13 +537,13 @@ class TestHipaaGate:
             "confidence": 0.77,
             "reason": "cached-reason",
             "classified_at": "2026-05-11T00:00:00+00:00",
-            "model": "[local-llm-model]
+            "model": "qwen3.5:35b",
         }))
 
-        clf = OllamaClassifier(model="[local-llm-model]
+        clf = OllamaClassifier(model="qwen3.5:35b")
 
         async def _stub_resolve_model():
-            return "[local-llm-model]
+            return "qwen3.5:35b"
 
         # Patch HTTP to a sentinel that would BLOW UP if called — proves
         # the cache short-circuited.
@@ -574,22 +647,22 @@ class TestCacheKeyPerAccount:
     def test_per_account_isolation(self):
         k_a = make_cache_key(
             account_id=1, sender="x@y.com", subject="hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         k_b = make_cache_key(
             account_id=2, sender="x@y.com", subject="hi",
-            body_hash="abc", classifier_model="[local-llm-model]
+            body_hash="abc", classifier_model="qwen3.5:35b",
         )
         assert k_a != k_b
 
     def test_per_body_isolation(self):
         k1 = make_cache_key(
             account_id=1, sender="x@y.com", subject="hi",
-            body_hash="aaa", classifier_model="[local-llm-model]
+            body_hash="aaa", classifier_model="qwen3.5:35b",
         )
         k2 = make_cache_key(
             account_id=1, sender="x@y.com", subject="hi",
-            body_hash="bbb", classifier_model="[local-llm-model]
+            body_hash="bbb", classifier_model="qwen3.5:35b",
         )
         assert k1 != k2
 
@@ -628,7 +701,7 @@ class TestSharedClassifierHelpers:
             cache_lookup_for_message,
         )
         outer, inner, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model] {"fyi": "info"},
+            self._msg(), "qwen3.5:35b", {"fyi": "info"},
         )
         assert outer is None and inner is None
         assert hit is None and hint is None
@@ -650,13 +723,13 @@ class TestSharedClassifierHelpers:
         msg = self._msg(hipaa=True)
         # Lookup returns keys (no longer None-on-HIPAA).
         outer, inner, hit, hint = cache_lookup_for_message(
-            msg, "[local-llm-model] {"fyi": "info"},
+            msg, "qwen3.5:35b", {"fyi": "info"},
         )
         assert outer is not None and inner is not None
         assert hit is None and hint is None  # cold miss
         # Store the result with is_hipaa=True — reason should be stripped.
         cache_store_for_message(
-            outer, inner, "[local-llm-model]
+            outer, inner, "qwen3.5:35b",
             Classification(category="fyi", confidence=0.8,
                            reason="leaks-phi-here", source="llm"),
             {"fyi": "info"}, is_hipaa=True,
@@ -666,7 +739,7 @@ class TestSharedClassifierHelpers:
         v = _json.loads(raw)
         assert v["category"] == "fyi"
         assert v["confidence"] == 0.8
-        assert v["model"] == "[local-llm-model]
+        assert v["model"] == "qwen3.5:35b"
         assert "reason" not in v  # stripped under HIPAA
 
     def test_force_reclassify_bypasses_cache(self, stub):
@@ -677,7 +750,7 @@ class TestSharedClassifierHelpers:
         cache = ClassificationCache(url="redis://stub:6379/0")
         set_install_classification_cache(cache)
         outer, inner, hit, hint = cache_lookup_for_message(
-            self._msg(force=True), "[local-llm-model] {"fyi": "info"},
+            self._msg(force=True), "qwen3.5:35b", {"fyi": "info"},
         )
         assert outer is None and inner is None
         assert hit is None and hint is None
@@ -694,17 +767,18 @@ class TestSharedClassifierHelpers:
         set_install_classification_cache(cache)
         outer = make_outer_cache_key(
             account_id=42, sender="alice@example.com",
-            classifier_model="[local-llm-model]
+            classifier_model="qwen3.5:35b",
+            categories={"fyi": "info"},
         )
         inner = make_inner_cache_field(
             subject="hello", body_hash=compute_body_hash("hi there"),
         )
         stub.hset(outer, inner, _json.dumps({
             "category": "fyi", "confidence": 0.77, "reason": "r",
-            "classified_at": "2026-05-11", "model": "[local-llm-model]
+            "classified_at": "2026-05-11", "model": "qwen3.5:35b",
         }))
         got_outer, got_inner, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model] {"fyi": "info"},
+            self._msg(), "qwen3.5:35b", {"fyi": "info"},
         )
         assert got_outer == outer
         assert got_inner == inner
@@ -731,17 +805,18 @@ class TestSharedClassifierHelpers:
         set_install_classification_cache(cache)
         outer = make_outer_cache_key(
             account_id=42, sender="alice@example.com",
-            classifier_model="[local-llm-model]
+            classifier_model="qwen3.5:35b",
+            categories={"fyi": "info"},
         )
         # Seed 3 sibling fields (different subjects, all fyi).
         for i in range(3):
-            stub.hset(outer, f"field_{i}", _json.dumps({
+            cache.store_inner(outer, f"field_{i}", {
                 "category": "fyi", "confidence": 0.9, "reason": "r",
                 "classified_at": f"2026-05-{i+1:02d}",
-                "model": "[local-llm-model]
-            }))
+                "model": "qwen3.5:35b",
+            })
         got_outer, got_inner, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model] {"fyi": "info"},
+            self._msg(), "qwen3.5:35b", {"fyi": "info"},
         )
         assert got_outer == outer
         assert hit is None  # inner miss
@@ -765,20 +840,21 @@ class TestSharedClassifierHelpers:
         set_install_classification_cache(cache)
         outer = make_outer_cache_key(
             account_id=42, sender="alice@example.com",
-            classifier_model="[local-llm-model]
+            classifier_model="qwen3.5:35b",
+            categories={"fyi": "info", "promotions": "promo"},
         )
         # 9 fyi + 1 promotions = 90% dominant, threshold 70%.
         for i in range(9):
-            stub.hset(outer, f"f_{i}", _json.dumps({
+            cache.store_inner(outer, f"f_{i}", {
                 "category": "fyi", "confidence": 0.9,
-                "classified_at": "2026-05-01", "model": "[local-llm-model]
-            }))
-        stub.hset(outer, "f_pro", _json.dumps({
+                "classified_at": "2026-05-01", "model": "qwen3.5:35b",
+            })
+        cache.store_inner(outer, "f_pro", {
             "category": "promotions", "confidence": 0.9,
-            "classified_at": "2026-05-02", "model": "[local-llm-model]
-        }))
+            "classified_at": "2026-05-02", "model": "qwen3.5:35b",
+        })
         _, _, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model]
+            self._msg(), "qwen3.5:35b",
             {"fyi": "info", "promotions": "promo"},
         )
         assert hit is None
@@ -801,21 +877,22 @@ class TestSharedClassifierHelpers:
         set_install_classification_cache(cache)
         outer = make_outer_cache_key(
             account_id=42, sender="alice@example.com",
-            classifier_model="[local-llm-model]
+            classifier_model="qwen3.5:35b",
+            categories={"fyi": "info", "promotions": "promo"},
         )
         # 6 fyi + 4 promotions = 60% top — below 70% threshold.
         for i in range(6):
-            stub.hset(outer, f"fyi_{i}", _json.dumps({
+            cache.store_inner(outer, f"fyi_{i}", {
                 "category": "fyi", "confidence": 0.9,
-                "classified_at": "2026-05-01", "model": "[local-llm-model]
-            }))
+                "classified_at": "2026-05-01", "model": "qwen3.5:35b",
+            })
         for i in range(4):
-            stub.hset(outer, f"pro_{i}", _json.dumps({
+            cache.store_inner(outer, f"pro_{i}", {
                 "category": "promotions", "confidence": 0.9,
-                "classified_at": "2026-05-02", "model": "[local-llm-model]
-            }))
+                "classified_at": "2026-05-02", "model": "qwen3.5:35b",
+            })
         _, _, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model]
+            self._msg(), "qwen3.5:35b",
             {"fyi": "info", "promotions": "promo"},
         )
         assert hit is None
@@ -830,7 +907,7 @@ class TestSharedClassifierHelpers:
         cache = ClassificationCache(url="redis://stub:6379/0")
         set_install_classification_cache(cache)
         _, _, hit, hint = cache_lookup_for_message(
-            self._msg(), "[local-llm-model] {"fyi": "info"},
+            self._msg(), "qwen3.5:35b", {"fyi": "info"},
         )
         assert hit is None and hint is None
         assert get_counters().misses_cold == 1
@@ -844,7 +921,7 @@ class TestSharedClassifierHelpers:
         cache = ClassificationCache(url="redis://stub:6379/0")
         set_install_classification_cache(cache)
         cache_store_for_message(
-            "fake-outer", "fake-inner", "[local-llm-model]
+            "fake-outer", "fake-inner", "qwen3.5:35b",
             Classification(category="not_in_taxonomy", confidence=0.5,
                            reason="garbage", source="llm"),
             {"fyi": "info"},
@@ -859,7 +936,7 @@ class TestSharedClassifierHelpers:
         cache = ClassificationCache(url="redis://stub:6379/0")
         set_install_classification_cache(cache)
         cache_store_for_message(
-            "real-outer", "real-inner", "[local-llm-model]
+            "real-outer", "real-inner", "qwen3.5:35b",
             Classification(category="fyi", confidence=0.8,
                            reason="seems fyi", source="llm"),
             {"fyi": "info"},
@@ -869,7 +946,7 @@ class TestSharedClassifierHelpers:
         import json as _json
         v = _json.loads(stub._hashes["real-outer"]["real-inner"])
         assert v["category"] == "fyi"
-        assert v["model"] == "[local-llm-model]
+        assert v["model"] == "qwen3.5:35b"
         assert v["reason"] == "seems fyi"  # non-HIPAA keeps reason
         assert "classified_at" in v
 
@@ -999,8 +1076,8 @@ class TestLazyImport:
 
 def test_privacy_invariant_no_operator_identifiers_in_cache_module():
     """Pin: the cache module's docstrings, comments, examples MUST NOT
-    name operator-owned hosts (redis-host, mail-host, etc.) or operator personal
-    names (Alex, Maintainer, agent-instance, ...). The leak in this exact module
+    name operator-owned hosts (the filter host, the mail host, etc.) or operator personal
+    names (Alex, Doe, the agent, ...). The leak in this exact module
     on 2026-05-11 is the reason this pin exists.
     """
     from pathlib import Path
@@ -1011,11 +1088,11 @@ def test_privacy_invariant_no_operator_identifiers_in_cache_module():
     ]
     forbidden = [
         # Hostnames
-        "redis-host", "mail-host", "dns-host", "agents-host", "llm-host",
-        "monitor-host", "deploy-host", "storage-host", "compute-host", "render-host", "label-host",
-        "example.com",
+        "the filter host", "the mail host", "the DNS host", "the gateway host", "llm-host",
+        "the monitoring host", "the deploy host", "the storage host", "the ML host", "a homelab host", "a homelab host",
+        "examplerealm.com",
         # Personal names + agent instances
-        "agent-instance", "code-reviewer-agent",
+        "the agent", "the agent",
     ]
     offenders: list[str] = []
     for p in paths:
@@ -1062,8 +1139,8 @@ class TestAdminUI:
         # Flush form present.
         assert "/admin/integrations/cache/flush" in text
         # Privacy: generic placeholder, NOT an operator host.
-        assert "redis-host" not in text.lower()
-        assert "therealms" not in text.lower()
+        assert "the filter host" not in text.lower()
+        assert "examplerealm" not in text.lower()
         assert "your-redis-host.example.local" in text
 
 

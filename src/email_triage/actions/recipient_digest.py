@@ -58,6 +58,7 @@ from email.utils import formatdate
 from typing import Any
 
 from email_triage._errfmt import fmt_exc
+from email_triage._isotime import parse_iso
 from email_triage.mail_headers import (
     X_EMAIL_TRIAGE_HEADER, build_triage_header,
 )
@@ -236,11 +237,10 @@ def _format_datetime(entry: dict[str, Any], fallback_iso: str) -> str:
     pre-dating the writer's date persistence).
     """
     raw = entry.get("date") or fallback_iso or ""
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
+    dt = parse_iso(raw)
+    if dt is None:
         return str(raw)[:16]
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def render_html(
@@ -354,13 +354,14 @@ def build_custom_digest_subject(dcfg, now_local) -> str:
       (the operator-typed digest name) so the subject still
       identifies the digest. Empty name itself falls back to
       "Email" so we never emit a stray "Your Daily  Digest".
-    * Exactly one category → that category's display title
-      (pluralized: ``newsletter`` → ``Newsletters``, ``alerts``
-      stays ``Alerts``).
+    * Exactly one category → that category's display title, used
+      verbatim as a singular attributive noun (``newsletter`` →
+      ``Newsletter``, ``cooking`` → ``Cooking``). No pluralization:
+      see the note in the body.
     * Two or more categories → first category's title + ``+N``
       where N = additional count. Example: filtering
       ``[newsletter, promotions, alerts]`` produces
-      ``Newsletters +2``. Keeps the subject scannable while
+      ``Newsletter +2``. Keeps the subject scannable while
       still telling the reader more is included.
 
     Preset (``preset_daily_activity``) is built elsewhere with the
@@ -379,13 +380,16 @@ def build_custom_digest_subject(dcfg, now_local) -> str:
     ).strip().title()
     cats = list(getattr(getattr(dcfg, "filter", None), "categories", None) or [])
     if cats:
+        # Category title used verbatim as a singular attributive
+        # noun — "Newsletter Digest", "Cooking Digest". An earlier
+        # naive ``+ "s"`` pluralizer turned gerund / uncountable
+        # category slugs into nonsense ("cooking" → "Cookings",
+        # "marketing" → "Marketings"). Category slugs are
+        # operator-defined and arbitrary, so no pluralization
+        # heuristic survives; singular-attributive is both correct
+        # English ("News Digest", "Sports Digest") and matches the
+        # legacy pre-Phase-4 subject shape.
         first = _category_title(cats[0])
-        # Pluralize naturally — _category_title returns the
-        # title-cased slug as-is. "newsletter" → "Newsletter" needs
-        # an "s"; "alerts" → "Alerts" already ends in s; "news"
-        # ends in s but is uncountable (rare false-negative).
-        if not first.lower().endswith("s"):
-            first = first + "s"
         body = first
         if len(cats) > 1:
             body = f"{first} +{len(cats) - 1}"

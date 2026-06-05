@@ -1,4 +1,4 @@
-"""Tests for ACME retry classification + backoff curves (#77)."""
+"""Tests for ACME retry classification + backoff curves."""
 
 import pytest
 

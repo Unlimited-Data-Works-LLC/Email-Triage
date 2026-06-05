@@ -1,6 +1,6 @@
 """Render tests for templates/triage/_results.html.
 
-Punch-list #119 (filed 2026-05-08): the template only branched on
+the backlog  (filed 2026-05-08): the template only branched on
 ``status == 'ok'`` and rendered every non-ok row as red "error".
 This mislabelled email-triage's own outbound digest mail —
 correctly marked ``status="skipped"`` by the watcher / push

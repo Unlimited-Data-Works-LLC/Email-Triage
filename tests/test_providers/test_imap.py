@@ -1,5 +1,6 @@
 """Tests for the IMAP provider with mocked aioimaplib."""
 
+import asyncio
 import email.policy
 import sys
 from datetime import datetime, timezone
@@ -80,7 +81,7 @@ def _mock_client():
     client.idle_start = AsyncMock()
     client.idle_done = MagicMock()
     client.wait_server_push = AsyncMock()
-    # #147 — pre-flight auth check reads ``get_state`` synchronously.
+    #  — pre-flight auth check reads ``get_state`` synchronously.
     # Default to AUTH so existing tests can ignore the new path; tests
     # that exercise NONAUTH / LOGOUT recovery override this.
     client.get_state = MagicMock(return_value="AUTH")
@@ -388,6 +389,51 @@ class TestImapProvider:
         client.search.return_value = ("NO", [b"Search failed"])
         pairs = await provider.peek_recent_uids("ALL")
         assert pairs == []
+
+    @pytest.mark.asyncio
+    async def test_watch_raises_on_idle_push_timeout(self, monkeypatch):
+        """A half-open IDLE socket yields no server push — watch() must
+        time out, tear down the dead client, and raise so the watcher
+        reconnect path rebuilds the connection."""
+        import email_triage.providers.imap as imap_mod
+        monkeypatch.setattr(imap_mod, "_IDLE_PUSH_GRACE_SECS", 0.05)
+
+        provider = _make_provider(idle_timeout=0.0)
+        client = _mock_client()
+        provider._client = client
+        # Real idle_start returns an asyncio.Task whose .cancel() is
+        # sync; give the mock a plain MagicMock so .cancel() doesn't
+        # produce an un-awaited coroutine.
+        client.idle_start = AsyncMock(return_value=MagicMock())
+        # close() walks client.protocol.transport — leave it None so the
+        # mock doesn't auto-vivify an async transport.close().
+        client.protocol = None
+
+        async def _never_returns():
+            await asyncio.sleep(3600)
+
+        client.wait_server_push = _never_returns
+
+        with pytest.raises(ConnectionError, match="IDLE timed out"):
+            async for _ in provider.watch():
+                pass
+
+        # close() ran — the dead client is dropped so the next
+        # _connect() builds a fresh socket.
+        assert provider._client is None
+
+    @pytest.mark.asyncio
+    async def test_select_folder_captures_uidvalidity(self):
+        """select_folder records the mailbox UIDVALIDITY for the 
+        high-water-mark guard."""
+        provider = _make_provider()
+        client = _mock_client()
+        provider._client = client
+        client.select.return_value = (
+            "OK", [b"* OK [UIDVALIDITY 1717171717] UIDs valid"],
+        )
+        await provider.select_folder("INBOX")
+        assert provider._uidvalidity == 1717171717
 
 
 class TestQueryTranslation:

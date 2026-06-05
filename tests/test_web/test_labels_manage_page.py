@@ -1,4 +1,4 @@
-"""Tests for the /labels page copy + structure fixes (#159).
+"""Tests for the /labels page copy + structure fixes.
 
 Covers:
   * The "Has label" filter doc claim is GONE — operator caught it
@@ -8,14 +8,14 @@ Covers:
     structure (the screenshot showed Rules orphaned on its own
     line; the rewrite keeps prose on one line + "Rules tab"
     inside the sentence).
-  * The /labels page renders the My Settings tab strip (#158).
+  * The /labels page renders the My Settings tab strip.
   * The /rules page renders the My Settings tab strip + the
     inner Rules cluster strip.
   * The Suggested-Category dropdown options on /rules are slug-
     only (the long-description blow-out is gone) but descriptions
     are still surfaced via the title= attribute.
   * The "Also adds labels" fieldset on /rules renders even with
-    zero labels (#159.1 gate fix) and points users at the Labels
+    zero labels and points users at the Labels
     tab.
 """
 
@@ -71,7 +71,7 @@ class TestLabelsManagePageCopy:
     def test_renders_my_settings_tab_strip(
         self, client, user_cookies,
     ):
-        """#158 — /labels is now inside the My Settings cluster."""
+        """ — /labels is now inside the My Settings cluster."""
         resp = client.get("/labels", cookies=user_cookies)
         assert resp.status_code == 200
         # The cluster header + the tab strip's Labels entry.
@@ -85,7 +85,7 @@ class TestRulesPageCopy:
     def test_renders_my_settings_tab_strip(
         self, client, user_cookies,
     ):
-        """#158 — /rules is now inside the My Settings cluster too."""
+        """ — /rules is now inside the My Settings cluster too."""
         resp = client.get("/rules", cookies=user_cookies)
         assert resp.status_code == 200
         assert "My Settings" in resp.text
@@ -96,7 +96,7 @@ class TestRulesPageCopy:
     def test_suggested_category_options_slug_only(
         self, client, user_cookies,
     ):
-        """#159.4 — dropdown options must be slug-only; descriptions
+        """.4 — dropdown options must be slug-only; descriptions
         ride along on title= so the native picker stays narrow."""
         resp = client.get("/rules", cookies=user_cookies)
         assert resp.status_code == 200
@@ -120,7 +120,7 @@ class TestRulesPageCopy:
     def test_also_adds_labels_fieldset_renders_with_zero_labels(
         self, client, user_cookies,
     ):
-        """#159.1 — the fieldset must render even with no labels,
+        """.1 — the fieldset must render even with no labels,
         with a hint pointing users at the Labels tab."""
         resp = client.get("/rules", cookies=user_cookies)
         assert resp.status_code == 200
@@ -147,7 +147,7 @@ class TestNavTopLevelEntries:
     def test_top_nav_no_longer_carries_labels_link(
         self, client, user_cookies,
     ):
-        """#158 — Labels is moved off the top-nav into My Settings."""
+        """ — Labels is moved off the top-nav into My Settings."""
         resp = client.get("/dashboard", cookies=user_cookies)
         assert resp.status_code == 200
         # The top-nav <ul> uses class nav-items / nav-grouped or
@@ -173,7 +173,7 @@ class TestNavTopLevelEntries:
     def test_top_nav_no_longer_carries_rules_link(
         self, client, user_cookies,
     ):
-        """#158 — Rules is moved off the top-nav into My Settings."""
+        """ — Rules is moved off the top-nav into My Settings."""
         # Same shape as the Labels test; covered above via top_nav.
         # Kept as a separate test name for grep + intent clarity.
         resp = client.get("/dashboard", cookies=user_cookies)
@@ -187,7 +187,7 @@ class TestNavTopLevelEntries:
         assert ">Rules<" not in m.group(1)
 
     def test_labels_url_still_resolves(self, client, user_cookies):
-        """#158 — moving Labels off the top-nav must not break the
+        """ — moving Labels off the top-nav must not break the
         /labels URL. Deep links must still work."""
         resp = client.get("/labels", cookies=user_cookies)
         assert resp.status_code == 200

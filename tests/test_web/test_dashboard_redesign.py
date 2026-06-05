@@ -1,4 +1,4 @@
-"""Tests for the #12 dashboard redesign.
+"""Tests for the  dashboard redesign.
 
 Covers:
 - regular-user shell is welcome + orientation (no stat wall)
@@ -271,7 +271,7 @@ def test_dashboard_no_watcher_banner_when_all_connected(
 def test_dashboard_health_chip_counts_watching_status_as_connected(
     client, db, app, admin_user, admin_cookies,
 ):
-    """Regression: #12 dashboard chip was looking for status=='running',
+    """Regression:  dashboard chip was looking for status=='running',
     but WatcherManager emits status=='watching' — /health reports
     2/2 connected while the dashboard rendered 0/2 connected. Both
     surfaces now agree on 'watching' as the connected label."""

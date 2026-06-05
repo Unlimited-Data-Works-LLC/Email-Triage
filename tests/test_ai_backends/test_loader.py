@@ -90,7 +90,7 @@ def test_load_backend_none_with_config_uses_config_values():
 
     class FakeClassifierCfg:
         ollama_url = "http://homelab.lan:11434"
-        model = "[local-llm-model]
+        model = "qwen3.8:50b"
 
     class FakeTlsCfg:
         local_url_suffixes = [".home.lan"]
@@ -106,7 +106,7 @@ def test_load_backend_none_with_config_uses_config_values():
         )
         assert isinstance(adapter, OllamaAdapter)
         assert adapter._client._base_url == "http://homelab.lan:11434"  # type: ignore[attr-defined]
-        assert adapter._client._model == "[local-llm-model]  # type: ignore[attr-defined]
+        assert adapter._client._model == "qwen3.8:50b"  # type: ignore[attr-defined]
     finally:
         conn.close()
 
@@ -289,7 +289,7 @@ def test_placeholder_adapter_raises_on_chat_complete():
     clear :class:`NotImplementedError` with the backend type in the
     message.
 
-    As of #171-A every enum value (``ollama`` / ``openai`` /
+    As of -A every enum value (``ollama`` / ``openai`` /
     ``azure_openai`` / ``gemini``) has a concrete adapter — so this
     test injects a placeholder via :func:`register_backend` rather
     than relying on a still-placeholder enum value. The invariant

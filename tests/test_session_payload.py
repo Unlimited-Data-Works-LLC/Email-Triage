@@ -1,4 +1,4 @@
-"""Tests for session-cookie payload extension (#67).
+"""Tests for session-cookie payload extension.
 
 Adds ``auth_source`` + ``auth_key_id`` to the payload while preserving
 back-compat with cookies minted before the upgrade.
@@ -6,10 +6,15 @@ back-compat with cookies minted before the upgrade.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+from starlette.responses import Response
 
 from email_triage.web.auth import (
+    SESSION_COOKIE_NAME,
     create_session_token,
+    set_session_cookie,
     verify_session_token,
 )
 
@@ -64,3 +69,46 @@ def test_wrong_secret_rejected():
     """Different secret can't verify the token (signature mismatch)."""
     token = create_session_token(SECRET, "a@b.com", "admin")
     assert verify_session_token("different-secret", token) is None
+
+
+# ---------------------------------------------------------------------------
+# set_session_cookie —  Secure-flag gating
+# ---------------------------------------------------------------------------
+
+def _session_set_cookie_header(config) -> str:
+    """Run set_session_cookie against a fresh Response, return its
+    single Set-Cookie header."""
+    resp = Response()
+    set_session_cookie(resp, "tok123", config)
+    cookies = [
+        v.decode() for k, v in resp.raw_headers if k == b"set-cookie"
+    ]
+    assert len(cookies) == 1
+    return cookies[0]
+
+
+def test_session_cookie_secure_when_tls_enabled():
+    """ — on a TLS install the session cookie MUST carry Secure,
+    so the session token can't ride a plaintext request."""
+    header = _session_set_cookie_header(
+        SimpleNamespace(tls=SimpleNamespace(enabled=True), auth=None)
+    )
+    assert SESSION_COOKIE_NAME in header
+    assert "; Secure" in header
+    assert "HttpOnly" in header
+    assert "samesite=lax" in header.lower()
+
+
+def test_session_cookie_not_secure_without_tls():
+    """Plain-HTTP dev/LAN install: no Secure flag — else the browser
+    would never send the cookie and login would silently break."""
+    header = _session_set_cookie_header(
+        SimpleNamespace(tls=SimpleNamespace(enabled=False), auth=None)
+    )
+    assert "; Secure" not in header
+
+
+def test_session_cookie_tls_block_missing_degrades_safely():
+    """A config with no tls block degrades to not-Secure, not a crash."""
+    header = _session_set_cookie_header(SimpleNamespace(auth=None))
+    assert "; Secure" not in header

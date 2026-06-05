@@ -431,7 +431,7 @@ class TestOnePerDaySpread:
         events on contact-derived calendars come back transparent
         from Google; ``showAs == "free"`` from MS Graph maps to
         transparent. Operator-symptom (2026-05-14): a Monday
-        all-day "(redacted personal event)" event blanked the whole day
+        all-day "an all-day birthday" event blanked the whole day
         from suggestions even though it has no real busy time."""
         # Two events on Monday: a transparent all-day birthday +
         # an opaque 10:30-11:30 actual meeting. Expect slots BEFORE
@@ -439,7 +439,7 @@ class TestOnePerDaySpread:
         birthday = _ev(
             _utc(2026, 4, 20, 0, 0), _utc(2026, 4, 21, 0, 0),
             all_day=True, transparency="transparent",
-            summary="(redacted personal event)",
+            summary="an all-day birthday",
         )
         meeting = _ev(
             _utc(2026, 4, 20, 10, 30), _utc(2026, 4, 20, 11, 30),
@@ -484,16 +484,16 @@ class TestOnePerDaySpread:
         per Google API spec) must block 2026-04-21 in the USER'S
         local timezone, NOT shift back by the timezone offset.
 
-        Operator-symptom 2026-05-14: (redacted personal event) stored as
+        Operator-symptom 2026-05-14: an all-day birthday stored as
         ``date: "2026-05-19"`` (Tue) blanked Mon 5/18 from
         suggestions because the pre-fix code did
-        ``.astimezone(America/Detroit).date()`` → ``2026-05-18 20:00
+        ``.astimezone(America/New_York).date()`` → ``2026-05-18 20:00
         EDT`` → ``.date() == May 18``. The fix reads the date
         AS-IS from start.date() and anchors the busy block in the
         viewer's timezone so it covers the right calendar day.
         """
         # Reproduce the bug: opaque all-day event stored as Tue
-        # UTC-midnight. Viewer in America/Detroit. The block should
+        # UTC-midnight. Viewer in America/New_York. The block should
         # cover Tue 05-21 local, NOT bleed into Mon 05-20.
         tue_all_day = _ev(
             _utc(2026, 4, 21, 0, 0),  # 2026-04-21 00:00 UTC
@@ -507,12 +507,12 @@ class TestOnePerDaySpread:
             horizon_start=MONDAY,
             horizon_end=MONDAY + timedelta(days=2),
             length_minutes=30, count=2,
-            timezone_name="America/Detroit",
+            timezone_name="America/New_York",
         )
         assert len(slots) == 2
         # Both slots should be on Monday (Tue is correctly blocked).
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/Detroit")
+        tz = ZoneInfo("America/New_York")
         for s, _ in slots:
             assert s.astimezone(tz).date() == datetime(
                 2026, 4, 20, tzinfo=tz,

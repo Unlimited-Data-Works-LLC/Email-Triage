@@ -1,5 +1,5 @@
 """ProviderTraits registry — collapses ``if ptype ==`` switches across
-the codebase into table-driven dispatch (#138.2).
+the codebase into table-driven dispatch.
 
 Many call sites need to know per-provider data:
 
@@ -20,8 +20,8 @@ is a ``ProviderTraits`` dataclass; helper functions below resolve the
 trait without leaking the lookup-or-default boilerplate.
 
 Migration is incremental: 8-10 of the 19 ``if ptype ==`` switch sites
-across the codebase are migrated in this commit (#138 first pass).
-The remainder are flagged with ``# TODO #138 traits-migration`` and
+across the codebase are migrated in this commit.
+The remainder are flagged with ``# TODO  traits-migration`` and
 will move in a follow-up.
 """
 

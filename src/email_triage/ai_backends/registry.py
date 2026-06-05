@@ -13,7 +13,7 @@ Adapters that don't have a concrete subclass yet get a
 :class:`NotImplementedAdapter` subclass with the right
 ``backend_type`` — instantiation succeeds (loader doesn't trip), but
 the first :meth:`chat_complete` call raises a clear error pointing at
-the missing wave. As of #171-A every enum value has a concrete adapter
+the missing wave. As of -A every enum value has a concrete adapter
 shipped, so the placeholder mechanism is unused in practice — the
 :class:`NotImplementedAdapter` base remains as the contract for future
 migrations that add a new enum value before the concrete adapter lands.

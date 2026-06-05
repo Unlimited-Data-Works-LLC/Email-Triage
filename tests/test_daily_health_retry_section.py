@@ -1,5 +1,4 @@
-"""Tests for the retry-deads section of the daily-health email
-(#175 R-B).
+"""Tests for the retry-deads section of the daily-health email.
 
 Covers:
   * Threshold logic — per-account (≥3) + install-wide (≥5).
@@ -27,7 +26,12 @@ from email_triage.web.db import init_db
 
 
 def _install_ra_schema(db) -> None:
-    """Install the v30 shape R-A is going to deliver."""
+    """Install the real v30 ``watcher_retry_queue`` schema.
+
+    : the dead-in-24h window filters on ``resolved_at`` (the
+    column stamped on the dead transition), not the non-existent
+    ``updated_at`` an earlier synthetic-schema guess used.
+    """
     try:
         db.execute("DROP TABLE IF EXISTS watcher_retry_queue")
     except Exception:
@@ -39,18 +43,20 @@ def _install_ra_schema(db) -> None:
             account_id INTEGER NOT NULL,
             provider_type TEXT NOT NULL,
             mailbox TEXT,
-            uid TEXT,
-            uidvalidity TEXT,
+            uid INTEGER,
+            uidvalidity INTEGER,
             gmail_msg_id TEXT,
             o365_msg_id TEXT,
-            error_class TEXT,
-            error_msg TEXT,
             state TEXT NOT NULL DEFAULT 'pending',
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+            next_attempt_at TEXT NOT NULL,
+            last_error_class TEXT,
+            last_error_msg TEXT,
+            last_error_at TEXT,
+            resolved_at TEXT,
             dead_reason TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
@@ -79,19 +85,22 @@ def _make_account(db, *, account_id=1, name="acct1"):
 
 
 def _seed_dead(db, *, account_id, dead_reason, updated_hours_ago=2, count=1):
+    """Insert ``count`` dead rows. ``updated_hours_ago`` sets
+    ``resolved_at`` — the timestamp the dead transition stamps and
+    the column the 24h dead-window query filters on."""
     for _ in range(count):
-        updated = (
+        resolved = (
             datetime.now(timezone.utc) - timedelta(hours=updated_hours_ago)
         ).isoformat()
         db.execute(
             "INSERT INTO watcher_retry_queue ("
-            " account_id, provider_type, error_class, error_msg, "
-            " state, attempts, next_attempt_at, dead_reason, "
-            " created_at, updated_at"
+            " account_id, provider_type, last_error_class, last_error_msg, "
+            " state, attempt_count, next_attempt_at, dead_reason, "
+            " created_at, resolved_at"
             ") VALUES (?, 'imap', 'ReadTimeout', '', 'dead', 3, ?, ?, ?, ?)",
             (
-                account_id, updated, dead_reason,
-                updated, updated,
+                account_id, resolved, dead_reason,
+                resolved, resolved,
             ),
         )
     db.commit()
