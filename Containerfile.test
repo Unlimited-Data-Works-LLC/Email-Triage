@@ -11,7 +11,7 @@
 # Build (from the repo root):
 #   MSYS_NO_PATHCONV=1 "$PODMAN" build -t email-triage-test:local -f Containerfile.test .
 # See the memory drawer reference_podman_local_windows_testing for the WSL2 gotchas.
-FROM docker.io/library/python:3.12
+FROM docker.io/library/python:3.14
 
 # The WSL2 podman machine has NO IPv6 route to the internet, and glibc prefers
 # IPv6 (AAAA) -> large pip downloads stall. Force IPv4 precedence so the build's
