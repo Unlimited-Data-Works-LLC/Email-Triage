@@ -57,7 +57,7 @@ dependencies = [
     # TimeoutError instead. Bounded threat model: rules are operator-
     # authored via admin UI, not external input — but admin typo or
     # curiosity-test of an evil regex is still a foot-gun we close here.
-    "regex>=2024.0",
+    "regex>=2026.7.19",
     # v0.1.2 single-file encryption: SQLAlchemy Core 2.x engine
     # factory + connection pool + Alembic migration scaffolding. NOT ORM
     # — hand-tuned SQL with qmark ``?`` params is retained at every
