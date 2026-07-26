@@ -35,7 +35,7 @@ dependencies = [
     # to direct dep because dev_keypair + acme_renewer use it directly.
     "cryptography>=48.0.1",  # >=48.0.1: GHSA-537c-gmf6-5ccf (bundled-OpenSSL OOB read)
     # WebAuthn / FIDO2 hardware-key auth (Duo's library, BSD).
-    "webauthn>=2.0",
+    "webauthn>=3.0.0",
     "pyasn1>=0.6.4",  # CVE-2026-59885/59886 fix (webauthn transitive via pyasn1)
     # ACME client (Let's Encrypt) + JOSE for protocol-level signing.
     # Same library certbot uses internally.
