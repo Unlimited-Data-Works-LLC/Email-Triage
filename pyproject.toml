@@ -81,7 +81,7 @@ dependencies = [
 
 [project.optional-dependencies]
 keyfile = ["cryptography>=48.0.1"]
-keyring = ["keyring>=25.0.0"]
+keyring = ["keyring>=25.7.0"]
 # v0.1.2 single-file encryption + N-432 Path-3 hybrid (2026-07-20): SQLCipher
 # single-file encryption-at-rest, UNIFIED across arches (superseded the
 # per-arch  split — the Containerfile now source-builds ``sqlcipher3``
