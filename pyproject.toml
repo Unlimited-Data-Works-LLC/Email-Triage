@@ -111,7 +111,7 @@ encryption = [
 imap = ["aioimaplib>=1.1.0"]
 office365 = ["msal>=1.30.0"]
 openai = ["openai>=1.0.0"]
-gemini = ["google-generativeai>=0.8.0"]
+gemini = ["google-generativeai>=0.8.6"]
 #  — optional Redis-backed classification cache. Operator paste a
 # Redis URL into /admin/integrations to enable. ``valkey`` (Linux
 # Foundation fork) speaks the identical wire protocol and works with
