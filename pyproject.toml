@@ -109,7 +109,7 @@ encryption = [
     "sqlcipher3==0.6.2",
 ]
 imap = ["aioimaplib>=1.1.0"]
-office365 = ["msal>=1.30.0"]
+office365 = ["msal>=1.37.0"]
 openai = ["openai>=1.0.0"]
 gemini = ["google-generativeai>=0.8.0"]
 #  — optional Redis-backed classification cache. Operator paste a
