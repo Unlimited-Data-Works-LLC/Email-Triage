@@ -67,7 +67,7 @@ dependencies = [
     # Forward-compat seam: v0.2.0  Postgres retrofit swaps the
     # engine URL + ``WriterBackend`` impl (``AsyncpgWriterPool``) with
     # zero callsite changes per §7.
-    "sqlalchemy>=2.0",
+    "sqlalchemy>=2.0.51",
     "alembic>=1.13",
     # ``packaging`` for PEP-440 Version parsing — used by
     # scripts/rapid-cve-bump.py (check_already_patched gate) and
