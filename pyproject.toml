@@ -43,7 +43,7 @@ dependencies = [
     "josepy>=1.14",
     # DNS-01 challenge needs dnspython for RFC-2136 (TSIG-signed dynamic
     # updates against the operator's BIND).
-    "dnspython>=2.4",
+    "dnspython>=2.8.0",
     # Vector math for the M-4 sent-mail RAG cosine hot-path. Pure
     # Python cosine over ~10k rows x 768 dims is seconds per draft reply
     # and blocks the event loop. numpy + precomputed L2 norms get the
