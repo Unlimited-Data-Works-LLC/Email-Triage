@@ -116,7 +116,7 @@ gemini = ["google-generativeai>=0.8.0"]
 # Redis URL into /admin/integrations to enable. ``valkey`` (Linux
 # Foundation fork) speaks the identical wire protocol and works with
 # the same client unchanged — no library change is needed.
-cache = ["redis>=5.0"]
+cache = ["redis>=8.0.1"]
 # In-process CPU embedding backend (M-4 / M-5). Pulls sentence-
 # transformers + the torch CPU stack into the install. Used when
 # the install's primary GPU is saturated by the chat model and a
