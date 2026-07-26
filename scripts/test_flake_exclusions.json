@@ -1,0 +1,17 @@
+{
+  "_doc": "Known-infra test flake EXCLUSION list for test_flake_classifier.py. Tests matching a glob here are classified INFRA-FLAKE and NEVER auto-repaired — the failure is in the test-isolation infrastructure, not the test itself. Fixing the test body would be actively wrong. See memory/testinfra_full_tree_xdist_flakes.md + the backlog line 68 (db-sme-owned).",
+  "known_infra_flakes": [
+    {
+      "test_id_glob": "tests/test_cli_audit*",
+      "reason": "request_id global bleed under xdist. Test-isolation infra defect, tracked as the backlog line 68."
+    },
+    {
+      "test_id_glob": "tests/test_audit_strict*",
+      "reason": "request_id global bleed under xdist. Test-isolation infra defect."
+    },
+    {
+      "test_id_glob": "tests/*sqlite_lock*",
+      "reason": "SQLite file-lock contention under heavy parallel workers. Infra, not a test-body bug."
+    }
+  ]
+}

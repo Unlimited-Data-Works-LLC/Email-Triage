@@ -233,7 +233,7 @@
         {# Webhook is power-user plumbing — hide behind a disclosure so
            non-technical operators don't have to think about HMAC
            signatures, JSON bodies, or URLs. The default-collapsed
-           pattern matches admin/integrations.html "How do I find these
+           pattern matches admin/config_tabs/integrations.html "How do I find these
            values?". #}
         <details style="margin:0.5rem 0 0.25rem 0;
                         padding:0.5rem 0.75rem;
@@ -266,6 +266,33 @@
                        style="max-width:32rem;">
             </label>
         </details>
+    </fieldset>
+
+    {# #48 — auto-retire after N matches. Optional; 0 = run indefinitely. #}
+    <fieldset style="margin-top:0.5rem;">
+        <legend style="font-size:0.9rem;">Auto-retire (optional)</legend>
+        <label style="font-size:0.85rem;">
+            Stop this watch automatically after it has matched this many
+            emails (leave 0 to keep it running indefinitely):
+            <input type="number" name="auto_retire_after" min="0" step="1"
+                   value="{{ rep.actions.auto_retire.after_n }}"
+                   style="max-width:8rem;">
+        </label>
+        <small style="display:block;color:#555;margin-top:0.25rem;">
+            The count is the total across every account this watch covers, not
+            per account.
+        </small>
+        <label style="font-size:0.85rem;margin-top:0.5rem;">
+            When it reaches that many:
+            <select name="auto_retire_action" style="max-width:18rem;">
+                <option value="disable"{% if rep.actions.auto_retire.action != 'delete' %} selected{% endif %}>Turn it off (you can switch it back on later)</option>
+                <option value="delete"{% if rep.actions.auto_retire.action == 'delete' %} selected{% endif %}>Delete it permanently</option>
+            </select>
+        </label>
+        <small style="display:block;color:#555;margin-top:0.25rem;">
+            "Delete it permanently" removes the watch and can't be undone. To
+            keep the option of switching it back on, choose "Turn it off".
+        </small>
     </fieldset>
 
     <div style="display:flex;gap:0.5rem;margin-top:1rem;">

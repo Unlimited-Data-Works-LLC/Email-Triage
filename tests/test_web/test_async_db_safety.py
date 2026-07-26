@@ -134,6 +134,8 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import SRC_ROOT, iter_files, iter_src_files, parse_module, relpath, parse_source  # N-350 R31
+
 # ---------------------------------------------------------------------------
 # Helper-name catalogues — extracted from web/db.py / db_auth_helpers /
 # auth.py / dependencies.py. These mirror the one-shot  analyzer.
@@ -840,7 +842,7 @@ class _ModuleInfo:
         # itself, not its parent — the flag the relative-import resolver
         # needs to avoid an off-by-one.
         is_package = path.name == "__init__.py"
-        self.tree = ast.parse(path.read_text(encoding="utf-8"))
+        self.tree = parse_module(path); assert self.tree is not None  # N-350 R31
         self.aliases = _alias_map(self.tree)
         self.import_sources = _import_sources(
             self.tree, self.dotted, is_package,
@@ -870,9 +872,11 @@ def _build_module_index(src_root: Path) -> dict[str, _ModuleInfo]:
     only async-bearing ones) — a sync-only module can still DEFINE a
     DB-touching helper that an async module imports."""
     index: dict[str, _ModuleInfo] = {}
-    for path in sorted(src_root.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
+    # Route the src walk through the shared harness (run17  DA catch — this
+    # file already imports the harness, so a hand-rolled rglob here was the one
+    # live "harness-importer that still re-rolls a walk" the substring-exemption
+    # masked). iter_files == sorted(root.rglob(pattern)) minus __pycache__.
+    for path in iter_files(src_root, "*.py"):
         try:
             info = _ModuleInfo(path, src_root)
         except (SyntaxError, UnicodeDecodeError):
@@ -1257,18 +1261,21 @@ class _AsyncDbFinder(ast.NodeVisitor):
 # ---------------------------------------------------------------------------
 
 def _src_root() -> Path:
-    """Locate ``src/email_triage`` relative to this test file."""
-    here = Path(__file__).resolve()
-    # tests/test_web/test_async_db_safety.py -> repo root is parents[2]
-    root = here.parents[2] / "src" / "email_triage"
-    assert root.is_dir(), f"src tree not found at {root}"
-    return root
+    """Locate ``src/email_triage`` — the package root.
+
+    Delegates to the shared pin harness ``SRC_ROOT`` (computed once,
+    R5b) so this guard can never drift in its src-root resolution. The
+    ``is_dir`` assert is kept as a fail-loud sanity check: a broken root
+    would make every parametrised guard below pass vacuously.
+    """
+    assert SRC_ROOT.is_dir(), f"src tree not found at {SRC_ROOT}"
+    return SRC_ROOT
 
 
 def _has_async_def(path: Path) -> bool:
     """True if the module contains at least one ``async def``."""
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = parse_module(path); assert tree is not None  # N-350 R31
     except (SyntaxError, UnicodeDecodeError):
         return False
     return any(
@@ -1282,14 +1289,10 @@ def _guarded_modules() -> list[Path]:
 
     Discovery is dynamic): there is no hand-maintained list,
     so a new async-bearing module is in scope automatically and the
-    guarded set can never silently shrink. ``__pycache__`` is excluded.
+    guarded set can never silently shrink. ``__pycache__`` is excluded
+    (the shared pin harness ``iter_src_files`` walk owns that, R5b).
     """
-    root = _src_root()
-    files = sorted(
-        p for p in root.rglob("*.py")
-        if "__pycache__" not in p.parts
-    )
-    return [f for f in files if f.is_file() and _has_async_def(f)]
+    return [f for f in iter_src_files() if f.is_file() and _has_async_def(f)]
 
 
 def _scan(path: Path) -> list[tuple[str, str, int, str]]:
@@ -1309,7 +1312,7 @@ def _scan(path: Path) -> list[tuple[str, str, int, str]]:
         # Module outside the index (should not happen for a guarded
         # module) — fall back to a standalone parse.
         src = path.read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        tree = parse_source(src)
         aliases = _alias_map(tree)
         deferred = _deferred_call_functions(tree)
         local = _local_db_helpers(tree, aliases, deferred)
@@ -1348,7 +1351,7 @@ def test_guarded_module_set_is_comprehensive():
         f"expected the full async surface (>=30 modules), found "
         f"{len(modules)}: {sorted(m.name for m in modules)}"
     )
-    rels = {str(m.relative_to(_src_root())).replace("\\", "/") for m in modules}
+    rels = {relpath(m) for m in modules}
     names = {m.name for m in modules}
 
     # Router surface (the old guard's only scope).
@@ -1377,7 +1380,7 @@ def test_guarded_module_set_is_comprehensive():
 @pytest.mark.parametrize(
     "module_path",
     _guarded_modules(),
-    ids=lambda p: str(p.relative_to(_src_root())).replace("\\", "/"),
+    ids=relpath,
 )
 def test_no_async_reachable_unsafe_db_touch(module_path: Path):
     """ /  — no ``async def`` may touch the shared connection
@@ -1392,7 +1395,7 @@ def test_no_async_reachable_unsafe_db_touch(module_path: Path):
     """
     findings = _scan(module_path)
     if findings:
-        rel = str(module_path.relative_to(_src_root())).replace("\\", "/")
+        rel = relpath(module_path)
         lines = "\n".join(
             f"  [{kind}] {rel}:{lineno}  in async def {func}(): {desc}"
             for kind, func, lineno, desc in sorted(
@@ -1414,7 +1417,7 @@ def test_no_async_reachable_unsafe_db_touch(module_path: Path):
 
 def _findings(src: str) -> list[tuple[str, str, int, str]]:
     """Run the full two-pass scan on a synthetic source string."""
-    tree = ast.parse(src)
+    tree = parse_source(src)
     aliases = _alias_map(tree)
     deferred = _deferred_call_functions(tree)
     local_helpers = _local_db_helpers(tree, aliases, deferred)
@@ -2286,20 +2289,17 @@ def _all_source_modules() -> list[Path]:
     """Every ``.py`` under ``src/email_triage`` — NOT filtered by
     ``async def``. A connection-holding class can live in a sync-only
     module (``secrets.py`` is exactly that), so this guard must scan
-    the whole tree.
+    the whole tree. ``__pycache__`` is excluded via the shared pin
+    harness ``iter_src_files`` walk (R5b).
     """
-    root = _src_root()
-    return sorted(
-        p for p in root.rglob("*.py")
-        if "__pycache__" not in p.parts and p.is_file()
-    )
+    return [p for p in iter_src_files() if p.is_file()]
 
 
 # --- detector unit tests (synthetic source — no real-tree dependency) ------
 
 def _conn_holder_findings(src: str) -> list[tuple[str, str, int, str]]:
     """Run the connection-holding-class scan on a synthetic source."""
-    return _scan_connection_holding_classes(ast.parse(src), src)
+    return _scan_connection_holding_classes(parse_source(src), src)
 
 
 def test_conn_holder_unguarded_method_is_flagged():
@@ -2433,7 +2433,7 @@ def test_conn_holder_dbsecrets_is_detected_as_a_holder():
     """
     secrets_py = _src_root() / "secrets.py"
     assert secrets_py.is_file(), f"secrets.py not found at {secrets_py}"
-    tree = ast.parse(secrets_py.read_text(encoding="utf-8"))
+    tree = parse_module(secrets_py); assert tree is not None  # N-350 R31
     holders = {
         cls.name: _connection_attrs_from_init(cls)
         for cls in ast.walk(tree)
@@ -2483,10 +2483,10 @@ def test_no_unguarded_connection_holding_class_methods():
     for path in _all_source_modules():
         try:
             src = path.read_text(encoding="utf-8")
-            tree = ast.parse(src)
+            tree = parse_source(src)
         except (SyntaxError, UnicodeDecodeError):
             continue
-        rel = str(path.relative_to(_src_root())).replace("\\", "/")
+        rel = relpath(path)
         for cls, method, lineno, desc in _scan_connection_holding_classes(
             tree, src,
         ):

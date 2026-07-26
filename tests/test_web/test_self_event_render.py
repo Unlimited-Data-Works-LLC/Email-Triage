@@ -25,6 +25,9 @@ def env():
         loader=FileSystemLoader(str(_TEMPLATE_DIR)),
         autoescape=True,
     )
+    # SSOT: us_datetime filter registration via install_filter (2026-07-14  fanout).
+    from email_triage._us_datetime import install_filter as _install_us_datetime
+    _install_us_datetime(e)
     return e
 
 

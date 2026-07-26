@@ -9,6 +9,9 @@ available.
 from __future__ import annotations
 
 import logging
+
+from email_triage._int_utils import bounded_int  # N-219c/44 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from datetime import date, datetime, time, timezone
 from typing import Any
 
@@ -19,7 +22,7 @@ except ImportError:
     HAS_ICAL = False
     Calendar = Event = vCalAddress = vText = None  # type: ignore[assignment]
 
-logger = logging.getLogger("email_triage.engine.ics")
+logger = get_logger("email_triage.engine.ics")  # N-196b R21_4
 
 
 def _to_utc(value: Any) -> datetime | None:
@@ -80,7 +83,10 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
     try:
         cal = Calendar.from_ical(blob)
     except Exception as e:
-        logger.debug("ICS parse failed: %s", e)
+        logger.debug(
+            "ICS parse failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+        )
         return None
 
     # Component-level METHOD lives on the top-level Calendar.
@@ -121,10 +127,7 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
             attendees = [_attendee_dict(a) for a in attendees_prop]
 
             sequence_raw = component.get("SEQUENCE")
-            try:
-                sequence = int(sequence_raw) if sequence_raw is not None else 0
-            except (TypeError, ValueError):
-                sequence = 0
+            sequence = bounded_int(sequence_raw, default=0) if sequence_raw is not None else 0  # N-219c/44 R23: SSOT
 
             return {
                 "uid": uid,
@@ -140,7 +143,10 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
                 "sequence": sequence,
             }
         except Exception as e:
-            logger.debug("VEVENT parse failed: %s", e)
+            logger.debug(
+                "VEVENT parse failed",
+                extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            )
             continue
 
     return None
@@ -191,6 +197,64 @@ def build_imip_reply(
     if attendee_name:
         attendee.params["CN"] = vText(attendee_name)
     event.add("ATTENDEE", attendee, encode=0)
+
+    cal.add_component(event)
+    return cal.to_ical()
+
+
+def build_clock_ics(
+    *,
+    uid: str,
+    label: str,
+    deadline_at: str | None,
+    deep_link: str = "",
+    lead_minutes: int = 1440,
+) -> bytes | None:
+    """Build a PHI-FREE VEVENT (+ VALARM) for a regulatory-clock deadline.
+
+    The always-on ``.ics``-in-email baseline + the direct-write payload. An
+    all-day event on the deadline's date; ``SUMMARY`` = the clock LABEL (non-PHI
+    policy metadata, the def title); ``DESCRIPTION`` = an advisory line + the
+    in-app deep-link. **SCRUB-AT-WRITE** (the ``.ics`` is readable by any
+    calendar app / OpenClaw / digest): NO ``case_ref``, NO ``raw_deadline_
+    phrase``, NO trigger-email subject/sender/body. A ``VALARM`` fires
+    ``lead_minutes`` before. Returns the ``.ics`` bytes, or ``None`` when
+    icalendar is unavailable or the deadline is unparseable."""
+    if not HAS_ICAL or not deadline_at:
+        return None
+    from datetime import timedelta
+
+    from email_triage._isotime import parse_iso
+    dl = parse_iso(deadline_at)
+    if dl is None:
+        return None
+    from icalendar import Alarm
+
+    cal = Calendar()
+    cal.add("PRODID", "-//Email Triage//Regulatory Clock//EN")
+    cal.add("VERSION", "2.0")
+
+    event = Event()
+    event.add("UID", uid)
+    event.add("DTSTAMP", datetime.now(timezone.utc))
+    event.add("SUMMARY", f"Regulatory deadline: {label}")
+    desc = (
+        "Reminder based on your configured policy — verify against your SOP. "
+        "Advisory, not an official record."
+    )
+    if deep_link:
+        desc += f"\n{deep_link}"
+    event.add("DESCRIPTION", desc)
+    # All-day event on the deadline's date (the regulator's local day boundary
+    # is pinned upstream; here we use the derived UTC deadline's date).
+    event.add("DTSTART", dl.date())
+    event.add("DTEND", (dl + timedelta(days=1)).date())
+
+    alarm = Alarm()
+    alarm.add("ACTION", "DISPLAY")
+    alarm.add("DESCRIPTION", f"Regulatory deadline: {label}")
+    alarm.add("TRIGGER", timedelta(minutes=-int(lead_minutes)))
+    event.add_component(alarm)
 
     cal.add_component(event)
     return cal.to_ical()

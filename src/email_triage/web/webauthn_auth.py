@@ -287,7 +287,7 @@ def begin_authentication(
     keys = list_hardware_keys(conn, user_id)
     if not keys:
         raise WebAuthnAuthError(
-            "User has no active hardware keys; OTP path applies."
+            "User has no active passkeys; OTP path applies."
         )
     descriptors = []
     for k in keys:
@@ -410,7 +410,7 @@ def finish_authentication(
 #
 # These two helpers are an additional path alongside the existing
 # begin_authentication / finish_authentication. The original "email -> touch"
-# flow stays for hardware keys that aren't discoverable.
+# flow stays for passkeys that aren't discoverable.
 #
 # Challenge storage: we don't have a user_id at begin time. The caller
 # (login route) holds the challenge bytes in a short-lived signed cookie

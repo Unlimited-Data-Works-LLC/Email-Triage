@@ -16,7 +16,7 @@ import json as json_mod
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from typing import Any
 from zoneinfo import available_timezones
 
@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
+from email_triage.web._audit import safe_audit_write
 from email_triage.web import settings_keys as _S
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
 from email_triage.web.auth import (
@@ -39,42 +40,28 @@ from email_triage.web.auth import (
     verify_otp,
 )
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import (
+from email_triage.web.dependencies import (  # N-337: audit-XFF SSOT
+    audit_forwarded_for,
+    request_meta,
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
     RequireUser,
+    admin_gate_response,
     get_current_user,
     get_session_secret,
     require_auth,
     require_role,
 )
 from email_triage.triage_logging import get_logger
+from email_triage._envbool import parse_bool
 from email_triage._errfmt import fmt_exc
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.users")
 
 router = APIRouter()
-
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 
 from . import _shared
@@ -87,13 +74,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -129,7 +135,7 @@ async def login_email(request: Request, email: str = Form(...)):
     db = get_db(request)
     config = get_config(request)
     templates = get_templates(request)
-    client_host = (request.client.host if request.client else None)
+    client_host = audit_forwarded_for(request).host or None  # N-337: XFF-aware SSOT (§164.312(b))
     user_agent = request.headers.get("user-agent")
 
     #  lockout gate — runs first. A locked email or IP gets the
@@ -141,9 +147,7 @@ async def login_email(request: Request, email: str = Form(...)):
         LoginLocked,
     )
 
-    skip_hw_picker = bool(
-        request.query_params.get("otp_fallback") == "1"
-    )
+    skip_hw_picker = parse_bool(request.query_params.get("otp_fallback"))
 
     def _login_email_db_work() -> tuple[str, dict]:
         """/ — lockout gate + user lookup + (hardware-key
@@ -186,7 +190,7 @@ async def login_email(request: Request, email: str = Form(...)):
             return "disabled", {}
 
         #  — hardware-key picker. If the user has at least one
-        # active hardware key, render the choose-method step (touch
+        # active passkey, render the choose-method step (touch
         # security key primary + send-OTP-instead fallback) WITHOUT
         # sending the OTP. User picks "OTP fallback" to fall through
         # into the existing path (posts back with otp_fallback=1).
@@ -223,7 +227,6 @@ async def login_email(request: Request, email: str = Form(...)):
         # Don't generate or store an OTP. Don't call SMTP. Don't reveal
         # the account is disabled — present the same verify screen so
         # there's no account-state oracle for a probing attacker.
-        from email_triage.triage_logging import get_logger
         log = get_logger("web.auth")
         log.warning("OTP delivery skipped: user disabled", email=email)
         return await _render(templates, request, "login.html", {
@@ -241,9 +244,23 @@ async def login_email(request: Request, email: str = Form(...)):
     smtp = config.smtp
 
     if smtp.host:
+        secrets = get_secrets(request)
+        from email_triage.secrets import SecretsDecryptError, read_secret
+        # A5: explicit decrypt-error handling — an unreadable secret store
+        # (master-key mismatch) fails closed (no blank-password send).
         try:
-            secrets = get_secrets(request)
-            smtp_password = secrets.get("SMTP_PASSWORD") or ""
+            smtp_password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            get_logger("web.auth").error(
+                "OTP login email aborted — SMTP password unreadable "
+                "(corrupt secret row / master-key mismatch)",
+                email=email,
+            )
+            return await _render(templates, request, "login.html", {
+                "step": "email",
+                "error": "Could not send login code. Please try again or contact admin.",
+            })
+        try:
             # smtplib is blocking — run it off the event loop so the
             # login request doesn't stall every other request + the
             # watchers during the SMTP handshake.
@@ -260,7 +277,6 @@ async def login_email(request: Request, email: str = Form(...)):
                 from_name=smtp.from_name,
             )
         except Exception as exc:
-            from email_triage.triage_logging import get_logger
             log = get_logger("web.auth")
             log.error("Failed to send OTP email", error=str(exc))
             return await _render(templates, request, "login.html", {
@@ -268,10 +284,20 @@ async def login_email(request: Request, email: str = Form(...)):
                 "error": "Could not send login code. Please try again or contact admin.",
             })
     else:
-        # Dev mode — no SMTP configured, log the code.
-        from email_triage.triage_logging import get_logger
+        # Dev mode — no SMTP configured, log the code. The `code` kwarg
+        # was previously dropped by TriageLogger's structured extra-kwarg
+        # filter, silently breaking the intended "grep container logs for
+        # the OTP" dev bootstrap flow (surfaced 2026-07-21 during the
+        #  wizard-Playwright arc — see
+        # pattern_demo_wizard_playwright_torm). Inline it into the message
+        # string so the emit is filter-proof. Safe: this branch fires ONLY
+        # when SMTP is not configured (dev / bootstrap only); OTP codes
+        # are not PHI.
         log = get_logger("web.auth")
-        log.warning("No SMTP configured — logging OTP (dev mode)", email=email, code=code)
+        log.warning(
+            "No SMTP configured — logging OTP (dev mode) code=%s" % code,
+            email=email,
+        )
 
     return await _render(templates, request, "login.html", {
         "step": "verify", "email": email,
@@ -294,7 +320,7 @@ async def login_verify(
     db = get_db(request)
     config = get_config(request)
     templates = get_templates(request)
-    client_host = (request.client.host if request.client else None)
+    client_host = audit_forwarded_for(request).host or None  # N-337: XFF-aware SSOT (§164.312(b))
     user_agent = request.headers.get("user-agent")
 
     #  lockout gate.
@@ -354,7 +380,7 @@ async def login_verify(
             return "disabled", {}
 
         # H-05 (Cycle 7) — §164.312(d) MFA enforcement gate. In
-        # HIPAA mode, a user with any registered hardware key OR
+        # HIPAA mode, a user with any registered passkey OR
         # any unconsumed recovery code MUST authenticate via the
         # WebAuthn / recovery-code path. OTP-only login is the
         # non-MFA factor and is regulatorily insufficient for the
@@ -368,8 +394,8 @@ async def login_verify(
         from email_triage.web.mfa import is_mfa_required_for
         from email_triage.web.db import record_auth_event
         if is_mfa_required_for(db, user_):
-            try:
-                record_auth_event(
+            safe_audit_write(
+                lambda: record_auth_event(
                     db,
                     event_type="login_otp",
                     email=email,
@@ -378,9 +404,9 @@ async def login_verify(
                     ip=client_host,
                     user_agent=user_agent,
                     outcome="denied:mfa_required",
-                )
-            except Exception:
-                pass
+                ),
+                description="auth_event login_otp outcome=denied:mfa_required",
+            )
             return "mfa_required", {}
 
         update_last_login(db, email)
@@ -389,9 +415,12 @@ async def login_verify(
         # login alongside the existing update_last_login (which is
         # the admin UI's "last login" display column; this table is
         # the historical source of truth).
-        try:
-            from email_triage.web.db import record_auth_event
-            record_auth_event(
+        # Audit-write failure must not block a valid login; the
+        # operator detects drift via /health (safe_audit_write logs
+        # an "audit_write_failed" WARNING and never raises).
+        from email_triage.web.db import record_auth_event
+        safe_audit_write(
+            lambda: record_auth_event(
                 db,
                 event_type="login_otp",
                 email=email,
@@ -400,13 +429,9 @@ async def login_verify(
                 ip=client_host,
                 user_agent=user_agent,
                 outcome="success",
-            )
-        except Exception:
-            # Audit-write failure must not block a valid login. The
-            # operator detects drift via /health (audit_failures-style
-            # counter is filed for follow-up if this becomes a
-            # problem).
-            pass
+            ),
+            description="auth_event login_otp outcome=success",
+        )
         return "ok", {"user": user_}
 
     kind, payload = await db_call(_login_verify_db_work)
@@ -429,7 +454,6 @@ async def login_verify(
             "step": "email", "error": "Account not found.",
         })
     if kind == "disabled":
-        from email_triage.triage_logging import get_logger
         log = get_logger("web.auth")
         log.warning("Login blocked: user disabled", email=email)
         return await _render(templates, request, "login.html", {
@@ -442,7 +466,6 @@ async def login_verify(
         # WebAuthn / passkey flow. No error-message disclosure of
         # the user's MFA enrollment state (prevents
         # enumerate-which-accounts-have-MFA probing).
-        from email_triage.triage_logging import get_logger
         log = get_logger("web.auth")
         log.info(
             "OTP login refused: MFA required in HIPAA mode",
@@ -452,16 +475,9 @@ async def login_verify(
 
     user = payload["user"]
 
-    # PR 10 / E — metrics counter. Bounded label cardinality (3
-    # surfaces × 2 outcomes), so the registry stays tiny.
-    try:
-        from email_triage import metrics as metrics_mod
-        metrics_mod.counter(
-            "et_auth_attempts_total",
-            "Login attempts by surface and outcome.",
-        ).inc(surface="otp", outcome="success")
-    except Exception:
-        pass
+    # PR 10 / E — success-edge metric via the shared funnel (record_login_success).
+    from email_triage.web.login_guard import record_login_success
+    record_login_success(surface="otp")
 
     secret = get_session_secret(request)
     # H-05 (Cycle 7) — first-login bootstrap fix per DA-4 R-Surface-1
@@ -491,7 +507,7 @@ async def login_verify(
     # PR 8 / D1 follow-up: cookie max_age tracks the effective
     # session TTL (HIPAA-aware) so the browser drops the cookie at
     # the same moment the server stops accepting it.
-    set_session_cookie(response, token, request.app.state.config)
+    set_session_cookie(response, token, request.app.state.config, request=request)
     return response
 
 
@@ -508,8 +524,9 @@ async def logout():
 
 @router.get("/users", response_class=HTMLResponse)
 async def users_page(request: Request, user: RequireUser):
-    if user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
     templates = get_templates(request)
@@ -531,27 +548,49 @@ async def create_user(
     notify_email: str = Form(""),
 ):
     user = await db_call(get_current_user, request)  # 
-    if user is None or user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
+    #  R32 DA-fold R1 — canonicalise on write to match the read-side
+    # SSOT (canonical_email); idempotent for ASCII, A-label for IDN.
+    from email_triage.mail_headers import canonical_email
+    email = canonical_email(email)
 
     def _create_user_snapshot(db, email, name, role, notify_email, now):
-        """ phase 2 — dup-check + insert + commit in one hop."""
+        """ phase 2 — dup-check + insert + commit in one hop.
+
+        Returns "ok" | "active_dup" | "disabled_dup". A "removed" (offboarded)
+        user is soft-disabled, not deleted, so its email lingers —
+        distinguish that from a live duplicate so the admin gets an actionable
+        recovery path (re-enable) instead of a bare "already exists" (R2).
+        """
         if get_user_by_email(db, email) is not None:
-            return False
+            row = db.execute(
+                "SELECT disabled FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            return "disabled_dup" if (row and row["disabled"]) else "active_dup"
         db.execute(
             "INSERT INTO users (email, name, role, notify_email, created_at) VALUES (?, ?, ?, ?, ?)",
             (email, name, role, notify_email or None, now),
         )
         db.commit()
-        return True
+        return "ok"
 
-    success = await db_call(
+    result = await db_call(
         _create_user_snapshot, db, email, name, role, notify_email, now,
     )
-    if not success:
+    if result == "disabled_dup":
+        return HTMLResponse(
+            '<p class="error">That email belongs to a <strong>removed (disabled)</strong> '
+            'user. User records are retained for the audit trail and are never deleted — '
+            '<strong>re-enable</strong> them from the user list to restore the account, or '
+            'use a different address.</p>',
+            status_code=409,
+        )
+    if result == "active_dup":
         return HTMLResponse(
             '<p class="error">A user with that email already exists.</p>',
             status_code=409,
@@ -570,27 +609,41 @@ async def update_user(
     notify_email: str = Form(""),
 ):
     user = await db_call(get_current_user, request)  # 
-    if user is None or user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
 
     def _update_user_snapshot(db, user_id, email, name, role, notify_email):
-        """ phase 2 — conflict check + update + commit in one hop."""
+        """ phase 2 — conflict check + update + commit in one hop.
+
+         R32 DA-fold R1 — canonicalise the email before the conflict
+        SELECT + INSERT so all three sides (dup-check, WHERE, stored form)
+        share one normalisation (canonical_email SSOT).
+        """
         if email:
+            from email_triage.mail_headers import canonical_email
+            email = canonical_email(email)
             existing = db.execute(
                 "SELECT id FROM users WHERE email = ? AND id != ?",
                 (email, user_id),
             ).fetchone()
             if existing:
                 return False
+            # N-238 R24: bump session_epoch inline — role/email changes
+            # invalidate existing session tokens per §164.312(a)(2)(iii).
+            # A demoted admin's live cookie must lose authority
+            # immediately, not on next login.
             db.execute(
-                "UPDATE users SET email = ?, name = ?, role = ?, notify_email = ? WHERE id = ?",
+                "UPDATE users SET email = ?, name = ?, role = ?, notify_email = ?, "
+                "session_epoch = session_epoch + 1 WHERE id = ?",
                 (email, name, role, notify_email or None, user_id),
             )
         else:
             db.execute(
-                "UPDATE users SET name = ?, role = ?, notify_email = ? WHERE id = ?",
+                "UPDATE users SET name = ?, role = ?, notify_email = ?, "
+                "session_epoch = session_epoch + 1 WHERE id = ?",  # N-238 R24
                 (name, role, notify_email or None, user_id),
             )
         db.commit()
@@ -614,30 +667,99 @@ async def delete_user(
     user_id: int,
 ):
     user = await db_call(get_current_user, request)  # 
-    if user is None or user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
 
-    def _delete_user_snapshot(db, user_id, current_email):
-        """ phase 2 — self-delete check + delete + commit in one hop."""
+    def _delete_user_preflight(db, user_id, current_email):
+        """ phase 2 — self-delete check + account_id enumeration.
+
+        Returns (False, []) on self-delete (refuse).
+        Returns (True, [account_id, ...]) on success — account IDs are
+        collected BEFORE the user row is deleted so the funnel can purge
+        watcher/secrets state; the actual DELETE happens in the async
+        caller after the funnel runs.
+        """
         target = db.execute(
             "SELECT email FROM users WHERE id = ?", (user_id,),
         ).fetchone()
         if target and target["email"] == current_email:
-            return False
-        db.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        db.commit()
-        return True
+            return False, []
+        # Enumerate account_ids NOW (before the row is gone).
+        from email_triage.db.accounts import list_email_accounts
+        accounts = list_email_accounts(db, user_id=user_id, include_delegated=False)
+        account_ids = [a["id"] for a in accounts]
+        return True, account_ids
 
-    success = await db_call(
-        _delete_user_snapshot, db, user_id, user["email"],
+    ok, account_ids = await db_call(
+        _delete_user_preflight, db, user_id, user["email"],
     )
-    if not success:
+    if not ok:
         return HTMLResponse(
             '<p class="error">Cannot delete your own account.</p>',
             status_code=400,
         )
+
+    # L1 + L2 — purge watcher/secrets for EACH account owned by this user
+    # BEFORE deleting the user row. The email_accounts rows CASCADE-delete with
+    # the user (FK ON DELETE CASCADE), but settings + secrets_store have no FK,
+    # and the watcher manager has no FK awareness. Fail CLOSED: if ANY account's
+    # purge raises, do NOT delete the user — that would orphan that account's
+    # credentials (§164.310(d)(2)(i)); the operator retries. Watcher-stop is
+    # best-effort inside the funnel, so only a real purge failure trips this.
+    from email_triage.db.accounts import purge_account_local_state
+    watcher_mgr = getattr(request.app.state, "watcher_manager", None)
+    for acct_id in account_ids:
+        try:
+            if watcher_mgr is not None:
+                await watcher_mgr.apply_account_deleted(
+                    acct_id, actor_user_id=user["id"],
+                )
+            else:
+                secrets = getattr(request.app.state, "secrets", None)
+                await db_call(purge_account_local_state, db, acct_id, secrets)
+        except Exception as _e:
+            _log.error(
+                "delete_user: local-state purge FAILED for account — aborting "
+                "user delete to avoid orphaning stored credentials",
+                user_id=user_id,
+                account_id=acct_id,
+                error=fmt_exc(_e),
+            )
+            return HTMLResponse(
+                "Delete failed: an account's stored credentials could not be "
+                "purged. The user was NOT deleted — please retry.",
+                status_code=500,
+            )
+
+    def _offboard_user(db, user_id, account_ids, actor_user_id):
+        """Offboard — NEVER hard-delete (operator ruling 2026-06-19, ).
+
+        A ``DELETE FROM users`` would (a) NULL the actor link across the 9
+        tamper-evident audit tables (their actor FK is ON DELETE SET NULL,
+        breaking the §164.312(c)(1) verify chain) AND (b) cascade-delete each
+        account's ``hipaa_access_events`` (``account_id`` is ON DELETE CASCADE)
+        — wiping the §164.312(b) PHI-access trail. So we SOFT-DISABLE the user
+        and DEACTIVATE (not delete) the accounts; credentials are already purged
+        above. The user + account rows + all audit history are retained.
+
+        NOTE: the direct account-delete actuator now ALSO soft-deactivates
+        (operator ruled 2026-06-20: never delete accounts either — N-108), so
+        BOTH the user and account offboard legs preserve the audit trail.
+        """
+        from email_triage.db.accounts import set_account_active
+        from email_triage.db.audit import set_user_disabled
+        for acct_id in account_ids:
+            set_account_active(db, acct_id, False)
+        set_user_disabled(
+            db, user_id, True, actor_user_id=actor_user_id,
+            reason="offboarded via admin Remove (soft-disable; row retained for audit)",
+        )
+        return True
+
+    await db_call(_offboard_user, db, user_id, account_ids, user["id"])
 
     return RedirectResponse("/users", status_code=303)
 
@@ -656,8 +778,9 @@ async def disable_user(
     accounts are stopped immediately.
     """
     user = await db_call(get_current_user, request)  # 
-    if user is None or user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
 
@@ -720,8 +843,9 @@ async def enable_user(
     silently resume it.
     """
     user = await db_call(get_current_user, request)  # 
-    if user is None or user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
 

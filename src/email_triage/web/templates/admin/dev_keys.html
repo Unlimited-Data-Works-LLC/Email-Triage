@@ -11,11 +11,11 @@
     machine.
 </p>
 <p>
-    <strong>Hardware-key-wins rule:</strong> if a user has registered
-    any active hardware key, dev-keypair logins for that email are
+    <strong>Passkey-wins rule:</strong> if a user has registered
+    any active passkey, dev-keypair logins for that email are
     denied with 403. OTP login remains available regardless. Users
-    register their own hardware keys at
-    <a href="/profile/hardware-keys">/profile/hardware-keys</a>
+    register their own passkeys under
+    <a href="/profile/security">My Settings &rsaquo; Security</a>
     (each user manages their own; admins do NOT register on behalf
     of users -- the private side never leaves the user's device).
 </p>
@@ -38,11 +38,11 @@
 {% endif %}
 
 <aside style="border-left:3px solid var(--pico-primary);padding:0.5rem 1rem;margin:1rem 0;background:var(--pico-form-element-background-color);">
-    <strong>🔑 Personal hardware keys.</strong>
+    <strong>🔑 Personal passkeys.</strong>
     Want to register your own YubiKey / passkey for stronger login?
-    <a href="/profile/hardware-keys" role="button" class="outline secondary"
+    <a href="/profile/security" role="button" class="outline secondary"
        style="padding:0.15rem 0.6rem;font-size:0.85rem;margin-left:0.5rem;">
-        Open /profile/hardware-keys
+        Open Security settings
     </a>
 </aside>
 
@@ -100,18 +100,18 @@
                 <td><small>{{ k.email_allowlist | join(", ") }}</small></td>
                 <td>
                     {% if k.revoked_at %}
-                    <small style="color:var(--pico-del-color);">revoked {{ k.revoked_at[:10] }}</small>
+                    <small style="color:var(--pico-del-color);">revoked {% if k.revoked_at %}<time datetime="{{ k.revoked_at }}" data-us-datetime>{{ k.revoked_at | us_datetime }}</time>{% else %}&mdash;{% endif %}</small>
                     {% elif not k.active %}
                     <small style="color:var(--pico-del-color);">expired</small>
                     {% else %}
                     <small style="color:var(--pico-ins-color);">active</small>
                     {% endif %}
                 </td>
-                <td><small>{{ k.expires_at[:19] }}</small></td>
+                <td><small>{% if k.expires_at %}<time datetime="{{ k.expires_at }}" data-us-datetime>{{ k.expires_at | us_datetime }}</time>{% else %}&mdash;{% endif %}</small></td>
                 <td>
                     <small>
                         {% if k.last_used_at %}
-                        {{ k.last_used_at[:19] }}<br>
+                        <time datetime="{{ k.last_used_at }}" data-us-datetime>{{ k.last_used_at | us_datetime }}</time><br>
                         as {{ k.last_used_email }}
                         {% else %}
                         &mdash;

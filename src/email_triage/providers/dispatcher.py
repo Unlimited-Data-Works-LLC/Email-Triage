@@ -39,12 +39,15 @@ multi-branch dispatch and don't pay the dispatcher tax.
 from __future__ import annotations
 
 import logging
+import html
+from email_triage.web.error_html import error_chip
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from email_triage.db._helpers import row_get
 
-logger = logging.getLogger("email_triage.providers.dispatcher")
+logger = get_logger("email_triage.providers.dispatcher")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +148,7 @@ async def _imap_start_push(manager, account_id: int, acct: dict) -> str:
 
 def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> bool:
     """Infer IMAP push_enabled from the legacy ``watch:<id>`` setting."""
-    import json as _json
+    from email_triage.db._helpers import load_json_col
     import sqlite3
     from email_triage.web.settings_keys import watch as _watch_key
 
@@ -165,20 +168,17 @@ def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> boo
     # N-16: row_get duck-types on keys() so a sqlcipher3 Row takes the
     # keyed branch — isinstance(row, sqlite3.Row) goes False for it.
     raw_val = row_get(row, "value_json", 0)
-    try:
-        parsed = _json.loads(raw_val) if raw_val else {}
-    except (TypeError, ValueError):
-        parsed = {}
-    return bool(
-        parsed.get("enabled", False) if isinstance(parsed, dict) else False
-    )
+    # census  SSOT — corrupt value_json degrades to {} (→ enabled False).
+    parsed = load_json_col(raw_val, default={})
+    return bool(parsed.get("enabled", False))
 
 
 async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
     """IMAP connection probe — opens IMAP4_SSL, logs in, selects mailbox."""
-    import imaplib
     import socket
     import ssl as ssl_mod
+
+    from email_triage.providers.imap_fetch_transport import imap_connect
 
     from email_triage.providers.factory import secret_key_for_account
 
@@ -191,7 +191,17 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
     username = cfg.get("username", "")
     use_ssl = cfg.get("use_ssl", True)
     sk = secret_key_for_account(account_id, ptype)
-    password = secrets.get(sk) if sk else ""
+    from email_triage.secrets import SecretsDecryptError, read_secret
+    try:
+        password = read_secret(secrets, sk) if sk else ""
+    except SecretsDecryptError:
+        # A5 — fail closed + legible: a stored password that won't decrypt
+        # (master-key mismatch) is not a connection problem to retry.
+        return False, (
+            '<small style="color:var(--pico-del-color);">'
+            'Stored password unreadable — secrets master-key mismatch. '
+            'Check the secrets master key.</small>'
+        )
 
     if not host or not username:
         return False, (
@@ -199,11 +209,10 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
             'Host and username required.</small>'
         )
     try:
-        if use_ssl:
-            ctx = ssl_mod.create_default_context()
-            imap = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
-        else:
-            imap = imaplib.IMAP4(host, port)
+        imap = imap_connect(
+            host, port, use_ssl=use_ssl,
+            ssl_context=ssl_mod.create_default_context() if use_ssl else None,
+        )
         imap.login(username, password or "")
         mailbox = cfg.get("mailbox", "INBOX")
         status, data = imap.select(mailbox, readonly=True)
@@ -211,7 +220,7 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
         imap.logout()
         return True, (
             f'<small style="color:var(--pico-ins-color);">'
-            f'Connected. {count} messages in {mailbox}.</small>'
+            f'Connected. {html.escape(str(count))} messages in {html.escape(str(mailbox))}.</small>'
         )
     except ssl_mod.SSLCertVerificationError as e:
         err_msg = str(e)
@@ -227,32 +236,32 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
                 if suggestion and suggestion != host:
                     return False, (
                         f'<small style="color:var(--pico-del-color);">'
-                        f'SSL certificate hostname mismatch: the certificate is not valid for "<code>{host}</code>". '
-                        f'Try using the fully qualified domain name: <code>{suggestion}</code>'
+                        f'SSL certificate hostname mismatch: the certificate is not valid for "<code>{html.escape(host)}</code>". '
+                        f'Try using the fully qualified domain name: <code>{html.escape(suggestion)}</code>'
                         f'</small>'
                     )
             except Exception:
                 pass
             return False, (
                 f'<small style="color:var(--pico-del-color);">'
-                f'SSL certificate hostname mismatch. The server certificate does not match "<code>{host}</code>". '
+                f'SSL certificate hostname mismatch. The server certificate does not match "<code>{html.escape(host)}</code>". '
                 f'Use the server\'s fully qualified domain name (e.g. <code>mail.example.com</code>).'
                 f'</small>'
             )
         elif "CERTIFICATE_VERIFY_FAILED" in err_msg:
             return False, (
                 f'<small style="color:var(--pico-del-color);">'
-                f'SSL certificate verification failed for "<code>{host}</code>": {err_msg}. '
+                f'SSL certificate verification failed for "<code>{html.escape(host)}</code>": {html.escape(err_msg)}. '
                 f'If this is a self-signed certificate, uncheck "Use SSL" and use port 143, '
                 f'or ensure the server\'s CA is trusted.'
                 f'</small>'
             )
         return False, (
-            f'<small style="color:var(--pico-del-color);">SSL error: {e}</small>'
+            error_chip(e, prefix='SSL error: ')
         )
     except Exception as e:
         return False, (
-            f'<small style="color:var(--pico-del-color);">Failed: {e}</small>'
+            error_chip(e, prefix='Failed: ')
         )
 
 
@@ -286,8 +295,9 @@ async def _imap_post_create_start_watch(
         except Exception as e:
             return ("", f"Account added, but watcher failed to start: {e}.")
     else:
-        # Strip HTML tags from the inline error for the banner.
-        reason = re.sub(r"<[^>]+>", "", test_msg).strip()
+        # Strip HTML tags from the inline error for the banner —  SSOT.
+        from email_triage.engine.html_text import strip_tags
+        reason = strip_tags(test_msg)
         return (
             "",
             f"Account added, but connection test failed: {reason}. "
@@ -363,7 +373,16 @@ async def _gmail_test_connection(acct: dict, secrets) -> tuple[bool, str]:
     account_id = acct["id"]
 
     sk = secret_key_for_account(account_id, ptype)
-    has_token = bool(secrets.get(sk)) if sk else False
+    from email_triage.secrets import SecretsDecryptError, read_secret
+    try:
+        has_token = bool(read_secret(secrets, sk)) if sk else False
+    except SecretsDecryptError:
+        # A5 — fail closed + legible (master-key mismatch, not "not authed").
+        return False, (
+            '<small style="color:var(--pico-del-color);">'
+            'Stored token unreadable — secrets master-key mismatch. '
+            'Check the secrets master key.</small>'
+        )
     if not has_token:
         return False, (
             '<small style="color:var(--pico-color-amber-500);">'
@@ -380,7 +399,7 @@ async def _gmail_test_connection(acct: dict, secrets) -> tuple[bool, str]:
         )
     except Exception as e:
         return False, (
-            f'<small style="color:var(--pico-del-color);">Failed: {e}</small>'
+            error_chip(e, prefix='Failed: ')
         )
 
 

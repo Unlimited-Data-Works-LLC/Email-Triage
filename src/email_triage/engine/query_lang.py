@@ -232,11 +232,27 @@ def emit_o365_filter(filt) -> str:
 # Raw IMAP-shape query → provider-native via parse-then-emit
 # ---------------------------------------------------------------------------
 
+_GMAIL_OPERATOR_PREFIXES = ("in:", "label:")
+
+# ``is:`` is HANDLED for the specific ``is:unread`` shape; every OTHER
+# ``is:*`` (``is:read``, ``is:sent``, ``is:starred``, …) is a Gmail
+# operator that produces malformed IMAP SEARCH criteria and MUST be
+# rejected here — otherwise it reaches ``client.search(...)`` and the
+# server BAD-replies (N-390 2026-07-12 root cause: ``sent_mail_capture``
+# fallback passing ``"in:sent"`` verbatim to the deploy host dovecot).
+
+
 def translate_imap_query_to_imap(query: str) -> str:
     """IMAP shortcuts → IMAP SEARCH criteria.
 
     Existing IMAP behaviour (mostly identity) preserved: ``is:unread``
-    becomes ``UNSEEN``, otherwise pass through.
+    becomes ``UNSEEN``, otherwise pass through. Gmail-operator prefixes
+    (``in:``, ``label:``, non-``is:unread`` ``is:*``) are REJECTED with
+    a WARNING and an empty return — a defensive SSOT so a caller who
+    mistakenly passes a Gmail-syntax query cannot smuggle it to a
+    dovecot ``client.search(...)`` where it produces ``BAD``. Callers
+    treat empty as "no criteria" (upstream typically falls back to
+    ``ALL`` or refuses to run — either is preferable to a server BAD).
     """
     q = query.strip()
     if q == "is:unread":
@@ -244,6 +260,20 @@ def translate_imap_query_to_imap(query: str) -> str:
     if q.startswith("is:unread "):
         rest = q[len("is:unread "):].strip()
         return f"UNSEEN {rest}"
+    # Reject Gmail-operator syntax at this SSOT so no downstream IMAP
+    # ``client.search(...)`` can BAD-reply on it (N-390).
+    if q.startswith(_GMAIL_OPERATOR_PREFIXES) or (
+        q.startswith("is:") and not q.startswith("is:unread")
+    ):
+        from email_triage.triage_logging import get_logger
+
+        get_logger("engine.query_lang").warning(
+            "translate_imap_query_to_imap: rejected Gmail-operator query "
+            "(fail-CLOSED to empty criteria)",
+            query_len=len(q),
+            first_token=q.split(":", 1)[0] if ":" in q else q,
+        )
+        return ""
     return q
 
 

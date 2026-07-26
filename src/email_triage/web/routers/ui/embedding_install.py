@@ -49,6 +49,8 @@ right home; the worker is a fire-and-forget asyncio task.
 
 from __future__ import annotations
 
+from . import _shared
+
 import asyncio
 import logging
 import sqlite3
@@ -58,7 +60,6 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from email_triage._errfmt import fmt_exc
 from email_triage.embedding_bits import (
     DEFAULT_MANIFEST_PATH,
     get_install_status,
@@ -69,13 +70,15 @@ from email_triage.embedding_bits import (
     request_cancel,
     reverify,
 )
+from email_triage.web._audit import safe_audit_write
 from email_triage.web.app import get_db, get_templates
 from email_triage.web.db import record_auth_event
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
 
 # async-db: handlers route SQLite through db_call
-_log = logging.getLogger("email_triage.web.ui.embedding_install")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+
+_log = get_logger("email_triage.web.ui.embedding_install")  # N-196b R21_4
 router = APIRouter()
 
 
@@ -83,18 +86,8 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(request: Request) -> tuple[dict | None, Any]:
-    """Standard admin gate. Mirrors the pattern in ai_backends_crud.
-
-    Returns (user, error_response). When user is None the caller
-    should ``return err`` directly.
-    """
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 def _audit(
@@ -105,44 +98,30 @@ def _audit(
     detail: str,
     outcome: str = "success",
 ) -> None:
-    """Best-effort audit log. Mirrors ai_backends_crud._audit."""
-    try:
-        record_auth_event(
+    """Best-effort audit log. Mirrors ai_backends_crud._audit.
+
+    Routes record_auth_event through the best-effort audit SSOT (census
+    run17 #3). Audit failures are logged uniformly via ``safe_audit_write``
+    (so /health's audit-failure drift check sees the miss) and never poison
+    the user flow.
+    """
+    safe_audit_write(
+        lambda: record_auth_event(
             db,
             event_type=event_type,
             email=user.get("email", "") or "",
             user_id=user.get("id"),
             outcome=outcome,
             detail=detail,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log.warning(
-            "embedding-install audit row failed",
-            extra={"_extra": {
-                "event": event_type, "outcome": outcome,
-                "error": fmt_exc(exc),
-            }},
-        )
+        ),
+        description=f"embedding_install_audit event={event_type} outcome={outcome}",
+    )
 
 
 def _redirect_to_tab() -> RedirectResponse:
     return RedirectResponse(
         "/config?tab=ai_backends", status_code=303,
     )
-
-
-def _is_htmx(request: Request) -> bool:
-    """Did this request come from HTMX (vs a plain browser POST)?
-
-    Used by every mutating route to decide between (a) returning the
-    install-card partial in-place (HTMX case), or (b) emitting a 303
-    redirect to the full /config page (back-compat for direct form
-    posts / scripted tools / curl).
-
-    Header set by htmx.org's request layer. Case-insensitive lookup
-    via FastAPI's headers Mapping.
-    """
-    return request.headers.get("HX-Request", "").lower() == "true"
 
 
 async def _render_install_card(request: Request) -> HTMLResponse:
@@ -179,7 +158,7 @@ async def _post_response(request: Request) -> HTMLResponse | RedirectResponse:
     HTMX: return the install-card partial (current DB state).
     Plain: 303 to /config?tab=ai_backends (back-compat).
     """
-    if _is_htmx(request):
+    if _shared.is_htmx(request):
         return await _render_install_card(request)
     return _redirect_to_tab()
 
@@ -529,20 +508,31 @@ async def embedding_reindex(request: Request, account_id: int):
             status_code=303,
         )
 
+    #  — pin the LIVE target so a later model change can supersede this
+    # manual reindex if it's still in-flight + stale. Read app.state on the
+    # loop thread (cheap attribute access) before the threadpool hop.
+    _app_state = request.app.state
+    _eb = getattr(_app_state, "embedding_backend", None)
+    live_target = {
+        "backend_type": getattr(_eb, "backend_type", "") if _eb is not None else "",
+        "model": getattr(_app_state, "embedding_model", "") or "",
+    }
+
     def _reindex_db_work() -> str:
-        """/ — enqueue the reindex job + audit in one hop."""
+        """/ — enqueue (supersede-aware, ) + audit in one hop."""
         from email_triage.jobs.embedding_reindex import (
-            enqueue_embedding_reindex,
+            supersede_or_enqueue_reindex,
         )
-        job_id = enqueue_embedding_reindex(
+        outcome = supersede_or_enqueue_reindex(
             db, account_id=account_id, actor_user_id=user.get("id"),
+            target=live_target,
         )
         _audit(
             db, user,
             event_type="embedding_reindex_enqueue",
-            detail=f"account_id={account_id} job_id={job_id}",
+            detail=f"account_id={account_id} outcome={outcome}",
         )
-        return job_id
+        return outcome
 
     await db_call(_reindex_db_work)
     return RedirectResponse(

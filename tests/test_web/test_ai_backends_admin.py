@@ -117,6 +117,20 @@ class TestIndexRender:
 # ---------------------------------------------------------------------------
 
 class TestCreate:
+    def test_new_form_shows_backup_models_control(self, client, admin_cookies):
+        """ — the ai_backends new/edit form now renders the Backup models
+        control SHOWN (show_backups=true), since the style-learning complete()
+        path got failover. Rule 17: assert the rendered view — the fieldset must
+        NOT carry display:none on THIS form (it did, pre-#45)."""
+        client.cookies.set(
+            SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME],
+        )
+        resp = client.get("/config/ai-backends/new")
+        assert resp.status_code == 200
+        assert "Backup models" in resp.text                       # fieldset renders
+        assert "margin:0.8rem 0 0;" in resp.text                  # its style is present
+        assert "display:none;margin:0.8rem 0 0;" not in resp.text  # …and NOT hidden
+
     def test_create_round_trip(self, client, db, admin_cookies):
         client.cookies.set(
             SESSION_COOKIE_NAME,
@@ -189,8 +203,8 @@ class TestCreate:
         resp = client.post(
             "/config/ai-backends",
             data={
-                "name": "X", "type": "anthropic",  # NOT in the enum
-                "endpoint": "https://api.anthropic.com",
+                "name": "X", "type": "AI provider",  # NOT in the enum
+                "endpoint": "https://api.AI provider.com",
                 "enabled": "1",
             },
         )

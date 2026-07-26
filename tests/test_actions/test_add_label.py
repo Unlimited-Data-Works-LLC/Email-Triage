@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from _db_tracking import track
+
 from email_triage.actions.add_label import AddLabelAction, _normalise_string_list
 from email_triage.engine.models import (
     ActionResult,
@@ -85,7 +87,7 @@ def _db_with_labels(tmp_path):
      sweep dispatches ``apply_labels_to_message`` through
     ``db_call``, which runs it on a threadpool worker."""
     from email_triage.web.migrations import _v18_create_labels
-    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db = track(sqlite3.connect(":memory:", check_same_thread=False))
     db.row_factory = sqlite3.Row
     # Tables referenced by the schema's foreign keys. Minimal stand-ins
     # for the v1 base schema's users + email_accounts tables.

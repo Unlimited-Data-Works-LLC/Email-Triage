@@ -39,6 +39,7 @@ re-fire would re-enqueue itself.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timezone
@@ -59,7 +60,7 @@ from email_triage.web.watcher_retry import (
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     yield conn
     conn.close()
 
@@ -326,14 +327,11 @@ class TestLivePathCallSiteWiring:
         marker match (``_res =`` / bare ``res =``) below naturally
         selects only the modules that actually contain a caller.
         """
-        from pathlib import Path
-        web = (
-            Path(__file__).resolve().parents[2]
-            / "src" / "email_triage" / "web"
-        )
+        from _pin_harness import SRC_ROOT, iter_src_files
+        web = SRC_ROOT / "web"  # harness-rooted (R5b)
         return {
             p.relative_to(web).as_posix(): p.read_text(encoding="utf-8")
-            for p in sorted(web.glob("**/*.py"))
+            for p in iter_src_files("web")
         }
 
     def test_live_path_callers_check_the_field(self):
@@ -384,6 +382,70 @@ class TestLivePathCallSiteWiring:
                 f"the helper so the failure_kind label stays consistent "
                 f"across call sites."
             )
+
+    def test_live_path_delivery_retry_enqueue_logs_on_failure(self):
+        """#8: each live-path watch-delivery-retry enqueue must
+        LOG a failed enqueue (fail VISIBLE, PD#8), never a bare ``except: pass``.
+        A lost enqueue is a lost escalation that the operator must be able to
+        see. Discovered by the ``enqueue_watch_delivery_retry as _wdr`` import
+        marker across web/ (the 5 live sites all enqueue via ``db_call(_wdr,…)``
+        right below that import), so a future ingestion path is auto-covered."""
+        n = 0
+        for name, src in self._web_sources().items():
+            idx = 0
+            while True:
+                idx = src.find("enqueue_watch_delivery_retry as _wdr", idx)
+                if idx == -1:
+                    break
+                n += 1
+                window = src[idx: idx + 3500]
+                exc = window.find("except Exception")
+                assert exc != -1, (
+                    f"{name}: a _wdr delivery-retry enqueue is not wrapped in a "
+                    f"try/except — a raised enqueue would crash the ingest loop."
+                )
+                # Search the whole except handler (a long #8 comment can precede
+                # the log call), bounded so it can't bleed into the next block.
+                handler = window[exc: exc + 1200]
+                # Tightened (DA impl-review should-fix): require an OPERATOR-VISIBLE
+                # level — log.warning/error — not just any `log.` (which a stray
+                # log.info/log.debug or an unrelated nearby line could satisfy). A
+                # visible-level log also proves the handler is not a bare `pass`.
+                has_visible_log = (
+                    "log.warning(" in handler or "log.error(" in handler
+                )
+                assert has_visible_log, (
+                    f"{name}: the watch-delivery-retry enqueue except handler does "
+                    f"not log at warning/error level — a failed enqueue (a lost "
+                    f"escalation) must be OPERATOR-VISIBLE (PD#8, -followup-C), "
+                    f"not a bare `pass` or a low-visibility log.info/debug."
+                )
+                idx += 1
+        assert n >= 1, (
+            "found ZERO `_wdr` delivery-retry enqueue sites across web/ — the "
+            "#8 fail-visible guard has drifted; re-anchor the discovery."
+        )
+
+    def test_watcher_enqueues_delivery_retry_before_status_e_reraise(self):
+        """#9: in the watcher live loop the  delivery-retry
+        enqueue must run BEFORE the status=='e' re-raise. A message that BOTH
+        errored a routed action AND left a watch undelivered used to skip the
+        enqueue (the re-raise pre-empted it), so the generic handler stamped a
+        NULL-kind row the admin reads as a generic 'fetch/process error' instead
+        of a delivery failure. Ordering the enqueue first fixes the label."""
+        src = self._web_sources()["watcher.py"]
+        enqueue = src.find("_res.unretried_watch_failures > 0")
+        reraise = src.find('_entry.get("error", "triage error")')
+        assert enqueue != -1 and reraise != -1, (
+            "watcher.py markers drifted — could not locate the  enqueue "
+            "block or the status=='e' re-raise."
+        )
+        assert enqueue < reraise, (
+            "the  watch-delivery-retry enqueue must PRECEDE the status=='e' "
+            "re-raise in watcher.py — otherwise a watch-undelivered status=='e' "
+            "message is mislabelled NULL-kind instead of watch_delivery_failure "
+            "."
+        )
 
     def test_drainer_call_does_NOT_act_on_the_field(self):
         # The drainer assigns ``res = await triage_single_message(...)``

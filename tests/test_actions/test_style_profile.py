@@ -6,6 +6,7 @@ settings-table round-trip via :func:`get_style_profile` /
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 from datetime import datetime, timezone
@@ -297,7 +298,7 @@ class TestStyleProfilePersistence:
         )
 
         db_path = tmp_path / "triage.db"
-        conn = init_db(str(db_path))
+        conn = track(init_db(str(db_path)))
 
         # Pre-existing read returns None.
         assert get_style_profile(conn, account_id=42) is None

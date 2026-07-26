@@ -94,8 +94,8 @@
                         <span class="op-value">{{ health.uptime_secs | default(0) }} s</span>
                     </div>
                     <div class="op-row">
-                        <span class="op-label">last_triage {{ m.help("ISO timestamp of the most recent triage_runs row across every account. Compared against now() to derive the 'stale > 24h' degraded flag.") }}</span>
-                        <span class="op-value"><small>{{ health.last_triage or "—" }}</small></span>
+                        <span class="op-label">last_triage {{ m.help("Timestamp of the most recent triage_runs row across every account. Server-rendered as US-local; JS enhances to your browser's local timezone.") }}</span>
+                        <span class="op-value"><small>{% if health.last_triage %}<time datetime="{{ health.last_triage }}" data-us-datetime>{{ health.last_triage | us_datetime }}</time>{% else %}—{% endif %}</small></span>
                     </div>
                     <div class="op-row">
                         <span class="op-label">db {{ m.help("'ok' when a SELECT 1 on triage.db succeeds within the health budget; 'error' when the DB ping fails or times out.") }}</span>
@@ -510,7 +510,7 @@
             <tr>
                 <th>Account</th>
                 <th>Status</th>
-                <th style="text-align:right;">Processed</th>
+                <th style="text-align:right;">Processed <small style="color:var(--pico-muted-color);">(window)</small></th>
                 <th style="text-align:right;">Errors</th>
                 <th>Started</th>
             </tr>
@@ -529,9 +529,14 @@
                     {% endif %}
                 </td>
                 <td><code>{{ w.status }}</code></td>
-                <td style="text-align:right;">{{ w.processed }}</td>
+                {# N-411 anti-irony fold-in: count semantics differ per-provider
+                   (IMAP lifetime vs Gmail/O365 14-day rolling). Surface the
+                   window per-row so an operator comparing accounts side-by-side
+                   can't draw a false conclusion — exactly the operator-facing
+                   accuracy defect class N-411 exists to prevent. #}
+                <td style="text-align:right;">{{ w.processed }} <small style="color:var(--pico-muted-color);">({{ w.count_window or "?" }})</small></td>
                 <td style="text-align:right;">{{ w.errors }}</td>
-                <td><small>{{ w.started_at or "-" }}</small></td>
+                <td><small>{% if w.started_at %}<time datetime="{{ w.started_at }}" data-us-datetime>{{ w.started_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
             </tr>
             {% endfor %}
         </tbody>

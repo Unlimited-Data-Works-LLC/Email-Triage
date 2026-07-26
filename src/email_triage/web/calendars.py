@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
+
 
 # Role keys the schema permits. Order also drives column order in
 # the editor table.
@@ -309,10 +311,7 @@ def get_surrogate_account_id(acct: dict[str, Any]) -> int | None:
     raw = (acct.get("config") or {}).get("calendar_surrogate_account_id")
     if raw is None or raw == "":
         return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+    return parse_int_or_none(raw)  # N-219b R23: SSOT
 
 
 def resolve_surrogate_account(

@@ -25,16 +25,9 @@ If the heuristic flags a false positive, add the specific
 
 from __future__ import annotations
 
-from pathlib import Path
+from _pin_harness import TEMPLATES_ROOT, iter_template_files, relpath
 
-
-TEMPLATES = (
-    Path(__file__).resolve().parents[2]
-    / "src"
-    / "email_triage"
-    / "web"
-    / "templates"
-)
+TEMPLATES = TEMPLATES_ROOT
 
 # Fields that require an effective-HIPAA wrap at render time.
 #
@@ -122,8 +115,8 @@ def _window_has_guard(lines: list[str], idx: int, size: int = 10) -> bool:
 
 def test_templates_guard_phi_fields():
     offenders: list[tuple[str, str, str]] = []
-    for path in TEMPLATES.rglob("*.html"):
-        rel = path.relative_to(TEMPLATES).as_posix()
+    for path in iter_template_files():
+        rel = relpath(path, base=TEMPLATES_ROOT)
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         for i, line in enumerate(lines, 1):

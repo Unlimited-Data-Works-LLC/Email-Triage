@@ -209,7 +209,7 @@
             <strong style="color:var(--pico-ins-color);">✓ Installed</strong>
             {% if install_state.installed_at %}
             <small style="color:var(--pico-muted-color);">
-                ({{ install_state.installed_at[:19] }})
+                (<time datetime="{{ install_state.installed_at }}" data-us-datetime>{{ install_state.installed_at | us_datetime }}</time>)
             </small>
             {% endif %}
             {% if install_state.install_method %}

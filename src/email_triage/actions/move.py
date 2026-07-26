@@ -32,7 +32,8 @@ from email_triage.engine.models import (
 from email_triage.providers.base import EmailProvider
 from email_triage._errfmt import fmt_exc
 
-logger = logging.getLogger("email_triage.actions.move")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.move")  # N-196b R21_4
 
 
 class MoveAction(Action):
@@ -85,9 +86,8 @@ class MoveAction(Action):
 
         if not folder:
             logger.info(
-                "No folder mapping for category '%s', skipping move",
-                classification.category,
-                extra=_extras(),
+                "No folder mapping for category, skipping move",
+                extra={**_extras(), "category": classification.category},
             )
             return ActionOutput(
                 result=ActionResult.SKIPPED,
@@ -144,9 +144,8 @@ class MoveAction(Action):
             )
         except NotImplementedError:
             logger.info(
-                "Provider %s does not support move, skipping",
-                provider.name,
-                extra=_extras(),
+                "Provider does not support move, skipping",
+                extra={**_extras(), "provider": provider.name},
             )
             return ActionOutput(
                 result=ActionResult.SKIPPED,

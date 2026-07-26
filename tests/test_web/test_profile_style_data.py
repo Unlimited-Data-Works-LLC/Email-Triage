@@ -675,3 +675,76 @@ class TestHipaaActorOwnerGate:
         )
         hipaa_rows = list_hipaa_access_events(db, account_id=a, limit=10)
         assert hipaa_rows == []
+
+
+# ---------------------------------------------------------------------------
+#  / run18  — closure-laundered account_id parse must not 500
+# ---------------------------------------------------------------------------
+
+class TestNonNumericAccountIdDoesNot500:
+    """A tampered (non-numeric) ``?account_id=abc`` on the style-data POST
+    endpoints must NOT 500 — it must run the §164.312(b) failure-audit path
+    and return the handled 403.
+
+    Pre-fix (run18 ): ``account_id_raw = request.query_params.get("account_id")``
+    was closure-laundered into a nested ``_..._db_work`` helper, whose
+    ``if acct is None:`` failure branch recorded the audit with
+    ``int(account_id_raw or 0)`` → ``int("abc")`` → an UNCAUGHT ValueError →
+    HTTP 500 across all four endpoints, AND the crash destroyed the very
+    §164.312(b) failure-audit row that branch exists to write. The DA static
+    walk MISSED these — the closure hop (outer-assign → nested-use) is invisible
+    to an intra-function walk. The now-applied ``_safe_int(account_id_raw, 0)``
+    coerces "abc" → 0, so the failure-audit row is written and the handler
+    returns the handled 403.
+
+    This behavioral regression is the prevention the SYNTACTIC pin
+    (``tests/test_safe_int_request_parse_pin``) cannot provide for the closure
+    hop — it keys on the call-site accessor shape, not data-flow.
+    """
+
+    _ROUTES = (
+        "/profile/style-data/export",
+        "/profile/style-data/delete-profile",
+        "/profile/style-data/delete-index",
+        "/profile/style-data/delete-all",
+    )
+
+    @pytest.mark.parametrize("route", _ROUTES)
+    def test_non_numeric_account_id_returns_403_not_500(
+        self, route, client, user_cookies, db, regular_user,
+    ):
+        # Own at least one account so the user is a valid actor; the tampered
+        # id resolves to nothing regardless of what the user manages.
+        _make_acct(db, regular_user["id"], "Acct")
+        resp = client.post(
+            f"{route}?account_id=abc",
+            cookies=user_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code != 500, (
+            f"{route} with a non-numeric account_id 500'd — the run18  "
+            "closure-laundered-int regression"
+        )
+        # _safe_int("abc", 0) -> 0 -> resolver "Invalid account id." -> 403.
+        assert resp.status_code == 403
+
+    def test_failure_audit_row_is_written_not_destroyed(
+        self, client, user_cookies, db, regular_user,
+    ):
+        """The §164.312(b) failure-audit row SURVIVES the tampered input — the
+        pre-fix crash fired ON the audit-write line, so a 500 meant the row was
+        never written. Asserting its presence proves the availability hole AND
+        the audit-integrity hole are both closed."""
+        _make_acct(db, regular_user["id"], "Acct")
+        resp = client.post(
+            "/profile/style-data/export?account_id=abc",
+            cookies=user_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 403
+        rows = list_auth_events(
+            db, event_type="style_data_export", limit=10,
+        )
+        assert any(r.get("outcome") == "failure" for r in rows), (
+            "the failure-audit row was not written — the crash destroyed it"
+        )

@@ -265,6 +265,51 @@ class TestEventDispatcher:
         secret = dispatcher._resolve_secret(target)
         assert secret == ""
 
+    def test_resolve_secret_propagates_decrypt_error(self):
+        """A5 — a configured signing secret that won't decrypt must NOT
+        collapse to "" (which would ship an unsigned webhook). It raises."""
+        from email_triage.secrets import SecretsDecryptError
+
+        mock_secrets = MagicMock()
+        mock_secrets.get.side_effect = SecretsDecryptError("WEBHOOK_SECRET")
+        target = WebhookTarget(url="http://hook", secret_key="WEBHOOK_SECRET")
+        dispatcher = EventDispatcher(targets=[target], secrets_provider=mock_secrets)
+
+        with pytest.raises(SecretsDecryptError):
+            dispatcher._resolve_secret(target)
+
+    async def test_fire_drops_when_signing_secret_unreadable(self):
+        """A5 (security-material) — when a target HAS a configured
+        secret_key but it won't decrypt (corrupt row / master-key
+        mismatch), fire() must DROP the delivery, never POST it unsigned.
+        Proves the webhook signing control fails CLOSED."""
+        from email_triage.secrets import SecretsDecryptError
+
+        mock_secrets = MagicMock()
+        mock_secrets.get.side_effect = SecretsDecryptError("WEBHOOK_SECRET")
+        target = WebhookTarget(
+            url="http://hook.test/cb", events=["test.event"],
+            secret_key="WEBHOOK_SECRET",
+        )
+        dispatcher = EventDispatcher(
+            targets=[target], allow_external=True, secrets_provider=mock_secrets,
+        )
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            results = await dispatcher.fire("test.event", {"k": "v"})
+
+            # The delivery is dropped, fail-closed...
+            assert len(results) == 1
+            assert results[0]["success"] is False
+            assert results[0]["dropped"] == "signing_secret_unreadable"
+            # ...and NOTHING was ever POSTed (no unsigned send).
+            mock_client.post.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # is_in_quiet_hours / fire_triage_completed

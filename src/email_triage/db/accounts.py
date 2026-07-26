@@ -47,12 +47,17 @@ cycle):
 
 from __future__ import annotations
 
+from email_triage._int_utils import bounded_int  # N-219c/21 R23
+from email_triage._isotime import now_utc_iso
+
 import json
 import sqlite3
 from typing import Any
 
-from email_triage.db._helpers import _rows
+from email_triage.db._helpers import _rows, dump_json_col, load_json_col
+from email_triage.mail_headers import canonical_email  # N-346 R31 SSOT
 from email_triage.web.db_writelock import db_write
+from email_triage.web.dependencies import is_admin  # N-222b R22 bool SSOT
 
 
 def get_mailbox_route_overrides(
@@ -175,10 +180,7 @@ def clamp_poll_interval_minutes(value: int) -> int:
     needs to normalise an interval — keeps the "what's a valid cadence"
     answer in one place.
     """
-    try:
-        v = int(value)
-    except (TypeError, ValueError):
-        return INGESTION_POLL_DEFAULT
+    v = bounded_int(value, default=INGESTION_POLL_DEFAULT)  # N-219c/21 R23: SSOT
     v = max(INGESTION_POLL_MIN, min(INGESTION_POLL_MAX, v))
     # Snap to nearest step.
     v = INGESTION_POLL_MIN + round(
@@ -338,7 +340,7 @@ def account_aliases(acct: dict | None) -> list[dict]:
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
-            addr = str(entry.get("address") or "").strip().lower()
+            addr = canonical_email(str(entry.get("address") or ""))
             if not addr:
                 continue
             label = str(entry.get("label") or "").strip()
@@ -370,7 +372,7 @@ def account_addresses(acct: dict | None) -> set[str]:
     if not acct:
         return set()
     out: set[str] = set()
-    primary = account_email(acct).strip().lower()
+    primary = canonical_email(account_email(acct))
     if primary:
         out.add(primary)
     #  canonical path — JSON-array column.
@@ -394,7 +396,7 @@ def account_addresses(acct: dict | None) -> set[str]:
     else:
         candidates = []
     for c in candidates:
-        addr = c.strip().lower()
+        addr = canonical_email(c)
         if addr and "@" in addr:
             out.add(addr)
     return out
@@ -403,6 +405,7 @@ def list_email_accounts(
     conn: sqlite3.Connection,
     user_id: int | None = None,
     include_delegated: bool = True,
+    active_only: bool = False,
 ) -> list[dict]:
     """List email accounts. If user_id is None, returns all (admin view).
 
@@ -415,15 +418,27 @@ def list_email_accounts(
     Each row includes ``is_delegate`` (False for owner-of, True
     when surfaced via the delegates JOIN) so the UI can chip
     appropriately.
+
+    ``active_only`` (N-109): operational PICKERS — surfaces where a human or an
+    API client SELECTS a mailbox to act on (route targets, watch lists, digest
+    recipients, bulk-triage/discover, the OpenClaw roster) — pass ``True`` to
+    drop deactivated (``is_active=0``) accounts. A Removed account's credentials
+    are purged, so offering it for selection is a footgun. **Default ``False``
+    PRESERVES every management / audit / re-enable / background-purge caller**,
+    which MUST still see deactivated rows (a disabled account stays visible on
+    the /accounts page so it can be re-enabled, exactly like a disabled user).
+    ``COALESCE(is_active, 1)`` so legacy NULL rows count as active — matches the
+    consumer-side ``acct.get("is_active", True)`` gate at watcher.py / admin.py.
     """
     import json
+    _active = " AND COALESCE(ea.is_active, 1) = 1" if active_only else ""
     if user_id is not None:
         # Owner rows.
         owner_rows = conn.execute(
             "SELECT ea.*, u.email AS owner_email, u.name AS owner_name, "
             "       0 AS is_delegate "
             "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-            "WHERE ea.user_id = ? ORDER BY ea.id",
+            f"WHERE ea.user_id = ?{_active} ORDER BY ea.id",
             (user_id,),
         ).fetchall()
         rows = list(owner_rows)
@@ -434,40 +449,33 @@ def list_email_accounts(
                 "FROM email_accounts ea "
                 "JOIN users u ON ea.user_id = u.id "
                 "JOIN account_delegates ad ON ad.account_id = ea.id "
-                "WHERE ad.user_id = ? AND ea.user_id != ? "
+                f"WHERE ad.user_id = ? AND ea.user_id != ?{_active} "
                 "ORDER BY ea.id",
                 (user_id, user_id),
             ).fetchall()
             rows.extend(delegate_rows)
     else:
+        _active_where = " WHERE COALESCE(ea.is_active, 1) = 1" if active_only else ""
         rows = conn.execute(
             "SELECT ea.*, u.email AS owner_email, u.name AS owner_name, "
             "       0 AS is_delegate "
             "FROM email_accounts ea JOIN users u ON ea.user_id = u.id "
-            "ORDER BY u.email, ea.id",
+            f"{_active_where} ORDER BY u.email, ea.id",
         ).fetchall()
     result = []
     for r in rows:
         d = dict(r)
         cfg = _apply_account_config_back_compat(
-            json.loads(d.pop("config_json", "{}")),
+            load_json_col(d.pop("config_json", "{}"), default={}),
         )
         cfg = apply_ingestion_back_compat(conn, d["id"], d["provider_type"], cfg)
         d["config"] = cfg
-        # Parse the alias list once on read. Stored as a JSON array of
-        # ``{"address","label"}`` dicts; malformed values fall back to
-        # an empty list so a corrupt row doesn't blow up the whole
-        # /accounts page render. Pre-aliases-column rows (legacy DBs
-        # before v10) surface as missing keys in the dict_factory
-        # output — also coerce to empty list.
-        raw_aliases = d.pop("aliases_json", "[]") or "[]"
-        try:
-            parsed_aliases = json.loads(raw_aliases)
-        except (TypeError, ValueError):
-            parsed_aliases = []
-        if not isinstance(parsed_aliases, list):
-            parsed_aliases = []
-        d["aliases"] = parsed_aliases
+        # Parse the alias list once on read (census  SSOT). Stored as
+        # a JSON array of ``{"address","label"}`` dicts; a malformed/NULL
+        # column degrades to ``[]`` so a corrupt row doesn't blow up the
+        # /accounts page render. Pre-aliases-column legacy rows (pre-v10)
+        # surface as a missing key → ``"[]"`` default → ``[]``.
+        d["aliases"] = load_json_col(d.pop("aliases_json", "[]"), default=[])
         # Synthesize the resolved email address up-front so callers
         # don't have to know the per-provider field-name dance. See
         # ``account_email`` for the resolution rules.
@@ -486,7 +494,6 @@ def add_account_delegate(
     True on first add, False if the row already exists. Raises ValueError
     if user_id == account_owner (owner is not a delegate of their own
     account)."""
-    from datetime import datetime, timezone
     owner = conn.execute(
         "SELECT user_id FROM email_accounts WHERE id = ?",
         (account_id,),
@@ -497,7 +504,7 @@ def add_account_delegate(
         raise ValueError(
             "Owner cannot be added as a delegate of their own account"
         )
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cur = conn.execute(
         "INSERT OR IGNORE INTO account_delegates "
         "(account_id, user_id, granted_by, granted_at) VALUES (?, ?, ?, ?)",
@@ -572,11 +579,49 @@ def can_manage_account(
     """
     if not user or not acct:
         return False
-    if user.get("role") == "admin":
+    # N-222b R22: fold onto the is_admin bool SSOT.
+    if is_admin(user):
         return True
     if acct.get("user_id") == user.get("id"):
         return True
     return is_account_delegate(conn, acct["id"], user["id"])
+
+def can_administer_account(
+    conn: sqlite3.Connection,
+    user: dict | None,
+    acct: dict | None,
+) -> bool:
+    """Authz gate for SENSITIVE per-account operations — the HIPAA-flag
+    flip, account deletion, and delegate grant/revoke. True when:
+
+    * ``user`` has admin role, OR
+    * ``user`` is the account owner.
+
+    Deliberately STRICTER than :func:`can_manage_account`: **a delegate is
+    NOT an administrator.** A delegate may run the account (manage) but must
+    never escalate (grant/revoke further delegation), flip the HIPAA flag,
+    or destroy the account — exactly the carve-out :func:`can_manage_account`
+    documents ("Sensitive operations … bypass this and check admin/owner
+    directly — delegates intentionally cannot escalate or destroy the
+    account"). This is the SSOT for the ``owner-or-admin, no-delegate``
+    decision that was previously inlined as
+    ``acct["user_id"] == user["id"] or is_admin`` across the sensitive-op
+    handlers (divergence census 2026-06-11). Using :func:`can_manage_account`
+    for any of these ops would silently let a delegate escalate — the
+    actuator pin (``tests/test_account_administer_gate_pin.py``) forbids it.
+
+    ``conn`` is unused today (the role+owner decision needs no DB lookup) but
+    kept for signature-parity with :func:`can_manage_account`, so the two
+    gates are mechanically interchangeable at call sites and a future
+    ``account_admins`` table can extend the decision here alone without
+    touching every caller.
+    """
+    if not user or not acct:
+        return False
+    # N-222b R22: fold onto the is_admin bool SSOT.
+    if is_admin(user):
+        return True
+    return acct.get("user_id") == user.get("id")
 
 def get_email_account(conn: sqlite3.Connection, account_id: int) -> dict | None:
     """Get a single email account by ID."""
@@ -591,18 +636,12 @@ def get_email_account(conn: sqlite3.Connection, account_id: int) -> dict | None:
         return None
     d = dict(row)
     cfg = _apply_account_config_back_compat(
-        json.loads(d.pop("config_json", "{}")),
+        load_json_col(d.pop("config_json", "{}"), default={}),
     )
     cfg = apply_ingestion_back_compat(conn, d["id"], d["provider_type"], cfg)
     d["config"] = cfg
-    raw_aliases = d.pop("aliases_json", "[]") or "[]"
-    try:
-        parsed_aliases = json.loads(raw_aliases)
-    except (TypeError, ValueError):
-        parsed_aliases = []
-    if not isinstance(parsed_aliases, list):
-        parsed_aliases = []
-    d["aliases"] = parsed_aliases
+    # census  SSOT — corrupt/NULL aliases column degrades to [].
+    d["aliases"] = load_json_col(d.pop("aliases_json", "[]"), default=[])
     d["email_address"] = account_email(d)
     return d
 
@@ -637,9 +676,8 @@ def create_email_account(
     the monitoring system alerts on the homelab monitoring path.
     """
     import json
-    from datetime import datetime, timezone
     from email_triage.triage_logging import is_hipaa_mode
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     system_hipaa = is_hipaa_mode()
     if hipaa is None:
         hipaa = system_hipaa
@@ -650,12 +688,36 @@ def create_email_account(
         " created_under_system_hipaa, is_active, "
         " created_at, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (user_id, name, provider_type, json.dumps(config),
+        (user_id, name, provider_type, dump_json_col(config),
          int(bool(hipaa)), created_under, int(bool(is_active)),
          now, now),
     )
     conn.commit()
     return cursor.lastrowid
+
+
+def account_is_active(conn: sqlite3.Connection, account_id: int) -> bool:
+    """Cheap single-column read of an account's ``is_active`` flag.
+
+    Used by the IMAP IDLE watcher's per-message fail-closed re-check
+    (Loop-5 census) — a full ``get_email_account`` would JOIN users +
+    run the config back-compat shim on a hot path. Fail-closed default:
+    a vanished account (no row) reads False (stop ingesting); a row with
+    a NULL/absent column reads as active (the column is NOT NULL DEFAULT
+    1, so this only matters for a corrupt row, and pausing-everyone on a
+    NULL would be worse than the rare corrupt-row over-run).
+    """
+    row = conn.execute(
+        "SELECT is_active FROM email_accounts WHERE id = ?",
+        (account_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    val = row[0]
+    if val is None:
+        return True
+    return bool(val)
+
 
 @db_write
 def set_account_active(
@@ -672,17 +734,118 @@ def set_account_active(
 
     Returns True when a row was updated.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "UPDATE email_accounts SET is_active = ?, updated_at = ? "
         "WHERE id = ?",
         (int(bool(active)), now, account_id),
     )
     conn.commit()
-    return cursor.rowcount > 0
+    ok = cursor.rowcount > 0
+    if ok:
+        #  R32 (census wf_56d1585d 2026-07-09 MED-UX) — flush the
+        # 5-min-TTL provider-labels cache so the picker doesn't serve
+        # stale entries for a paused/re-enabled account. Sibling of the
+        # delete_email_account invalidator at line 1318. Best-effort per
+        # N-294 R30 (observable failure, not silent).
+        try:
+            from email_triage.providers.provider_labels import (
+                invalidate_cache_for_account,
+            )
+            invalidate_cache_for_account(int(account_id))
+        except Exception as _n322_e:
+            from email_triage.triage_logging import get_logger as _gl
+            _gl(__name__).debug(
+                "N-322 R32: provider_labels invalidate skipped after "
+                "set_account_active(account_id=%d): %s",
+                account_id, _n322_e,
+            )
+    return ok
 
 @db_write
+def _hipaa_flip_on_cascade(
+    conn: sqlite3.Connection,
+    account_id: int,
+    actor_id: int | None = None,
+) -> dict[str, Any]:
+    """N-262 R26 — cascade side-effects on a HIPAA 0→1 flip.
+
+    Per-field semantics (operator-decided 2026-07-03 during the R26
+    cascade sweep):
+
+    * ``auto_scan_enabled`` → **force-OFF**. Auto-scanning under HIPAA
+      is a §164.502(a) risk — fail-closed on flip. Operator can
+      re-enable knowing HIPAA is on; the UI carries a warning banner
+      at the flip surface communicating this cascade.
+    * ``style_alias_mode_enabled`` → **leave-as-is**. Existing style-
+      mine PHI-scrub handles the PHI-derived-identity concern.
+    * ``calendar_surrogate_account_id`` → **leave-as-is**. The
+      resolver at ``web/calendars.py:318`` already refuses if EITHER
+      account is HIPAA (bidirectional gate).
+    * calendar ``api`` role → **force-downgrade to viewer + audit
+      event**. The per-request ``HIPAA_RESTRICTED_ROLES`` gate is
+      belt-and-braces at read time; proactively downgrade the
+      persisted role too so the account can't hit the request-time
+      block. Actual downgrade is DEFERRED — the api-role persistence
+      path is complex; a follow-up commit lands the calendar-role
+      strip once the persistence seam is fully mapped.
+    * ``style_knobs_hipaa_allow`` → **leave-as-is**. Operator's
+      explicit opt-in; don't unwind it on flip.
+    * ``style_profile`` → **leave-as-is**. Read-time PHI-scrub
+      handles the pre-HIPAA-signal concern.
+
+    Called AFTER the flag flip UPDATE + audit event write, inside the
+    SAME transaction. Returns a dict of {field: (before, after)}
+    describing the applied cascade so the caller can log / audit the
+    per-field decisions.
+    """
+    from email_triage.web.db import (
+        is_auto_scan_enabled_for_account,
+        set_auto_scan_enabled_for_account,
+    )
+    applied: dict[str, Any] = {}
+    acct_after_flip = get_email_account(conn, account_id)
+    if acct_after_flip is None:
+        return applied
+    # Force-OFF auto_scan_enabled if currently on.
+    if is_auto_scan_enabled_for_account(acct_after_flip):
+        set_auto_scan_enabled_for_account(conn, account_id, False)
+        applied["auto_scan_enabled"] = (True, False)
+    # N-262c R26 — calendar api-role force-downgrade. Per operator's
+    # per-field decision, any calendar carrying `roles.api = True` for
+    # this account is downgraded on the HIPAA flip (the belt-and-braces
+    # `HIPAA_RESTRICTED_ROLES` request-time gate is preserved; this
+    # proactively strips the persisted role so the account cannot ever
+    # hit the request-time block).
+    cfg = acct_after_flip.get("config") or {}
+    cals = cfg.get("calendars") if isinstance(cfg, dict) else None
+    if isinstance(cals, list):
+        api_downgrade_count = 0
+        new_cals: list[dict[str, Any]] = []
+        for cal in cals:
+            if not isinstance(cal, dict):
+                new_cals.append(cal)
+                continue
+            roles = cal.get("roles") if isinstance(cal.get("roles"), dict) else None
+            if roles and roles.get("api"):
+                # Copy-on-write so the original list stays clean if we
+                # abort. Force api=False; other roles unchanged.
+                new_roles = dict(roles)
+                new_roles["api"] = False
+                new_cal = dict(cal)
+                new_cal["roles"] = new_roles
+                new_cals.append(new_cal)
+                api_downgrade_count += 1
+            else:
+                new_cals.append(cal)
+        if api_downgrade_count > 0:
+            update_account_config_keys(conn, account_id, calendars=new_cals)
+            applied["calendar_api_role"] = (
+                f"downgraded {api_downgrade_count} calendar(s)"
+            )
+    return applied
+
+
 def set_account_hipaa(
     conn: sqlite3.Connection,
     account_id: int,
@@ -696,6 +859,11 @@ def set_account_hipaa(
     HIPAA was on AND system HIPAA is still on, the flag cannot be
     turned off.  Raises ``PermissionError`` in that case.  The flip
     and the boundary-event write happen in a single transaction.
+
+    N-262 R26 — on a 0→1 transition, ``_hipaa_flip_on_cascade`` runs
+    inside the same transaction to force-off derived-state fields
+    that would otherwise silently continue to permit non-HIPAA-safe
+    processing (see helper docstring for the per-field decisions).
 
     Returns the refreshed account dict.
     """
@@ -716,8 +884,7 @@ def set_account_hipaa(
             "for an account that was created under system HIPAA."
         )
 
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     direction = "on" if hipaa else "off"
     scope = f"account:{account_id}"
     try:
@@ -726,11 +893,38 @@ def set_account_hipaa(
             "UPDATE email_accounts SET hipaa = ?, updated_at = ? WHERE id = ?",
             (int(bool(hipaa)), now, account_id),
         )
-        conn.execute(
-            "INSERT INTO hipaa_boundary_events "
-            "(ts, scope, direction, actor_id, reason) VALUES (?, ?, ?, ?, ?)",
-            (now, scope, direction, actor_id, reason),
-        )
+        #  — chained audit write via the SSOT (the SECOND writer of this
+        # table; record_hipaa_boundary in db/audit.py is the first). Txn-aware:
+        # NO commit here — the explicit COMMIT below keeps the hipaa flag flip +
+        # the boundary-event row atomic. Imported locally to avoid any cycle.
+        from email_triage.db.audit import _chain_insert
+        _chain_insert(conn, "hipaa_boundary_events", {
+            "ts": now,
+            "scope": scope,
+            "direction": direction,
+            "actor_id": actor_id,
+            "reason": reason,
+        })
+        # N-262 R26 — cascade side-effects on a 0→1 transition (fail-
+        # closed HIPAA posture). Runs inside the same transaction; a
+        # cascade failure rolls back the flag flip too. The 1→0
+        # direction has no cascade (revealing pre-existing settings
+        # is the operator's explicit choice).
+        cascade: dict[str, Any] = {}
+        if hipaa and not current:
+            cascade = _hipaa_flip_on_cascade(conn, account_id, actor_id=actor_id)
+            if cascade:
+                _chain_insert(conn, "hipaa_boundary_events", {
+                    "ts": now,
+                    "scope": scope,
+                    "direction": "cascade",
+                    "actor_id": actor_id,
+                    "reason": (
+                        "0->1 cascade: " + ", ".join(
+                            f"{k}=off" for k in cascade
+                        )
+                    ),
+                })
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -746,17 +940,103 @@ def update_email_account(
     config: dict,
     is_active: bool = True,
 ) -> bool:
-    """Update an email account. Returns True if updated."""
+    """Update an email account. Returns True if updated.
+
+    N-280 R29: on-config-change, sweep the per-mailbox settings that
+    the old config's mailbox list minted but the new config's list
+    dropped (`watch_hwm:<id>:mailbox:<name>`, `mailbox_routes:<id>:
+    <mailbox>`). Otherwise those settings orphan forever — the
+    census R29 #7 finding.
+    """
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    # Read OLD config BEFORE the UPDATE so we can compute the removed-
+    # mailbox delta. Failure to read = fall through to the UPDATE (best-
+    # effort orphan cleanup; the account update itself must not block).
+    removed_mailboxes: set[str] = set()
+    try:
+        old_row = conn.execute(
+            "SELECT config_json FROM email_accounts WHERE id = ?", (account_id,),
+        ).fetchone()
+        if old_row is not None:
+            # N-296 R30 (CI-red fix-forward on N-280): route through
+            # the `row_get` SSOT — the N-234 hasattr ratchet caught
+            # the bare-hasattr I hand-rolled here + fired at
+            # baseline 81→82.
+            from email_triage.db._helpers import load_json_col, row_get
+            old_cfg_raw = row_get(old_row, "config_json", 0)
+            if old_cfg_raw:
+                # N-309 R30 (CI-red fix-forward + tranche  batch
+                # A DB-SME + DA panel): route the JSON-col decode
+                # through the `load_json_col` SSOT — pin
+                # `test_json_col_decode_pin` census  fires on the
+                # bare `json.loads` (corrupt column → 500). SSOT
+                # returns `{}` on corrupt so the orphan-sweep degrades
+                # to "no mailboxes removed" instead of a bare 500.
+                old_cfg = load_json_col(old_cfg_raw, default={})
+                old_mailboxes = set(old_cfg.get("mailboxes") or [])
+                new_mailboxes = set(config.get("mailboxes") or [])
+                removed_mailboxes = old_mailboxes - new_mailboxes
+    except Exception as _n309_e:
+        # N-309 R30: DA flagged the pre-fix broad `except: pass` as
+        # a silent-swallow that would hide a bug in the OLD-read /
+        # JSON decode from any forensic review. Route to `.debug`
+        # per N-294 pattern (silent-swallow → debug log at 4
+        # provider_labels sites, same session). Best-effort orphan
+        # sweep MUST still not block the parent UPDATE, so we don't
+        # re-raise — but the observability is now there.
+        from email_triage.triage_logging import get_logger as _n309_gl
+        _n309_gl("db.accounts").debug(
+            "N-280 orphan-mailbox sweep: OLD config read/decode failed",
+            account_id=account_id,
+            error=type(_n309_e).__name__,
+        )
+
+    now = now_utc_iso()
     cursor = conn.execute(
         "UPDATE email_accounts SET name = ?, provider_type = ?, config_json = ?, "
         "is_active = ?, updated_at = ? WHERE id = ?",
-        (name, provider_type, json.dumps(config), int(is_active), now, account_id),
+        (name, provider_type, dump_json_col(config), int(is_active), now, account_id),
     )
+    ok = cursor.rowcount > 0
+    # N-280 R29: per-removed-mailbox settings sweep. Bidirectional PD#18
+    # — mint a key when a mailbox is added, delete the key when it's
+    # removed. Without this, `watch_hwm:<id>:mailbox:<removed>` +
+    # `mailbox_routes:<id>:<removed>` orphan across the update boundary.
+    if ok and removed_mailboxes:
+        try:
+            from email_triage.web.db import delete_setting
+            for mb in removed_mailboxes:
+                # watch_hwm
+                delete_setting(conn, f"watch_hwm:{account_id}:mailbox:{mb}")
+                # mailbox_routes
+                delete_setting(conn, f"mailbox_routes:{account_id}:{mb}")
+        except Exception:
+            # Best-effort: the update already committed. A cleanup miss
+            # here means the orphan will re-appear until manually
+            # cleaned — surface via the audit log rather than block
+            # the update.
+            pass
     conn.commit()
-    return cursor.rowcount > 0
+    if ok:
+        #  R32 (census wf_56d1585d 2026-07-09 MED-UX) — flush the
+        # 5-min-TTL provider-labels cache so the picker doesn't serve
+        # stale entries after name/provider_type/config change.
+        # Sibling of the invalidator at update_email_account_config:1025
+        # + set_account_active + delete_email_account. Best-effort per
+        # N-294 R30 (observable failure, not silent).
+        try:
+            from email_triage.providers.provider_labels import (
+                invalidate_cache_for_account,
+            )
+            invalidate_cache_for_account(int(account_id))
+        except Exception as _n322_e:
+            from email_triage.triage_logging import get_logger as _gl
+            _gl(__name__).debug(
+                "N-322 R32: provider_labels invalidate skipped after "
+                "update_email_account(account_id=%d): %s",
+                account_id, _n322_e,
+            )
+    return ok
 
 @db_write
 def update_email_account_config(
@@ -766,13 +1046,21 @@ def update_email_account_config(
     columns. Used by the history-poll loop to clear a
     ``poll_interval_override`` on push↔poll transitions."""
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "UPDATE email_accounts SET config_json = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(config), now, account_id),
+        (dump_json_col(config), now, account_id),
     )
     conn.commit()
+    # N-348b R31 (2026-07-04, census follow-up on N-348 partial): bust
+    # provider_labels cache — any config_json write may have changed
+    # imap.host / smtp.host / oauth-scope-adjacent knobs the
+    # provider_labels cache-key is sensitive to. Unconditional bust
+    # keeps the SSOT close in the seam without per-key inspection.
+    from email_triage.providers.provider_labels import (
+        invalidate_cache_for_account,
+    )
+    invalidate_cache_for_account(account_id)
     return cursor.rowcount > 0
 
 @db_write
@@ -815,28 +1103,38 @@ def update_account_config_keys(
         ``account_id`` does not exist.
     """
     import json
-    from datetime import datetime, timezone
 
     # BEGIN IMMEDIATE acquires the write lock up front so a concurrent
     # reader-then-writer can't slot in between our SELECT and UPDATE.
     # SQLite's default deferred mode would hit "database is locked"
     # under contention but only after the SELECT — too late. We fold
     # the read + write into one transaction explicitly.
-    conn.execute("BEGIN IMMEDIATE")
+    #
+    # N-342 R31 (2026-07-04 CI-red fix-forward from Phase-4 DA finding):
+    # detect an already-open outer transaction so a caller that owns the
+    # BEGIN (e.g. ``set_account_hipaa`` + ``_hipaa_flip_on_cascade`` on
+    # accounts with ``auto_scan_enabled=True`` or a calendar carrying
+    # the ``api`` role) doesn't trip ``sqlite3.OperationalError: cannot
+    # start a transaction within a transaction``. When nested we skip
+    # our OWN BEGIN/COMMIT/ROLLBACK and let the caller's outer txn own
+    # the atomicity — the read-modify-write is still safe because the
+    # outer BEGIN already holds the write lock. Raises propagate to the
+    # caller's rollback path unchanged.
+    nested = bool(getattr(conn, "in_transaction", False))
+    if not nested:
+        conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
             "SELECT config_json FROM email_accounts WHERE id = ?",
             (account_id,),
         ).fetchone()
         if row is None:
-            conn.execute("ROLLBACK")
+            if not nested:
+                conn.execute("ROLLBACK")
             return False
-        try:
-            current = json.loads(row[0] or "{}")
-        except (TypeError, ValueError):
-            current = {}
-        if not isinstance(current, dict):
-            current = {}
+        # census  SSOT — corrupt config_json degrades to {} so this
+        # read-modify-write doesn't crash inside the BEGIN IMMEDIATE txn.
+        current = load_json_col(row[0], default={})
 
         merged = dict(current)
         changed_keys: list[str] = []
@@ -851,21 +1149,24 @@ def update_account_config_keys(
                     changed_keys.append(key)
 
         if not changed_keys:
-            conn.execute("ROLLBACK")
+            if not nested:
+                conn.execute("ROLLBACK")
             return True  # No-op write — row exists, nothing to change.
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = now_utc_iso()
         conn.execute(
             "UPDATE email_accounts "
             "SET config_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(merged), now, account_id),
+            (dump_json_col(merged), now, account_id),
         )
-        conn.execute("COMMIT")
+        if not nested:
+            conn.execute("COMMIT")
     except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
+        if not nested:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
         raise
 
     # Structured-log emission AFTER the commit so a log failure
@@ -881,8 +1182,9 @@ def update_account_config_keys(
             "WHERE ea.id = ?",
             (account_id,),
         ).fetchone()
-        import logging
-        logger = logging.getLogger("email_triage.web.db")
+        # N-242b R24: TriageLogger SSOT.
+        from email_triage.triage_logging import get_logger
+        logger = get_logger("web.db")
         log_extra: dict[str, Any] = {"account_id": account_id}
         if meta is not None:
             d = dict(meta)
@@ -895,12 +1197,25 @@ def update_account_config_keys(
         log_extra["changed_keys"] = sorted(changed_keys)
         logger.info(
             "Account config keys updated",
-            extra={"_extra": log_extra},
+            **log_extra,  # N-242b R24: TriageLogger takes kwargs, not extra=
         )
     except Exception:
         # Log emission must never sink the call — the write already
         # landed. Best-effort only.
         pass
+    # N-348c R31 (2026-07-04 census follow-up): bust provider_labels
+    # cache when config_json keys changed — any patched key may have
+    # touched imap.host / smtp.host / oauth-scope-adjacent config the
+    # cache-key depends on. Gated on `changed_keys` so a no-op call
+    # doesn't churn the cache. Best-effort — never sink the caller.
+    if changed_keys:
+        try:
+            from email_triage.providers.provider_labels import (
+                invalidate_cache_for_account,
+            )
+            invalidate_cache_for_account(account_id)
+        except Exception:
+            pass
     return True
 
 class AliasValidationError(ValueError):
@@ -944,7 +1259,7 @@ def normalize_aliases(
     Raises :class:`AliasValidationError` on first violation with a
     plain-language reason. Returns the cleaned list on success.
     """
-    norm_primary = (primary or "").strip().lower()
+    norm_primary = canonical_email(primary or "")
     seen: set[str] = set()
     out: list[dict] = []
     for entry in raw or []:
@@ -952,7 +1267,7 @@ def normalize_aliases(
             raise AliasValidationError(
                 "Each additional address must be a name/value entry."
             )
-        addr = str(entry.get("address") or "").strip().lower()
+        addr = canonical_email(str(entry.get("address") or ""))
         label = str(entry.get("label") or "").strip()
         if not addr:
             raise AliasValidationError(
@@ -989,22 +1304,357 @@ def update_email_account_aliases(
     was updated.
     """
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "UPDATE email_accounts SET aliases_json = ?, updated_at = ? "
         "WHERE id = ?",
-        (json.dumps(aliases), now, account_id),
+        (dump_json_col(aliases), now, account_id),
     )
     conn.commit()
     return cursor.rowcount > 0
 
 @db_write
 def delete_email_account(conn: sqlite3.Connection, account_id: int) -> bool:
-    """Delete an email account. Returns True if deleted."""
-    cursor = conn.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
+    """N-275 R28: SOFT-deactivate the email account. Returns True if the
+    account existed + was deactivated.
+
+    OPERATOR DESIGN RULING (2026-07-03, punch ): "No delete, ever.
+    Mark as disabled and hide from any picker not in the /admin
+    section." A hard `DELETE FROM email_accounts` cascade-destroys
+    the account's `hipaa_access_events` rows (`account_id ON DELETE
+    CASCADE`) — the SAME §164.312(b)/(c)(1) tamper-evident audit
+    destruction the  ruling forbade for users. This function used
+    to hard-delete; now it soft-deactivates by flipping `is_active=0`
+    (the "disabled" state operator ruling references) so:
+      - The row + ALL its `hipaa_access_events` history are RETAINED.
+      - Account pickers filtering `active_only=True` (the default
+        outside `/admin`) drop it invisibly.
+      - `/admin` views see the deactivated row and can re-enable it.
+
+    The primitive KEEPS its `delete_email_account` name for backwards
+    compat + so the pin `test_account_delete_purge_pin` continues to
+    guard the "delete-shape ⇒ pair with purge" invariant. Credentials
+    purge is still the caller's responsibility (via
+    `WatcherManager.apply_account_deleted` → `purge_account_local_
+    state`) — this function does NOT purge.
+    """
+    now = now_utc_iso()
+    cursor = conn.execute(
+        "UPDATE email_accounts SET is_active = 0, updated_at = ? "
+        "WHERE id = ? AND COALESCE(is_active, 1) = 1",
+        (now, account_id),
+    )
     conn.commit()
-    return cursor.rowcount > 0
+    ok = cursor.rowcount > 0
+    if ok:
+        # N-247 R24: flush the 5-min-TTL provider-labels cache so the
+        # picker doesn't serve stale labels for a deactivated account.
+        try:
+            from email_triage.providers.provider_labels import (
+                invalidate_cache_for_account,
+            )
+            invalidate_cache_for_account(int(account_id))
+        except Exception as _n271_e:  # N-294 R30 (HIPAA-SME follow-up)
+            # Best-effort still, but the failure is now observable —
+            # a broken invalidator SSOT (e.g. new required arg) previously
+            # silently deleted the invalidation across all 4 sites.
+            from email_triage.triage_logging import get_logger as _gl
+            _gl(__name__).debug(
+                "provider_labels invalidate best-effort failed",
+                extra={"error": type(_n271_e).__name__, "account_id": account_id},
+            )
+    return ok
+
+
+def purge_account_local_state(
+    conn: sqlite3.Connection,
+    account_id: int,
+    secrets=None,
+) -> dict:
+    """Purge ALL account-scoped persistent state (settings + secrets).
+
+    This is the L1 §164.310(d)(2)(i) media-disposal SSOT for per-account
+    credential/state cleanup.  It MUST be called (via
+    :func:`WatcherManager.apply_account_deleted`) before or as part of
+    deleting an ``email_accounts`` row.  It does NOT delete the row
+    itself — the caller does that, or the FK CASCADE on a user-delete does.
+
+    Three stores are purged:
+
+    1. **Settings table** — every key scheme keyed by ``account_id``,
+       via :func:`email_triage.web.settings_keys.delete_account_settings`
+       (the pre-existing SSOT for the ``settings`` table sweep).
+
+    2. **Secrets store** — account-scoped provider credentials:
+       * ``ACCOUNT_{id}_IMAP_PASSWORD``
+       * ``ACCOUNT_{id}_O365_SECRET``
+       * ``ACCOUNT_{id}_GMAIL_REFRESH_TOKEN``
+       * ``ACCOUNT_{id}_%`` LIKE prefix — forward-compat catch; any
+         future per-account secret that obeys the ``ACCOUNT_{id}_``
+         naming convention is removed without a code change.
+       * ``office365_clientstate:{id}`` — Graph webhook clientState,
+         stored in secrets (not settings; see docstring in
+         ``settings_keys.office365_clientstate``).  It is purged HERE via
+         the secrets path; it was REMOVED from ``_ACCOUNT_KEY_CATALOG``
+         (run17 ) because a settings-sweep entry was a no-op against the
+         settings table (the value never lives there) and falsely implied
+         coverage.  This call is the real — and only — disposal path.
+
+    3. **On-disk per-account MSAL token cache** (run18 #1) —
+       ``./data/msal_cache_<id>.json`` holds PLAINTEXT O365 OAuth
+       access+refresh tokens (written 0o600 but UNENCRYPTED, OUTSIDE the
+       SQLCipher DB).  It is the ONLY purged store that lives on the
+       FILESYSTEM rather than in the DB; the path is derived from the SSOT
+       ``providers.factory.msal_cache_path_for_account`` so the unlink can
+       never diverge from the factory writer.  This is the §164.310(d)(2)(i)
+       disposal for the most-exposed token copy — without it the token file
+       SURVIVED account deletion (and stayed redeemable).
+
+    Key derivation for the ACCOUNT_ family delegates entirely to
+    :func:`email_triage.providers.traits.secret_key_for_account` (the
+    SSOT).  The LIKE sweep catches any key the SSOT constructs, so
+    adding a new provider key to the SSOT automatically catches it here
+    without a separate code change.
+
+    Args:
+        conn:       A live DB connection (used only for the settings sweep).
+        account_id: The account being deleted.
+        secrets:    The ``DbSecrets`` provider (or any compatible object
+                    with ``.delete(key) -> bool`` and ``.list_keys() ->
+                    list[str]``).  When ``None`` the secrets sweep is
+                    skipped (e.g. unit-test environments that need to
+                    verify the settings sweep in isolation; the caller
+                    MUST pass secrets in production).
+
+    Returns a dict with counts::
+
+        {
+            "settings_deleted": int,
+            "secrets_deleted": int,
+            "phi_rows_deleted": int,
+            "msal_cache_deleted": int,  # 0/1 — the on-disk token-cache file
+            "account_id": int,
+        }
+
+    FAIL-CLOSED contract (PD#8): a secrets ``delete()`` that RAISES — OR a real
+    on-disk MSAL-cache ``unlink()`` error (perms / FS; NOT a "file absent",
+    which ``missing_ok=True`` swallows) — is a real backend error (locked store
+    / decrypt failure / undeletable credential file; NOT a "key absent", which
+    returns False). It is collected (in ``secret_failures``) and RE-RAISED at
+    the end, so the caller refuses the row delete rather than orphan
+    credentials. The settings + PHI-table deletes that already committed are
+    idempotent on the operator's retry.
+
+    Also purged (census N-64 SME panel — the builder's original enumeration was
+    INCOMPLETE; these share the same "an account goes away" root cause +
+    §164.310(d)(2)(i) disposal obligation):
+      * ``watch_{watch_id}_hmac`` — per-watch HMAC signing secrets, keyed by
+        WATCH id (not ``ACCOUNT_{id}_*``) so the prefix sweep misses them; the
+        ``email_watches`` rows cascade with the account but their secrets do not.
+      * ``hipaa_style_descriptors`` + ``per_contact_style_hipaa`` rows — PHI-
+        derived per-account style data. NOTE (verify-don't-accept): these DO
+        have a table-level FK ``ON DELETE CASCADE`` to ``email_accounts`` and
+        ``PRAGMA foreign_keys=ON`` makes it fire, so the cascade is the primary
+        disposal; this explicit DELETE is belt-and-braces defense-in-depth.
+    """
+    # N-242 R24: TriageLogger SSOT — the account-delete cascade is
+    # §164.310(d) load-bearing; a raw `logging.getLogger` fork this
+    # sensitive audit outside the HMAC chain.
+    from email_triage._errfmt import fmt_exc
+    from email_triage.triage_logging import get_logger
+    _log = get_logger("db.accounts")
+
+    # ------------------------------------------------------------------
+    # 1. Settings sweep — delegate to the existing SSOT.
+    # ------------------------------------------------------------------
+    from email_triage.web.settings_keys import delete_account_settings
+    settings_deleted = delete_account_settings(conn, account_id)
+
+    # ------------------------------------------------------------------
+    # 2. Secrets sweep — provider credentials + clientstate.
+    # ------------------------------------------------------------------
+    secrets_deleted = 0
+    secret_failures: list[str] = []  # keys whose delete()/list RAISED → fail closed
+
+    def _purge_secret(key: str) -> None:
+        nonlocal secrets_deleted
+        try:
+            if secrets.delete(key):
+                secrets_deleted += 1
+        except Exception as exc:  # noqa: BLE001 — a real backend error (locked
+            # store / decrypt). NOT a "key absent" (delete returns False for
+            # that). Collect + fail closed below; never silently swallow.
+            secret_failures.append(key)
+            _log.warning(
+                "purge_account_local_state: secret delete FAILED (fail closed)",
+                extra={"account_id": account_id, "key_name": key,
+                       "error": fmt_exc(exc)},
+            )
+
+    if secrets is not None:
+        from email_triage.providers.traits import secret_key_for_account
+        from email_triage.web import settings_keys as _S
+
+        # Explicit per-provider keys via the SSOT constructor.
+        explicit = {
+            secret_key_for_account(account_id, pt)
+            for pt in ("imap", "office365", "gmail_api")
+            if secret_key_for_account(account_id, pt)
+        }
+        for sk in explicit:
+            _purge_secret(sk)
+
+        # LIKE-prefix forward-compat sweep — any future ACCOUNT_{id}_* key.
+        prefix = f"ACCOUNT_{int(account_id)}_"
+        try:
+            for k in list(secrets.list_keys()):
+                if k.startswith(prefix) and k not in explicit:
+                    _purge_secret(k)
+        except Exception as exc:  # noqa: BLE001
+            secret_failures.append("<list_keys>")
+            _log.warning(
+                "purge_account_local_state: list_keys FAILED (LIKE sweep "
+                "skipped; fail closed)",
+                extra={"account_id": account_id, "error": fmt_exc(exc)},
+            )
+
+        # Graph webhook clientState — in secrets, not settings.
+        _purge_secret(_S.office365_clientstate(account_id))
+
+        # Per-WATCH HMAC signing secrets `watch_{watch_id}_hmac` (census N-64
+        # DA must-fix): keyed by WATCH id, not ACCOUNT_{id}_*, so the prefix
+        # sweep misses them. The email_watches rows cascade with the account
+        # but their secrets do not — enumerate the account's watches NOW
+        # (before the cascade) and purge each watch's key.
+        from email_triage.web.email_watches import hmac_secret_key
+        try:
+            watch_ids = [
+                r[0] for r in conn.execute(
+                    "SELECT watch_id FROM email_watches WHERE account_id = ?",
+                    (int(account_id),),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            watch_ids = []  # table absent (older schema)
+        for wid in watch_ids:
+            _purge_secret(hmac_secret_key(wid))  # SSOT key: watch_{id}_hmac
+
+    # ------------------------------------------------------------------
+    # 2b. On-disk per-account MSAL token cache — §164.310(d)(2)(i) MEDIA
+    #     DISPOSAL (run18 #1). ``./data/msal_cache_<id>.json`` persists
+    #     PLAINTEXT O365 OAuth access+refresh tokens (providers/office365.py
+    #     :_save_cache — atomic 0o600 but UNENCRYPTED, OUTSIDE the SQLCipher
+    #     DB), so it lives on the FILESYSTEM, not in any DB-backed store the
+    #     sweeps above touch. Without THIS unlink the MORE-exposed token copy
+    #     SURVIVES the purge chartered to erase it (and stays redeemable — the
+    #     install-level client_secret persists). Runs UNCONDITIONALLY (not
+    #     gated on ``secrets``) since it is a filesystem op. Path via the
+    #     factory SSOT so the unlink can NEVER disagree with the writer.
+    # ------------------------------------------------------------------
+    # N-245b R24: route through the per-account artifact REGISTRY funnel
+    # (`providers/_ondisk_artifacts::dispose_all_per_account_artifacts`)
+    # so a NEW per-account artifact inherits the disposal without editing
+    # this handler. Keep the path-derivation reference for the error-msg
+    # sentinel so the fail-closed audit reads the actual filename.
+    from email_triage.providers._ondisk_artifacts import (
+        dispose_all_per_account_artifacts,
+    )
+    from email_triage.providers.factory import msal_cache_path_for_account
+    msal_cache_deleted = 0
+    _cache_path = msal_cache_path_for_account(account_id)  # kept for the error-msg sentinel
+    try:
+        msal_cache_deleted = dispose_all_per_account_artifacts(account_id)
+    except OSError as exc:  # a REAL unlink error (perms / FS),
+        # NOT a "file absent" (missing_ok=True already swallows that). A token
+        # file we could not delete is an orphaned PLAINTEXT credential, so
+        # collect + fail CLOSED below EXACTLY like the secrets sweep (the
+        # ``<...>`` sentinel mirrors the ``<list_keys>`` entry above; the final
+        # ``if secret_failures: raise`` gate then refuses to report success).
+        secret_failures.append(f"<msal_cache:{_cache_path}>")
+        _log.warning(
+            "purge_account_local_state: MSAL token-cache unlink FAILED "
+            "(fail closed)",
+            extra={"account_id": account_id, "path": str(_cache_path),
+                   "error": fmt_exc(exc)},
+        )
+
+    # ------------------------------------------------------------------
+    # 3. PHI-derived per-account style tables — DEFENSE-IN-DEPTH disposal.
+    #    VERIFY-DON'T-ACCEPT (census N-64): the SME panel claimed these have NO
+    #    FK and are orphaned; the actual schema (migrations.py) gives BOTH a
+    #    table-level ``FOREIGN KEY (account_id) REFERENCES email_accounts(id)
+    #    ON DELETE CASCADE``, and with ``PRAGMA foreign_keys=ON`` (set in
+    #    db.py:862 / _engine.py) the rows DO cascade on the row delete (verified
+    #    at runtime: 1->0). So the primary disposal is the FK cascade; this
+    #    explicit DELETE is belt-and-braces — it guarantees §164.310(d)(2)(i)
+    #    PHI disposal even if FK enforcement is ever disabled or the cascade
+    #    removed, and runs BEFORE the row delete so it is idempotent with it.
+    # ------------------------------------------------------------------
+    phi_rows_deleted = 0
+    for tbl in ("hipaa_style_descriptors", "per_contact_style_hipaa"):
+        try:
+            cur = conn.execute(
+                f"DELETE FROM {tbl} WHERE account_id = ?", (int(account_id),),
+            )
+            phi_rows_deleted += cur.rowcount or 0
+        except sqlite3.OperationalError:
+            pass  # table absent (older schema) — defensive
+    conn.commit()
+
+    # FAIL CLOSED (PD#8): if ANY secret delete (or list_keys) RAISED, the
+    # credentials may still be on disk — raise so the caller refuses the row
+    # delete and the operator retries (the committed settings + PHI deletes are
+    # idempotent on retry). A delete() returning False (key absent) is NOT a
+    # failure. This is the must-happen §164.310(d)(2)(i) guarantee.
+    if secret_failures:
+        raise RuntimeError(
+            f"purge_account_local_state: {len(secret_failures)} secret(s) "
+            f"failed to purge for account {account_id} ({secret_failures}); "
+            f"refusing to report success so the caller fails closed and does "
+            f"not orphan credentials."
+        )
+
+    # N-271 R28: PROVIDER-LABELS CACHE INVALIDATION FUNNEL. Credentials
+    # for this account are now purged; the 5-min-TTL label cache
+    # (`providers/provider_labels.py`) was populated UNDER those
+    # now-gone credentials + must NOT continue serving stale labels
+    # for the account until TTL expiry. Route through the SSOT + fail-
+    # open (the purge already succeeded — a cache-flush failure is
+    # best-effort). Sibling to N-247 which wired it into
+    # `delete_email_account`; R28 census #2 flagged this + the OAuth
+    # completion sites as the un-wired siblings.
+    try:
+        from email_triage.providers.provider_labels import (
+            invalidate_cache_for_account,
+        )
+        invalidate_cache_for_account(int(account_id))
+    except Exception as _n271_e:  # N-294 R30 (HIPAA-SME follow-up)
+        # Best-effort still, but the failure is now observable —
+        # a broken invalidator SSOT (e.g. new required arg) previously
+        # silently deleted the invalidation across all 4 sites.
+        from email_triage.triage_logging import get_logger as _gl
+        _gl(__name__).debug(
+            "provider_labels invalidate best-effort failed",
+            extra={"error": type(_n271_e).__name__, "account_id": account_id},
+        )
+
+    _log.info(
+        "purge_account_local_state: purge complete",
+        extra={
+            "account_id": account_id,
+            "settings_deleted": settings_deleted,
+            "secrets_deleted": secrets_deleted,
+            "phi_rows_deleted": phi_rows_deleted,
+            "msal_cache_deleted": msal_cache_deleted,
+        },
+    )
+    return {
+        "settings_deleted": settings_deleted,
+        "secrets_deleted": secrets_deleted,
+        "phi_rows_deleted": phi_rows_deleted,
+        "msal_cache_deleted": msal_cache_deleted,
+        "account_id": account_id,
+    }
 
 def list_account_routes(conn: sqlite3.Connection, account_id: int) -> list[dict]:
     """Return all route mappings for an account."""
@@ -1017,7 +1667,7 @@ def list_account_routes(conn: sqlite3.Connection, account_id: int) -> list[dict]
     result = []
     for r in rows:
         d = dict(r)
-        d["actions"] = json.loads(d.pop("actions_json", "[]"))
+        d["actions"] = load_json_col(d.pop("actions_json", "[]"), default=[])
         result.append(d)
     return result
 
@@ -1032,7 +1682,7 @@ def get_account_route(conn: sqlite3.Connection, account_id: int, category: str) 
     if row is None:
         return None
     d = dict(row)
-    d["actions"] = json.loads(d.pop("actions_json", "[]"))
+    d["actions"] = load_json_col(d.pop("actions_json", "[]"), default=[])
     return d
 
 @db_write
@@ -1044,9 +1694,8 @@ def upsert_account_route(
 ) -> int:
     """Create or update a route mapping. Returns the row ID."""
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    actions_json = json.dumps(actions)
+    now = now_utc_iso()
+    actions_json = dump_json_col(actions)
 
     existing = conn.execute(
         "SELECT id FROM account_routes WHERE account_id = ? AND category = ?",
@@ -1160,29 +1809,30 @@ def normalise_from_address(value: str | None) -> str:
     """
     if not value:
         return ""
-    s = str(value).strip()
+    # A7 (census 2026-06-09): the bare-address extraction is the shared
+    # SSOT; this function ADDS the account-bucket canonicalization on top
+    # (Gmail-style ``+suffix`` collapse) — its distinct purpose. The SSOT
+    # already drops the display name + angle brackets and lower-cases.
+    #
+    # KNOWN EDGE (SME DA-#4, verified): the SSOT anchors on the FIRST
+    # ``<...>`` block; the prior impl used ``rfind("<")`` (LAST). They are
+    # byte-identical for every mainstream From shape (display-name,
+    # bracketed, bare, +suffix, quoted-display-name, "Last, First") — the
+    # ONLY divergence is a display name that itself contains an unescaped
+    # ``<`` (e.g. ``'"a<b" <real@x>'``), which RFC 5322 requires quoted and
+    # which providers normalize away one level before this is reached. On
+    # that pathological input the bucket key degrades; the failure mode is
+    # graceful — a wrong/no per-alias bucket falls back to the account
+    # profile (no crash, no cross-account access, no PHI surface; the bucket
+    # is style-learning sample routing, not an authz key).
+    from email_triage.mail_headers import extract_bare_address
+    s = extract_bare_address(value)
     if not s:
         return ""
-    # If a ``<addr>`` block is present, prefer its content over the
-    # display-name part. We deliberately don't try to be RFC 5322
-    # complete — the inputs are ``From:`` header values pulled from
-    # an ``EmailMessage`` that the providers have already normalised
-    # one level (display name + bare address coexisting is the
-    # mainstream shape).
-    if "<" in s and ">" in s:
-        lt = s.rfind("<")
-        gt = s.find(">", lt)
-        if lt != -1 and gt != -1 and gt > lt:
-            s = s[lt + 1: gt].strip()
-    # Drop any surrounding quotes / whitespace.
-    s = s.strip().strip('"').strip("'").strip()
-    if not s:
-        return ""
-    # Lowercase + split off the ``+suffix`` tag if present. The tag
-    # is part of the same delivery destination on Gmail-style "plus
-    # addressing" -- two captures of ``alice+work@x`` and ``alice@x``
-    # belong in the same bucket.
-    s = s.lower()
+    # Split off the ``+suffix`` tag if present. The tag is part of the
+    # same delivery destination on Gmail-style "plus addressing" --
+    # two captures of ``alice+work@x`` and ``alice@x`` belong in the
+    # same bucket.
     if "@" not in s:
         return s
     local, _, domain = s.partition("@")

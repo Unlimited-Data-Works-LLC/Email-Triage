@@ -1,0 +1,71 @@
+{# #34 P4d-ii — the clocks table + disposition actions. Self-contained in the
+   #clocks-table wrapper so an HTMX outerHTML swap (the action POSTs) replaces
+   the whole block consistently. HIPAA-minimal: label + state + days only. #}
+<div id="clocks-table">
+{% if not clocks %}
+  <article>
+    <p>No active regulatory clocks. A clock appears here when a safety-reporting
+       deadline is detected or recorded on one of your accounts.</p>
+  </article>
+{% else %}
+  <figure>
+    <table role="grid">
+      <thead>
+        <tr>
+          <th scope="col">Obligation</th>
+          <th scope="col">Account</th>
+          <th scope="col">Status</th>
+          <th scope="col">Time left</th>
+          <th scope="col">Due (UTC)</th>
+          <th scope="col">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in clocks %}
+        <tr>
+          <td>{{ c.label }}</td>
+          <td>{{ c.account_name }}</td>
+          <td>
+            {% if c.state == "breached" %}<strong>Overdue</strong>
+            {% elif c.state == "at_risk" %}Due soon
+            {% elif c.state == "running" %}Running
+            {% elif c.state == "acked" %}Acknowledged
+            {% elif c.state == "candidate" %}Possible — confirm?
+            {% else %}{{ c.state | capitalize }}{% endif %}
+          </td>
+          <td>
+            {% if c.days_left is none %}—
+            {% elif c.days_left < 0 %}{{ -c.days_left }} day(s) overdue
+            {% else %}{{ c.days_left }} day(s){% endif %}
+          </td>
+          <td>{% if c.deadline_at %}<time datetime="{{ c.deadline_at }}" data-us-datetime>{{ c.deadline_at | us_datetime }}</time>{% else %}—{% endif %}</td>
+          <td>
+            {% set tgt = {"hx-target": "#clocks-table", "hx-swap": "outerHTML"} %}
+            {% if c.state == "candidate" %}
+              <button hx-post="/clocks/{{ c.instance_id }}/confirm"
+                      hx-target="#clocks-table" hx-swap="outerHTML"
+                      class="outline">Confirm reportable</button>
+            {% endif %}
+            {% if c.state in ("running", "at_risk", "breached") %}
+              <button hx-post="/clocks/{{ c.instance_id }}/ack"
+                      hx-target="#clocks-table" hx-swap="outerHTML"
+                      class="outline secondary">Acknowledge</button>
+              <button hx-post="/clocks/{{ c.instance_id }}/submit"
+                      hx-target="#clocks-table" hx-swap="outerHTML"
+                      class="outline">Mark submitted</button>
+            {% endif %}
+            <button hx-post="/clocks/{{ c.instance_id }}/dismiss"
+                    hx-target="#clocks-table" hx-swap="outerHTML"
+                    hx-confirm="Dismiss this clock as non-reportable? This is recorded."
+                    class="outline contrast">Dismiss</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </figure>
+  <p><small>An escalating clock acts only when you have confirmed you are the
+     party who submits the report. Sponsor deadlines are shown for awareness
+     only.</small></p>
+{% endif %}
+</div>

@@ -27,10 +27,15 @@ to::
 
 The sync helper keeps its sync signature; the wrap lives at the call
 site. This was a deliberate choice — see ``feedback_root_cause_scope.md``
-for the partial-conversion rationale: this commit converts the highest-
-traffic handlers (``/health``, ``/health/detail``, ``/dashboard``) plus
-the access-audit middleware. Other handlers are flagged with
-``# TODO  async-DB migration`` so future passes know what's left.
+for the partial-conversion rationale: the initial pass converted the
+highest-traffic handlers (``/health``, ``/health/detail``, ``/dashboard``)
+plus the access-audit middleware; the remainder of the handlers were
+flagged in-code with ``# TODO  async-DB migration`` as the working
+the backlog. **#200 (2026-05-20) closed the async-DB migration** — the
+final tranche of 13 ``routers/ui/*.py`` modules was converted via the
+same ``db_call`` pattern and the ``# TODO `` markers were removed.
+This note is retained as design-history: the same wrap-at-snapshot
+pattern applies to any handler introduced from here on.
 
 Concurrency note
 ----------------
@@ -79,7 +84,8 @@ from typing import Any, Callable, TypeVar
 
 from email_triage.web.db_writelock import get_write_lock
 
-_log = logging.getLogger("email_triage.web.db_threadpool")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.db_threadpool")  # N-196b R21_4
 
 T = TypeVar("T")
 

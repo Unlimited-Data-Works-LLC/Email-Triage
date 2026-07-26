@@ -139,6 +139,31 @@ class TestGmailSearchIter:
         first_call = provider._http.request.call_args_list[0]
         assert first_call.kwargs["params"]["pageToken"] == "resume-tok-9"
 
+    async def test_filter_constrains_every_page(self):
+        """/Bug-A — a windowed bulk caller (topic back-scan) passes
+        ``filter=MailFilter``; the date constraint must ride EVERY page, not
+        just the first. The single-page ``search`` is Google-capped at 500, so
+        the back-scan MUST paginate ``search_iter`` — and every page must keep
+        the window or pages 2..N silently enumerate the whole mailbox."""
+        from datetime import datetime, timezone
+
+        from email_triage.engine.models import MailFilter
+
+        provider = _gmail_provider()
+        provider._http.request = AsyncMock(side_effect=[
+            _gmail_resp({"messages": [{"id": "a1"}], "nextPageToken": "tok1"}),
+            _gmail_resp({"messages": [{"id": "b1"}]}),
+        ])
+        mf = MailFilter(after=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+        async for _b, _c in provider.search_iter("", filter=mf):
+            pass
+
+        calls = provider._http.request.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["params"]["q"] == "after:2026/01/01"
+        assert calls[1].kwargs["params"]["q"] == "after:2026/01/01"  # page 2 too
+
 
 # ---------------------------------------------------------------------------
 # Office 365 — @odata.nextLink loop
@@ -229,6 +254,28 @@ class TestOffice365SearchIter:
         # Subsequent calls hit the absolute nextLink URL.
         assert calls[1].args[0] == next1
         assert calls[2].args[0] == next2
+
+    async def test_filter_sets_odata_filter_on_first_page(self, _inject_msal):
+        """/Bug-A — a windowed back-scan passes ``filter=MailFilter``; the
+        first page builds ``$filter`` from it (subsequent pages ride the
+        nextLink, which Graph encodes the filter into). Filter WINS over a bare
+        free-text $search."""
+        from datetime import datetime, timezone
+
+        from email_triage.engine.models import MailFilter
+
+        provider = _o365_provider()
+        provider._http.get = AsyncMock(
+            return_value=_o365_resp({"value": [{"id": "a1"}]})
+        )
+        mf = MailFilter(after=datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+        async for _b, _c in provider.search_iter("", filter=mf):
+            pass
+
+        params = provider._http.get.call_args_list[0].kwargs["params"]
+        assert params["$filter"] == "receivedDateTime ge 2026-01-01T00:00:00Z"
+        assert "$search" not in params  # structured filter wins over free-text
 
     async def test_terminates_when_no_nextlink(self, _inject_msal):
         provider = _o365_provider()

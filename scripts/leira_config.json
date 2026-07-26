@@ -1,0 +1,81 @@
+{
+  "_doc": "Tunable config for the Ollama offload stack (historical name: llm-host offload — the first inference host was llm-host). Multi-host aware as of 2026-07-02: `hosts.<name>` map + `default_host` selects the active inference endpoint. Env overrides win: OLLAMA_HOST picks which host entry to use; OLLAMA_URL / OLLAMA_MODEL / OLLAMA_TIMEOUT_S / OLLAMA_TEMPERATURE / OLLAMA_CONTEXT_TOKENS override individual fields. Legacy LEIRA_URL / LEIRA_MODEL / LEIRA_TIMEOUT_S / LEIRA_TEMPERATURE / LEIRA_CONTEXT_TOKENS still honored for backward compat (deprecated). Input-size caps are DERIVED at runtime from the model's actual context window (learned via /api/show), NOT hardcoded. Values below are RATIOS of context or per-consumer knobs. To force an absolute byte cap on any consumer, use its `*_override` key (e.g. draft.max_input_bytes_override). `think: false` (2026-07-18) — top-level Ollama /api/chat `think` field default; prepass contract is fast structured-JSON extraction, thinking never helps and can silently hang a call for the full timeout (qwen3.6:35b is a reasoning model; runs 21+22 census offload defeated for this reason — see feedback_leira_silent_fallback_wastes_offload). Direct-probe measurement: think=false = 1.5s vs 180s+ silent-hang with no field. Per-call `think=` kwarg on call_leira() still overrides; env OLLAMA_THINK/LEIRA_THINK still wins.",
+  "default_host": "llm-host",
+  "hosts": {
+    "llm-host": {
+      "url": "http://llm-host:11434/api/chat",
+      "model": "qwen3.6:35b",
+      "context_tokens_fallback": 8192,
+      "notes": "Primary GPU host (RTX 3090, 24GB); qwen3.6:35b prefer-loaded per ollama-keepalive cron"
+    }
+  },
+  "url": "http://llm-host:11434/api/chat",
+  "model": "qwen3.6:35b",
+  "context_tokens_fallback": 8192,
+  "timeout_s": 300,
+  "temperature": 0.1,
+  "max_retries": 3,
+  "base_backoff_s": 1.0,
+  "cooldown_on_fail_s": 300,
+  "failover_hosts": [],
+  "strategy": "primary",
+  "think": false,
+  "keep_alive": -1,
+  "census_prepass": {
+    "context_usage_ratio": 0.4,
+    "cluster_window": 5
+  },
+  "verify_prepass": {
+    "per_file_context_ratio": 0.10,
+    "max_evidence_files": 5
+  },
+  "draft": {
+    "context_usage_ratio": 0.30
+  },
+  "log_triage": {
+    "context_usage_ratio": 0.40,
+    "default_max_lines": 12
+  },
+  "flake_classifier": {
+    "pytest_timeout_s": 1800
+  },
+  "docs_summarizer": {
+    "context_usage_ratio": 0.30,
+    "default_stale_days": 90
+  },
+  "pr_prereview": {
+    "context_usage_ratio": 0.50
+  },
+  "flag_advisor": {
+    "context_usage_ratio": 0.40
+  },
+  "newsletter_extract": {
+    "context_usage_ratio": 0.35,
+    "max_articles": 10
+  },
+  "style_precompute": {
+    "context_usage_ratio": 0.40,
+    "max_samples_per_account": 25,
+    "pipeline_timeout_s": 1800
+  },
+  "verify_fix": {
+    "context_usage_ratio": 0.50
+  },
+  "discover": {
+    "context_usage_ratio": 0.40,
+    "max_hits_per_scanner": 25
+  },
+  "hardcode_scanner": {
+    "context_usage_ratio": 0.40,
+    "max_hits_per_batch": 20
+  },
+  "defer_sweep": {
+    "_doc": "Consumer for scripts/leira_defer_sweep.py — the all-history postponement-language corpus sweep. Ratio 0.30 keeps a batch of ~25 short snippets comfortably under the runtime-discovered context. Batch size is a per-Ollama-call knob (not model-context sized), so it's a plain int here.",
+    "context_usage_ratio": 0.30,
+    "batch_size": 25
+  },
+  "push_ci_shepherd": {
+    "_doc": "Consumer for the push-ci-shepherd AI development tooling(.the AI assistant/agents/push-ci-shepherd.md). Invoked ONLY when the shepherd needs actual LLM reasoning about a CI failure — the happy path (list + watch + tail-of-log) is deterministic and never touches llm-host. Ratio 0.30 keeps the failing-step log tail comfortably under the runtime-discovered context window.",
+    "context_usage_ratio": 0.30
+  }
+}

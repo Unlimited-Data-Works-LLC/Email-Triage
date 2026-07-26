@@ -1,6 +1,7 @@
 """Tests for the numbered schema-migration framework."""
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 
@@ -274,7 +275,7 @@ def test_init_db_runs_framework_and_creates_v1():
     the bootstrap v1 row."""
     from email_triage.web.db import init_db
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         # Bookkeeping table exists.
         rows = conn.execute(
@@ -294,7 +295,7 @@ def test_init_db_idempotent_against_old_db_layout():
     from email_triage.web.db import init_db
 
     # First init creates schema + framework row.
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         rows_before = conn.execute(
             "SELECT version, checksum FROM schema_migrations"
@@ -320,7 +321,7 @@ def test_v26_creates_ai_backends_table_and_account_fk():
     table, selector index, and the new FK column on email_accounts."""
     from email_triage.web.db import init_db
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         # ai_backends table + columns.
         cols = {
@@ -365,14 +366,14 @@ def test_v26_type_check_constraint_rejects_unknown_value():
     five-element allowlist."""
     from email_triage.web.db import init_db
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO ai_backends "
                 "(name, type, endpoint, enabled) "
                 "VALUES (?, ?, ?, 1)",
-                ("BadBackend", "anthropic", "https://api.anthropic.com"),
+                ("BadBackend", "AI provider", "https://api.AI provider.com"),
             )
             conn.commit()
     finally:
@@ -384,7 +385,7 @@ def test_v26_baa_certified_requires_expiration():
     NOT NULL`` must reject a half-set BAA row."""
     from email_triage.web.db import init_db
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         # baa_certified=1 with NULL expiration must fail.
         with pytest.raises(sqlite3.IntegrityError):
@@ -435,7 +436,7 @@ def test_v26_idempotent_re_run_on_existing_db():
     from email_triage.web.db import init_db
     from email_triage.web.migrations import run_migrations
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         # Already-applied v26 from init_db. Running again is a no-op.
         applied = run_migrations(conn)
@@ -468,7 +469,7 @@ def test_v26_upgrade_path_from_v25(monkeypatch):
     ]
     try:
         from email_triage.web.db import init_db
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         try:
             # Pre-v26 state: table doesn't exist, column doesn't exist.
             cur = conn.execute(

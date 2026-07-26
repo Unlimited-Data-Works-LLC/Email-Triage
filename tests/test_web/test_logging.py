@@ -5,6 +5,7 @@ app startup and the background 30-minute sweep.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 import json
@@ -48,7 +49,7 @@ def _count_entries(conn) -> int:
 
 def test_prune_by_age_deletes_old_rows():
     """50 rows older than retention, 50 fresh — old rows go, new stay."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     old_ts = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
     new_ts = datetime.now(timezone.utc).isoformat()
 
@@ -72,7 +73,7 @@ def test_prune_by_age_deletes_old_rows():
 
 def test_prune_by_count_keeps_newest():
     """60k rows, cap 50k — exactly 50k remain, all the newest IDs."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     ts = datetime.now(timezone.utc).isoformat()
 
     # Bulk insert via executemany for speed.
@@ -98,7 +99,7 @@ def test_prune_by_count_keeps_newest():
 
 def test_prune_by_age_and_count_combined():
     """Both axes deleting — union of old + overflow rows goes."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     old_ts = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
     new_ts = datetime.now(timezone.utc).isoformat()
 
@@ -126,7 +127,7 @@ def test_prune_by_age_and_count_combined():
 
 def test_prune_idempotent():
     """A second call right after the first deletes zero rows."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     old_ts = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
     new_ts = datetime.now(timezone.utc).isoformat()
 
@@ -148,7 +149,7 @@ def test_prune_idempotent():
 
 def test_legacy_prune_log_entries_still_works():
     """Back-compat: the old count-only helper still runs."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     ts = datetime.now(timezone.utc).isoformat()
     for _ in range(100):
         _seed_entry(conn, ts=ts)
@@ -167,7 +168,7 @@ def test_startup_prunes_log_entries(tmp_path):
     db_path = tmp_path / "triage.db"
 
     # Pre-populate the DB with old rows before the app boots.
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     old_ts = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
     for _ in range(50):
         _seed_entry(conn, ts=old_ts)
@@ -213,7 +214,7 @@ def test_startup_prunes_log_entries(tmp_path):
     # window-fresh rows; the contract under test is "the prune
     # cleared the old data," so check for entries at the seeded
     # ts rather than total table size.
-    verify_conn = init_db(str(db_path))
+    verify_conn = track(init_db(str(db_path)))
     old_count = verify_conn.execute(
         "SELECT COUNT(*) FROM log_entries WHERE ts = ?", (old_ts,),
     ).fetchone()[0]
@@ -223,7 +224,7 @@ def test_startup_prunes_log_entries(tmp_path):
 
 def test_background_task_prunes_periodically():
     """The 30-min loop calls the helper at least once when driven."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
 
     # Seed one clearly-prunable old row.
     old_ts = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()

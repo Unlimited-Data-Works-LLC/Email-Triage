@@ -366,6 +366,14 @@
             {% endfor %}
         </tbody>
     </table>
+    {# #300 — widget caps at recent_jobs_cap AFTER scoping to your #}
+    {# visible accounts; surface when older runs of yours exist.   #}
+    {% if recent_jobs_total is defined and recent_jobs_total > (recent_jobs | length) %}
+    <p style="margin-top:0.5rem;font-size:0.85rem;color:var(--pico-muted-color);">
+        Showing the newest {{ recent_jobs | length }} of {{ recent_jobs_total }}
+        background runs. See <a href="/triage/jobs">all bulk runs</a> for the rest.
+    </p>
+    {% endif %}
 </section>
 {% endif %}
 {% endif %}

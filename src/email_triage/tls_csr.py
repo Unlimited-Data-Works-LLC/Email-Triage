@@ -33,7 +33,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-logger = logging.getLogger("email_triage.tls_csr")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.tls_csr")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +190,12 @@ def make_csr(
     csr = csr_builder.sign(key, hashes.SHA256())
     csr_pem = csr.public_bytes(serialization.Encoding.PEM)
 
-    # Atomic write of the keypair + CSR.
-    pending_key.write_bytes(key_pem)
-    pending_csr.write_bytes(csr_pem)
-    try:
-        os.chmod(pending_key, 0o600)
-    except OSError:
-        pass
+    # census  — genuinely atomic write now (was a bare write_bytes that a
+    # power-loss could leave half-written). The private key lands 0o600 from
+    # the atomic temp (no world-readable window between write and chmod).
+    from email_triage._atomicio import atomic_write_bytes
+    atomic_write_bytes(pending_key, key_pem, mode=0o600)
+    atomic_write_bytes(pending_csr, csr_pem)  # CSR is public — no mode
     return pending_key, pending_csr, csr_pem
 
 
@@ -208,7 +208,7 @@ def cancel_pending(cert_dir: Path) -> None:
             (cert_dir / name).unlink(missing_ok=True)
         except OSError as e:
             logger.warning(
-                "Failed to remove pending CSR file: %s (%s)", name, e,
+                f"Failed to remove pending CSR file: {name} ({e})",
             )
 
 
@@ -320,8 +320,7 @@ def import_signed_cert(
         not_after = leaf.not_valid_after.replace(tzinfo=timezone.utc)
     if not_after < now:
         logger.warning(
-            "Importing a cert that's already expired: not_after=%s",
-            not_after.isoformat(),
+            f"Importing a cert that's already expired: not_after={not_after.isoformat()}",
         )
 
     # Atomic swap: promote the pending KEY first, then atomic-write the
@@ -335,11 +334,11 @@ def import_signed_cert(
         os.chmod(active_key, 0o600)
     except OSError:
         pass
-    # Atomic temp+replace for the cert -- guarantees the watcher
-    # never sees a partially-written cert PEM.
-    tmp_cert = active_cert.with_suffix(active_cert.suffix + ".new")
-    tmp_cert.write_bytes(cert_pem)
-    os.replace(tmp_cert, active_cert)
+    # Atomic temp+replace for the cert (census  — via the _atomicio
+    # SSOT) -- guarantees the watcher never sees a partially-written cert
+    # PEM. Cert is public → default perms (no mode).
+    from email_triage._atomicio import atomic_write_bytes
+    atomic_write_bytes(active_cert, cert_pem)
     # Clean up the CSR; it served its purpose.
     try:
         pending_csr.unlink(missing_ok=True)
@@ -414,7 +413,7 @@ def active_cert_metadata(cert_dir: Path) -> dict[str, Any] | None:
     try:
         return cert_metadata(p.read_bytes())
     except Exception as e:
-        logger.warning("active_cert_metadata: parse failed: %s", e)
+        logger.warning(f"active_cert_metadata: parse failed: {e}")
         return None
 
 

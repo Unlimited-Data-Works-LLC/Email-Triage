@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """email-triage-api OpenClaw skill.
 
-Thin HTTP wrapper around email-triage's /api/openclaw/* surface so
+Thin HTTP wrapper around email-triage's /api/v1/* surface so
 OpenClaw / the agent can operate mail, calendar, and triage actions the
 same way it operates SSH. No business logic lives here; every
 subcommand maps 1:1 to a server endpoint, passes the bearer token,
@@ -12,22 +12,47 @@ Config:
                        Usually set in ~/.openclaw/openclaw.json's
                        skills.entries.email-triage-api.env block.
 
-Token resolution order (first hit wins):
-  1. --token et_...              explicit CLI override
-  2. --as <alias>                 users.json[<alias>] — per-user tokens
-                                  live in ~/.openclaw/skills/
-                                  email-triage-api/users.json
-  3. users.json["default"]        installation-wide fallback
-  4. EMAIL_TRIAGE_TOKEN env var   legacy path, also injected by
-                                  OpenClaw SecretRef if configured
+Token resolution order (first hit wins). For an alias `A` (from
+``--as A``; the implicit installation default is the alias ``default``):
+
+  1. --token et_...                 explicit CLI override (probes, register-me)
+  2. EMAIL_TRIAGE_TOKEN_CMD         a credential HELPER command — run it,
+                                    use its stdout as the token. This is the
+                                    SECURE path (no plaintext on disk): bridge
+                                    to OpenClaw's native exec-provider SecretRef,
+                                    `pass`, `secret-tool`, 1Password `op`,
+                                    HashiCorp `vault`, the Windows Credential
+                                    Manager, etc. The alias is passed as the
+                                    ``{alias}`` placeholder and the ``ET_ALIAS``
+                                    env var. ** FAIL-CLOSED**: if configured and
+                                    it errors / returns nothing, resolution
+                                    FAILS (exit 4) — it never silently falls
+                                    back to the plaintext store (a stale/revoked
+                                    plaintext token must not mask a backend miss).
+  3. EMAIL_TRIAGE_TOKEN_<ALIAS>     per-alias env var (what an OpenClaw
+                                    per-user SecretRef injects), e.g.
+                                    EMAIL_TRIAGE_TOKEN_CRAIG.
+  4. users.json[A]                  LEGACY plaintext store (deprecated; emits a
+                                    one-time security warning on use). Lives at
+                                    ~/.openclaw/skills/email-triage-api/users.json.
+                                    An explicit ``--as A`` that misses here FAILS
+                                    (exit 4) — it never acts as a different user.
+  5. EMAIL_TRIAGE_TOKEN env var     single-value fallback (default alias only);
+                                    a legacy single-token SecretRef inject.
 
 Multi-user: each human mints their own token in the email-triage web
-UI, then runs (or has their agent run) the ``register-me`` subcommand
-to store it under an alias. The agent's system prompt pins that
-alias via ``--as <name>`` on every call.
+UI. The SECURE flow stores it in a secret backend (configure
+EMAIL_TRIAGE_TOKEN_CMD, or set EMAIL_TRIAGE_TOKEN_SET_CMD and run
+``register-me``); the LEGACY flow writes ``users.json`` plaintext via
+``register-me``. The agent's system prompt pins the alias via
+``--as <name>`` on every call. See internal documentation.
 
 Optional:
-  EMAIL_TRIAGE_TIMEOUT Per-call timeout, seconds. Default 30.
+  EMAIL_TRIAGE_TIMEOUT             Per-call HTTP timeout, seconds. Default 30.
+  EMAIL_TRIAGE_TOKEN_SET_CMD       write counterpart to _CMD — store a token
+                                   (passed on stdin) so ``register-me`` never
+                                   writes plaintext. {alias}/ET_ALIAS as above.
+  EMAIL_TRIAGE_SUPPRESS_PLAINTEXT_WARNING=1  silence the plaintext deprecation.
 
 Exit codes:
   0  success
@@ -42,11 +67,134 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+#  — secret-backend configuration. A credential HELPER (read) + an optional
+# STORE command (write) let the skill source tokens from a real secret store
+# instead of the plaintext users.json. This is the git/docker credential-helper
+# pattern: the command is operator-controlled config, run via the shell, with
+# the alias exposed as the {alias} placeholder and the ET_ALIAS env var. The
+# secret itself never crosses argv (read: returned on stdout; write: passed on
+# stdin) so it can't leak to `ps`. See internal documentation.
+# ---------------------------------------------------------------------------
+_ENV_TOKEN_CMD = "EMAIL_TRIAGE_TOKEN_CMD"            # read helper → stdout
+_ENV_TOKEN_SET_CMD = "EMAIL_TRIAGE_TOKEN_SET_CMD"    # write helper ← stdin
+_ENV_TOKEN_SINGLE = "EMAIL_TRIAGE_TOKEN"             # single-value fallback
+_ENV_TOKEN_ALIAS_PREFIX = "EMAIL_TRIAGE_TOKEN_"      # per-alias: ..._<ALIAS>
+_ENV_SUPPRESS_PLAINTEXT_WARN = "EMAIL_TRIAGE_SUPPRESS_PLAINTEXT_WARNING"
+_CRED_HELPER_TIMEOUT = 10.0
+
+# One-time-per-process latch so the plaintext-store deprecation warning fires
+# at most once even if resolution is reached twice.
+_plaintext_warned = False
+
+
+class TokenResolutionError(Exception):
+    """A configured secret backend failed to produce a token. The skill
+    FAILS CLOSED on this rather than falling through to the plaintext
+    users.json — a stale (possibly revoked) plaintext token silently used
+    in place of a backend miss is a security hole, not a convenience."""
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# An alias is interpolated into the shell-run credential helper command and
+# folded into an env-var name, so constrain it to a conservative charset.
+# Defense-in-depth: the alias is normally system-prompt-pinned, but a value
+# carrying shell metacharacters would otherwise be an injection vector.
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _require_safe_alias(alias: str) -> None:
+    if not _ALIAS_RE.match(alias):
+        print(
+            f"error: alias {alias!r} is invalid — use only letters, digits, "
+            "'.', '-', '_'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _alias_env_name(alias: str) -> str:
+    """EMAIL_TRIAGE_TOKEN_<ALIAS> with the alias upper-cased and any
+    non-alphanumeric char folded to '_' (env-var-safe)."""
+    safe = "".join(ch.upper() if ch.isalnum() else "_" for ch in alias)
+    return _ENV_TOKEN_ALIAS_PREFIX + safe
+
+
+def _alias_env_value(alias: str) -> str:
+    """Per-alias injected token, or '' if absent. Skips the reserved knob
+    names (so an alias literally called 'cmd'/'set_cmd' can't shadow the
+    helper config vars)."""
+    name = _alias_env_name(alias)
+    if name in (_ENV_TOKEN_CMD, _ENV_TOKEN_SET_CMD):
+        return ""
+    return os.environ.get(name, "").strip()
+
+
+def _run_cred_helper(cmd: str, alias: str) -> str:
+    """Run the read credential helper; return its stdout (the token),
+    stripped. FAIL CLOSED: nonzero exit, empty output, timeout, or a spawn
+    error all raise TokenResolutionError."""
+    expanded = cmd.replace("{alias}", alias)
+    child_env = {**os.environ, "ET_ALIAS": alias}
+    try:
+        proc = subprocess.run(
+            expanded, shell=True, capture_output=True, text=True,
+            timeout=_CRED_HELPER_TIMEOUT, env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        raise TokenResolutionError(
+            f"credential helper ({_ENV_TOKEN_CMD}) timed out after "
+            f"{_CRED_HELPER_TIMEOUT:.0f}s for alias '{alias}'"
+        )
+    except OSError as e:
+        raise TokenResolutionError(
+            f"credential helper ({_ENV_TOKEN_CMD}) could not run: {e}"
+        )
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        raise TokenResolutionError(
+            f"credential helper ({_ENV_TOKEN_CMD}) exited {proc.returncode} "
+            f"for alias '{alias}'" + (f": {err}" if err else "")
+        )
+    token = (proc.stdout or "").strip()
+    if not token:
+        raise TokenResolutionError(
+            f"credential helper ({_ENV_TOKEN_CMD}) produced no token for "
+            f"alias '{alias}'"
+        )
+    return token
+
+
+def _warn_plaintext(alias: str) -> None:
+    """One-time stderr deprecation warning when a token is read from the
+    plaintext users.json. Suppressible."""
+    global _plaintext_warned
+    if _plaintext_warned:
+        return
+    _plaintext_warned = True
+    if _truthy_env(_ENV_SUPPRESS_PLAINTEXT_WARN):
+        return
+    print(
+        "security: resolved the API token from the plaintext users.json "
+        f"({_users_json_path()}) for alias '{alias}'. Plaintext token "
+        "storage is deprecated — migrate to a secret backend "
+        f"(set {_ENV_TOKEN_CMD} to a credential helper, or inject a per-alias "
+        "SecretRef env var). See internal documentation. "
+        f"Suppress with {_ENV_SUPPRESS_PLAINTEXT_WARN}=1.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +253,28 @@ class _Ctx:
     def __init__(self, args: argparse.Namespace):
         self.url = (args.url or os.environ.get("EMAIL_TRIAGE_URL") or "").rstrip("/")
         self.alias = args.as_alias  # may be None
-        self.token = self._resolve_token(args)
+        if getattr(args, "_no_server", False):
+            # Local file ops (register-me / forget-me / list-aliases) never
+            # call the server and MUST NOT invoke the credential backend —
+            # otherwise a configured helper would be exec'd (and a failing one
+            # would fail-closed exit 4) before the local command could run.
+            self.token = args.token or ""
+            self.timeout = 30.0
+            self.verbose = bool(args.verbose)
+            self.pretty = not args.compact
+            return
+        try:
+            self.token = self._resolve_token(args)
+        except TokenResolutionError as e:
+            print(f"error: {e}", file=sys.stderr)
+            print(
+                f"  A credential helper ({_ENV_TOKEN_CMD}) is configured, so the "
+                "skill fails closed instead of using the plaintext fallback. "
+                "Check the helper command and that this alias has a stored "
+                "secret. See internal documentation.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
         timeout_raw = os.environ.get("EMAIL_TRIAGE_TIMEOUT", "30")
         try:
             self.timeout = float(timeout_raw)
@@ -116,26 +285,50 @@ class _Ctx:
 
     @staticmethod
     def _resolve_token(args: argparse.Namespace) -> str:
-        # 1. Explicit --token wins — useful for probes + register-me itself.
+        """Resolve the bearer token for this invocation. See the module
+        docstring for the full precedence; secure backends (the credential
+        helper + per-alias SecretRef env) are tried BEFORE the legacy
+        plaintext users.json. Raises TokenResolutionError when a configured
+        helper fails (fail-closed)."""
+        # 1. Explicit --token wins — probes + register-me itself.
         if args.token:
             return args.token
-        users = _read_users_json()
-        # 2. --as <alias> → users.json[alias]
+
+        helper = os.environ.get(_ENV_TOKEN_CMD, "").strip()
+
         if args.as_alias:
-            tok = users.get(args.as_alias, "")
+            alias = args.as_alias
+            _require_safe_alias(alias)
+            # 2. A configured credential helper OWNS the alias path
+            #    (fail-closed — never falls through to plaintext).
+            if helper:
+                return _run_cred_helper(helper, alias)
+            # 3. Per-alias SecretRef-injected env var.
+            env_val = _alias_env_value(alias)
+            if env_val:
+                return env_val
+            # 4. Legacy plaintext users.json[alias]. An explicit --as that
+            #    misses here returns "" → require() fails (exit 4). It never
+            #    falls through to the single env var — that would act as a
+            #    different user than the caller asked for.
+            tok = _read_users_json().get(alias, "")
             if tok:
+                _warn_plaintext(alias)
                 return tok
-            # If --as was requested but the alias isn't in the map,
-            # DON'T silently fall through — that would act as a
-            # different user than the caller asked for, which is the
-            # opposite of safe. Let require() fail with a clear error.
             return ""
-        # 3. users.json["default"]
-        default = users.get("default", "")
+
+        # No --as → the installation default (alias "default").
+        if helper:
+            return _run_cred_helper(helper, "default")
+        env_val = _alias_env_value("default")  # EMAIL_TRIAGE_TOKEN_DEFAULT
+        if env_val:
+            return env_val
+        default = _read_users_json().get("default", "")
         if default:
+            _warn_plaintext("default")
             return default
-        # 4. Legacy env var (the SecretRef path).
-        return os.environ.get("EMAIL_TRIAGE_TOKEN", "") or ""
+        # 5. Single-value fallback (legacy single-token SecretRef inject).
+        return os.environ.get(_ENV_TOKEN_SINGLE, "") or ""
 
     def require(self) -> None:
         missing: list[str] = []
@@ -178,9 +371,9 @@ def _request(
     params: dict[str, Any] | None = None,
     json_body: Any | None = None,
 ) -> tuple[int, Any, dict[str, str]]:
-    """Issue one HTTP request to /api/openclaw<path>. Returns
+    """Issue one HTTP request to /api/v1<path>. Returns
     (status, parsed_body, headers_dict)."""
-    url = ctx.url + "/api/openclaw" + path
+    url = ctx.url + "/api/v1" + path
     if params:
         # Drop Nones + False-if-flag-style; keep 0/False for booleans
         # we want to send explicitly (callers decide by including them).
@@ -296,31 +489,100 @@ def _print_body(ctx: _Ctx, body: Any, *, stream=sys.stdout) -> None:
 # delegates to _request + _emit_and_exit.
 # ---------------------------------------------------------------------------
 
+def _store_via_backend(set_cmd: str, alias: str, token: str) -> None:
+    """Store a token through the configured write helper. The token is
+    passed on STDIN (never argv) so it can't leak to `ps`. Exits nonzero
+    on any failure — we must not silently report success when the secret
+    didn't land in the backend."""
+    expanded = set_cmd.replace("{alias}", alias)
+    child_env = {**os.environ, "ET_ALIAS": alias}
+    try:
+        proc = subprocess.run(
+            expanded, shell=True, input=token, text=True,
+            capture_output=True, timeout=_CRED_HELPER_TIMEOUT, env=child_env,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"error: store command ({_ENV_TOKEN_SET_CMD}) failed to run: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        print(
+            f"error: store command ({_ENV_TOKEN_SET_CMD}) exited "
+            f"{proc.returncode}" + (f": {err}" if err else ""),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _cmd_register_me(ctx: _Ctx, args: argparse.Namespace) -> None:
-    """Write/overwrite one alias → token entry in users.json."""
+    """Store one alias → token. Routes through the secret backend when one
+    is configured; only the legacy path writes plaintext users.json."""
     alias = args.as_alias.strip()
     token = args.token.strip()
     if not alias or not token:
         print("error: --as and --token are both required.", file=sys.stderr)
         sys.exit(1)
+    _require_safe_alias(alias)
     if not token.startswith("et_"):
         print(
             "warning: token does not start with 'et_' — double-check you copied\n"
             "         the whole value from the email-triage Access Tokens page.",
             file=sys.stderr,
         )
+
+    set_cmd = os.environ.get(_ENV_TOKEN_SET_CMD, "").strip()
+    helper = os.environ.get(_ENV_TOKEN_CMD, "").strip()
+
+    # Secure path: a write helper stores the token in the backend.
+    if set_cmd:
+        _store_via_backend(set_cmd, alias, token)
+        print(f"Stored token for alias '{alias}' via {_ENV_TOKEN_SET_CMD}.")
+        sys.exit(0)
+
+    # A read helper is configured but no write helper: refuse to write a
+    # plaintext token the read path would ignore (it fails closed before
+    # ever consulting users.json). Guide the operator to their backend.
+    if helper:
+        print(
+            f"error: a read credential helper ({_ENV_TOKEN_CMD}) is configured "
+            f"but no store command ({_ENV_TOKEN_SET_CMD}) is set. Refusing to "
+            "write a plaintext token to users.json that the read path would "
+            "ignore.\n"
+            f"  Store the token in your backend directly, e.g.:\n"
+            f"    pass insert email-triage/{alias}\n"
+            f"    printf %s '<token>' | secret-tool store --label=email-triage "
+            f"service email-triage account {alias}\n"
+            f"  or set {_ENV_TOKEN_SET_CMD} to your store command and re-run. "
+            "See internal documentation.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Legacy plaintext path (back-compat) — write users.json, but nudge.
     users = _read_users_json()
     existed = alias in users
     users[alias] = token
     _write_users_json(users)
     verb = "Updated" if existed else "Registered"
     print(f"{verb} alias '{alias}' in {_users_json_path()}.")
+    if not _truthy_env(_ENV_SUPPRESS_PLAINTEXT_WARN):
+        print(
+            f"  note: token stored in PLAINTEXT at {_users_json_path()}. For a "
+            f"secret-backed store (no plaintext on disk) configure "
+            f"{_ENV_TOKEN_CMD}/{_ENV_TOKEN_SET_CMD} — see "
+            "internal documentation.",
+            file=sys.stderr,
+        )
     sys.exit(0)
 
 
 def _cmd_forget_me(ctx: _Ctx, args: argparse.Namespace) -> None:
     """Remove an alias from users.json."""
     alias = args.as_alias.strip()
+    _require_safe_alias(alias)
     users = _read_users_json()
     if alias not in users:
         print(f"No alias '{alias}' in {_users_json_path()}.")
@@ -333,15 +595,23 @@ def _cmd_forget_me(ctx: _Ctx, args: argparse.Namespace) -> None:
 
 def _cmd_list_aliases(ctx: _Ctx, args: argparse.Namespace) -> None:
     """Show the aliases configured, WITHOUT printing any token values."""
+    helper = os.environ.get(_ENV_TOKEN_CMD, "").strip()
     users = _read_users_json()
-    if not users:
+    if not users and not helper:
         print("No aliases configured.")
         sys.exit(0)
-    for alias, tok in sorted(users.items()):
-        # Show just enough of the suffix to distinguish tokens without
-        # leaking them to screen/logs.
-        tail = tok[-4:] if len(tok) >= 6 else "***"
-        print(f"  {alias}  (ends in …{tail})")
+    if helper:
+        print(
+            f"A credential helper ({_ENV_TOKEN_CMD}) is configured; "
+            "backend-stored aliases are resolved on demand and not listed here."
+        )
+    if users:
+        print("Plaintext users.json aliases:" if helper else "Aliases:")
+        for alias, tok in sorted(users.items()):
+            # Show just enough of the suffix to distinguish tokens without
+            # leaking them to screen/logs.
+            tail = tok[-4:] if len(tok) >= 6 else "***"
+            print(f"  {alias}  (ends in …{tail})")
     sys.exit(0)
 
 
@@ -724,13 +994,122 @@ def _bool_flag_or_none(v: str | None) -> bool | None:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+
+# ---------------------------------------------------------------------------
+# Email watches CRUD
+# ---------------------------------------------------------------------------
+
+def _cmd_watches_list(ctx, args):
+    status, body, headers = _request(
+        ctx, "GET",
+        "/accounts/{}/watches".format(args.account_id),
+    )
+    _emit_and_exit(ctx, status, body, headers, ok_summary="ok: watches listed")
+
+
+def _cmd_watches_create(ctx, args):
+    payload = {"name": args.name, "enabled": True}
+    payload["account_id"] = None if args.all_accounts else args.account_id
+    f = {}
+    if args.from_addr:
+        f["from_addr"] = args.from_addr
+    if args.from_domain:
+        f["from_domain"] = args.from_domain
+    if args.subject:
+        f["subject_contains"] = args.subject
+    if args.keyword:
+        f["keyword"] = args.keyword
+    if args.advanced:
+        f["advanced"] = args.advanced
+    payload["filter"] = f
+    channels = (args.channels or "sms").split(",")
+    escalate = {"enabled": True, "channels": channels}
+    if args.notify_email:
+        escalate["notify_email"] = args.notify_email
+    webhook = {"enabled": bool(args.webhook_url), "url": args.webhook_url or ""}
+    payload["actions"] = {"escalate": escalate, "webhook": webhook}
+    status, body, headers = _request(
+        ctx, "POST",
+        "/accounts/{}/watches".format(args.account_id),
+        json_body=payload,
+    )
+    wid = body.get("watch_id", "?") if isinstance(body, dict) else "?"
+    _emit_and_exit(ctx, status, body, headers,
+                   ok_summary="ok: watch created — id={}".format(wid))
+
+
+def _cmd_watches_update(ctx, args):
+    payload = {}
+    if args.name is not None:
+        payload["name"] = args.name
+    if args.enabled is not None:
+        payload["enabled"] = args.enabled
+    filter_flags = [args.from_addr, args.from_domain, args.subject,
+                    args.keyword, args.advanced]
+    if any(v is not None for v in filter_flags):
+        f = {}
+        if args.from_addr is not None:
+            f["from_addr"] = args.from_addr
+        if args.from_domain is not None:
+            f["from_domain"] = args.from_domain
+        if args.subject is not None:
+            f["subject_contains"] = args.subject
+        if args.keyword is not None:
+            f["keyword"] = args.keyword
+        if args.advanced is not None:
+            f["advanced"] = args.advanced
+        payload["filter"] = f
+    if any(v is not None for v in [args.notify_email, args.channels, args.webhook_url]):
+        actions = {"escalate": {}, "webhook": {}}
+        if args.notify_email is not None:
+            actions["escalate"]["notify_email"] = args.notify_email
+            actions["escalate"]["enabled"] = True
+        if args.channels is not None:
+            actions["escalate"]["channels"] = args.channels.split(",")
+        if args.webhook_url is not None:
+            actions["webhook"]["url"] = args.webhook_url
+            actions["webhook"]["enabled"] = bool(args.webhook_url)
+        payload["actions"] = actions
+    status, body, headers = _request(
+        ctx, "PATCH",
+        "/accounts/{}/watches/{}".format(args.account_id, args.watch_id),
+        json_body=payload,
+    )
+    _emit_and_exit(ctx, status, body, headers,
+                   ok_summary="ok: watch {} updated".format(args.watch_id))
+
+
+def _cmd_watches_delete(ctx, args):
+    status, body, headers = _request(
+        ctx, "DELETE",
+        "/accounts/{}/watches/{}".format(args.account_id, args.watch_id),
+    )
+    _emit_and_exit(ctx, status, body, headers,
+                   ok_summary="ok: watch {} deleted".format(args.watch_id))
+
+
+def _cmd_watches_test(ctx, args):
+    payload = {}
+    if args.sender:
+        payload["sender"] = args.sender
+    if args.subject:
+        payload["subject"] = args.subject
+    status, body, headers = _request(
+        ctx, "POST",
+        "/accounts/{}/watches/{}/test-fire".format(args.account_id, args.watch_id),
+        json_body=payload,
+    )
+    _emit_and_exit(ctx, status, body, headers,
+                   ok_summary="ok: test-fire sent for watch {}".format(args.watch_id))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="email-triage-api",
-        description="OpenClaw skill wrapping the email-triage /api/openclaw HTTP API.",
+        description="OpenClaw skill wrapping the email-triage /api/v1 HTTP API.",
     )
     parser.add_argument("--url", default=None,
-                        help="Override EMAIL_TRIAGE_URL (no trailing /api/openclaw).")
+                        help="Override EMAIL_TRIAGE_URL (no trailing /api/v1).")
     parser.add_argument("--token", default=None,
                         help="Explicit bearer token (overrides --as and users.json).")
     parser.add_argument("--as", dest="as_alias", default=None, metavar="ALIAS",
@@ -1003,6 +1382,62 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--responses-json", required=True, dest="responses_json",
                    help='e.g. \'[{"event_id":"abc","response":"accepted"}]\'.')
     p.set_defaults(handler=_cmd_calendar_bulk_respond)
+
+
+    # ------------------------------------------------------------------ watches
+    p = sub.add_parser("watches-list",
+                       help="List watches for an account.")
+    p.add_argument("account_id", type=int)
+    p.set_defaults(handler=_cmd_watches_list)
+
+    p = sub.add_parser("watches-create",
+                       help="Create an email watch (fire action when mail matches).")
+    p.add_argument("account_id", type=int)
+    p.add_argument("--name", required=True)
+    p.add_argument("--from", dest="from_addr", default=None, metavar="EMAIL")
+    p.add_argument("--from-domain", dest="from_domain", default=None, metavar="DOMAIN")
+    p.add_argument("--subject", dest="subject", default=None, metavar="TEXT")
+    p.add_argument("--keyword", dest="keyword", default=None, metavar="TEXT")
+    p.add_argument("--advanced", dest="advanced", default=None, metavar="QUERY")
+    p.add_argument("--notify-email", dest="notify_email", default=None, metavar="EMAIL")
+    p.add_argument("--channels", dest="channels", default="sms",
+                   metavar="sms|email|sms,email")
+    p.add_argument("--webhook-url", dest="webhook_url", default=None, metavar="URL")
+    p.add_argument("--all-accounts", dest="all_accounts", action="store_true",
+                   help="Watch ALL non-HIPAA accounts, not just this one.")
+    p.set_defaults(handler=_cmd_watches_create)
+
+    p = sub.add_parser("watches-update",
+                       help="Partial-update a watch.")
+    p.add_argument("account_id", type=int)
+    p.add_argument("watch_id")
+    p.add_argument("--name", default=None)
+    p.add_argument("--enabled", dest="enabled", type=_bool_flag_or_none,
+                   default=None, metavar="true|false")
+    p.add_argument("--from", dest="from_addr", default=None, metavar="EMAIL")
+    p.add_argument("--from-domain", dest="from_domain", default=None, metavar="DOMAIN")
+    p.add_argument("--subject", dest="subject", default=None, metavar="TEXT")
+    p.add_argument("--keyword", dest="keyword", default=None, metavar="TEXT")
+    p.add_argument("--advanced", dest="advanced", default=None, metavar="QUERY")
+    p.add_argument("--notify-email", dest="notify_email", default=None, metavar="EMAIL")
+    p.add_argument("--channels", dest="channels", default=None,
+                   metavar="sms|email|sms,email")
+    p.add_argument("--webhook-url", dest="webhook_url", default=None, metavar="URL")
+    p.set_defaults(handler=_cmd_watches_update)
+
+    p = sub.add_parser("watches-delete", help="Remove a watch.")
+    p.add_argument("account_id", type=int)
+    p.add_argument("watch_id")
+    p.set_defaults(handler=_cmd_watches_delete)
+
+    p = sub.add_parser("watches-test",
+                       help="Test-fire a watch against a synthetic envelope.")
+    p.add_argument("account_id", type=int)
+    p.add_argument("watch_id")
+    p.add_argument("--sender", default=None)
+    p.add_argument("--subject", dest="subject", default=None)
+    p.set_defaults(handler=_cmd_watches_test)
+
 
     return parser
 

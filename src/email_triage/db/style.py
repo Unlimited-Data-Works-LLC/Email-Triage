@@ -83,14 +83,26 @@ HIPAA (hipaa-sme dual-gate CLEAR 2026-05-29):
 
 from __future__ import annotations
 
-import sqlite3
+from email_triage._int_utils import bounded_int, parse_int_or_none  # N-219c R23
+from email_triage._isotime import now_utc_iso, to_utc_iso
 
-from email_triage.db._helpers import _has_column, _has_table, _row, _rows
+import sqlite3
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only for the ``now: "datetime | None"`` string annotations below — never
+    # evaluated at runtime (PEP 563); style.py imports datetime function-locally.
+    from datetime import datetime
+
+from email_triage.db._helpers import (
+    _has_column, _has_table, _row, _rows, dump_json_col, load_json_col, row_get,
+)
 from email_triage.retry_backoff import (
     STYLE_DISTILL_SCHEDULE as _STYLE_DISTILL_SCHEDULE,
     compute_next_attempt_at as _compute_next_attempt_at,
 )
 from email_triage.web.db_writelock import db_write
+from email_triage.db.audit import audit_emitter, _chain_insert
 
 
 def _style_profile_key(account_id: int) -> str:
@@ -170,12 +182,10 @@ def get_account_style_per_alias(
         return None
     if row is None:
         return None
-    import json as _json
-    raw = row["descriptor_json"] if hasattr(row, "keys") else row[0]
-    try:
-        parsed = _json.loads(raw or "{}")
-    except (TypeError, ValueError):
-        return None
+    # census  SSOT — empty descriptor_json → {} (back-compat), corrupt
+    # /non-dict → None (the isinstance gate treats it as "no descriptor").
+    raw = row_get(row, "descriptor_json", 0)
+    parsed = load_json_col(raw or "{}", default=None)
     return parsed if isinstance(parsed, dict) else None
 
 @db_write
@@ -203,11 +213,10 @@ def set_account_style_per_alias(
         raise ValueError("descriptor must be a dict")
     addr = normalise_from_address(from_address)
     import json as _json
-    from datetime import datetime, timezone
     sc = sample_count if sample_count is not None else int(
         descriptor.get("sample_count") or 0,
     )
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute(
         "INSERT INTO account_style_per_alias "
         "(account_id, from_address, descriptor_json, sample_count, updated_at) "
@@ -216,7 +225,7 @@ def set_account_style_per_alias(
         "  descriptor_json = excluded.descriptor_json, "
         "  sample_count    = excluded.sample_count, "
         "  updated_at      = excluded.updated_at",
-        (int(account_id), addr, _json.dumps(descriptor), int(sc), now),
+        (int(account_id), addr, dump_json_col(descriptor), int(sc), now),
     )
     conn.commit()
 
@@ -240,16 +249,11 @@ def list_account_style_per_alias(
         ).fetchall()
     except sqlite3.OperationalError:
         return []
-    import json as _json
     out: list[dict] = []
     for r in rows:
-        raw = r["descriptor_json"] if hasattr(r, "keys") else r[1]
-        try:
-            desc = _json.loads(raw or "{}")
-        except (TypeError, ValueError):
-            desc = {}
-        if not isinstance(desc, dict):
-            desc = {}
+        # census  SSOT — empty/corrupt/non-dict descriptor_json → {}.
+        raw = row_get(r, "descriptor_json", 1)
+        desc = load_json_col(raw, default={})
         out.append({
             "from_address": (
                 r["from_address"] if hasattr(r, "keys") else r[0]
@@ -428,18 +432,14 @@ def get_style_learning_capture_interval_hours(
     raw = get_setting(conn, "style_learning:capture_interval_hours")
     hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
     if isinstance(raw, dict):
-        try:
-            hours = int(
-                raw.get("hours")
-                or STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
-            )
-        except (TypeError, ValueError):
-            hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
+        hours = bounded_int(  # N-219c/17 R23: SSOT
+            raw.get("hours") or STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS,
+            default=STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS,
+        )
     elif isinstance(raw, (int, float)):
-        try:
-            hours = int(raw)
-        except (TypeError, ValueError):
-            hours = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
+        hours = bounded_int(  # N-219c/17 R23: SSOT
+            raw, default=STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS,
+        )
     if hours < STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS:
         hours = STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS
     elif hours > STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS:
@@ -457,10 +457,9 @@ def set_style_learning_capture_interval_hours(
     # here; importing at module top would cycle. Mirrors the
     # accounts.py #277b late-import precedent.
     from email_triage.web.db import set_setting
-    try:
-        h = int(hours)
-    except (TypeError, ValueError):
-        h = STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS
+    h = bounded_int(  # N-219c/17 R23: SSOT
+        hours, default=STYLE_LEARNING_CAPTURE_INTERVAL_DEFAULT_HOURS,
+    )
     if h < STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS:
         h = STYLE_LEARNING_CAPTURE_INTERVAL_MIN_HOURS
     elif h > STYLE_LEARNING_CAPTURE_INTERVAL_MAX_HOURS:
@@ -482,17 +481,14 @@ def get_style_learning_mine_limit_default(
     raw = get_setting(conn, "style_learning:mine_limit_default")
     val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
     if isinstance(raw, dict):
-        try:
-            val = int(
-                raw.get("limit") or STYLE_LEARNING_MINE_LIMIT_DEFAULT
-            )
-        except (TypeError, ValueError):
-            val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
+        val = bounded_int(  # N-219c/17 R23: SSOT
+            raw.get("limit") or STYLE_LEARNING_MINE_LIMIT_DEFAULT,
+            default=STYLE_LEARNING_MINE_LIMIT_DEFAULT,
+        )
     elif isinstance(raw, (int, float)):
-        try:
-            val = int(raw)
-        except (TypeError, ValueError):
-            val = STYLE_LEARNING_MINE_LIMIT_DEFAULT
+        val = bounded_int(  # N-219c/17 R23: SSOT
+            raw, default=STYLE_LEARNING_MINE_LIMIT_DEFAULT,
+        )
     if val < STYLE_LEARNING_MINE_LIMIT_MIN:
         val = STYLE_LEARNING_MINE_LIMIT_MIN
     elif val > STYLE_LEARNING_MINE_LIMIT_MAX:
@@ -510,10 +506,9 @@ def set_style_learning_mine_limit_default(
     # here; importing at module top would cycle. Mirrors the
     # accounts.py #277b late-import precedent.
     from email_triage.web.db import set_setting
-    try:
-        v = int(limit)
-    except (TypeError, ValueError):
-        v = STYLE_LEARNING_MINE_LIMIT_DEFAULT
+    v = bounded_int(  # N-219c/17 R23: SSOT
+        limit, default=STYLE_LEARNING_MINE_LIMIT_DEFAULT,
+    )
     if v < STYLE_LEARNING_MINE_LIMIT_MIN:
         v = STYLE_LEARNING_MINE_LIMIT_MIN
     elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
@@ -534,16 +529,15 @@ def resolve_account_mine_limit(
         if isinstance(cfg, dict):
             raw = cfg.get("mine_limit_override")
             if raw is not None and raw != "":
-                try:
-                    v = int(raw)
-                    if v > 0:
-                        if v < STYLE_LEARNING_MINE_LIMIT_MIN:
-                            v = STYLE_LEARNING_MINE_LIMIT_MIN
-                        elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
-                            v = STYLE_LEARNING_MINE_LIMIT_MAX
-                        return v
-                except (TypeError, ValueError):
-                    pass
+                # N-219c/25 R23: parse_int_or_none SSOT; on non-numeric or
+                # v <= 0, fall through to the install-wide default below.
+                v = parse_int_or_none(raw)
+                if v is not None and v > 0:
+                    if v < STYLE_LEARNING_MINE_LIMIT_MIN:
+                        v = STYLE_LEARNING_MINE_LIMIT_MIN
+                    elif v > STYLE_LEARNING_MINE_LIMIT_MAX:
+                        v = STYLE_LEARNING_MINE_LIMIT_MAX
+                    return v
     return get_style_learning_mine_limit_default(conn)
 
 def is_style_learning_account_enabled(account: dict | None) -> bool:
@@ -725,7 +719,6 @@ def get_hipaa_style_descriptor(
     the caller falls back to "no descriptor available; either re-distill
     or render empty".
     """
-    import json as _json
     row = conn.execute(
         "SELECT descriptor_json, descriptor_version, rebuilt_at, "
         "       message_count, scrubber_outcome "
@@ -734,12 +727,10 @@ def get_hipaa_style_descriptor(
     ).fetchone()
     if row is None:
         return None
-    try:
-        descriptor = _json.loads(
-            row["descriptor_json"] if hasattr(row, "keys") else row[0]
-        )
-    except (ValueError, TypeError):
-        return None
+    # census  SSOT — empty/NULL/corrupt/non-dict descriptor_json → None.
+    descriptor = load_json_col(
+        row_get(row, "descriptor_json", 0), default=None,
+    )
     if not isinstance(descriptor, dict):
         return None
     return {
@@ -777,10 +768,9 @@ def set_hipaa_style_descriptor(
     partial / poisoned descriptor.
     """
     import json as _json
-    from datetime import datetime, timezone
     if not isinstance(descriptor, dict):
         raise ValueError("descriptor must be a dict")
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute(
         "INSERT INTO hipaa_style_descriptors "
         "(account_id, descriptor_json, descriptor_version, rebuilt_at, "
@@ -794,7 +784,7 @@ def set_hipaa_style_descriptor(
         "  scrubber_outcome   = excluded.scrubber_outcome",
         (
             int(account_id),
-            _json.dumps(descriptor),
+            dump_json_col(descriptor),
             int(version),
             now,
             int(message_count),
@@ -819,6 +809,7 @@ def delete_hipaa_style_descriptor(
     conn.commit()
 
 @db_write
+@audit_emitter  # A2 (census 2026-06-09) — 8th emitter; gap-event on write failure
 def record_style_distill_event(
     conn: sqlite3.Connection,
     *,
@@ -851,7 +842,6 @@ def record_style_distill_event(
     address for ``kind='per_contact'`` rows — NEVER the plaintext
     address. NULL for ``kind='account_m3'`` rows.
     """
-    from datetime import datetime, timezone
     # Defensive: reject anything that looks like a plaintext email.
     # The hash is exactly 64 hex chars, lower-cased; plaintext would
     # carry an ``@`` or be the wrong length.
@@ -866,34 +856,32 @@ def record_style_distill_event(
                 "recipient_hash must be a 64-char SHA-256 hex digest"
             )
         recipient_hash = h
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO style_distill_events "
-        "(ts, account_id, actor_user_id, backend_id, backend_type, "
-        " was_cloud, outcome, latency_ms, layer1_drops, layer2_matches, "
-        " layer3_entities, scrubber_degraded, error_class, kind, "
-        " recipient_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            now,
-            int(account_id),
-            actor_user_id if actor_user_id is None else int(actor_user_id),
-            backend_id if backend_id is None else int(backend_id),
-            str(backend_type or ""),
-            1 if was_cloud else 0,
-            str(outcome),
-            int(latency_ms or 0),
-            int(layer1_drops or 0),
-            int(layer2_matches or 0),
-            int(layer3_entities) if layer3_entities is not None else 0,
-            1 if scrubber_degraded else 0,
-            (str(error_class) if error_class else None),
-            str(kind or "account_m3"),
-            recipient_hash,
+    now = now_utc_iso()
+    #  — chained audit write via the SSOT (_chain_insert). §164.502(e)
+    # cloud-PHI-egress accounting; all columns immutable, all hashed. Own-commit.
+    row_id = _chain_insert(conn, "style_distill_events", {
+        "ts": now,
+        "account_id": int(account_id),
+        "actor_user_id": (
+            actor_user_id if actor_user_id is None else int(actor_user_id)
         ),
-    )
+        "backend_id": backend_id if backend_id is None else int(backend_id),
+        "backend_type": str(backend_type or ""),
+        "was_cloud": 1 if was_cloud else 0,
+        "outcome": str(outcome),
+        "latency_ms": int(latency_ms or 0),
+        "layer1_drops": int(layer1_drops or 0),
+        "layer2_matches": int(layer2_matches or 0),
+        "layer3_entities": (
+            int(layer3_entities) if layer3_entities is not None else 0
+        ),
+        "scrubber_degraded": 1 if scrubber_degraded else 0,
+        "error_class": (str(error_class) if error_class else None),
+        "kind": str(kind or "account_m3"),
+        "recipient_hash": recipient_hash,
+    })
     conn.commit()
-    return int(cur.lastrowid)
+    return int(row_id)
 
 def style_distill_event_counts(
     conn: sqlite3.Connection,
@@ -917,9 +905,9 @@ def style_distill_event_counts(
     """
     from datetime import datetime, timezone, timedelta
     if since_iso is None:
-        since_iso = (
+        since_iso = to_utc_iso(
             datetime.now(timezone.utc) - timedelta(hours=24)
-        ).isoformat()
+        )
     out = {
         "local_24h": 0,
         "cloud_24h": 0,
@@ -1013,8 +1001,7 @@ def enqueue_style_distill_retry(
     is the short class-name of the failure (NEVER raw error text). Returns
     the row shape post-update.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     existing = conn.execute(
         "SELECT attempt_count, paused FROM style_distill_queue "
         "WHERE account_id = ?",
@@ -1078,8 +1065,7 @@ def pause_style_distill_account(
     auto-retry loop until operator intervention. Admin UI surfaces
     paused accounts in a banner.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     existing = conn.execute(
         "SELECT account_id FROM style_distill_queue WHERE account_id = ?",
         (int(account_id),),
@@ -1119,6 +1105,82 @@ def unpause_style_distill_account(
         (int(account_id),),
     )
     conn.commit()
+
+@db_write
+def unpause_scrubber_fail_style_distill_accounts(
+    conn: sqlite3.Connection,
+) -> int:
+    """Bulk clear paused flag on every style_distill_queue row whose
+    ``last_error`` marks a scrubber-fail lapse (``'scrubber_fail:'``
+    prefix; e.g. ``'scrubber_fail:structural_leak'`` set at
+    ``style_learning/distill_hipaa.py:655``).
+
+    the backlog  sibling to
+    :func:`unpause_baa_paused_style_distill_accounts` — DA panel F2
+    same-drive closure. Comment at ``distill_hipaa.py:650`` says
+    "retrying a leaky LLM won't help", so pause is indefinite until
+    the operator changes the classifier config (backend / model /
+    prompt-adjacent). Called on any classifier-config change from
+    ``web/routers/ui/admin.py::config_save``; the retry queue re-fires
+    with the new backend on next tick + re-pauses if the new
+    scrubber still fails (bounded to one tick interval).
+
+    Uses the ``substr()`` form to avoid the same ``LIKE``-wildcard
+    hazard the BAA sibling documents (``_`` inside ``scrubber_fail``
+    is a LIKE single-char wildcard). Returns rowcount.
+    """
+    cur = conn.execute(
+        "UPDATE style_distill_queue SET "
+        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
+        "  last_error = NULL "
+        "WHERE paused = 1 "
+        "  AND substr(last_error, 1, 14) = 'scrubber_fail:'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+@db_write
+def unpause_baa_paused_style_distill_accounts(
+    conn: sqlite3.Connection,
+) -> int:
+    """Bulk clear paused flag on every style_distill_queue row whose
+    ``last_error`` marks a BAA-gate lapse (``'baa_required:'`` prefix).
+
+    the backlog  (Census v3 finding #1) — Prime Directive 
+    compliance for ``pause_style_distill_account`` at
+    ``style_learning/distill_hipaa.py:508`` (BAA lapse trigger). The
+    per-row :func:`unpause_style_distill_account` was only reachable
+    by tests, so a BAA-lapsed mailbox was PARKED permanently — the
+    per-account HIPAA overlay degraded to the global scrubber.
+    §164.308(b)(1) BAA-gate lifecycle / PD#18 SET-must-CLEAR.
+
+    Called by the operator BAA acknowledgment path
+    (``web/routers/ui/admin.py::_baa_ack_db_work``) — see that site
+    for the atomicity + fail-forward ordering. Every account paused
+    for a BAA reason across the install becomes eligible to resume in
+    ONE shot; the retry-queue re-fire re-checks BAA state on the next
+    tick, so a stale ACK re-pauses within one tick interval (not
+    "no window"; bounded to the retry cadence).
+
+    Returns the number of rows unpaused (operator confirmation
+    chip + audit-event ``detail``).
+
+    db-sme F2: uses ``substr(last_error,1,13) = 'baa_required:'`` in
+    place of ``LIKE 'baa_required:%'`` — the LIKE form treats the
+    literal ``_`` inside ``baa_required`` as a single-char wildcard,
+    so ``baaXrequired:...`` would match (no live writer today, but
+    the pin cannot catch that class).
+    """
+    cur = conn.execute(
+        "UPDATE style_distill_queue SET "
+        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
+        "  last_error = NULL "
+        "WHERE paused = 1 "
+        "  AND substr(last_error, 1, 13) = 'baa_required:'"
+    )
+    conn.commit()
+    return cur.rowcount
 
 @db_write
 def clear_style_distill_queue_entry(
@@ -1170,8 +1232,7 @@ def claim_next_style_distill_queue_entry(
     short polling loop; SQLite's single-writer guarantee makes the
     poll-and-update sequence safe.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     row = conn.execute(
         "SELECT * FROM style_distill_queue "
         "WHERE paused = 0 AND next_retry_at IS NOT NULL "
@@ -1208,7 +1269,6 @@ def get_per_contact_style_hipaa(
     Tolerant of corrupt JSON (returns None) so a hand-edit / legacy
     shape doesn't crash the draft-time look-up.
     """
-    import json as _json
     if not recipient_hash:
         return None
     row = conn.execute(
@@ -1220,12 +1280,10 @@ def get_per_contact_style_hipaa(
     ).fetchone()
     if row is None:
         return None
-    try:
-        descriptor = _json.loads(
-            row["descriptor_json"] if hasattr(row, "keys") else row[0]
-        )
-    except (ValueError, TypeError):
-        return None
+    # census  SSOT — empty/NULL/corrupt/non-dict descriptor_json → None.
+    descriptor = load_json_col(
+        row_get(row, "descriptor_json", 0), default=None,
+    )
     if not isinstance(descriptor, dict):
         return None
     return {
@@ -1268,7 +1326,6 @@ def set_per_contact_style_hipaa(
     "accidentally passed the plaintext address" mistake.
     """
     import json as _json
-    from datetime import datetime, timezone
     if not isinstance(descriptor, dict):
         raise ValueError("descriptor must be a dict")
     if not isinstance(recipient_hash, str):
@@ -1278,7 +1335,7 @@ def set_per_contact_style_hipaa(
         raise ValueError(
             "recipient_hash must be a 64-char lowercase SHA-256 hex digest"
         )
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute(
         "INSERT INTO per_contact_style_hipaa "
         "(account_id, recipient_hash, descriptor_json, "
@@ -1295,7 +1352,7 @@ def set_per_contact_style_hipaa(
         (
             int(account_id),
             h,
-            _json.dumps(descriptor),
+            dump_json_col(descriptor),
             int(version),
             int(message_count),
             now,
@@ -1379,7 +1436,11 @@ def gc_per_contact_style_hipaa(
     from datetime import datetime, timezone, timedelta
     days = HIPAA_PER_CONTACT_GC_DAYS if gc_days is None else int(gc_days)
     base = now or datetime.now(timezone.utc)
-    cutoff = (base - timedelta(days=days)).isoformat()
+    # N-203 R22 (2026-07-02): route through A10 stored-ISO SSOT.
+    # The pre-widened pin missed `base` as an aware-now-rooted var because
+    # `base = now or datetime.now(tz)` is a BoolOp, previously outside the
+    # detector's Name/BinOp/Call/UnaryOp coverage.
+    cutoff = to_utc_iso(base - timedelta(days=days))
     cur = conn.execute(
         "DELETE FROM per_contact_style_hipaa "
         "WHERE last_distilled_at < ?",
@@ -1403,7 +1464,6 @@ def enqueue_style_distill_contact_retry(
     (:data:`STYLE_DISTILL_BACKOFF_SECONDS`). Upsert by ``(account_id,
     recipient_hash)``.
     """
-    from datetime import datetime, timezone
     if not recipient_hash:
         raise ValueError("recipient_hash required")
     h = str(recipient_hash).lower()
@@ -1411,7 +1471,7 @@ def enqueue_style_distill_contact_retry(
         raise ValueError(
             "recipient_hash must be a 64-char SHA-256 hex digest"
         )
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     existing = conn.execute(
         "SELECT attempt_count, paused FROM style_distill_queue_contacts "
         "WHERE account_id = ? AND recipient_hash = ?",
@@ -1476,9 +1536,8 @@ def pause_style_distill_contact(
     The account-level row stays active; only THIS contact pauses.
     Operator clears via :func:`unpause_style_distill_contact`.
     """
-    from datetime import datetime, timezone
     h = str(recipient_hash).lower()
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     existing = conn.execute(
         "SELECT 1 FROM style_distill_queue_contacts "
         "WHERE account_id = ? AND recipient_hash = ?",
@@ -1518,6 +1577,51 @@ def unpause_style_distill_contact(
         (int(account_id), str(recipient_hash).lower()),
     )
     conn.commit()
+
+@db_write
+def unpause_scrubber_fail_style_distill_contacts(
+    conn: sqlite3.Connection,
+) -> int:
+    """Sibling of :func:`unpause_scrubber_fail_style_distill_accounts`
+    for the per-contact HIPAA overlay queue. Same trigger + rationale
+    (classifier-config change). ``last_error`` prefix
+    ``'scrubber_fail:'`` covers the ``:structural_leak`` shape set at
+    ``style_learning/per_contact_hipaa.py:818``. Returns rowcount.
+    """
+    cur = conn.execute(
+        "UPDATE style_distill_queue_contacts SET "
+        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
+        "  last_error = NULL "
+        "WHERE paused = 1 "
+        "  AND substr(last_error, 1, 14) = 'scrubber_fail:'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+@db_write
+def unpause_baa_paused_style_distill_contacts(
+    conn: sqlite3.Connection,
+) -> int:
+    """Sibling of :func:`unpause_baa_paused_style_distill_accounts` for
+    the per-contact HIPAA overlay queue. Same trigger + rationale +
+    ``substr`` predicate (see the account variant's docstring for
+    §-anchor + db-sme F2 rationale).
+
+    the backlog  (Census v3 finding #1) — clears the auto-CLEAR
+    gap for ``pause_style_distill_contact`` at
+    ``style_learning/per_contact_hipaa.py:683,814``. Returns the
+    number of rows unpaused.
+    """
+    cur = conn.execute(
+        "UPDATE style_distill_queue_contacts SET "
+        "  paused = 0, attempt_count = 0, next_retry_at = NULL, "
+        "  last_error = NULL "
+        "WHERE paused = 1 "
+        "  AND substr(last_error, 1, 13) = 'baa_required:'"
+    )
+    conn.commit()
+    return cur.rowcount
 
 @db_write
 def clear_style_distill_contact_queue_entry(
@@ -1576,8 +1680,7 @@ def claim_next_style_distill_contact_queue_entry(
     Sibling to :func:`claim_next_style_distill_queue_entry`. Worker
     polls both queues on each tick.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     row = conn.execute(
         "SELECT * FROM style_distill_queue_contacts "
         "WHERE paused = 0 AND next_retry_at IS NOT NULL "

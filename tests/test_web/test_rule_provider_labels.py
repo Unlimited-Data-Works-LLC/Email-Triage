@@ -7,9 +7,12 @@ Covers:
   * DB helpers get_rule_provider_labels / set_rule_provider_labels —
     round-trip + malformed-entry filtering.
   * list_provider_labels_for_account helper — Gmail / IMAP / O365
-    dispatch, HIPAA returns empty, 5-min cache hit.
+    dispatch, HIPAA accounts STILL return labels (the HIPAA-flag gate
+    was removed 2026-06-06 per SME ruling — access control is the
+    caller's job, the flag is the wrong axis), 5-min cache hit.
   * Route handler — GET /rules/{list}/rules/{rule}/edit renders the
-    picker with one group per non-HIPAA account.
+    picker with one group per account the requester can manage
+    (HIPAA accounts included).
   * Save handler — POST with ``provider_labels=<aid>:<slug>`` round-
     trips through the DB into ``list_rules.provider_labels`` JSON.
   * Apply phase — per-account scoping: rule fires only on messages
@@ -33,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 
+from _db_tracking import track
 from email_triage.providers import provider_labels as pl_mod
 from email_triage.providers.provider_labels import (
     list_provider_labels_for_account,
@@ -106,7 +110,7 @@ class TestSchemaV22:
         )
         # Build a tiny standalone DB with a list_rules table carrying
         # provider_labels pre-populated.
-        conn = sqlite3.connect(":memory:")
+        conn = track(sqlite3.connect(":memory:"))
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE list_rules (id INTEGER PRIMARY KEY, "
@@ -317,26 +321,30 @@ class TestListProviderLabelsForAccount:
             )
         assert {e["slug"] for e in out} == {"Follow up", "Reference"}
 
-    def test_hipaa_returns_empty(self, db, regular_user):
+    def test_hipaa_account_still_returns_labels(self, db, regular_user):
+        """2026-06-06 SME ruling: the HIPAA-flag gate was REMOVED.
+        Surfacing an account's own labels to its authorized manager is an
+        intra-entity §160.103 'use' (strings never leave the install),
+        NOT a third-party disclosure — owner self-access is
+        §164.502(b)(2)-exempt + §164.524-favored. Access control is the
+        CALLER's job (can_manage_account / requester-scoped list), not
+        this helper's. So a HIPAA-flagged account returns its labels like
+        any other; build_provider IS invoked."""
         account_id = _make_account(
             db, regular_user["id"], provider_type="gmail_api",
             hipaa=True,
         )
-        # No provider mock — helper must short-circuit before calling
-        # build_provider. If it didn't, the absence of secrets would
-        # blow up.
+        fake_labels = [{"id": "Label_1", "name": "Tag"}]
         with patch.object(
             pl_mod, "build_provider",
-            side_effect=AssertionError(
-                "HIPAA gate failed — build_provider invoked"
-            ),
+            return_value=_FakeGmailProvider(fake_labels),
         ):
             out = asyncio.run(
                 list_provider_labels_for_account(
                     db=db, secrets=None, account_id=account_id,
                 )
             )
-        assert out == []
+        assert {e["slug"] for e in out} == {"Tag"}
 
     def test_unknown_account_returns_empty(self, db):
         out = asyncio.run(
@@ -461,9 +469,15 @@ class TestRuleEditPicker:
         assert f'value="{aid_gmail}:Tag-A"' in body
         assert f'value="{aid_imap}:INBOX.Folder1"' in body
 
-    def test_hipaa_account_excluded_from_picker(
+    def test_hipaa_account_included_in_picker(
         self, client, db, regular_user, user_cookies,
     ):
+        """2026-06-06 SME ruling: HIPAA accounts are NO LONGER excluded
+        from the picker. The access boundary is the control — the
+        requester only ever sees accounts they own/are-delegated (the
+        route scopes list_email_accounts to user_id=requester), so every
+        rendered account is one they may manage. The owner viewing their
+        own HIPAA account's labels is §164.502(b)(2)-exempt self-access."""
         aid_normal = _make_account(
             db, regular_user["id"], provider_type="gmail_api",
             name="normal",
@@ -475,12 +489,12 @@ class TestRuleEditPicker:
         list_id, rule_id = _make_rule(db, regular_user["id"])
 
         async def _fake_lookup(*, db, secrets, account_id):
-            # Helper would itself return [] for HIPAA, but the route
-            # filter should keep it from ever being called.
-            assert account_id != aid_hipaa, (
-                "HIPAA account must not reach provider_labels helper"
-            )
-            return [{"slug": "Tag", "name": "Tag", "color": ""}]
+            # The HIPAA account now reaches the helper like any other —
+            # the route no longer pre-filters it.
+            return [
+                {"slug": f"Tag-{account_id}",
+                 "name": f"Tag-{account_id}", "color": ""},
+            ]
 
         with patch(
             "email_triage.web.routers.ui.categories."
@@ -493,11 +507,11 @@ class TestRuleEditPicker:
             )
         assert resp.status_code == 200
         body = resp.text
-        # Normal account renders.
+        # Both accounts render — including the HIPAA one.
         assert "normal" in body
-        # HIPAA account name does NOT appear in any group header.
-        # Use a specific anchor that only the picker produces.
-        assert f'value="{aid_hipaa}:' not in body
+        assert "phi" in body
+        # The HIPAA account's labels now appear in the picker.
+        assert f'value="{aid_hipaa}:Tag-{aid_hipaa}"' in body
 
 
 class TestRuleSaveProviderLabelsForm:
@@ -576,6 +590,73 @@ class TestRuleSaveProviderLabelsForm:
         assert row is not None
         parsed = json.loads(row["provider_labels"])
         assert parsed == [{"account_id": aid, "label_slug": "Receipts"}]
+
+    def test_save_drops_unmanageable_account_target_A1(
+        self, client, db, regular_user, admin_user, user_cookies,
+    ):
+        """A1 (divergence census 2026-06-09, CRITICAL): the ``provider_labels``
+        form value ``<account_id>:<slug>`` carries an attacker-controllable
+        account_id. A requester must NOT be able to write a provider-label-apply
+        targeting an account they don't manage (cross-account §164.312(a)(1)
+        write, applied later by the background rule-runner). The save handler
+        now fail-closed gates each target against can_manage_account."""
+        mine = _make_account(
+            db, regular_user["id"], provider_type="gmail_api", name="mine",
+        )
+        # Account owned by a DIFFERENT user — the requester cannot manage it.
+        victim = _make_account(
+            db, admin_user["id"], provider_type="gmail_api", name="victim",
+        )
+        list_id, rule_id = _make_rule(db, regular_user["id"])
+
+        resp = client.post(
+            f"/rules/{list_id}/rules/{rule_id}/save",
+            data={
+                "rule_type": "sender",
+                "pattern": "boss@example.com",
+                "skip_ai": "0",
+                "provider_labels": [f"{mine}:Mine", f"{victim}:Pwned"],
+            },
+            cookies=user_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code in (200, 303)
+        row = db.execute(
+            "SELECT provider_labels FROM list_rules WHERE id = ?", (rule_id,),
+        ).fetchone()
+        parsed = json.loads(row["provider_labels"] or "[]")
+        aids = {e["account_id"] for e in parsed}
+        assert mine in aids, "the requester's own account must be kept"
+        assert victim not in aids, (
+            "cross-account provider-label target must be DROPPED fail-closed"
+        )
+
+    def test_build_map_drops_unmanageable_target_A1_apply_gate(
+        self, db, regular_user, admin_user,
+    ):
+        """A1 apply-gate (build-time defense-in-depth): even a row that bypassed
+        the storage gate (pre-existing poison, or a future non-handler writer)
+        is dropped at `_build_rule_provider_labels_map` — the apply path never
+        sees a target the rule OWNER can't manage."""
+        from email_triage.web.triage_one import _build_rule_provider_labels_map
+        mine = _make_account(
+            db, regular_user["id"], provider_type="gmail_api", name="mine",
+        )
+        victim = _make_account(
+            db, admin_user["id"], provider_type="gmail_api", name="victim",
+        )
+        list_id, rule_id = _make_rule(db, regular_user["id"])
+        # Directly poison the rule (bypassing the storage gate).
+        set_rule_provider_labels(db, rule_id, [
+            {"account_id": mine, "label_slug": "Keep"},
+            {"account_id": victim, "label_slug": "Poison"},
+        ])
+        out = _build_rule_provider_labels_map(db)
+        aids = {e["account_id"] for e in out.get(rule_id, [])}
+        assert mine in aids, "the rule owner's own account stays"
+        assert victim not in aids, (
+            "pre-existing cross-account target dropped at the actuator"
+        )
 
 
 # ---------------------------------------------------------------------------

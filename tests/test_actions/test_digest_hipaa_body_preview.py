@@ -298,7 +298,7 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
     # The filter step reads a row out of triage_runs.results_json;
     # short-circuit it to return a single row referencing message_id "m1".
     def _fake_filter(*, db, acct, dcfg, now_utc, last_sent):
-        return [{
+        rows = [{
             "message_id": "m1",
             "category": "newsletters",
             "sender": "boss@hospital.org",
@@ -306,6 +306,8 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
             "source": "llm",
             "date": "2026-05-08T08:00:00+00:00",
         }]
+        #  — _filter_digest_candidates now returns (rows, total_matched).
+        return rows, len(rows)
 
     # #277d: _filter_digest_candidates moved to web.digest; _render_digest_payload
     # resolves it from that module's globals, so patch it there (not the web.app
@@ -332,7 +334,9 @@ async def test_render_digest_payload_stamps_hipaa_on_fetched_messages(
         "email_address": "doctor@hospital.org",
     }
 
-    subject, html_body, plain_body, rows = await app_mod._render_digest_payload(
+    (
+        subject, html_body, plain_body, rows, _total_matched,
+    ) = await app_mod._render_digest_payload(
         db=None, secrets={}, acct=acct, dcfg=dcfg, hipaa=True,
         now_utc=datetime.now(timezone.utc), last_sent=None, config=_Cfg(),
     )

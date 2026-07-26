@@ -99,7 +99,9 @@ def store_db():
     """A FlowStore-shaped SQLite DB with one fixture row."""
     from email_triage.engine.store import FlowStore
 
-    store = FlowStore(":memory:")
+    from _db_tracking import track
+
+    store = track(FlowStore(":memory:"))
     yield store
 
 

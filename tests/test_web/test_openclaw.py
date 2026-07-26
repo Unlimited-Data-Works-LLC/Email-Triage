@@ -1,4 +1,4 @@
-"""Tests for the /api/openclaw/* bearer-token API."""
+"""Tests for the /api/v1/* bearer-token API."""
 
 import json
 from datetime import datetime, timezone
@@ -61,7 +61,7 @@ def fake_provider():
 def patch_provider(fake_provider):
     """Stub _create_provider_from_account to return our fake."""
     with patch(
-        "email_triage.web.routers.openclaw._create_provider_from_account",
+        "email_triage.web.routers.agent_api._create_provider_from_account",
         create=True,
     ):
         # The router imports it lazily inside endpoints; patch the source.
@@ -78,19 +78,19 @@ def patch_provider(fake_provider):
 
 class TestAuth:
     def test_missing_bearer_is_401(self, client):
-        resp = client.get("/api/openclaw/accounts")
+        resp = client.get("/api/v1/accounts")
         assert resp.status_code == 401
 
     def test_unknown_bearer_is_401(self, client):
         resp = client.get(
-            "/api/openclaw/accounts",
+            "/api/v1/accounts",
             headers={"Authorization": "Bearer et_does_not_exist"},
         )
         assert resp.status_code == 401
 
     def test_valid_bearer_lists_accounts(self, client, db, admin_user, bearer):
         _make_account(db, admin_user["id"], name="Work")
-        resp = client.get("/api/openclaw/accounts", headers=bearer)
+        resp = client.get("/api/v1/accounts", headers=bearer)
         assert resp.status_code == 200
         data = resp.json()
         assert "accounts" in data
@@ -101,7 +101,7 @@ class TestHipaaGate:
     def test_hipaa_account_excluded_from_list(self, client, db, admin_user, bearer):
         _make_account(db, admin_user["id"], hipaa=True, name="PHI Inbox")
         _make_account(db, admin_user["id"], hipaa=False, name="Work")
-        resp = client.get("/api/openclaw/accounts", headers=bearer)
+        resp = client.get("/api/v1/accounts", headers=bearer)
         assert resp.status_code == 200
         names = [a["name"] for a in resp.json()["accounts"]]
         assert "Work" in names
@@ -112,7 +112,7 @@ class TestHipaaGate:
     ):
         aid = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/messages?q=is:unread",
+            f"/api/v1/accounts/{aid}/messages?q=is:unread",
             headers=bearer,
         )
         assert resp.status_code == 403
@@ -124,7 +124,7 @@ class TestHipaaGate:
     ):
         aid = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/triage",
+            f"/api/v1/accounts/{aid}/triage",
             json={"query": "is:unread", "limit": 1},
             headers=bearer,
         )
@@ -146,7 +146,7 @@ class TestOwnership:
 
         aid = _make_account(db, admin_user["id"], name="AdminBox")
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/messages?q=ALL",
+            f"/api/v1/accounts/{aid}/messages?q=ALL",
             headers=bearer,
         )
         assert resp.status_code == 404
@@ -173,11 +173,11 @@ class TestOwnership:
         never_existed = owned_by_other + 99999
 
         not_owned = client.get(
-            f"/api/openclaw/accounts/{owned_by_other}/messages?q=ALL",
+            f"/api/v1/accounts/{owned_by_other}/messages?q=ALL",
             headers=bearer,
         )
         missing = client.get(
-            f"/api/openclaw/accounts/{never_existed}/messages?q=ALL",
+            f"/api/v1/accounts/{never_existed}/messages?q=ALL",
             headers=bearer,
         )
         assert not_owned.status_code == missing.status_code == 404
@@ -199,7 +199,7 @@ class TestOwnership:
             db, regular_user["id"], name="OtherUserBox",
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{other_aid}/messages?q=ALL",
+            f"/api/v1/accounts/{other_aid}/messages?q=ALL",
             headers=bearer,
         )
         assert resp.status_code == 404
@@ -212,7 +212,7 @@ class TestOwnership:
         _make_account(db, admin_user["id"], name="AdminBox")
         _make_account(db, regular_user["id"], name="OtherBox")
         resp = client.get(
-            "/api/openclaw/accounts", headers=bearer,
+            "/api/v1/accounts", headers=bearer,
         )
         assert resp.status_code == 200
         names = [a["name"] for a in resp.json()["accounts"]]
@@ -230,7 +230,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/messages?q=is:unread&limit=20",
+            f"/api/v1/accounts/{aid}/messages?q=is:unread&limit=20",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -243,7 +243,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/messages/m1", headers=bearer,
+            f"/api/v1/accounts/{aid}/messages/m1", headers=bearer,
         )
         assert resp.status_code == 200
         body = resp.json()
@@ -255,7 +255,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/messages/m1/label",
+            f"/api/v1/accounts/{aid}/messages/m1/label",
             json={"label": "Priority"},
             headers=bearer,
         )
@@ -268,7 +268,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/messages/m1/move",
+            f"/api/v1/accounts/{aid}/messages/m1/move",
             json={"folder": "Archive"},
             headers=bearer,
         )
@@ -280,7 +280,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/messages/m1/archive",
+            f"/api/v1/accounts/{aid}/messages/m1/archive",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -291,7 +291,7 @@ class TestProviderEndpoints:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/messages/m1/draft",
+            f"/api/v1/accounts/{aid}/messages/m1/draft",
             json={"to": ["bob@x.com"], "subject": "Re", "body": "hi"},
             headers=bearer,
         )
@@ -325,7 +325,7 @@ class TestTriageEndpoint:
             mk_cls.return_value = mock_cls
 
             resp = client.post(
-                f"/api/openclaw/accounts/{aid}/triage",
+                f"/api/v1/accounts/{aid}/triage",
                 json={"query": "ALL", "limit": 2},
                 headers=bearer,
             )
@@ -354,10 +354,10 @@ class TestRateLimit:
         bearer = {"Authorization": f"Bearer {raw}"}
 
         # Two requests succeed.
-        assert client.get("/api/openclaw/accounts", headers=bearer).status_code == 200
-        assert client.get("/api/openclaw/accounts", headers=bearer).status_code == 200
+        assert client.get("/api/v1/accounts", headers=bearer).status_code == 200
+        assert client.get("/api/v1/accounts", headers=bearer).status_code == 200
         # Third gets rate-limited.
-        resp = client.get("/api/openclaw/accounts", headers=bearer)
+        resp = client.get("/api/v1/accounts", headers=bearer)
         assert resp.status_code == 429
         assert "Retry-After" in resp.headers
 
@@ -372,7 +372,7 @@ class TestQuietHoursEndpoint:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.put(
-            f"/api/openclaw/accounts/{aid}/quiet-hours",
+            f"/api/v1/accounts/{aid}/quiet-hours",
             json={"enabled": True, "start_utc": "22:00", "end_utc": "08:00"},
             headers=bearer,
         )
@@ -387,7 +387,7 @@ class TestQuietHoursEndpoint:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.put(
-            f"/api/openclaw/accounts/{aid}/quiet-hours",
+            f"/api/v1/accounts/{aid}/quiet-hours",
             json={"paused": True},
             headers=bearer,
         )
@@ -397,7 +397,7 @@ class TestQuietHoursEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# /api/openclaw/health (admin-token gated, install-wide health)
+# /api/v1/health (admin-token gated, install-wide health)
 # ---------------------------------------------------------------------------
 
 class TestOpenclawHealth:
@@ -405,7 +405,7 @@ class TestOpenclawHealth:
         self, client, db, admin_user, bearer,
     ):
         """Admin bearer token gets the same body /health/detail serves."""
-        resp = client.get("/api/openclaw/health", headers=bearer)
+        resp = client.get("/api/v1/health", headers=bearer)
         assert resp.status_code == 200
         body = resp.json()
         # Same shape /health/detail returns -- carries the operator
@@ -419,13 +419,13 @@ class TestOpenclawHealth:
         }
 
     def test_missing_bearer_is_401(self, client):
-        resp = client.get("/api/openclaw/health")
+        resp = client.get("/api/v1/health")
         assert resp.status_code == 401
 
     def test_non_admin_token_is_403(self, client, db, regular_user):
         """Token from a non-admin user gets 403 (install-wide health
         is admin-only). Different gate than the per-user account
-        scope on other /api/openclaw/* endpoints."""
+        scope on other /api/v1/* endpoints."""
         from email_triage.web.auth import (
             generate_api_key, hash_api_key, store_api_key,
         )
@@ -435,7 +435,34 @@ class TestOpenclawHealth:
             user_id=regular_user["id"],
         )
         resp = client.get(
-            "/api/openclaw/health",
+            "/api/v1/health",
             headers={"Authorization": f"Bearer {raw}"},
         )
         assert resp.status_code == 403
+
+
+class TestLegacyOpenClawRedirect:
+    """ — the legacy /api/openclaw/* path 308-redirects to the neutral
+    /api/v1/* so existing integrations keep working through the rename. 308
+    (Permanent Redirect) PRESERVES method + body — a 301/302 would downgrade
+    POST/PUT/PATCH/DELETE to GET and silently break every mutating endpoint."""
+
+    def test_legacy_get_308_preserves_path_and_query(self, client):
+        r = client.get("/api/openclaw/runs?limit=5", follow_redirects=False)
+        assert r.status_code == 308, r.status_code
+        assert r.headers["location"] == "/api/v1/runs?limit=5"
+
+    def test_legacy_post_308_preserves_method(self, client):
+        # The redirect is auth-free (it only maps the path); the 308 fires
+        # before the target's bearer gate, so no creds are needed to observe it.
+        r = client.post(
+            "/api/openclaw/accounts/1/triage", follow_redirects=False,
+        )
+        assert r.status_code == 308, r.status_code
+        assert r.headers["location"] == "/api/v1/accounts/1/triage"
+
+    def test_canonical_v1_path_is_mounted(self, client):
+        # /api/v1 is LIVE (401 without auth — NOT 404, and NOT a 308), proving
+        # the router moved to /api/v1 rather than still living at /api/openclaw.
+        r = client.get("/api/v1/accounts", follow_redirects=False)
+        assert r.status_code in (401, 403), r.status_code

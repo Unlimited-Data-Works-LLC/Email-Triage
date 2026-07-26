@@ -46,6 +46,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _pin_harness import parse_module
 from email_triage.providers.imap_blocking import (
     _blocking_fetch_batch,
     fetch_messages_batch_blocking,
@@ -429,11 +430,14 @@ class TestPollOnceWiring:
     def test_poll_once_calls_batch_method(self):
         import ast
         from pathlib import Path
-        src = (
+        tree = parse_module(
             Path(__file__).resolve().parent.parent
             / "src" / "email_triage" / "providers" / "imap.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        )
+        assert tree is not None, (
+            "expected parseable source at "
+            "src/email_triage/providers/imap.py"
+        )
 
         # Find the poll_once method body.
         poll_once_body = None

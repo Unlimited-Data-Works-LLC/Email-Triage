@@ -53,7 +53,7 @@
         {% if baa_status.acked %}
             <strong style="color:var(--pico-ins-color);">yes</strong>
             ({{ baa_status.acked_by_email or '?' }} •
-            {{ baa_status.acked_at or '?' }})
+            {% if baa_status.acked_at %}<time datetime="{{ baa_status.acked_at }}" data-us-datetime>{{ baa_status.acked_at | us_datetime }}</time>{% else %}?{% endif %})
         {% else %}
             <strong style="color:var(--pico-del-color);">no</strong>
         {% endif %}

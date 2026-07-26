@@ -1,4 +1,4 @@
-"""Tests for /api/openclaw/accounts/{id}/watches CRUD + admin /admin/watches."""
+"""Tests for /api/v1/accounts/{id}/watches CRUD + admin /admin/watches."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class TestList:
     ):
         acct_id = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -68,7 +68,7 @@ class TestList:
     def test_unauth_is_401(self, client, db, admin_user):
         acct_id = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
         )
         assert resp.status_code == 401
 
@@ -88,7 +88,7 @@ class TestCreate:
             },
         }
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         )
         assert resp.status_code == 200
@@ -106,7 +106,7 @@ class TestCreate:
             "actions": {"escalate": {"enabled": True}},
         }
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         )
         assert resp.status_code == 400
@@ -126,7 +126,7 @@ class TestCreate:
             },
         }
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         )
         assert resp.status_code == 200
@@ -147,12 +147,12 @@ class TestUpdate:
             "actions": {"escalate": {"enabled": True}},
         }
         created = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         ).json()
         wid = created["watch_id"]
         resp = client.patch(
-            f"/api/openclaw/accounts/{acct_id}/watches/{wid}",
+            f"/api/v1/accounts/{acct_id}/watches/{wid}",
             json={"enabled": False}, headers=bearer,
         )
         assert resp.status_code == 200
@@ -172,12 +172,12 @@ class TestDelete:
             "actions": {"escalate": {"enabled": True}},
         }
         created = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         ).json()
         wid = created["watch_id"]
         resp = client.delete(
-            f"/api/openclaw/accounts/{acct_id}/watches/{wid}",
+            f"/api/v1/accounts/{acct_id}/watches/{wid}",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -188,7 +188,7 @@ class TestDelete:
     ):
         acct_id = _make_account(db, admin_user["id"])
         resp = client.delete(
-            f"/api/openclaw/accounts/{acct_id}/watches/watch_nope",
+            f"/api/v1/accounts/{acct_id}/watches/watch_nope",
             headers=bearer,
         )
         assert resp.status_code == 404
@@ -209,7 +209,7 @@ class TestTestFire:
             },
         }
         created = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             json=body, headers=bearer,
         ).json()
         wid = created["watch_id"]
@@ -217,7 +217,7 @@ class TestTestFire:
         # (returns ok=False with smtp_not_configured) but the endpoint
         # itself returns 200 + the result dict.
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/watches/{wid}/test-fire",
+            f"/api/v1/accounts/{acct_id}/watches/{wid}/test-fire",
             json={}, headers=bearer,
         )
         assert resp.status_code == 200
@@ -233,7 +233,7 @@ class TestHIPAA:
     ):
         acct_id = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{acct_id}/watches",
+            f"/api/v1/accounts/{acct_id}/watches",
             headers=bearer,
         )
         # The OpenClaw scope-gate refuses HIPAA accounts at 403 — same

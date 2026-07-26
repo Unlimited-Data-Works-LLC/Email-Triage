@@ -39,7 +39,8 @@ from email_triage.web.db import (
 # ---------------------------------------------------------------------------
 
 def _make_db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection, *, email: str = "u@example.com") -> int:
@@ -504,10 +505,16 @@ class TestDistillHipaaStyle:
         classifier.complete.assert_not_awaited()
 
     async def test_llm_failure_returns_llm_failed(self):
-        """Classifier raises → llm_failed + audit row final outcome=error."""
+        """Classifier raises → llm_failed + audit row final outcome=error.
+
+        N-80: the §164.312(b) bookend is gated actor≠owner (owner-self exempt),
+        so this drives a NON-owner actor (a manager distilling someone else's
+        HIPAA account) to exercise the recording path. Owner-self exemption is
+        pinned in test_audit_phi_access_pin (phi_access_audit_required)."""
         conn = _make_db()
-        user_id = _seed_user(conn)
-        acct = _seed_account(conn, user_id=user_id, hipaa=True)
+        owner_id = _seed_user(conn)
+        actor_id = _seed_user(conn, email="manager@example.com")  # non-owner
+        acct = _seed_account(conn, user_id=owner_id, hipaa=True)
         set_hipaa_style_distill_enabled(conn, True)
         set_style_knobs_hipaa_allow(conn, acct["id"], enabled=True)
 
@@ -518,12 +525,12 @@ class TestDistillHipaaStyle:
         descriptor, status = await distill_hipaa_style(
             conn, acct, classifier,
             messages=[_msg("real reply")],
-            actor_user_id=user_id,
+            actor_user_id=actor_id,
         )
         assert descriptor is None
         assert status == "llm_failed"
 
-        # Audit row should still close cleanly.
+        # Audit row (non-owner access) records + closes cleanly.
         events = list_hipaa_access_events(conn, account_id=acct["id"])
         assert len(events) == 1
         assert events[0]["outcome"] == "error"

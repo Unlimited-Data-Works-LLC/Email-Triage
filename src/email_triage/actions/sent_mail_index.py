@@ -50,17 +50,19 @@ external vector stores. No remote embedding backend.
 
 from __future__ import annotations
 
+from email_triage._int_utils import parse_int_or_none  # N-219c/31 R23
+from email_triage.db._helpers import dump_json_col, load_json_col  # N-186 R20_10
+
 import json
 import math
 import sqlite3
 import struct
-from datetime import datetime, timezone
 from typing import Any, Iterable, Protocol
 
 import numpy as np
 
 from email_triage.engine.models import EmailMessage
-from email_triage.triage_logging import get_logger, is_account_hipaa
+from email_triage.triage_logging import REDACTED, get_logger, is_account_hipaa
 from email_triage.web.db_writelock import get_write_lock
 
 log = get_logger("actions.sent_mail_index")
@@ -181,7 +183,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    from email_triage._isotime import now_utc_iso
+    return now_utc_iso()
 
 
 def _strip_quoted(body: str) -> str:
@@ -229,6 +232,12 @@ class SentMailIndex:
         self._account_id = int(account_id)
         self._backend = embedding_backend
         self._model = embedding_model
+        #  — the value written to + filtered on embedding_model.
+        # Encodes the E5 prefix scheme (no-op for non-E5 models, so
+        # existing rows are unchanged). Write + both retrieve filters use
+        # self._stamp so they always match.
+        from email_triage.engine.embedding_backend import embedding_stamp
+        self._stamp = embedding_stamp(embedding_model)
         self._provider = provider
         self._vec_available = bool(sqlite_vec_available)
         # 2026-05-11 — multi-folder override mirroring SentMailCaptureLoop.
@@ -236,12 +245,17 @@ class SentMailIndex:
         # MailFilter and merges the result so IMAP SELECTs each mailbox
         # in turn. Empty list falls through to the provider's default
         # mailbox + "in:sent" query (Gmail / O365 path).
-        cleaned: list[str] = []
-        if sent_folders:
-            for f in sent_folders:
-                if isinstance(f, str) and f.strip():
-                    cleaned.append(f.strip())
-        self._sent_folders: tuple[str, ...] = tuple(cleaned)
+        # run18  (PD#5): coerce through the
+        # normalize_sent_folder_override SSOT — the strip/drop-blank/
+        # legacy-scalar contract lives in ONE place, so a future caller
+        # that does NOT pre-normalize stays safe (the old inline loop
+        # iterated a bare str into its characters).
+        from email_triage.providers.sent_folder import (
+            normalize_sent_folder_override,
+        )
+        self._sent_folders: tuple[str, ...] = tuple(
+            normalize_sent_folder_override(sent_folders)
+        )
 
     # -- account-state helpers ---------------------------------------------
 
@@ -316,9 +330,14 @@ class SentMailIndex:
         if await db_call(self._hipaa_short_circuit, "index_message"):
             return
 
-        rfc_id = message.headers.get("Message-ID") or message.headers.get(
-            "message-id",
-        ) or ""
+        # A6 (census 2026-06-09): message-level SSOT. Was Message-ID /
+        # message-id only — an IMAP ``Message-Id``-cased sent message
+        # resolved to "" → the dedup lookup below was skipped → a fresh
+        # row was inserted on EVERY re-scan (the census double-count). The
+        # SSOT covers all casings AND falls back to the provider-native id
+        # so a header-less sent message still dedups.
+        from email_triage.mail_headers import get_message_rfc_id
+        rfc_id = get_message_rfc_id(message)
         # Skip rows we already have. Index look-up is on the unique
         # constraint -- O(log n) and avoids the embedding round-trip.
         #  — index_message is awaited from the sent-mail-capture
@@ -348,8 +367,14 @@ class SentMailIndex:
         text_for_embedding = (
             (message.subject or "").strip() + "\n\n" + body
         ).strip()
+        #  — E5 models need a "passage: " prefix on indexed docs,
+        # symmetric with the "query: " prefix at retrieve. No-op for
+        # non-E5 models (the helper returns "").
+        from email_triage.engine.embedding_backend import e5_prefix
         try:
-            vec = await self._backend.embed_text(text_for_embedding)
+            vec = await self._backend.embed_text(
+                e5_prefix(self._model, "passage") + text_for_embedding
+            )
         except Exception as exc:
             log.warning(
                 "sent_mail_index: embed_text failed",
@@ -364,7 +389,7 @@ class SentMailIndex:
         # (so this branch is dead in normal operation); leaving the
         # guard here in case a future caller bypasses the gate.
         if message.hipaa:
-            excerpt = "[REDACTED]"
+            excerpt = REDACTED
 
         # Precompute the L2 norm at write time so retrieval never has
         # to recompute it ( -- on a 10k-row corpus that recompute
@@ -386,21 +411,27 @@ class SentMailIndex:
                 "account_id, message_id, rfc_message_id, sent_at, "
                 "to_addresses, subject, body_excerpt, embedding_vec, "
                 "embedding_model, indexed_at, is_captured_pair, "
-                "embedding_norm"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "embedding_norm, embedding_dimension"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     self._account_id,
                     message.message_id,
                     rfc_id or None,
                     message.date.isoformat() if message.date else now,
-                    json.dumps(message.recipients or []),
-                    "[REDACTED]" if message.hipaa else (message.subject or ""),
+                    dump_json_col(message.recipients or []),  # N-186 R20_10 SSOT (ensure_ascii=False)
+                    REDACTED if message.hipaa else (message.subject or ""),
                     excerpt,
                     _pack_vec(vec),
-                    self._model,
+                    self._stamp,
                     now,
                     1 if is_captured_pair else 0,
                     float(norm),
+                    #  — stamp the per-row dimension at index time. The
+                    # v32 migration's "new rows backfill via index_message"
+                    # promise was never kept (this INSERT omitted the
+                    # column → NULL). Needed so needs_reindex()'s
+                    # dimension trigger is reliable on fresh corpora.
+                    len(vec),
                 ),
             )
             self._db.commit()
@@ -602,7 +633,7 @@ class SentMailIndex:
             raw_sim * _CAPTURED_PAIR_BOOST if is_captured else raw_sim
         )
         try:
-            to_list = json.loads(row_dict["to_addresses"] or "[]")
+            to_list = load_json_col(row_dict["to_addresses"], default=[])
             if not isinstance(to_list, list):
                 to_list = []
         except (TypeError, ValueError):
@@ -619,9 +650,10 @@ class SentMailIndex:
             "similarity": float(raw_sim),
             "is_captured_pair": is_captured,
         }
-        try:
-            row_id = int(row_dict["id"])
-        except (KeyError, TypeError, ValueError):
+        # N-219c/31 R23: dict.get + parse_int_or_none handles all 3 shapes
+        # (missing key, None value, non-numeric) with -1 sentinel.
+        row_id = parse_int_or_none(row_dict.get("id"))
+        if row_id is None:
             row_id = -1
         return ranking_score, entry, row_id
 
@@ -665,8 +697,14 @@ class SentMailIndex:
         if not query_text or not query_text.strip():
             return []
 
+        #  — E5 models need a "query: " prefix on search queries,
+        # symmetric with the "passage: " prefix at index. No-op for
+        # non-E5 models.
+        from email_triage.engine.embedding_backend import e5_prefix
         try:
-            qvec = await self._backend.embed_text(query_text)
+            qvec = await self._backend.embed_text(
+                e5_prefix(self._model, "query") + query_text
+            )
         except Exception as exc:
             log.warning(
                 "sent_mail_index: embed_text failed on query",
@@ -692,9 +730,22 @@ class SentMailIndex:
             # short-circuit than to scan rows that all score 0.0.
             return []
 
-        # Normalise the contact address: strip + case-fold so the
-        # SQL LIKE is consistent regardless of how the caller framed
-        # the address. Empty after normalisation = treat as no filter.
+        # the backlog  (Census v3 #2 wider follow-up) — this site
+        # is on the wider providers/actions/style_learning pin's
+        # allow-list because the SQL below LIKE-matches against the
+        # RAW ``to_addresses`` column (display form, e.g.
+        # ``"Alice <alice@münchen.de>, bob@x.com"``). Canonicalizing
+        # the filter side (which IDNA-normalizes + strips display-
+        # wrap) would produce ``alice@xn--mnchen-3ya.de`` — a
+        # substring the raw ``to_addresses`` never contains — so
+        # every LIKE match would drop to zero. A proper fix requires
+        # canonicalizing BOTH sides (index column migration + write-
+        # path normalize), which is a separate scope. For now: strip
+        # + case-fold to match the SQL's ``LOWER(to_addresses)``
+        # side. Allow-listed in
+        # ``tests/test_canonical_email_ssot_providers_pin.py::
+        # _ALLOWED_PROVIDERS_BYPASSES`` — the SSOT bypass is
+        # RATIONALIZED, not silent.
         contact_norm = (contact_address or "").strip().lower() or None
 
         # In-memory cosine over candidate rows. The vec0 virtual-
@@ -725,7 +776,7 @@ class SentMailIndex:
                     "WHERE account_id = ? "
                     "AND embedding_model = ? "
                     "AND LOWER(to_addresses) LIKE '%' || ? || '%'",
-                    (self._account_id, self._model, contact_norm),
+                    (self._account_id, self._stamp, contact_norm),
                 ).fetchall()
 
             rows = await db_call(_per_contact_rows)
@@ -761,7 +812,7 @@ class SentMailIndex:
                     "embedding_model, is_captured_pair, embedding_norm "
                     "FROM sent_mail_index "
                     "WHERE account_id = ? AND embedding_model = ?",
-                    (self._account_id, self._model),
+                    (self._account_id, self._stamp),
                 ).fetchall()
 
             rows = await db_call(_global_rows)

@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import base64  # noqa: F401  -- imported for clarity even though decoding lives in mail_headers
 import sqlite3
-from datetime import datetime, timezone
 from typing import Any
 
 from email_triage.engine.models import EmailMessage
@@ -84,7 +83,8 @@ log = get_logger("actions.sent_mail_capture")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    from email_triage._isotime import now_utc_iso
+    return now_utc_iso()
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +121,25 @@ class SentMailCaptureLoop:
         # etc. Empty/None falls through to the provider's default
         # mailbox + "in:sent" query. Stored as a tuple so the value is
         # immutable across the loop lifetime.
-        cleaned: list[str] = []
-        if sent_folders:
-            for f in sent_folders:
-                if isinstance(f, str) and f.strip():
-                    cleaned.append(f.strip())
-        self._sent_folders: tuple[str, ...] = tuple(cleaned)
+        # run18  (PD#5): coerce through the
+        # normalize_sent_folder_override SSOT — the strip/drop-blank/
+        # legacy-scalar contract lives in ONE place, so a future caller
+        # that does NOT pre-normalize stays safe (the old inline loop
+        # iterated a bare str into its characters).
+        from email_triage.providers.sent_folder import (
+            normalize_sent_folder_override,
+        )
+        self._sent_folders: tuple[str, ...] = tuple(
+            normalize_sent_folder_override(sent_folders)
+        )
+        # the backlog  (2026-07-12): memoize the N-402 auto-detected
+        # IMAP Sent folder across scans within THIS loop instance's
+        # lifetime. Saves one `LIST "" "*"` round-trip per sweep tick on
+        # IMAP-no-`sent_folders` accounts. Persists ONLY across the loop
+        # instance (a new loop instance re-detects); no cross-process
+        # state, no invalidation logic needed. Set once on first
+        # successful auto-detect; None means "not yet auto-detected".
+        self._auto_detected_sent_folder: str | None = None
 
     # -- account-state helpers ---------------------------------------------
 
@@ -226,18 +239,62 @@ class SentMailCaptureLoop:
         # 2026-05-13 root cause — UIDs are mailbox-scoped per RFC 3501
         # § 2.3.1.1; pair each UID with its source folder so the
         # subsequent fetch_message hits the right mailbox.
+        # N-82 (Defect A) — import the auth-revoked classifier so the
+        # per-folder and fallback search exception handlers can distinguish
+        # a dead-token failure (re-raise → reaches the sweeper's SET edge)
+        # from a genuinely transient error (swallow → return 0 as before).
+        from email_triage.web._auth_revoked import is_auth_revoked_exc
+
         seen: set[str] = set()
         merged_pairs: list[tuple[str, str]] = []  # (folder, uid)
         try:
-            if self._sent_folders:
+            # the backlog  (2026-07-12): auto-detect Sent folder on IMAP
+            # via find_sent_folder SSOT (RFC 6154 SPECIAL-USE + name fallback
+            # against Sent / INBOX.Sent / Sent Items / Sent Messages) so the
+            # operator-config-populate step becomes optional. On IMAP with
+            # no operator-configured `sent_folders`, promote the detected
+            # folder into a per-scan `folders_to_walk` tuple; do NOT mutate
+            # `self._sent_folders` — auto-detect is per-scan, so an operator
+            # who later configures explicit `sent_folders` overrides it
+            # cleanly. find_sent_folder never raises and always returns a
+            # str (default "Sent" if no probe matched); if that string
+            # names a folder that doesn't exist, the per-folder SELECT
+            # below fails and the existing per-folder warn+continue net
+            # handles it — no worse than N-390's pre-fix warn+return_0
+            # posture. Replaces N-390's caller-side skip (§4.19 register).
+            folders_to_walk: tuple[str, ...] = self._sent_folders
+            if not folders_to_walk:
+                from email_triage.providers.imap import ImapProvider
+
+                if isinstance(self._provider, ImapProvider):
+                    if self._auto_detected_sent_folder is None:
+                        from email_triage.providers.sent_folder import (
+                            find_sent_folder,
+                        )
+                        self._auto_detected_sent_folder = (
+                            await find_sent_folder(self._provider)
+                        )
+                        log.info(
+                            "sent_mail_capture: auto-detected IMAP Sent folder",
+                            account_id=self._account_id,
+                            folder=self._auto_detected_sent_folder,
+                        )
+                    folders_to_walk = (self._auto_detected_sent_folder,)
+
+            if folders_to_walk:
                 from email_triage.engine.models import MailFilter
-                for folder in self._sent_folders:
+                for folder in folders_to_walk:
                     try:
                         part = await self._provider.search(
                             "in:sent", limit,
                             filter=MailFilter(folder=folder),
                         )
                     except Exception as exc:
+                        # N-82 — auth-revoked: propagate so the sweeper's
+                        # except-scan_err branch SETs the auth_stale chip.
+                        # Transient errors are swallowed (continue) as before.
+                        if is_auth_revoked_exc(exc):
+                            raise
                         log.warning(
                             "sent_mail_capture: provider search failed "
                             "(continuing with other folders)",
@@ -251,11 +308,22 @@ class SentMailCaptureLoop:
                             seen.add(mid)
                             merged_pairs.append((folder, mid))
             else:
+                # Non-IMAP fallback (Gmail-API / O365): `"in:sent"` is
+                # honored natively by these providers' server-side search
+                # (Gmail via X-GM-RAW; Graph via well-known folder scoping).
+                # The translator-SSOT reject in `translate_imap_query_to_imap`
+                # (N-390) is the defense-in-depth peer to this caller-side
+                # correct behavior on non-IMAP providers.
                 fallback_ids = await self._provider.search("in:sent", limit)
                 merged_pairs = [
                     ("", mid) for mid in (fallback_ids or [])
                 ]
         except Exception as exc:
+            # N-82 — auth-revoked escapes the inner try (via re-raise above
+            # or from the fallback search): propagate so the sweeper SETs the
+            # chip. Transient errors are still swallowed → return 0.
+            if is_auth_revoked_exc(exc):
+                raise
             log.warning(
                 "sent_mail_capture: provider search failed",
                 account_id=self._account_id,
@@ -273,6 +341,14 @@ class SentMailCaptureLoop:
                 else:
                     msg = await self._provider.fetch_message(mid)
             except Exception as exc:
+                # #1 (census run16) — auth-revoked on the FETCH leg must
+                # propagate like the SEARCH leg already does (N-82), so the
+                # sweeper SETs the auth_stale chip instead of swallowing the
+                # dead-token error and letting the success path CLEAR it (a
+                # wrong CLEAR on a revoked credential masks re-auth). Transient
+                # errors are still swallowed (continue) as before.
+                if is_auth_revoked_exc(exc):
+                    raise
                 log.warning(
                     "sent_mail_capture: fetch failed; continuing",
                     message_id=mid,

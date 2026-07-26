@@ -72,11 +72,11 @@ def register_backend(type_name: str, adapter_cls: type[BackendAdapter]) -> None:
     old = BACKEND_TYPES[type_name]
     BACKEND_TYPES[type_name] = adapter_cls
     if old is not adapter_cls and not issubclass(old, NotImplementedAdapter):
-        logging.getLogger("email_triage.ai_backends").info(
+        # N-242b R24: TriageLogger SSOT.
+        from email_triage.triage_logging import get_logger
+        get_logger("ai_backends").info(
             "AI backend registry swap",
-            extra={"_extra": {
-                "type": type_name,
-                "old": old.__name__,
-                "new": adapter_cls.__name__,
-            }},
+            type=type_name,
+            old=old.__name__,
+            new=adapter_cls.__name__,
         )

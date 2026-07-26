@@ -92,10 +92,7 @@
                 <td><strong>Bulk Triage Rate</strong></td>
                 <td>
                     <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
-                        <input type="number" name="bulk_triage_rate_msg_per_min"
-                               value="{{ runtime.bulk_triage_rate_msg_per_min or 30 }}"
-                               min="1" max="600" step="1"
-                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {{ m.combo_input("bulk_triage_rate_msg_per_min", runtime.bulk_triage_rate_msg_per_min or 30, [30, 60, 120, 300], type="number", attrs="min=1 max=600 step=1 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                         msg / min
                     </label>
                 </td>
@@ -107,10 +104,7 @@
                 <td><strong>Bulk Triage Concurrency</strong></td>
                 <td>
                     <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
-                        <input type="number" name="bulk_triage_concurrency"
-                               value="{{ runtime.bulk_triage_concurrency or 1 }}"
-                               min="1" max="8" step="1"
-                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {{ m.combo_input("bulk_triage_concurrency", runtime.bulk_triage_concurrency or 1, [1, 2, 4, 8], type="number", attrs="min=1 max=8 step=1 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                         parallel
                     </label>
                 </td>
@@ -126,10 +120,7 @@
                 </td>
                 <td>
                     <label style="margin:0;display:inline-flex;align-items:center;gap:0.5rem;">
-                        <input type="number" name="bulk_triage_burst"
-                               value="{{ runtime.bulk_triage_burst or 1 }}"
-                               min="1" max="100" step="1"
-                               style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        {{ m.combo_input("bulk_triage_burst", runtime.bulk_triage_burst or 1, [1, 3, 5, 10, 50, 100], type="number", attrs="min=1 max=100 step=1 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                         msgs
                     </label>
                 </td>
@@ -211,21 +202,122 @@
                     AI backend for email classification.
                 </small></td>
             </tr>
+            {# #44 — model picker replaces the bare free-text Model input.
+               Submits the SAME name="classifier_model" (single string)
+               plus a new name="classifier_backup_models" (comma-
+               separated, ordered). Probes the live [name=classifier_backend]
+               + [name=classifier_ollama_url] on this form. The free-text
+               escape hatch keeps non-enumerable backends + offline use
+               working. Picker lives inside the Value cell so the 3-column
+               table layout is preserved. #}
             <tr>
                 <td><strong>Model</strong></td>
                 <td>
-                    <input type="text" name="classifier_model" value="{{ config.classifier.model }}"
-                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.model_picker("classifier_model", "classifier_backup_models", config.classifier.model, config.classifier.backup_models, "[name=classifier_backend]", "[name=classifier_ollama_url]") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Model name (e.g. <code>qwen3.5:35b</code>, <code>gpt-4o</code>, <code>gemini-2.0-flash</code>).
+                    Pick from the probed list, or tick <em>Enter manually</em> to type one.
+                    Backup models are tried in order if the primary can't classify.
+                </small></td>
+            </tr>
+            {# #49 — pin the Ollama context-window size (num_ctx). Blank = inherit
+               the model's loaded default (recommended). Sits next to the Model
+               picker because it governs both classify capacity AND the #33
+               Topic-match warm-prefix cache. #}
+            <tr>
+                <td><strong>Context window</strong></td>
+                <td>
+                    <input type="number" name="classifier_num_ctx" min="1" step="1"
+                           value="{{ config.classifier.num_ctx if config.classifier.num_ctx is not none else '' }}"
+                           placeholder="(inherit model default)"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;max-width:12rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Ollama only. Pins <code>num_ctx</code> for <em>every</em> Ollama call — classify,
+                    the Topic-match prefill, and the explain-this-error / style-learning completion.
+                    Leave blank to inherit the model's loaded default (recommended). A divergent value
+                    forces a one-time model reload; both Topic-match stages share it, so the warm-prefix
+                    cache stays intact. Values below ~8192 may silently degrade multi-Topic matching
+                    (the Topic pre-filter inlines several full Topic Details) and truncate long
+                    explanations — the app logs a warning if you pin one that low.
+                </small></td>
+            </tr>
+            {# N-378 — Ollama `think` payload option as a CONFIG KNOB. Sits
+               next to the model picker + num_ctx because it directly gates
+               the reasoning-mode budget on qwen3-family models. Tri-state:
+               blank = model default; false = disable thinking (~4-6× faster
+               on reasoning models); true = force thinking. Requires Ollama
+               ≥ 0.31.1 when combined with the classify/topic-match format
+               schema — see the ClassifierConfig docblock. #}
+            <tr>
+                <td><strong>Ollama <code>think</code></strong></td>
+                <td>
+                    <select name="classifier_ollama_think"
+                            style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;max-width:12rem;">
+                        <option value="" {% if config.classifier.ollama_think is none %}selected{% endif %}>(model default)</option>
+                        <option value="false" {% if config.classifier.ollama_think is false %}selected{% endif %}>false — disable thinking</option>
+                        <option value="true" {% if config.classifier.ollama_think is true %}selected{% endif %}>true — force thinking</option>
+                    </select>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Ollama only. Sent as the top-level <code>think</code> payload option
+                    on every /api/chat call (classify, topic-match, safety, style-learning).
+                    Reasoning models (qwen3.6:35b) burn the full <code>num_predict</code> budget
+                    on hidden reasoning tokens before emitting JSON; disabling thinking recovers
+                    that latency and prevents <em>finish_reason=length, raw_len=0</em> empty responses.
+                    Requires Ollama <strong>≥ 0.31.1</strong> when combined with the format schema
+                    (older Ollama drops the schema mask — bug #15260 fixed via PRs #15678/#15392).
+                </small></td>
+            </tr>
+            {# N-378 belt-and-braces companion. Qwen3-family models honour a
+               `/no_think` marker at the end of the user message as a per-call
+               thinking-off directive — independent of the `think` payload
+               option. Cheap safety net on top of the `think` knob. #}
+            <tr>
+                <td><strong>Append <code>/no_think</code> marker</strong></td>
+                <td>
+                    <label style="margin:0;">
+                        <input type="checkbox" name="classifier_ollama_no_think_marker" value="1"
+                               {% if config.classifier.ollama_no_think_marker %}checked{% endif %}
+                               style="margin:0 0.5rem 0 0;">
+                        <small>append <code>/no_think</code> to every prompt</small>
+                    </label>
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Qwen3-family only. Appends the <code>/no_think</code> marker to the end of
+                    every /api/chat user prompt — an independent per-call thinking-off directive
+                    that some Qwen3 tokenizer templates honour even when the payload option isn't
+                    set. No-op on non-Qwen3 models. Safe as a belt-and-braces companion to the
+                    <code>think</code> knob above.
+                </small></td>
+            </tr>
+            {# N-431 (2026-07-19) — Ollama `keep_alive` payload option, threaded
+               SSOT to every /api/chat + /api/embeddings site. Absent this
+               field the daemon applies its built-in default "5m" per call,
+               silently overriding any operator TTL pin (including a Forever
+               `-1` pin). Wire form: str "10m" / "1h" / "-1" / "0". #}
+            <tr>
+                <td><strong>Ollama <code>keep_alive</code></strong></td>
+                <td>
+                    <input type="text" name="classifier_ollama_keep_alive"
+                           value="{{ config.classifier.ollama_keep_alive }}"
+                           placeholder="10m"
+                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;max-width:12rem;">
+                </td>
+                <td><small style="color:var(--pico-muted-color);">
+                    Ollama only. Sent as the top-level <code>keep_alive</code> payload option
+                    on every /api/chat + /api/embeddings call. Accepts Ollama's native form:
+                    <code>10m</code>, <code>1h</code>, <code>-1</code> (Forever pin),
+                    <code>0</code> (unload immediately). Absent, Ollama applies its built-in
+                    <code>5m</code> default per call — silently overriding any operator TTL
+                    pin (including Forever). Empty saves keep the default (<code>10m</code>).
                 </small></td>
             </tr>
             <tr>
                 <td><strong>Ollama URL</strong></td>
                 <td>
-                    <input type="text" name="classifier_ollama_url" value="{{ config.classifier.ollama_url }}"
-                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.combo_input("classifier_ollama_url", config.classifier.ollama_url, ["http://localhost:11434", "http://ollama.home:11434"], type="url", attrs="style='margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Base URL for the Ollama API server.
@@ -234,9 +326,7 @@
             <tr>
                 <td><strong>OpenAI Base URL</strong></td>
                 <td>
-                    <input type="text" name="classifier_openai_base_url" value="{{ config.classifier.openai_base_url }}"
-                           placeholder="https://api.openai.com/v1"
-                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.combo_input("classifier_openai_base_url", config.classifier.openai_base_url, ["https://api.openai.com/v1", "https://<resource>.openai.azure.com/"], type="url", placeholder="https://api.openai.com/v1", attrs="style='margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     For OpenAI/Azure backend. Leave blank for default OpenAI endpoint.
@@ -294,8 +384,7 @@
             <tr>
                 <td><strong>Host</strong></td>
                 <td>
-                    <input type="text" name="smtp_host" value="{{ config.smtp.host }}"
-                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.combo_input("smtp_host", config.smtp.host, ["smtp.gmail.com", "smtp.office365.com", "smtp.fastmail.com", "smtp.sendgrid.net"], attrs="style='margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     SMTP server hostname.
@@ -304,8 +393,7 @@
             <tr>
                 <td><strong>Port</strong></td>
                 <td>
-                    <input type="number" name="smtp_port" value="{{ config.smtp.port }}"
-                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.combo_input("smtp_port", config.smtp.port, [587, 465, 25, 2525], type="number", attrs="min=1 max=65535 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     SMTP port (25, 465, 587).
@@ -415,12 +503,7 @@
             <tr>
                 <td><strong>Default poll interval</strong></td>
                 <td>
-                    <input type="number" name="ingestion_default_poll_interval_minutes"
-                           value="{{ config.ingestion.default_poll_interval_minutes }}"
-                           min="{{ config.ingestion.POLL_MIN }}"
-                           max="{{ config.ingestion.POLL_MAX }}"
-                           step="{{ config.ingestion.POLL_STEP }}"
-                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                    {{ m.combo_input("ingestion_default_poll_interval_minutes", config.ingestion.default_poll_interval_minutes, [10, 30, 60, 120, 240], type="number", attrs="min=" ~ config.ingestion.POLL_MIN ~ " max=" ~ config.ingestion.POLL_MAX ~ " step=" ~ config.ingestion.POLL_STEP ~ " style='margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} min
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     {{ config.ingestion.POLL_MIN }}–{{ config.ingestion.POLL_MAX }} min in {{ config.ingestion.POLL_STEP }}-min steps.
@@ -430,12 +513,7 @@
             <tr>
                 <td><strong>Push-mode interval</strong> <small>(legacy)</small></td>
                 <td>
-                    <input type="number" name="ingestion_push_poll_interval_min"
-                           value="{{ config.ingestion.push_poll_interval_min }}"
-                           min="{{ config.ingestion.PUSH_MIN }}"
-                           max="{{ config.ingestion.PUSH_MAX }}"
-                           step="{{ config.ingestion.STEP }}"
-                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                    {{ m.combo_input("ingestion_push_poll_interval_min", config.ingestion.push_poll_interval_min, [10, 30, 60, 120, 240], type="number", attrs="min=" ~ config.ingestion.PUSH_MIN ~ " max=" ~ config.ingestion.PUSH_MAX ~ " step=" ~ config.ingestion.STEP ~ " style='margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} min
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Legacy B3 field retained for YAML round-trip. No longer drives ingestion.
@@ -444,12 +522,7 @@
             <tr>
                 <td><strong>Poll-mode interval</strong> <small>(legacy)</small></td>
                 <td>
-                    <input type="number" name="ingestion_poll_poll_interval_min"
-                           value="{{ config.ingestion.poll_poll_interval_min }}"
-                           min="{{ config.ingestion.POLL_MIN }}"
-                           max="{{ config.ingestion.POLL_MAX }}"
-                           step="{{ config.ingestion.STEP }}"
-                           style="margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> min
+                    {{ m.combo_input("ingestion_poll_poll_interval_min", config.ingestion.poll_poll_interval_min, [10, 30, 60, 120, 240], type="number", attrs="min=" ~ config.ingestion.POLL_MIN ~ " max=" ~ config.ingestion.POLL_MAX ~ " step=" ~ config.ingestion.STEP ~ " style='margin:0;width:7rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} min
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Legacy B3 field retained for YAML round-trip. No longer drives ingestion.
@@ -486,10 +559,7 @@
                     {{ m.help("Hours between auto-scans of opted-in accounts. Default 6. Example: 12 = scan twice a day (lighter load); 1 = scan every hour (fresher style data, higher AI cost).") }}
                 </td>
                 <td>
-                    <input type="number" name="style_learning_capture_interval_hours"
-                           value="{{ style_learning_capture_interval_hours or 6 }}"
-                           min="1" max="72" step="1"
-                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> hours
+                    {{ m.combo_input("style_learning_capture_interval_hours", style_learning_capture_interval_hours or 6, [1, 2, 4, 6, 12, 24, 48, 72], type="number", attrs="min=1 max=72 step=1 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} hours
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Range 1&ndash;72 hours. Cadence applies to every account that has Auto-scan on schedule turned on.
@@ -501,10 +571,7 @@
                     {{ m.help("Default number of sent messages each mine press reads when no per-account override is set. Default 50. Example: 100 = pull twice as many sent messages on a one-click refresh (over " ~ (inline_limit_ceiling or 50) ~ " runs in the background on the Bulk runs page).") }}
                 </td>
                 <td>
-                    <input type="number" name="style_learning_mine_limit_default"
-                           value="{{ style_learning_mine_limit_default or 50 }}"
-                           min="1" max="500" step="1"
-                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> messages
+                    {{ m.combo_input("style_learning_mine_limit_default", style_learning_mine_limit_default or 50, [10, 25, 50, 100, 200, 500], type="number", attrs="min=1 max=500 step=1 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} messages
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Range 1&ndash;500. Each user can override this from their Style data page; values over {{ inline_limit_ceiling or 50 }} hand off to a background job so the browser doesn't sit waiting.
@@ -613,11 +680,7 @@
             <tr>
                 <td><strong>Send at</strong></td>
                 <td>
-                    <input type="text" name="health_email_send_at"
-                           value="{{ config.health_email.send_at }}"
-                           placeholder="07:15"
-                           pattern="[0-2][0-9]:[0-5][0-9]"
-                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                    {{ m.combo_input("health_email_send_at", config.health_email.send_at, ["07:00", "07:15", "08:00", "18:00", "20:00"], placeholder="07:15", attrs="pattern='[0-2][0-9]:[0-5][0-9]' style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     HH:MM in container local time.
@@ -626,10 +689,7 @@
             <tr>
                 <td><strong>Release notes URL</strong></td>
                 <td>
-                    <input type="text" name="admin_email_release_check_url"
-                           value="{{ config.admin_email.release_check_url }}"
-                           placeholder="https://api.github.com/repos/unlimited-data-works-llc/email-triage/releases/latest"
-                           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;">
+                    {{ m.combo_input("admin_email_release_check_url", config.admin_email.release_check_url, ["https://api.github.com/repos/unlimited-data-works-llc/email-triage/releases/latest"], type="url", placeholder="https://api.github.com/repos/unlimited-data-works-llc/email-triage/releases/latest", attrs="style='margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;'") }}
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     GitHub Releases API endpoint. Used for the "update
@@ -640,7 +700,7 @@
             </tr>
             <tr>
                 <td colspan="3" style="background:var(--pico-card-background-color);padding:0.4rem 0.75rem;">
-                    <strong>Content toggles</strong>
+                    <strong>Content toggles</strong>{{ m.help("Pick which sections appear in the daily health email. Each is a self-contained block; turning one off just omits it. Update-failed alerts always send regardless of these.") }}
                 </td>
             </tr>
             {% for key, label in [
@@ -684,10 +744,7 @@
             <tr>
                 <td><strong>Error-rate threshold</strong></td>
                 <td>
-                    <input type="number" name="health_email_error_rate_threshold_pct"
-                           value="{{ config.health_email.error_rate_threshold_pct }}"
-                           min="0" max="100"
-                           style="margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;"> %
+                    {{ m.combo_input("health_email_error_rate_threshold_pct", config.health_email.error_rate_threshold_pct, [0, 1, 5, 10, 25, 50], type="number", attrs="min=0 max=100 style='margin:0;width:6rem;padding:0.25rem 0.5rem;font-size:0.9rem;'") }} %
                 </td>
                 <td><small style="color:var(--pico-muted-color);">
                     Triage error rate above this flips the subject to

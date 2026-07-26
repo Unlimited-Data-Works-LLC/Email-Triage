@@ -84,7 +84,7 @@ class TestMailSearch:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/mail/search"
+            f"/api/v1/accounts/{aid}/mail/search"
             "?unread=true&label=Priority&after=2026-04-01T00:00:00Z&limit=5",
             headers=bearer,
         )
@@ -103,7 +103,7 @@ class TestMailSearch:
     def test_hipaa_account_403(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/mail/search?unread=true",
+            f"/api/v1/accounts/{aid}/mail/search?unread=true",
             headers=bearer,
         )
         assert resp.status_code == 403
@@ -119,7 +119,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={
                 "operation": "label",
                 "args": {"label": "Reviewed"},
@@ -142,7 +142,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={
                 "operation": "label",
                 "args": {"label": "Reviewed"},
@@ -165,7 +165,7 @@ class TestMailBulk:
             side_effect=[None, RuntimeError("boom"), None],
         )
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "label", "args": {"label": "X"},
                   "message_ids": ["a", "b", "c"]},
             headers=bearer,
@@ -181,7 +181,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "label", "message_ids": ["m1"]},
             headers=bearer,
         )
@@ -193,7 +193,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "delete_forever", "message_ids": ["m1"]},
             headers=bearer,
         )
@@ -204,7 +204,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={
                 "operation": "archive",
                 "message_ids": ["m1"],
@@ -219,7 +219,7 @@ class TestMailBulk:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "archive"},
             headers=bearer,
         )
@@ -232,7 +232,7 @@ class TestMailBulk:
         client.app.state.config.push.bulk_max_batch_size = 2
         try:
             resp = client.post(
-                f"/api/openclaw/accounts/{aid}/mail/bulk",
+                f"/api/v1/accounts/{aid}/mail/bulk",
                 json={"operation": "archive",
                       "message_ids": ["a", "b", "c"]},
                 headers=bearer,
@@ -245,7 +245,7 @@ class TestMailBulk:
     def test_bulk_hipaa_403(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "archive", "message_ids": ["m1"]},
             headers=bearer,
         )
@@ -267,7 +267,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "label", "args": {"label": "Reviewed"},
                   "message_ids": ["m1", "m2"]},
             headers=bearer,
@@ -283,7 +283,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/write",
+            f"/api/v1/accounts/{aid}/bulk/mail/write",
             json={"operation": "label", "args": {"label": "Reviewed"},
                   "message_ids": ["m1", "m2"]},
             headers=bearer,
@@ -299,7 +299,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/mail/bulk",
+            f"/api/v1/accounts/{aid}/mail/bulk",
             json={"operation": "archive", "message_ids": ["m1"]},
             headers=bearer,
         )
@@ -307,7 +307,7 @@ class TestBulkNamespaceMigration:
         assert resp.headers.get("Deprecation") == "true"
         assert resp.headers.get("Sunset") == "2027-01-01"
         link = resp.headers.get("Link", "")
-        assert f"/api/openclaw/accounts/{aid}/bulk/mail/write" in link
+        assert f"/api/v1/accounts/{aid}/bulk/mail/write" in link
         assert 'rel="successor-version"' in link
 
     def test_canonical_bulk_mail_write_no_deprecated_header(
@@ -315,7 +315,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/write",
+            f"/api/v1/accounts/{aid}/bulk/mail/write",
             json={"operation": "archive", "message_ids": ["m1"]},
             headers=bearer,
         )
@@ -331,7 +331,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/bulk-respond",
+            f"/api/v1/accounts/{aid}/calendar/bulk-respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
             ]},
@@ -347,7 +347,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/respond",
+            f"/api/v1/accounts/{aid}/bulk/calendar/respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
             ]},
@@ -363,7 +363,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/bulk-respond",
+            f"/api/v1/accounts/{aid}/calendar/bulk-respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
             ]},
@@ -373,7 +373,7 @@ class TestBulkNamespaceMigration:
         assert resp.headers.get("Deprecation") == "true"
         assert resp.headers.get("Sunset") == "2027-01-01"
         link = resp.headers.get("Link", "")
-        assert f"/api/openclaw/accounts/{aid}/bulk/calendar/respond" in link
+        assert f"/api/v1/accounts/{aid}/bulk/calendar/respond" in link
         assert 'rel="successor-version"' in link
 
     def test_canonical_bulk_calendar_respond_no_deprecated_header(
@@ -381,7 +381,7 @@ class TestBulkNamespaceMigration:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/respond",
+            f"/api/v1/accounts/{aid}/bulk/calendar/respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
             ]},
@@ -410,7 +410,7 @@ class TestFreeSlots:
         )
         # Pick a Monday horizon.
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/free-slots"
+            f"/api/v1/accounts/{aid}/calendar/free-slots"
             "?length=30&count=5"
             "&time_min=2026-04-20T00:00:00Z&time_max=2026-04-21T00:00:00Z",
             headers=bearer,
@@ -427,7 +427,7 @@ class TestFreeSlots:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=False)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/free-slots?length=30&count=5",
+            f"/api/v1/accounts/{aid}/calendar/free-slots?length=30&count=5",
             headers=bearer,
         )
         assert resp.status_code == 400
@@ -438,7 +438,7 @@ class TestFreeSlots:
     ):
         aid = _make_account(db, admin_user["id"], hipaa=True, calendar_enabled=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/free-slots?length=30&count=5",
+            f"/api/v1/accounts/{aid}/calendar/free-slots?length=30&count=5",
             headers=bearer,
         )
         assert resp.status_code == 403
@@ -454,7 +454,7 @@ class TestBulkRespond:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/bulk-respond",
+            f"/api/v1/accounts/{aid}/calendar/bulk-respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
                 {"event_id": "ev2", "response": "declined"},
@@ -472,7 +472,7 @@ class TestBulkRespond:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/bulk-respond",
+            f"/api/v1/accounts/{aid}/calendar/bulk-respond",
             json={"responses": [
                 {"event_id": "ev1", "response": "accepted"},
                 {"event_id": "ev2", "response": "maybe-later"},
@@ -486,7 +486,7 @@ class TestBulkRespond:
     def test_bulk_respond_hipaa_403(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True, calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/bulk-respond",
+            f"/api/v1/accounts/{aid}/calendar/bulk-respond",
             json={"responses": [{"event_id": "ev1", "response": "accepted"}]},
             headers=bearer,
         )
@@ -532,7 +532,7 @@ class TestBulkMailList:
             _fake_message("m3", subject="Third", labels=["INBOX"]),
         ])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?unread=true&limit=3",
+            f"/api/v1/accounts/{aid}/bulk/mail?unread=true&limit=3",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -556,7 +556,7 @@ class TestBulkMailList:
             RuntimeError("provider blew up on m2"),
         ])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=2",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=2",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -578,7 +578,7 @@ class TestBulkMailList:
                 side_effect=[_fake_message(f"m{i}") for i in range(5)],
             )
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/bulk/mail?limit=100",
+                f"/api/v1/accounts/{aid}/bulk/mail?limit=100",
                 headers=bearer,
             )
             assert resp.status_code == 200
@@ -589,7 +589,7 @@ class TestBulkMailList:
     def test_hipaa_403(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail", headers=bearer,
+            f"/api/v1/accounts/{aid}/bulk/mail", headers=bearer,
         )
         assert resp.status_code == 403
 
@@ -605,7 +605,7 @@ class TestBulkMailFetch:
             _fake_message("x1"), _fake_message("x2"),
         ])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/fetch",
+            f"/api/v1/accounts/{aid}/bulk/mail/fetch",
             json={"message_ids": ["x1", "x2"]}, headers=bearer,
         )
         assert resp.status_code == 200
@@ -619,7 +619,7 @@ class TestBulkMailFetch:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/fetch",
+            f"/api/v1/accounts/{aid}/bulk/mail/fetch",
             json={}, headers=bearer,
         )
         assert resp.status_code == 400
@@ -631,7 +631,7 @@ class TestBulkMailFetch:
         client.app.state.config.push.bulk_max_batch_size = 3
         try:
             resp = client.post(
-                f"/api/openclaw/accounts/{aid}/bulk/mail/fetch",
+                f"/api/v1/accounts/{aid}/bulk/mail/fetch",
                 json={"message_ids": ["a", "b", "c", "d"]},
                 headers=bearer,
             )
@@ -653,7 +653,7 @@ class TestBulkMailListFull:
             return_value=_fake_message("m1", body="Full newsletter body."),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full?label=Newsletters&limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail/full?label=Newsletters&limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -666,7 +666,7 @@ class TestBulkMailListFull:
     ):
         aid = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full?limit=100",
+            f"/api/v1/accounts/{aid}/bulk/mail/full?limit=100",
             headers=bearer,
         )
         # Pydantic/FastAPI Query(le=50) rejects limit>50.
@@ -685,7 +685,7 @@ class TestBulkCalendarFetch:
             {"event_id": "ev2", "summary": "Standup"},
         ])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/fetch",
+            f"/api/v1/accounts/{aid}/bulk/calendar/fetch",
             json={"event_ids": ["ev1", "ev2"]}, headers=bearer,
         )
         assert resp.status_code == 200
@@ -703,7 +703,7 @@ class TestBulkCalendarFetch:
             RuntimeError("not found"),
         ])
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/fetch",
+            f"/api/v1/accounts/{aid}/bulk/calendar/fetch",
             json={"event_ids": ["ev1", "ev2"]}, headers=bearer,
         )
         body = resp.json()
@@ -716,7 +716,7 @@ class TestBulkCalendarFetch:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/fetch",
+            f"/api/v1/accounts/{aid}/bulk/calendar/fetch",
             json={}, headers=bearer,
         )
         assert resp.status_code == 400
@@ -724,7 +724,7 @@ class TestBulkCalendarFetch:
     def test_hipaa_403(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True, calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/bulk/calendar/fetch",
+            f"/api/v1/accounts/{aid}/bulk/calendar/fetch",
             json={"event_ids": ["ev1"]}, headers=bearer,
         )
         assert resp.status_code == 403
@@ -751,7 +751,7 @@ class TestHTMLStripping:
             return_value=_fake_message("m1", body=self._HTML_BODY),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -773,7 +773,7 @@ class TestHTMLStripping:
             return_value=_fake_message("m1", body=self._HTML_BODY),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail/full?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -804,7 +804,7 @@ class TestHTMLStripping:
             return_value=_fake_message("m1", body=broken),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -825,7 +825,7 @@ class TestHTMLStripping:
             return_value=_fake_message("m1", body=plain),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail/full?limit=1",
             headers=bearer,
         )
         assert resp.json()["messages"][0]["body_text"] == plain
@@ -850,7 +850,7 @@ class TestSnippetZeroWidthStrip:
             return_value=_fake_message("m1", body=body),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -871,7 +871,7 @@ class TestSnippetZeroWidthStrip:
             return_value=_fake_message("m1", body=body),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -891,7 +891,7 @@ class TestSnippetZeroWidthStrip:
             return_value=_fake_message("m1", body=body),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -909,7 +909,7 @@ class TestSnippetZeroWidthStrip:
             return_value=_fake_message("m1", body=body),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -930,7 +930,7 @@ class TestSnippetZeroWidthStrip:
             return_value=_fake_message("m1", body=body),
         )
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full?limit=1",
+            f"/api/v1/accounts/{aid}/bulk/mail/full?limit=1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -949,7 +949,7 @@ class TestBulkDefaults:
         patch_email_factory.search.return_value = []
         patch_email_factory.fetch_message = AsyncMock()
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail",
+            f"/api/v1/accounts/{aid}/bulk/mail",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -962,7 +962,7 @@ class TestBulkDefaults:
         patch_email_factory.search.return_value = []
         patch_email_factory.fetch_message = AsyncMock()
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/bulk/mail/full",
+            f"/api/v1/accounts/{aid}/bulk/mail/full",
             headers=bearer,
         )
         assert resp.status_code == 200

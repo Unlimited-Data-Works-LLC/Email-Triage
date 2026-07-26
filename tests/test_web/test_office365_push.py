@@ -393,6 +393,64 @@ class TestO365WebhookReceiver:
             "office365_push.client_state_unset"
         ) == 1
 
+    def test_undecryptable_clientstate_records_distinct_cause(
+        self, push_app, client, db,
+    ):
+        """A5 / SME finding F-1 — when the stored clientState secret EXISTS
+        but won't decrypt (corrupt row / master-key mismatch), the receiver
+        still fails closed (401), but the §164.312(b) audit row + reason +
+        counter must record ``undecryptable``, NOT ``unset`` — a key
+        mismatch is not "operator forgot to register"."""
+        from email_triage.secrets import SecretsDecryptError
+
+        _seed_account(db, account_id=42)
+        future = (
+            datetime.now(timezone.utc) + timedelta(days=2)
+        ).isoformat()
+        upsert_o365_subscription(
+            db, account_id=42, subscription_id="sub-42",
+            expiration_at=future,
+        )
+
+        class _UnreadableSecrets:
+            def get(self, key):
+                if "clientstate" in key:
+                    raise SecretsDecryptError(key)
+                return None
+
+            def set(self, key, value):  # pragma: no cover
+                pass
+
+        push_app.state.secrets = _UnreadableSecrets()
+        resp = client.post(
+            "/webhooks/office365",
+            json={"value": [{
+                "subscriptionId": "sub-42",
+                "clientState": "anything",
+                "resource": "Users/u/Messages/msg-1",
+                "changeType": "created",
+                "resourceData": {"id": "msg-1"},
+            }]},
+        )
+        # Fails closed (no triage queued)...
+        assert resp.status_code == 401
+        assert push_app.state.push_queue.qsize() == 0
+        # ...with the TRUE cause threaded through reason, counter, audit.
+        assert resp.json()["reason"] == "clientstate_undecryptable"
+        assert push_app.state.metrics.get(
+            "office365_push.client_state_undecryptable"
+        ) == 1
+        row = db.execute(
+            "SELECT outcome, detail FROM auth_events "
+            "WHERE event_type = 'o365_webhook_auth' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        assert row["outcome"] == "failure"
+        assert "clientstate_undecryptable" in row["detail"]
+        # And NOT mislabeled as the operator-forgot-to-register case.
+        assert "clientstate_unset" not in row["detail"]
+
     def test_per_account_clientstate_overrides_install(
         self, push_app, client, db,
     ):

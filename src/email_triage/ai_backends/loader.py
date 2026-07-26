@@ -36,12 +36,16 @@ helper does NOT live in this module (CRUD is out of scope here).
 
 from __future__ import annotations
 
+from email_triage.secrets import read_secret
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+
 import logging
 import sqlite3
 from typing import Any
 
 from email_triage.ai_backends.base import (
     BackendAdapter,
+    BackendBAARequiredError,
     BackendDisabledError,
     BackendError,
     BackendNotFoundError,
@@ -53,7 +57,7 @@ from email_triage.ai_backends.ollama_adapter import (
 )
 from email_triage.ai_backends.registry import BACKEND_TYPES
 
-logger = logging.getLogger("email_triage.ai_backends.loader")
+logger = get_logger("email_triage.ai_backends.loader")  # N-196b R21_4
 
 
 def load_backend(
@@ -62,6 +66,7 @@ def load_backend(
     db_conn: sqlite3.Connection,
     secrets: Any = None,
     config: Any = None,
+    require_baa_certified: bool = False,
 ) -> BackendAdapter:
     """Instantiate the adapter for the given ``ai_backends`` row.
 
@@ -85,6 +90,15 @@ def load_backend(
         ``config`` is provided, the install-default Ollama adapter
         mirrors ``config.classifier`` settings instead of the hard-
         coded defaults. When ``None`` the hard-coded defaults apply.
+    require_baa_certified:
+        When ``True`` (a HIPAA account's PHI-egress path — e.g. the
+        style-learning distill), refuse to return an adapter for an
+        explicit ``ai_backends`` row that is not BAA-certified or whose
+        BAA has expired, raising :class:`BackendBAARequiredError`. This
+        is the RUNTIME reciprocal of the account-setup selector gate so
+        a backend whose BAA lapsed AFTER selection can't silently egress
+        PHI (census N-63). The install default (``backend_id is None``)
+        is local-only and therefore BAA-exempt regardless of this flag.
 
     Returns
     -------
@@ -92,10 +106,41 @@ def load_backend(
 
     Raises
     ------
-    BackendNotFoundError, BackendDisabledError, BackendError.
+    BackendNotFoundError, BackendDisabledError, BackendBAARequiredError,
+    BackendError.
     """
     if backend_id is None:
-        return _build_install_default(config)
+        adapter = _build_install_default(config)
+        # Census N-63 (install-default egress hole) — the install default
+        # points at ``config.classifier.ollama_url``, which is operator-
+        # configurable and NOT guaranteed local (the classifier BAA gate
+        # exists precisely because that URL can be remote). A HIPAA account
+        # with a NULL backend FK must not egress its PHI style corpus to a
+        # NON-LOCAL install default with no BAA. Mirror the classifier-path
+        # gate: local → exempt (no egress); non-local → require a BAA ack on
+        # file for that (backend, host). Fail closed. ``config is None`` means
+        # the hard-coded localhost default, which is local → exempt.
+        if require_baa_certified and not bool(
+            getattr(adapter, "is_local", False)
+        ):
+            acked = False
+            host = ""
+            if config is not None:
+                from email_triage.classify.baa_gate import (
+                    classifier_baa_status_from_config,
+                )
+                status = classifier_baa_status_from_config(db_conn, config)
+                acked = bool(status.get("baa_acked"))
+                host = status.get("host") or ""
+            if not acked:
+                raise BackendBAARequiredError(
+                    f"the install-default classifier endpoint ({host or '?'}) "
+                    f"is non-local and has no BAA acknowledgment on file; a "
+                    f"HIPAA account's PHI may not be sent to it. Acknowledge a "
+                    f"BAA on /config, or point the account at a local Ollama / "
+                    f"BAA-certified backend."
+                )
+        return adapter
 
     row = _fetch_row(db_conn, backend_id)
     if row is None:
@@ -114,6 +159,29 @@ def load_backend(
             f"different backend."
         )
 
+    # Runtime BAA chokepoint (census N-63) — a HIPAA account's PHI-egress
+    # caller sets ``require_baa_certified``; refuse to hand back an adapter
+    # for a backend that is not BAA-certified or whose BAA has expired so the
+    # style-learning distill path can't egress PHI to an uncertified
+    # subprocessor (§164.502(a)(1) / §164.308(b)(1)). The single BAA-validity
+    # rule lives in baa_expiry.is_backend_baa_valid_for_phi — the same
+    # predicate the account-setup selector gate uses (one SSOT, no inline
+    # re-derivation). Fail closed.
+    if require_baa_certified:
+        from email_triage.baa_expiry import is_backend_baa_valid_for_phi
+        if not is_backend_baa_valid_for_phi(
+            baa_certified=_row_get(row, "baa_certified"),
+            baa_expires_at=_row_get(row, "baa_expires_at"),
+        ):
+            name = _row_get(row, "name") or "<unnamed>"
+            raise BackendBAARequiredError(
+                f"ai_backends row id={backend_id!r} ({name!r}) is not "
+                f"BAA-certified or its BAA has expired; a HIPAA account's PHI "
+                f"may not be sent to it. Re-certify the BAA with a future "
+                f"expiry on the admin Backends page, or switch the account to "
+                f"a local Ollama backend."
+            )
+
     type_name = _row_get(row, "type")
     if type_name not in BACKEND_TYPES:
         # Defensive — the CHECK constraint should prevent this, but a
@@ -128,14 +196,26 @@ def load_backend(
     api_key = _resolve_api_key(row, secrets)
     local_url_suffixes = _local_url_suffixes_from_config(config)
 
-    try:
-        adapter = adapter_cls(
-            endpoint=_row_get(row, "endpoint"),
-            model=_row_get(row, "model"),
-            api_key=api_key,
-            local_url_suffixes=local_url_suffixes,
-            backend_type=type_name,
+    adapter_kwargs: dict[str, Any] = dict(
+        endpoint=_row_get(row, "endpoint"),
+        model=_row_get(row, "model"),
+        api_key=api_key,
+        local_url_suffixes=local_url_suffixes,
+        backend_type=type_name,
+    )
+    if type_name == "ollama":
+        #  — thread the per-account backup-model list ONLY for Ollama (its
+        # backups are same-endpoint models, so failover crosses no BAA
+        # boundary). Passing it to OpenAI/Gemini would trip the unexpected-
+        # kwarg TypeError fallback below — which drops EVERY kwarg — so scope
+        # it to the adapter that consumes it.
+        from email_triage.web.db import decode_backup_models_value
+        adapter_kwargs["backup_models"] = decode_backup_models_value(
+            _row_get(row, "backup_models_json")
         )
+
+    try:
+        adapter = adapter_cls(**adapter_kwargs)
     except TypeError as exc:
         # NotImplementedAdapter subclasses + simple adapters may not
         # accept every kwarg; retry with the minimal set. But ONLY
@@ -171,11 +251,22 @@ def _build_install_default(config: Any) -> BackendAdapter:
         except AttributeError:
             pass
     local_url_suffixes = _local_url_suffixes_from_config(config)
+    #  — the install-default Ollama path honours config.classifier.backup_models
+    # too, so the global style-learning complete() path gets failover like classify.
+    backup_models: list[str] = []
+    if config is not None:
+        try:
+            backup_models = list(
+                getattr(config.classifier, "backup_models", []) or []
+            )
+        except AttributeError:
+            pass
     return OllamaAdapter(
         endpoint=base_url,
         model=model,
         api_key=None,
         local_url_suffixes=local_url_suffixes,
+        backup_models=backup_models,
     )
 
 
@@ -191,6 +282,7 @@ def _local_url_suffixes_from_config(config: Any) -> list[str]:
 def _fetch_row(conn: sqlite3.Connection, backend_id: int) -> Any:
     cur = conn.execute(
         "SELECT id, name, type, endpoint, api_key_secret_ref, model, "
+        "backup_models_json, "
         "baa_certified, baa_expires_at, enabled, created_by, created_at "
         "FROM ai_backends WHERE id = ?",
         (backend_id,),
@@ -209,6 +301,7 @@ def _row_get(row: Any, key: str) -> Any:
     # Tuple ordering matches the SELECT in _fetch_row.
     order = [
         "id", "name", "type", "endpoint", "api_key_secret_ref", "model",
+        "backup_models_json",
         "baa_certified", "baa_expires_at", "enabled", "created_by",
         "created_at",
     ]
@@ -230,7 +323,7 @@ def _resolve_api_key(row: Any, secrets: Any) -> str | None:
             f"Pass the install's DbSecrets instance."
         )
     try:
-        key = secrets.get(ref)
+        key = read_secret(secrets, ref)
     except Exception as exc:
         # Wrap to keep the secrets-backend exception out of caller
         # traces (avoids leaking backend-specific error shape).

@@ -1,26 +1,17 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "pinned_for": "email-triage v0.1.1+",
-  "generated_at": "2026-05-20T00:00:00+00:00",
+  "generated_at": "2026-06-11T20:52:10.381091+00:00",
   "regenerate_with": "python3 scripts/build-embedding-bits-manifest.py --output scripts/embedding-bits-manifest.json",
   "notes": [
-    "Hashes MUST be filled in by running the regenerator on a connected machine before cutting a release.",
-    "The installer rejects any file whose SHA-256 does not match the value here.",
-    "Both the auto-download (pip + HF) and sideload paths verify against the same manifest.",
-    "Bumping any pinned version requires bumping `manifest_version` AND running the regenerator so the consumer-side installer can detect 'install on disk is from an older manifest, re-run' via the saved `embedding_bits_install_state.manifest_sha256` row."
+    "manifest_version 3: `wheels` holds arch-NEUTRAL py3-none-any wheels; `wheels_by_arch.{x86_64,aarch64}` holds the binary wheels. The installer (_load_manifest) merges the running arch's set into `wheels`.",
+    "Hashes are the canonical PyPI / pytorch-index sha256; the installer rejects any file whose SHA-256 does not match.",
+    "Both auto-download and sideload verify against the same manifest. Regenerate: python3 scripts/build-embedding-bits-manifest.py.",
+    "aarch64 torch is the /whl/cpu +cpu wheel (CPU-only): since PyTorch 2.11 a plain default-PyPI aarch64 torch is CUDA-bundled — do NOT use it on the CPU-only target."
   ],
   "install_target": "/app/data/runtime-deps/site-packages",
   "model_cache_target": "/app/data/runtime-deps/hf-cache",
   "wheels": [
-    {
-      "name": "torch",
-      "version": "2.12.0+cpu",
-      "filename": "torch-2.12.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl",
-      "url": "https://download.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
-      "sha256": "5e3dc83725581fa38b7b2e45c58692e30b2a3cde19191af54b675ffcac3840a6",
-      "size_bytes": 192268791,
-      "rationale": "CPU-only wheel from the PyTorch index. The default PyPI torch ships ~3 GB of CUDA libraries we don't need (the GPU is reserved for the chat model on the operator's Ollama host). v0.1.1 bump from 2.5.1+cpu -- 7 minors. torch is HF-stack-independent (sentence-transformers + transformers both accept torch>=1.11), so this bumps standalone ahead of the tokenizers/huggingface-hub/transformers/sentence-transformers atomic group. Platform tag advanced from bare linux_x86_64 to manylinux_2_28_x86_64 (glibc 2.28+; Debian bookworm slim base = glibc 2.36, satisfied). sha256 from the download.pytorch.org simple-index #sha256 fragment (the same hash pip verifies on install)."
-    },
     {
       "name": "sentence-transformers",
       "version": "5.5.0",
@@ -40,15 +31,6 @@
       "rationale": "sentence-transformers transitive dep. Pinned explicitly so the install doesn't drift on a future sentence-transformers minor bump."
     },
     {
-      "name": "tokenizers",
-      "version": "0.22.2",
-      "filename": "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/2e/76/932be4b50ef6ccedf9d3c6639b056a967a86258c6d9200643f01269211ca/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-      "sha256": "369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67",
-      "size_bytes": 3274982,
-      "rationale": "HuggingFace Rust binary for fast tokenization. Manylinux wheel \u00e2\u20ac\u201d works inside the slim-debian container."
-    },
-    {
       "name": "huggingface-hub",
       "version": "1.15.0",
       "filename": "huggingface_hub-1.15.0-py3-none-any.whl",
@@ -56,24 +38,6 @@
       "sha256": "a4a59af04cbc41a3fe3fec429b171ef994ef8c971eda10136746f408dd4e3744",
       "size_bytes": 663602,
       "rationale": "Required transitive of transformers + sentence-transformers. The installer disables HF telemetry via env vars before importing."
-    },
-    {
-      "name": "safetensors",
-      "version": "0.7.0",
-      "filename": "safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/a0/60/429e9b1cb3fc651937727befe258ea24122d9663e4d5709a48c9cbfceecb/safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-      "sha256": "dac7252938f0696ddea46f5e855dd3138444e82236e3be475f54929f0c510d48",
-      "size_bytes": 507152,
-      "rationale": "Required transitive of transformers for the safe model-weight format. Manylinux wheel."
-    },
-    {
-      "name": "regex",
-      "version": "2026.5.9",
-      "filename": "regex-2026.5.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/cc/1e/3fbe2fa1e8cebd62f3bb7d3321cff1640aca2e240b51d9bd624aad949260/regex-2026.5.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "dd2810d22146b6d838acc5ec15602cb6b47920aa4e33015df3868eedfd20bab8",
-      "size_bytes": 801239,
-      "rationale": "Required transitive of transformers tokenizers."
     },
     {
       "name": "filelock",
@@ -103,24 +67,6 @@
       "rationale": "Required transitive of huggingface-hub for file-system abstraction (only the local-fs backend is exercised at runtime; HF endpoints disabled via env)."
     },
     {
-      "name": "scikit-learn",
-      "version": "1.8.0",
-      "filename": "scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/97/74/b7a304feb2b49df9fafa9382d4d09061a96ee9a9449a7cbea7988dda0828/scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "a0bcfe4d0d14aec44921545fd2af2338c7471de9cb701f1da4c9d85906ab847a",
-      "size_bytes": 8931904,
-      "rationale": "Soft transitive of sentence-transformers (used for cosine + nearest-neighbour helpers). Pinned to keep the install reproducible. v0.1.1 bump from 1.5.2 -- 3 minors; manylinux platform tag advanced from _2_17/2014 to _2_27/2_28 (requires glibc 2.27+; both Debian bookworm + bullseye satisfy; matches the scipy tag already in this manifest). sentence-transformers 3.3.1 takes scikit-learn with no version pin so 1.8.0 satisfies. No direct sklearn imports in our src/ or tests/ surface -- exercised only via sentence-transformers internals on the lazy-install runtime path."
-    },
-    {
-      "name": "scipy",
-      "version": "1.17.1",
-      "filename": "scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/01/8e/1e35281b8ab6d5d72ebe9911edcdffa3f36b04ed9d51dec6dd140396e220/scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-      "sha256": "02ae3b274fde71c5e92ac4d54bc06c42d80e399fec704383dcd99b301df37458",
-      "size_bytes": 35235890,
-      "rationale": "Required transitive of scikit-learn. Bumped from 1.14.1 \u00e2\u2020\u2019 1.17.1 (2026-05-18) to clear the runtime warning `A NumPy version >=1.23.5 and <2.3.0 is required for this version of SciPy (detected version 2.4.4)` from the v0.1.0 install. scipy 1.17.x declares `numpy <2.7, >=1.26.4` which cleanly covers the base image's numpy 2.4.4. Operator preference (2026-05-18): push forward on version, don't pin numpy back. manylinux_2_27/2_28 wheel works on the slim-debian-bookworm base image (glibc 2.36)."
-    },
-    {
       "name": "joblib",
       "version": "1.5.3",
       "filename": "joblib-1.5.3-py3-none-any.whl",
@@ -137,15 +83,6 @@
       "sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb",
       "size_bytes": 18638,
       "rationale": "Required transitive of scikit-learn for BLAS thread management."
-    },
-    {
-      "name": "pillow",
-      "version": "12.2.0",
-      "filename": "pillow-12.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/e9/9e/c05e19657fd57841e476be1ab46c4d501bffbadbafdc31a6d665f8b737b6/pillow-12.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
-      "sha256": "b86024e52a1b269467a802258c25521e6d742349d760728092e1bc2d135b4d76",
-      "size_bytes": 8094744,
-      "rationale": "Optional transitive of sentence-transformers for image-embedding models we don't use. Pin keeps the install graph deterministic; can be removed in a future trim pass if size becomes a concern. v0.1.1 bump from 11.0.0 -- 1 major (Pillow 12). No direct PIL imports in our src/ or tests/, so the major-version API removals don't reach our code; exercised only via sentence-transformers internals. manylinux tag unchanged (_2_17/2014; glibc 2.17+)."
     },
     {
       "name": "sympy",
@@ -182,15 +119,6 @@
       "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
       "size_bytes": 134899,
       "rationale": "Already shipped in the base image (templates), but torch lists it as a hard transitive. Same version pinned in requirements.lock so the lazy install layers are a no-op for jinja2 specifically."
-    },
-    {
-      "name": "hf-xet",
-      "version": "1.5.0",
-      "filename": "hf_xet-1.5.0-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
-      "url": "https://files.pythonhosted.org/packages/49/4d/103f76b04310e5e57656696cc184690d20c466af0bca3ca88f8c8ea5d4f3/hf_xet-1.5.0-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
-      "sha256": "3531b1823a0e6d77d80f9ed15ca0e00f0d115094f8ac033d5cae88f4564cc949",
-      "size_bytes": 4465986,
-      "rationale": "Added in the v0.1.1 HF stack bump (transformers 5.x)."
     },
     {
       "name": "markdown-it-py",
@@ -256,9 +184,160 @@
       "rationale": "Added in the v0.1.1 HF stack bump (transformers 5.x)."
     }
   ],
+  "wheels_by_arch": {
+    "x86_64": [
+      {
+        "name": "torch",
+        "version": "2.12.0+cpu",
+        "filename": "torch-2.12.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "url": "https://download.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "sha256": "5e3dc83725581fa38b7b2e45c58692e30b2a3cde19191af54b675ffcac3840a6",
+        "size_bytes": 192268791,
+        "rationale": "CPU-only wheel from the PyTorch index. The default PyPI torch ships ~3 GB of CUDA libraries we don't need (the GPU is reserved for the chat model on the operator's Ollama host). v0.1.1 bump from 2.5.1+cpu -- 7 minors. torch is HF-stack-independent (sentence-transformers + transformers both accept torch>=1.11), so this bumps standalone ahead of the tokenizers/huggingface-hub/transformers/sentence-transformers atomic group. Platform tag advanced from bare linux_x86_64 to manylinux_2_28_x86_64 (glibc 2.28+; Debian bookworm slim base = glibc 2.36, satisfied). sha256 from the download.pytorch.org simple-index #sha256 fragment (the same hash pip verifies on install)."
+      },
+      {
+        "name": "tokenizers",
+        "version": "0.22.2",
+        "filename": "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/2e/76/932be4b50ef6ccedf9d3c6639b056a967a86258c6d9200643f01269211ca/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "sha256": "369cc9fc8cc10cb24143873a0d95438bb8ee257bb80c71989e3ee290e8d72c67",
+        "size_bytes": 3274982,
+        "rationale": "HuggingFace Rust binary for fast tokenization. Manylinux wheel â€” works inside the slim-debian container."
+      },
+      {
+        "name": "safetensors",
+        "version": "0.7.0",
+        "filename": "safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/a0/60/429e9b1cb3fc651937727befe258ea24122d9663e4d5709a48c9cbfceecb/safetensors-0.7.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "sha256": "dac7252938f0696ddea46f5e855dd3138444e82236e3be475f54929f0c510d48",
+        "size_bytes": 507152,
+        "rationale": "Required transitive of transformers for the safe model-weight format. Manylinux wheel."
+      },
+      {
+        "name": "regex",
+        "version": "2026.5.9",
+        "filename": "regex-2026.5.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/cc/1e/3fbe2fa1e8cebd62f3bb7d3321cff1640aca2e240b51d9bd624aad949260/regex-2026.5.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "dd2810d22146b6d838acc5ec15602cb6b47920aa4e33015df3868eedfd20bab8",
+        "size_bytes": 801239,
+        "rationale": "Required transitive of transformers tokenizers."
+      },
+      {
+        "name": "scikit-learn",
+        "version": "1.8.0",
+        "filename": "scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/97/74/b7a304feb2b49df9fafa9382d4d09061a96ee9a9449a7cbea7988dda0828/scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "a0bcfe4d0d14aec44921545fd2af2338c7471de9cb701f1da4c9d85906ab847a",
+        "size_bytes": 8931904,
+        "rationale": "Soft transitive of sentence-transformers (used for cosine + nearest-neighbour helpers). Pinned to keep the install reproducible. v0.1.1 bump from 1.5.2 -- 3 minors; manylinux platform tag advanced from _2_17/2014 to _2_27/2_28 (requires glibc 2.27+; both Debian bookworm + bullseye satisfy; matches the scipy tag already in this manifest). sentence-transformers 3.3.1 takes scikit-learn with no version pin so 1.8.0 satisfies. No direct sklearn imports in our src/ or tests/ surface -- exercised only via sentence-transformers internals on the lazy-install runtime path."
+      },
+      {
+        "name": "scipy",
+        "version": "1.17.1",
+        "filename": "scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/01/8e/1e35281b8ab6d5d72ebe9911edcdffa3f36b04ed9d51dec6dd140396e220/scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "02ae3b274fde71c5e92ac4d54bc06c42d80e399fec704383dcd99b301df37458",
+        "size_bytes": 35235890,
+        "rationale": "Required transitive of scikit-learn. Bumped from 1.14.1 â†’ 1.17.1 (2026-05-18) to clear the runtime warning `A NumPy version >=1.23.5 and <2.3.0 is required for this version of SciPy (detected version 2.4.4)` from the v0.1.0 install. scipy 1.17.x declares `numpy <2.7, >=1.26.4` which cleanly covers the base image's numpy 2.4.4. Operator preference (2026-05-18): push forward on version, don't pin numpy back. manylinux_2_27/2_28 wheel works on the slim-debian-bookworm base image (glibc 2.36)."
+      },
+      {
+        "name": "pillow",
+        "version": "12.2.0",
+        "filename": "pillow-12.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/e9/9e/c05e19657fd57841e476be1ab46c4d501bffbadbafdc31a6d665f8b737b6/pillow-12.2.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "sha256": "b86024e52a1b269467a802258c25521e6d742349d760728092e1bc2d135b4d76",
+        "size_bytes": 8094744,
+        "rationale": "Optional transitive of sentence-transformers for image-embedding models we don't use. Pin keeps the install graph deterministic; can be removed in a future trim pass if size becomes a concern. v0.1.1 bump from 11.0.0 -- 1 major (Pillow 12). No direct PIL imports in our src/ or tests/, so the major-version API removals don't reach our code; exercised only via sentence-transformers internals. manylinux tag unchanged (_2_17/2014; glibc 2.17+)."
+      },
+      {
+        "name": "hf-xet",
+        "version": "1.5.0",
+        "filename": "hf_xet-1.5.0-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "url": "https://files.pythonhosted.org/packages/49/4d/103f76b04310e5e57656696cc184690d20c466af0bca3ca88f8c8ea5d4f3/hf_xet-1.5.0-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "sha256": "3531b1823a0e6d77d80f9ed15ca0e00f0d115094f8ac033d5cae88f4564cc949",
+        "size_bytes": 4465986,
+        "rationale": "Added in the v0.1.1 HF stack bump (transformers 5.x)."
+      }
+    ],
+    "aarch64": [
+      {
+        "name": "torch",
+        "version": "2.12.0+cpu",
+        "filename": "torch-2.12.0+cpu-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "url": "https://download.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "sha256": "ce2ddb880b0813fcc91a737f08fdd973a8115a74c64ccb34e9c09a7964b4d448",
+        "size_bytes": 150023160,
+        "rationale": "CPU-ONLY aarch64 torch from the pytorch /whl/cpu index. CRITICAL: since PyTorch 2.11 a PLAIN default-PyPI `pip install torch` on aarch64 pulls a CUDA-BUNDLED wheel (~426MB + multi-GB CUDA stack) — the homelab/Spark target is CPU-only, so the aarch64 leg MUST use the /whl/cpu +cpu wheel exactly like x86_64 (the 2.11 change eliminated the index asymmetry). 150MB. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "tokenizers",
+        "version": "0.22.2",
+        "filename": "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/d6/84/7990e799f1309a8b87af6b948f31edaa12a3ed22d11b352eaf4f4b2e5753/tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "sha256": "2249487018adec45d6e3554c71d46eb39fa8ea67156c640f7513eb26f318cec7",
+        "size_bytes": 3290736,
+        "rationale": "HuggingFace Rust tokenizer. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "safetensors",
+        "version": "0.7.0",
+        "filename": "safetensors-0.7.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/f1/06/578ffed52c2296f93d7fd2d844cabfa92be51a587c38c8afbb8ae449ca89/safetensors-0.7.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+        "sha256": "e07d91d0c92a31200f25351f4acb2bc6aff7f48094e13ebb1d0fb995b54b6542",
+        "size_bytes": 491748,
+        "rationale": "Safe model-weight format. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "regex",
+        "version": "2026.5.9",
+        "filename": "regex-2026.5.9-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/d8/dd/ba103dc19614e25f3880800ca67ce093d6e21b325d72b8383c7bf906e9fa/regex-2026.5.9-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+        "sha256": "6441cc660d76107934a09c22167200839a0e89604a6297f78a974e66e931d2c0",
+        "size_bytes": 796732,
+        "rationale": "transformers tokenizer dep. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "scikit-learn",
+        "version": "1.8.0",
+        "filename": "scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/dd/47/f187b4636ff80cc63f21cd40b7b2d177134acaa10f6bb73746130ee8c2e5/scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "sha256": "4496bb2cf7a43ce1a2d7524a79e40bc5da45cf598dbf9545b7e8316ccba47bb4",
+        "size_bytes": 8660492,
+        "rationale": "sentence-transformers cosine/NN helpers. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "scipy",
+        "version": "1.17.1",
+        "filename": "scipy-1.17.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/da/34/16f10e3042d2f1d6b66e0428308ab52224b6a23049cb2f5c1756f713815f/scipy-1.17.1-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "sha256": "e19ebea31758fac5893a2ac360fedd00116cbb7628e650842a6691ba7ca28a21",
+        "size_bytes": 32927842,
+        "rationale": "scikit-learn dep. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "pillow",
+        "version": "12.2.0",
+        "filename": "pillow-12.2.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/2b/54/1789c455ed10176066b6e7e6da1b01e50e36f94ba584dc68d9eebfe9156d/pillow-12.2.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+        "sha256": "7371b48c4fa448d20d2714c9a1f775a81155050d383333e0a6c15b1123dda005",
+        "size_bytes": 6398371,
+        "rationale": "sentence-transformers image-model dep (unused but in graph). aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      },
+      {
+        "name": "hf-xet",
+        "version": "1.5.0",
+        "filename": "hf_xet-1.5.0-cp37-abi3-manylinux_2_28_aarch64.whl",
+        "url": "https://files.pythonhosted.org/packages/c4/a2/546f47f464737b3edbab6f8ddb57f2599b93d2cbb66f06abb475ccb48651/hf_xet-1.5.0-cp37-abi3-manylinux_2_28_aarch64.whl",
+        "sha256": "9a0ee58cd18d5ea799f7ed11290bbccbe56bdd8b1d97ca74b9cc49a3945d7a3b",
+        "size_bytes": 4259865,
+        "rationale": "HF xet transfer backend. aarch64 sibling of the x86_64 binary wheel; sha256 is the canonical PyPI/pytorch-index digest."
+      }
+    ]
+  },
   "models": [
     {
       "name": "all-MiniLM-L6-v2",
+      "hf_cache_dir": "sentence-transformers_all-MiniLM-L6-v2",
       "filename": "all-MiniLM-L6-v2.tar",
       "url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/",
       "files": [
@@ -311,7 +390,69 @@
           "size_bytes": 190
         }
       ],
-      "rationale": "Default embedding model. 384-dim \u00e2\u20ac\u201d note: this is 384, not 768; sent_mail_index.dimension currently stores 384 for MiniLM rows. Operator can switch to a different model via the AI Backends form; the installer will fetch that model lazily on first use (with hash verification disabled for operator-chosen models \u00e2\u20ac\u201d the manifest only covers the shipped default)."
+      "rationale": "Default embedding model. 384-dim â€” note: this is 384, not 768; sent_mail_index.dimension currently stores 384 for MiniLM rows. Operator can switch to a different model via the AI Backends form; the installer will fetch that model lazily on first use (with hash verification disabled for operator-chosen models â€” the manifest only covers the shipped default)."
+    },
+    {
+      "name": "multilingual-e5-base",
+      "hf_cache_dir": "intfloat_multilingual-e5-base",
+      "filename": "multilingual-e5-base.tar",
+      "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/",
+      "files": [
+        {
+          "name": "config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/config.json",
+          "sha256": "9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4",
+          "size_bytes": 694
+        },
+        {
+          "name": "pytorch_model.bin",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/pytorch_model.bin",
+          "sha256": "f061cb7641880f52895cbacab7c4ab39b0844e2e6b73794f2798de460d9fa418",
+          "size_bytes": 1112242989
+        },
+        {
+          "name": "tokenizer.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/tokenizer.json",
+          "sha256": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+          "size_bytes": 17082660
+        },
+        {
+          "name": "tokenizer_config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/tokenizer_config.json",
+          "sha256": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15",
+          "size_bytes": 418
+        },
+        {
+          "name": "special_tokens_map.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/special_tokens_map.json",
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+          "size_bytes": 280
+        },
+        {
+          "name": "sentencepiece.bpe.model",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/sentencepiece.bpe.model",
+          "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+          "size_bytes": 5069051
+        },
+        {
+          "name": "modules.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/modules.json",
+          "sha256": "c6e29747481e8b5dd2b58401966aeac910de39092f90cda9a704b1545f902b04",
+          "size_bytes": 387
+        },
+        {
+          "name": "sentence_bert_config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/sentence_bert_config.json",
+          "sha256": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+          "size_bytes": 57
+        },
+        {
+          "name": "1_Pooling/config.json",
+          "url": "https://huggingface.co/intfloat/multilingual-e5-base/resolve/main/1_Pooling/config.json",
+          "sha256": "f586ab6c734af7b8d14d898bfa7faa886f23b46f86dd1730514309893af13d75",
+          "size_bytes": 200
+        }
+      ]
     }
   ]
 }

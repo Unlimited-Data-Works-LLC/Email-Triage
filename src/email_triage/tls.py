@@ -123,17 +123,13 @@ def write_cert_files(
     cert_dir_path.mkdir(parents=True, exist_ok=True)
     crt = cert_dir_path / "server.crt"
     key = cert_dir_path / "server.key"
-    for path, data in ((key, key_pem), (crt, cert_pem)):
-        tmp = path.with_suffix(path.suffix + ".new")
-        tmp.write_bytes(data)
-        # Tighten the key tempfile pre-rename (Unix only — no-op on
-        # Windows). Cert file gets default perms, which is correct.
-        if path == key:
-            try:
-                os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-        os.replace(tmp, path)
+    # census  — route through the _atomicio SSOT (was a hand-rolled
+    # temp+replace+chmod copy). Key first, cert second (the hot-reload order
+    # the loop preserves — see the docstring); the key lands 0o600 via the
+    # mode param, the cert gets default perms (correct — it's public).
+    from email_triage._atomicio import atomic_write_bytes
+    for path, data, mode in ((key, key_pem, 0o600), (crt, cert_pem, None)):
+        atomic_write_bytes(path, data, mode=mode)
     return crt, key
 
 
@@ -199,7 +195,7 @@ def fetch_tailscale_cert(
         raise RuntimeError(
             f"tailscale binary not found ({e}). Install Tailscale on "
             f"the host and enable HTTPS in the admin console."
-        )
+        ) from e
     except subprocess.TimeoutExpired:
         raise RuntimeError(
             f"tailscale cert timed out after {timeout}s. The Tailnet "

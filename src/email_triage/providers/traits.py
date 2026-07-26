@@ -19,10 +19,14 @@ column holds: ``imap`` / ``gmail_api`` / ``office365``). Each entry
 is a ``ProviderTraits`` dataclass; helper functions below resolve the
 trait without leaking the lookup-or-default boilerplate.
 
-Migration is incremental: 8-10 of the 19 ``if ptype ==`` switch sites
-across the codebase are migrated in this commit.
-The remainder are flagged with ``# TODO  traits-migration`` and
-will move in a follow-up.
+Migration is substantially complete: the bulk of the original 19
+``if ptype ==`` switch sites resolve through this registry. The
+sites that remain are intentional, not pending — single-branch IMAP
+guards, the factory's independent secret-key copy, and
+dispatcher-owned functional sites that are clearer left explicit.
+(Corrected 2026-06-19: an earlier edition of this docstring claimed
+the remainder were tagged ``# TODO  traits-migration`` and would
+move in a follow-up; no such markers were ever placed.)
 """
 
 from __future__ import annotations
@@ -146,9 +150,33 @@ def is_authenticated(secrets, acct: dict) -> bool:
     sk = secret_key_for_account(acct["id"], ptype)
     if not sk:
         return False
+    # A5 (census 2026-06-09): an UNREADABLE secret (corrupt row /
+    # master-key mismatch) is NOT the same as an absent one. Folding it
+    # into ``False`` silently presents a configured account as "needs
+    # re-auth" — misleading, since re-auth can't fix a key mismatch. Keep
+    # fail-closed (False) but surface the true cause distinctly.
+    from email_triage.secrets import SecretsDecryptError, read_secret
     try:
-        return bool(secrets.get(sk))
+        return bool(read_secret(secrets, sk))
+    except SecretsDecryptError:
+        # A5 — the DISTINCT case: a stored secret that won't decrypt
+        # (corrupt row / master-key mismatch). Still fail-closed (False),
+        # but surface the true cause — re-auth can't fix a key mismatch.
+        # N-242b R24: TriageLogger SSOT — CRITICAL: replace `%s` printf
+        # with f-string. Positional 2nd arg to TriageLogger.error() binds
+        # to `exc_info=` → 500 (project style guide prime directive ).
+        from email_triage.triage_logging import get_logger
+        get_logger("providers.traits").error(
+            f"account {acct.get('id')} reported NOT authenticated because "
+            "its stored secret is unreadable (corrupt row / master-key "
+            "mismatch), not because it is unconfigured — re-auth will not "
+            "help; check the secrets master key",
+        )
+        return False
     except Exception:
+        # Transient backend error (e.g. secrets store offline): degrade
+        # gracefully to "not authenticated" so the account-status render
+        # doesn't crash. Distinct from the unreadable case handled above.
         return False
 
 

@@ -1,0 +1,38 @@
+# email-triage LOCAL TEST IMAGE — real SQLCipher, all deps baked in.
+#
+# Build ONCE (slow), then run the suite instantly against live-mounted source via
+# scripts/test-local-podman.sh. Lets a Windows dev box (no sqlcipher3 wheel) run the
+# REAL-SQLCipher / encrypted-DB / HIPAA-path tests that otherwise only run on the deploy host.
+#
+# Mirrors .github/workflows/tests.yml exactly:
+#   apt gcc+libffi-dev -> requirements.lock -> --no-deps -e . -> .[dev,encryption]
+#   (the `encryption` extra pulls the x86_64 sqlcipher3-binary wheel = real SQLCipher).
+#
+# Build (from the repo root):
+#   MSYS_NO_PATHCONV=1 "$PODMAN" build -t email-triage-test:local -f Containerfile.test .
+# See the memory drawer reference_podman_local_windows_testing for the WSL2 gotchas.
+FROM docker.io/library/python:3.12
+
+# The WSL2 podman machine has NO IPv6 route to the internet, and glibc prefers
+# IPv6 (AAAA) -> large pip downloads stall. Force IPv4 precedence so the build's
+# downloads don't hang. (gotcha 2 in the drawer.)
+RUN echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libffi-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY requirements.lock pyproject.toml README.md ./
+COPY src ./src
+RUN python -m pip install --upgrade pip \
+ && pip install --no-cache-dir --prefer-binary --timeout 300 --retries 10 -r requirements.lock \
+ && pip install --no-cache-dir --no-deps -e . \
+ && pip install --no-cache-dir --prefer-binary --timeout 300 --retries 10 -e '.[dev,encryption]'
+
+# Fail the BUILD loudly if real SQLCipher didn't land (mirrors the CI guard).
+RUN python -c "import sqlcipher3; v=sqlcipher3.dbapi2.connect(':memory:').execute('PRAGMA cipher_version').fetchone(); assert v and str(v[0]).startswith('4.'), v; print('OK sqlcipher', v)"
+
+# At runtime: mount the LIVE repo at /repo and set PYTHONPATH=/repo/src so the
+# checked-out source (not the build-time copy) is what gets tested.
+WORKDIR /repo

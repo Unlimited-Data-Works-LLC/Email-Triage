@@ -1,0 +1,66 @@
+{# #298 reachability — the digest "Show matches" dry-run. Pages through
+   EVERY matching message (not just the first max_rows that would send) so
+   the operator can see the whole match set before deciding to raise the
+   row limit. HTMX-swapped fragment → the pager hx-POSTs the same endpoint
+   with the offset (not a GET link). #}
+{% from "_pager.html" import pager %}
+{# data-cand-wrap is the pager's re-target anchor: "load older" replaces
+   THIS wrapper (outerHTML) regardless of which outer container the
+   fragment was first swapped into (preset uses #recipient-digest-result-N,
+   custom uses #digest-result-<id> — a hardcoded id would break for one).
+   Caught in the 2026-06-12 live Playwright review. #}
+<div data-cand-wrap style="font-size:0.85em;">
+    <p style="margin:0.3rem 0;">
+        <strong>{{ win.total }} message{{ 's' if win.total != 1 else '' }}</strong>
+        match{{ '' if win.total == 1 else 'ed' }} the window + filter.{{ eta_line }}
+    </p>
+    {% if send_note %}
+    <p style="margin:0.2rem 0;font-size:0.9em;color:var(--pico-muted-color);">{{ send_note }}</p>
+    {% endif %}
+    {# HIPAA display policy — N-172 threaded a viewer-INDEPENDENT display-min
+       gate; the follow-on owner-self-preview design point (operator ruling
+       2026-07-01 = viewer-AWARE) unredacts sender + subject when the ACTOR IS
+       THE ACCOUNT OWNER (they authored the mail into their own mailbox — no
+       min-necessary rationale for hiding their OWN PHI from themselves). A
+       managing NON-OWNER still sees [redacted] (§164.502(b)/§164.514(d)(1)).
+       effective_hipaa = the account's HIPAA flag; viewer_is_owner = the
+       actor==owner check. actor≠owner is the separate AUDIT gate — decoupled.
+       The DELIVERED digest is a SEPARATE surface and out of scope. #}
+    {% if effective_hipaa and not viewer_is_owner %}
+    <p style="margin:0.2rem 0;font-size:0.8em;color:var(--pico-muted-color);">
+        HIPAA privacy mode: sender + subject are redacted in this preview
+        (minimum-necessary — you are viewing another user's HIPAA account).
+        They appear in the digest delivered to the authorized recipient.
+    </p>
+    {% endif %}
+    {{ pager(win, "offset", request, "matching messages",
+             hx_post=cand_url, hx_target="closest [data-cand-wrap]",
+             hx_swap="outerHTML") }}
+    <table style="font-size:0.85em;">
+        <thead><tr>
+            <th>When</th><th>Sender</th><th>Subject</th><th>Category</th>
+        </tr></thead>
+        <tbody>
+        {# PHI policy for the sender/subject cells — N-172 + owner-self-preview
+           (2026-07-01 = viewer-AWARE): redact for a managing NON-OWNER under
+           HIPAA (§164.502(b)/§164.514(d)(1)); the OWNER sees verbatim (no
+           min-necessary rationale for hiding their own PHI from themselves).
+           Same combined gate as the banner + digest_preview handler.
+           Sibling triage/_discover_results.html is on the viewer-INDEPENDENT
+           gate — different surface (N-162 scope). #}
+        {% for r in rows %}
+        <tr>
+            {# run18 #17 — "When" via the format_digest_dt SSOT (matches the
+               delivered digest's "YYYY-MM-DD HH:MM" separator, not the inline
+               [:16] ISO "T"). #}
+            <td>{{ (r | format_digest_dt) or '—' }}</td>
+            {# N-172 + owner-self-preview — gate on effective_hipaa AND NOT
+               viewer_is_owner (on-line guard token; matches banner). #}
+            <td>{{ "[redacted]" if (effective_hipaa and not viewer_is_owner) else (r.get('sender') or '—') }}</td>
+            <td>{{ "[redacted]" if (effective_hipaa and not viewer_is_owner) else (r.get('subject') or '—') }}</td>
+            <td>{{ r.get('category') or '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>

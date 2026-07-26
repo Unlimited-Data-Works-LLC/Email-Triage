@@ -12,17 +12,16 @@ Session: ``itsdangerous.URLSafeTimedSerializer`` encoding email + role.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import secrets
 import sqlite3
-import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
+from email_triage._isotime import now_utc_iso, parse_iso, parse_iso_aware, to_utc_iso
 from email_triage.triage_logging import get_logger
 from email_triage.web.db_writelock import db_write, get_write_lock
 
@@ -62,7 +61,7 @@ def effective_session_ttl(config: Any) -> int:
 SESSION_MAX_AGE = 86400 * 7  # 7 days
 
 
-def set_session_cookie(response: Any, token: str, config: Any) -> None:
+def set_session_cookie(response: Any, token: str, config: Any, request: Any = None) -> None:
     """Attach the session cookie to ``response`` — the single place
     its flags are defined.
 
@@ -79,7 +78,15 @@ def set_session_cookie(response: Any, token: str, config: Any) -> None:
     unlike the SameSite=strict CSRF cookie) are the established
     posture — unchanged; only the absent Secure flag is fixed.
     """
-    secure = bool(getattr(getattr(config, "tls", None), "enabled", False))
+    # N-200 R22 (2026-07-02): route Secure decision through the _cookies SSOT
+    # so the reverse-proxy topology (nginx-front) is captured (via
+    # request.url.scheme=='https') alongside the direct-uvicorn HTTPS listener
+    # (via config.tls.enabled). Callers pre-N-200 that don't pass `request`
+    # degrade cleanly to the config.tls.enabled-only path (byte-identical to
+    # the pre-fix behavior — new callers pass `request` to get the widened
+    # coverage).
+    from email_triage.web._cookies import is_request_https
+    secure = is_request_https(request, config)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
@@ -91,8 +98,9 @@ def set_session_cookie(response: Any, token: str, config: Any) -> None:
 
 
 def _hash_code(code: str) -> str:
-    """SHA-256 hash of an OTP code."""
-    return hashlib.sha256(code.encode()).hexdigest()
+    """SHA-256 hash of an OTP code (routes through the credential-hash SSOT)."""
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(code)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +133,7 @@ def store_otp(conn: sqlite3.Connection, email: str, code: str) -> None:
 
     conn.execute(
         "INSERT INTO otp_codes (email, code_hash, expires_at, used) VALUES (?, ?, ?, 0)",
-        (email, _hash_code(code), expires.isoformat()),
+        (email, _hash_code(code), to_utc_iso(expires)),
     )
     conn.commit()
 
@@ -154,9 +162,21 @@ def verify_otp(conn: sqlite3.Connection, email: str, code: str) -> bool:
         log.info("OTP verification failed: no matching code", email=email)
         return False
 
-    expires = datetime.fromisoformat(row["expires_at"])
-    if now > expires:
-        log.info("OTP verification failed: code expired", email=email)
+    # Census N-65 — route through the parse_iso SSOT, never raw fromisoformat:
+    # a corrupt/unparseable expires_at on this OTP-verify path used to raise
+    # ValueError and 500 the login. parse_iso returns None on bad input → treat
+    # as expired/invalid (FAIL CLOSED — refuse the code), same as a real expiry.
+    # N-357 R31 (2026-07-05 trust-repair fix-forward — SSOT collapse of
+    # the N-302 assume-UTC-on-naive shim). Was 3 lines of inline
+    # `parse_iso` + `if tzinfo is None: replace(tzinfo=utc)`; now one
+    # `parse_iso_aware` call. Behaviour identical (None on unparseable,
+    # naive stamped UTC, aware returned as-is).
+    expires = parse_iso_aware(row["expires_at"])
+    if expires is None or now > expires:
+        log.info(
+            "OTP verification failed: code expired or invalid expiry",
+            email=email,
+        )
         conn.execute("UPDATE otp_codes SET used = 1 WHERE id = ?", (row["id"],))
         conn.commit()
         return False
@@ -176,7 +196,7 @@ def cleanup_expired_otps(conn: sqlite3.Connection) -> int:
      — ``@db_write`` serialises the DELETE + commit on the shared
     connection's write lock.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "DELETE FROM otp_codes WHERE expires_at < ? OR used = 1",
         (now,),
@@ -297,7 +317,15 @@ def get_user_by_email(conn: sqlite3.Connection, email: str) -> dict[str, Any] | 
     SELECT is serialised through the process-wide DB lock. The lock is
     an ``RLock``: callers already inside ``db_call`` (which holds the
     same lock) re-acquire it on the same thread without deadlock.
+
+     R32 (census wf_56d1585d 2026-07-09 DA-fold R1) — canonicalise
+    the lookup key at the READ SSOT so any caller passing a raw
+    ``.strip().lower()`` form OR a display-wrapped input still finds
+    the row (write paths were also fixed same-drive; this is the
+    symmetric read-side).
     """
+    from email_triage.mail_headers import canonical_email
+    email = canonical_email(email)
     with get_write_lock():
         row = conn.execute(
             "SELECT id, email, name, role, notify_email, created_at, last_login, "
@@ -318,8 +346,13 @@ def update_last_login(conn: sqlite3.Connection, email: str) -> None:
     directly, and ``@db_write`` also covers it when it lands on a
     threadpool worker via ``db_call``). The decorator serialises the
     UPDATE + commit on the process-wide write lock.
+
+     R32 — canonicalise the WHERE-clause key to match the
+    canonicalised storage form (see :func:`get_user_by_email`).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    from email_triage.mail_headers import canonical_email
+    email = canonical_email(email)
+    now = now_utc_iso()
     conn.execute("UPDATE users SET last_login = ? WHERE email = ?", (now, email))
     conn.commit()
 
@@ -329,17 +362,13 @@ def update_last_login(conn: sqlite3.Connection, email: str) -> None:
 # ---------------------------------------------------------------------------
 
 def format_from_header(from_addr: str, from_name: str | None = None) -> str:
-    """Compose an RFC-5322 ``From:`` value.
-
-    With a display name, emit ``"Display Name" <addr@example.com>``.
-    With an empty name, fall back to the bare address so operators who
-    don't care about branding see no change.  Double-quotes inside the
-    name are escaped so a malformed operator input can't break parsing.
-    """
-    if not from_name:
-        return from_addr
-    safe_name = from_name.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{safe_name}" <{from_addr}>'
+    """Compose an RFC-5322 ``From:`` value — delegates to the mail_headers SSOT
+    (divergence census 2026-06-09 #5), which additionally strips CR/LF from the
+    display name (header-injection defense). Kept as a re-export so existing
+    ``from web.auth import format_from_header`` callers (recipient_digest,
+    daily_health) are unchanged."""
+    from email_triage.mail_headers import format_from_header as _ssot
+    return _ssot(from_addr, from_name)
 
 
 def send_otp_email(
@@ -410,29 +439,30 @@ def smtp_send_digest(
     import email.utils
     import re
 
-    msg = email.mime.multipart.MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = format_from_header(from_addr, from_name)
-    msg["To"] = to_addr
+    # N-272 R28: route through the MIME envelope SSOT.
+    from email_triage.web._mime_builder import build_alternative_message
+    from email_triage.engine.html_text import strip_tags
+    plain = strip_tags(html_body)
+    _hdrs = dict(extra_headers) if extra_headers else {}
     if reply_to:
-        msg["Reply-To"] = reply_to
-    msg["Date"] = email.utils.formatdate(localtime=True)
-    if extra_headers:
-        for key, value in extra_headers.items():
-            msg[key] = value
+        _hdrs["Reply-To"] = reply_to
+    msg = build_alternative_message(
+        subject=subject,
+        from_addr=from_addr,
+        from_name=from_name,
+        to=to_addr,
+        plain_body=plain,
+        html_body=html_body,
+        source_tag="auth_email",
+        extra_headers=_hdrs or None,
+    )
 
-    # Plain-text fallback (strip tags, collapse whitespace).
-    plain = re.sub(r"<[^>]+>", "", html_body)
-    plain = re.sub(r"\s+", " ", plain).strip()
-    msg.attach(email.mime.text.MIMEText(plain, "plain", "utf-8"))
-    msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        if use_tls:
-            server.starttls()
-        if smtp_user:
-            server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+    # Census 2026-06-09 #2: route through the smtplib-transport SSOT.
+    from email_triage.web.smtp_send import send_smtp_message
+    send_smtp_message(
+        msg, smtp_host=smtp_host, smtp_port=smtp_port,
+        smtp_user=smtp_user, smtp_password=smtp_password, use_tls=use_tls,
+    )
 
     log.info("Digest email sent via SMTP", to=to_addr, subject=subject)
 
@@ -450,8 +480,9 @@ def generate_api_key() -> str:
 
 
 def hash_api_key(key: str) -> str:
-    """SHA-256 hash of an API key for storage."""
-    return hashlib.sha256(key.encode()).hexdigest()
+    """SHA-256 hash of an API key for storage (credential-hash SSOT)."""
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(key)
 
 
 @db_write
@@ -486,7 +517,7 @@ def store_api_key(
     cannot block the actual key creation. The structured log line
     always fires regardless.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "INSERT INTO api_keys (key_hash, name, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
         (key_hash, name, user_id, now, expires_at),
@@ -572,11 +603,15 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
     if row is None:
         return None
 
-    # Check expiry.
+    # Check expiry. Census N-65 — parse_iso SSOT, never raw fromisoformat:
+    # a corrupt expires_at used to 500 every bearer-token check. None (bad /
+    # unparseable) → FAIL CLOSED (reject the key), same as an elapsed expiry.
     if row["expires_at"]:
-        expires = datetime.fromisoformat(row["expires_at"])
-        if datetime.now(timezone.utc) > expires:
-            log.info("API key expired", key_name=row["key_name"])
+        # N-357 R31 (2026-07-05 SSOT collapse). See docstring at
+        # `_isotime.parse_iso_aware` and companion site above at ~L169.
+        expires = parse_iso_aware(row["expires_at"])
+        if expires is None or datetime.now(timezone.utc) > expires:
+            log.info("API key expired or invalid expiry", key_name=row["key_name"])
             return None
 
     # Fail-closed: a disabled user's keys never authenticate.
@@ -589,7 +624,7 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
         return None
 
     # Update last_used_at.
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (now, row["key_id"]))
     conn.commit()
 

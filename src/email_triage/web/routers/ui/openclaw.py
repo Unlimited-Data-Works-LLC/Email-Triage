@@ -55,25 +55,6 @@ _log = get_logger("web.ui.openclaw")
 router = APIRouter()
 
 
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-
 from . import _shared
 # Snapshot every helper from _shared into this module's globals so
 # handler bare-name references resolve. globals().update is used
@@ -84,13 +65,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -111,6 +111,13 @@ async def openclaw_editor_fragment(
     s = await db_call(get_openclaw_quiet_settings, db, account_id)
     enabled_chk = "checked" if s["enabled"] else ""
     paused_chk = "checked" if s["paused"] else ""
+    # N-83 (root-cause-scope): start_utc/end_utc are stored raw from a form
+    # with no HH:MM validation; in this `value="..."` attribute context an
+    # unescaped value like `"><script>` breaks out. The escape is INLINE at
+    # each interpolation site (NOT a pre-escaped var) so the N-83
+    # attribute-context pin re-flags a reverted bare `{start_v}` — vars stay
+    # raw on purpose. quote=True neutralises double-quotes too.
+    import html as _html
     start_v = s["start_utc"] or ""
     end_v = s["end_utc"] or ""
     return HTMLResponse(
@@ -120,9 +127,9 @@ async def openclaw_editor_fragment(
         f'<label style="margin:0;"><input type="checkbox" name="enabled" {enabled_chk}> on</label>'
         f'<label style="margin:0;"><input type="checkbox" name="paused" {paused_chk}> pause</label>'
         f'<label style="margin:0;font-size:0.8rem;">quiet '
-        f'<input type="time" name="start_utc" value="{start_v}" style="width:6.5rem;padding:0.1rem;margin:0;font-size:0.8rem;"></label>'
+        f'<input type="time" name="start_utc" value="{_html.escape(start_v, quote=True)}" style="width:6.5rem;padding:0.1rem;margin:0;font-size:0.8rem;"></label>'
         f'<label style="margin:0;font-size:0.8rem;">→ '
-        f'<input type="time" name="end_utc" value="{end_v}" style="width:6.5rem;padding:0.1rem;margin:0;font-size:0.8rem;"></label>'
+        f'<input type="time" name="end_utc" value="{_html.escape(end_v, quote=True)}" style="width:6.5rem;padding:0.1rem;margin:0;font-size:0.8rem;"></label>'
         f'<button type="submit" class="outline" style="padding:0.1rem 0.4rem;margin:0;font-size:0.8rem;">Save</button>'
         f'<button type="button" class="outline secondary" style="padding:0.1rem 0.4rem;margin:0;font-size:0.8rem;"'
         f' hx-get="/accounts/{account_id}/openclaw/chip"'

@@ -45,13 +45,15 @@ What the helper OWNS (the invariant body):
 
 from __future__ import annotations
 
+from email_triage.db._helpers import load_json_col
+
 import json as _json
 import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
 from email_triage._errfmt import fmt_exc
-from email_triage.triage_logging import get_logger
+from email_triage.triage_logging import REDACTED_PLACEHOLDER, get_logger
 
 log = get_logger("web.triage_one")
 
@@ -130,6 +132,14 @@ class TriageContext:
     set_keyword_on_success: bool = False
     #: When True, fire email watches after classification.
     fire_watches: bool = True
+    #: When True (default), the  live Topic-match stage runs after
+    #: classify: the just-classified message is matched against the
+    #: account's active Topics on ``ctx.classifier`` (so a HIPAA account's
+    #: match inherits its local-only classify gate — design §1a) and each
+    #: positive becomes a ``topic_hits`` row. Fail-OPEN (§4.4) and skipped
+    #: on ``dry_run`` (a preview must not write hits). Default True so the
+    #: feature lands on every ingestion path at once (the  invariant).
+    match_topics: bool = True
 
 
 @dataclass
@@ -173,7 +183,7 @@ def _build_rule_labels_map(db: sqlite3.Connection) -> dict[int, list[str]]:
         return {}
     for r in rows:
         try:
-            parsed = _json.loads(r["adds_labels"] or "[]")
+            parsed = load_json_col(r["adds_labels"], default=[])
         except Exception:
             parsed = []
         if isinstance(parsed, list) and parsed:
@@ -188,18 +198,51 @@ def _build_rule_provider_labels_map(
 
     Parsed from ``list_rules.provider_labels``. Built once per run.
     Pre-v22 schema (column missing) yields ``{}``.
+
+    A1 (census 2026-06-09) — **build-time account-scope gate** (the actuator
+    layer). Each entry's ``account_id`` is dropped unless the RULE'S OWNER can
+    manage it (owner/delegate/admin). The storage-time gate in
+    ``categories.py`` blocks NEW cross-account targets at write; this filter is
+    the defense-in-depth at the apply boundary — it additionally neutralizes
+    any pre-existing poisoned row OR a future non-handler writer, so the apply
+    path (``_apply_rule_provider_labels``) never sees an unauthorized target.
+    §164.312(a)(1) at the actuator. (2026-06-09 backfill of the live store was
+    CLEAN — zero poison — so this is durable hardening, not active remediation.)
     """
+    from email_triage.db.accounts import can_manage_account, get_email_account
     out: dict[int, list[dict]] = {}
     try:
         rows = db.execute(
-            "SELECT id, provider_labels FROM list_rules "
-            "WHERE provider_labels IS NOT NULL"
+            "SELECT lr.id, lr.provider_labels, cl.owner_id "
+            "FROM list_rules lr "
+            "JOIN classification_lists cl ON lr.list_id = cl.id "
+            "WHERE lr.provider_labels IS NOT NULL"
         ).fetchall()
     except Exception:
         return {}
+
+    _owner: dict[int, dict | None] = {}
+    _manageable: dict[tuple, bool] = {}
+
+    def _owner_can_manage(owner_id, account_id) -> bool:
+        key = (owner_id, account_id)
+        if key not in _manageable:
+            if owner_id not in _owner:
+                orow = db.execute(
+                    "SELECT id, role FROM users WHERE id = ?", (owner_id,),
+                ).fetchone()
+                _owner[owner_id] = dict(orow) if orow else None
+            owner = _owner[owner_id]
+            acct = get_email_account(db, account_id)
+            _manageable[key] = bool(
+                owner is not None and acct is not None
+                and can_manage_account(db, owner, acct)
+            )
+        return _manageable[key]
+
     for r in rows:
         try:
-            parsed = _json.loads(r["provider_labels"] or "[]")
+            parsed = load_json_col(r["provider_labels"], default=[])
         except Exception:
             parsed = []
         cleaned: list[dict] = []
@@ -212,6 +255,14 @@ def _build_rule_provider_labels_map(
                 if not isinstance(aid, int) or not isinstance(slug, str):
                     continue
                 if not slug:
+                    continue
+                # A1 actuator gate — drop targets the rule-owner can't manage.
+                if not _owner_can_manage(r["owner_id"], aid):
+                    log.warning(
+                        "provider-label apply gate: dropped unmanageable "
+                        "target (rule owner cannot manage account)",
+                        rule_id=int(r["id"]), account_id=aid,
+                    )
                     continue
                 cleaned.append({"account_id": aid, "label_slug": slug})
         if cleaned:
@@ -246,6 +297,9 @@ def build_default_registry(*, include_add_label: bool, include_self_event: bool)
         SuggestMeetingTimesAction,
     )
     from email_triage.actions.self_sent_event import SelfSentEventAction
+    from email_triage.actions.escalate import EscalateAction
+    from email_triage.actions.mute import MuteAction
+    from email_triage.actions.regulatory_clock import RegulatoryClockAction
 
     registry = ActionRegistry()
     registry.register(MoveAction())
@@ -258,9 +312,147 @@ def build_default_registry(*, include_add_label: bool, include_self_event: bool)
     registry.register(DeclineInviteAction())
     registry.register(TentativeInviteAction())
     registry.register(SuggestMeetingTimesAction())
+    # Feature-report eval fold (2026-07-17): `escalate` was implemented in
+    # actions/escalate.py + registered by cli.py's serve-path registry but
+    # ABSENT from the web/ingestion registry — so a route configured with
+    # `escalate` on a watched inbox never fired via any web ingestion path
+    # (IMAP watcher, Gmail/O365 push, poll, bulk). Same dead-in-prod class
+    # as -clock (incident_2026-06-11); the completeness pin
+    # test_available_actions_in_live_registry now covers it via
+    # _AVAILABLE_ROUTE_ACTIONS below.
+    registry.register(EscalateAction())
+    # 2026-07-17 — MuteAction: post-classification marker (see actions/mute.py
+    # docstring). Belongs in EVERY live ingestion registry so a route
+    # ticking "mute" is honored via watcher / poll / push / bulk. Missing here
+    # would resurrect the escalate/RSVP/self_sent_event "offered-but-dead"
+    # shape the b778e0a6 fold closed.
+    registry.register(MuteAction())
+    #  — the "clock" route action MUST live here (the registry EVERY live
+    # ingestion path uses), not only in cli.py's serve-path registry: an action
+    # offered in the routes UI but absent here is DEAD in prod (the operator
+    # configures it; nothing runs it). The completeness pin
+    # test_available_actions_in_live_registry enforces this.
+    registry.register(RegulatoryClockAction())
     if include_self_event:
         registry.register(SelfSentEventAction())
     return registry
+
+
+async def _match_topics_live(
+    ctx: "TriageContext",
+    message: Any,
+    msg_id: str,
+    rfc_id: str,
+    *,
+    db_call: Any,
+) -> None:
+    """ — match one just-classified message against the account's active
+    Topics and persist each positive as a ``topic_hits`` row (``source='live'``).
+
+    The steady-state Topic match (design §1) rides the SAME ``ctx.classifier``
+    the message was just classified on, so a HIPAA account's match runs on its
+    local-only backend automatically (§1a — the read/match gate is inherited
+    per-account, never a Topic-wide override). Mirrors the back-scan's
+    match→persist (``jobs/topic_backscan``) for the single live message:
+
+    1. Read the account's active Topics (``list_active_topics_for_account``)
+       off the loop via ``db_call``. No Topics ⇒ nothing to match — and NO LLM
+       call (the matcher is never invoked), so a mailbox with no Topics pays
+       only one small table read per message.
+    2. Run the band/K matcher, threading the REAL ``categories``
+       (``ctx.categories``) so the topic-match seam's taxonomy gate does not
+       fail every verdict open — the  categories-threading bug (see the
+       matcher docstring).
+    3. UPSERT a hit per matched verdict via ``insert_topic_hit`` on the
+       single-writer thread. The ``first_seen_at = MIN`` pin makes a later
+       back-scan of the same message idempotent (no double-count).
+
+    Fail-OPEN throughout (§4.4): a flaky GPU / classifier degrades the Topic
+    digest, it NEVER blocks core triage. The caller guards ``ctx.match_topics``
+    + ``not ctx.dry_run`` + a present ``rfc_id`` and swallows any raise; this
+    body additionally isolates each per-hit write so one bad row never sinks
+    the rest.
+    """
+    from email_triage.actions.topic_configs import (
+        insert_topic_hit, list_active_topics_for_account,
+        normalize_feedback_sender,
+    )
+    from email_triage.cache.topic_feedback import load_topic_sender_signals
+    from email_triage.actions.topic_matcher import match_topics_for_message
+    from email_triage.jobs.topic_backscan import (
+        _msg_body_keywords, _msg_folder, _msg_provider_uid, _msg_uidvalidity,
+        _v_confidence, _v_reason_terms, _v_topic_id,
+    )
+
+    db = ctx.db
+    account_id = int(ctx.acct["id"])
+
+    topics = await db_call(list_active_topics_for_account, db, account_id)
+    if not topics:
+        return
+
+    # Never persist a Topic hit for email-triage's OWN generated content
+    # (X-Email-Triage). The main triage flow already skips self-origin upstream
+    # (the loop-prevention guard), but defense-in-depth here keeps a Topic digest
+    # free of self-generated mail for any caller (operator 2026-06-12).
+    from email_triage.mail_headers import get_triage_header
+    if get_triage_header(getattr(message, "headers", None) or {}):
+        return
+
+    verdicts = await match_topics_for_message(
+        message, topics, ctx.classifier,
+        body_keywords=_msg_body_keywords(message),
+        categories=ctx.categories,
+    )
+    if not verdicts:
+        return
+
+    folder = _msg_folder(message)
+    provider_uid = _msg_provider_uid(message)
+    uidvalidity = _msg_uidvalidity(message)
+
+    # Resolve each verdict's topic_id to one of THIS account's active Topics
+    # before writing — never persist a hit for a Topic that isn't watching
+    # this account (defensive against a classifier echoing an unexpected id).
+    active_ids = [int(getattr(t, "id", 0) or 0) for t in topics]
+    active_id_set = set(active_ids)
+    #  v3 reinforcement (operator 2026-06-12): a thumbs-DOWN sender is muted
+    # for that Topic — never persist a live hit for it. Signals are per-Topic;
+    # cache the lookup so a multi-verdict message queries each Topic at most once.
+    _fb_sender_key = normalize_feedback_sender(getattr(message, "sender", "") or "")
+    _fb_sig_cache: dict[int, dict] = {}
+    for v in verdicts:
+        tid = _v_topic_id(v)
+        if tid is None and len(active_ids) == 1:
+            # A one-Topic account whose verdict didn't echo the id back —
+            # attribute it to the single watching Topic (mirrors the
+            # back-scan's ``_pick_verdict`` tolerance).
+            tid = active_ids[0]
+        if tid is None or int(tid) not in active_id_set:
+            continue
+        if _fb_sender_key:
+            sigs = _fb_sig_cache.get(int(tid))
+            if sigs is None:
+                # Cache-aware: OPTIONAL Redis mirror if configured, else the DB.
+                sigs = await load_topic_sender_signals(db, int(tid))
+                _fb_sig_cache[int(tid)] = sigs
+            if sigs.get(_fb_sender_key) == -1:
+                continue  # muted sender — skip the live hit
+        try:
+            await db_call(
+                insert_topic_hit, db,
+                topic_id=int(tid), account_id=account_id,
+                rfc822_message_id=rfc_id, folder=folder,
+                provider_uid=provider_uid, uidvalidity=uidvalidity,
+                reason_terms=_v_reason_terms(v),
+                confidence=_v_confidence(v),
+                source="live",
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad row ≠ block triage
+            log.warning(
+                "topic hit write failed",
+                message_id=msg_id, topic_id=tid, error=fmt_exc(exc),
+            )
 
 
 async def triage_single_message(
@@ -425,9 +617,66 @@ async def triage_single_message(
             lists=ctx.list_hints_lists,
             rules_by_list=ctx.list_hints_rules_by_list,
         )
+        # N-113 — HIPAA + BAA egress CHOKEPOINT (§164.308(b)(1), PD#5). EVERY
+        # ingestion + runner path funnels through this one function to classify;
+        # only run_triage gated at ctx-build, so poll/push/watcher/sweeper/bulk
+        # reached ctx.classifier.classify (and the downstream Topic match at
+        # _match_topics_live) with a HIPAA account's PHI UN-gated. Gate the SHARED
+        # consumer ONCE so all paths fail closed on an external, non-BAA'd
+        # classifier for a HIPAA message — covering the primary classify here AND
+        # the Topic match below. No-op for the common local / BAA-acked classifier
+        # (baa_block_status returns None). The shared decision SSOT, same as the
+        # back-scan job + the Topic preview.
+        if account_hipaa:
+            from email_triage.classify.baa_gate import baa_block_status
+            _baa_block = await db_call(baa_block_status, db, ctx.classifier, True)
+            if _baa_block is not None:
+                log.warning(
+                    "triage_single_message: classify BLOCKED for HIPAA account "
+                    f"{account_id} — classifier {_baa_block.get('backend')} @ "
+                    f"{_baa_block.get('host') or '?'} is not BAA-acked; skipped "
+                    "(no PHI egress, N-113).",
+                    message_id=msg_id,
+                )
+                entry["status"] = "skipped"
+                entry["skip_reason"] = "baa_required"
+                entry["reason"] = "hipaa_baa_required"
+                return TriageMessageResult(entry=entry, status="s")
         classification = await ctx.classifier.classify(
             message, ctx.categories, hints or None,
         )
+
+        # --  regulatory-clock detection (flag-OFF default) ----------
+        # Stage-A recall gate → Stage-B local-Ollama confirm → a CANDIDATE
+        # clock for human propose-then-confirm. Gated on the detection flag AND
+        # ``not ctx.dry_run`` (it writes a candidate = a side effect, N-61).
+        # Fully FAIL-SOFT: the orchestrator swallows all errors → None, and the
+        # whole block is also try/except'd, so a detector miss NEVER blocks core
+        # triage (§4.4). The orchestrator is async-on-the-loop (LLM I/O) and
+        # returns a SPEC; the @db_write candidate insert runs OFF the loop via
+        # db_call so it can't block the event loop on the writer lock.
+        if not ctx.dry_run and getattr(
+            getattr(ctx.config, "regulatory_clock", None),
+            "detection_enabled", False,
+        ):
+            try:
+                from email_triage.classify.safety_detect import (
+                    create_clock_candidate_from_detection,
+                    detect_regulatory_clock,
+                )
+                _match = await detect_regulatory_clock(
+                    message, ctx.classifier,
+                    account_id=account_id, detection_enabled=True,
+                )
+                if _match is not None:
+                    # The def-resolve + keyed-hash salt + candidate INSERT all
+                    # run OFF the event loop (F1) under the  writer RLock.
+                    await db_call(
+                        create_clock_candidate_from_detection,
+                        ctx.db, ctx.secrets, _match,
+                    )
+            except Exception:
+                pass  # belt-and-suspenders; the orchestrator is already fail-soft
 
         # --  rule-driven internal labels ---------------------------
         # #239a — the helper's body is cheap pure-Python rule matching
@@ -436,15 +685,20 @@ async def triage_single_message(
         # lock-acquire — runs off the event loop. The helper only
         # mutates ``entry`` (forwarded by reference) and the awaited
         # dispatch fully serialises that mutation before we read on.
-        await db_call(
-            _apply_rule_internal_labels,
-            ctx, message, msg_id, entry, classification,
-        )
+        # N-61 (Loop-5 census) — a dry_run/preview MUST apply no side effects:
+        # no internal/provider labels, no watch escalations/webhooks, no IMAP
+        # keyword, no dedup stamp. Gate every side-effecting stage on ``not
+        # ctx.dry_run`` (the action loop L735 + topic-match L683 already are).
+        if not ctx.dry_run:
+            await db_call(
+                _apply_rule_internal_labels,
+                ctx, message, msg_id, entry, classification,
+            )
 
-        # --  rule-driven provider-native labels --------------------
-        await _apply_rule_provider_labels(
-            ctx, message, msg_id, entry, classification,
-        )
+            # --  rule-driven provider-native labels ----------------
+            await _apply_rule_provider_labels(
+                ctx, message, msg_id, entry, classification,
+            )
 
         entry["category"] = classification.category
         entry["confidence"] = classification.confidence
@@ -459,14 +713,16 @@ async def triage_single_message(
         # HIPAA: classifier reason is free-form natural language that can
         # echo subject/body PHI. Redact before persisting.
         entry["reason"] = (
-            "[redacted]" if account_hipaa else classification.reason
+            REDACTED_PLACEHOLDER if account_hipaa else classification.reason  # N-217c R23
         )
 
         # -- Email watches ---------------------------------------
         # Match-and-fire BEFORE the per-route action loop. Errors NEVER
         # block the route-and-act stage.
         unretried_watch_failures = 0
-        if ctx.fire_watches:
+        # N-61 — watch-fire sends REAL escalations (SMTP/SMS) + webhook POSTs;
+        # a preview must never trigger them. ``not ctx.dry_run`` gate.
+        if ctx.fire_watches and not ctx.dry_run:
             try:
                 from email_triage.web.watch_runner import (
                     _delivered as _watch_delivered,
@@ -525,6 +781,25 @@ async def triage_single_message(
                 log.warning(
                     "watch fire raised in triage_single_message",
                     message_id=msg_id, error=fmt_exc(_watch_exc),
+                )
+
+        # --  Topic match (live path; design §1) ---------------------
+        # Match the just-classified message against the account's active
+        # Topics on the SAME classifier (HIPAA → local, gate inherited §1a)
+        # and record each positive as a topic_hits row — the steady-state
+        # match that feeds the Topic digest. Fail-OPEN: a degraded match
+        # NEVER blocks core triage. Skipped on dry-run (a preview must not
+        # write hits), when the caller opts out (ctx.match_topics), or when
+        # the message has no durable RFC Message-ID to key a hit on.
+        if ctx.match_topics and not ctx.dry_run and _rfc_id:
+            try:
+                await _match_topics_live(
+                    ctx, message, msg_id, _rfc_id, db_call=db_call,
+                )
+            except Exception as _topic_exc:  # noqa: BLE001 — never block triage
+                log.warning(
+                    "topic match raised in triage_single_message",
+                    message_id=msg_id, error=fmt_exc(_topic_exc),
                 )
 
         # -- Action loop -------------------------
@@ -604,6 +879,7 @@ async def triage_single_message(
                     "calendar_surrogate_active": ctx.calendar_surrogate_active,
                     "db": db,
                     "actor_user_id": ctx.actor_user_id,
+                    "config": ctx.config,
                 },
             )
             output = await action.execute(
@@ -651,6 +927,14 @@ async def triage_single_message(
         entry["status"] = "ok"
 
         # -- Post-success dedup stamp -----------------------------------
+        # N-61 — dry_run is "poll-but-don't-ACT": classify + record the run +
+        # advance the cursor + record PROCESSING, but take no actions. So the
+        # install-internal ``mark_triaged`` rfc_id dedup STAYS (the caller
+        # advances the durable cursor on status="p" in dry_run too — db-sme
+        # trace; keeping the stamp coherent with that avoids the DA MF-1
+        # dedup/cursor inconsistency, and the DB dedup covers replay). The IMAP
+        # ``$EmailTriaged`` keyword below, by contrast, is a LIVE-MAILBOX
+        # mutation (an ACTION) → suppressed in dry_run.
         if ctx.mark_triaged_on_success and _rfc_id:
             try:
                 from email_triage.web.db import mark_triaged
@@ -658,7 +942,8 @@ async def triage_single_message(
                 await db_call(mark_triaged, db, account_id, _rfc_id)
             except Exception:
                 pass
-        if ctx.set_keyword_on_success and acct.get("provider_type") == "imap":
+        if (ctx.set_keyword_on_success and not ctx.dry_run
+                and acct.get("provider_type") == "imap"):
             try:
                 await ctx.provider.set_keywords(msg_id, ["$EmailTriaged"])
             except Exception:
@@ -684,8 +969,12 @@ async def triage_single_message(
         from email_triage.llm_health import LLMBackendUnreachableError
         if isinstance(e, LLMBackendUnreachableError):
             raise
+        #  tail — see the sibling site at triage_runner.py:513 for
+        # the class rationale (results-entry ``entry["error"]`` shown to
+        # user via triage-completed webhook / UI must be scrub_exc'd).
+        from email_triage.web._flash import scrub_exc
         entry["status"] = "error"
-        entry["error"] = str(e)
+        entry["error"] = scrub_exc(e, purpose="triage")
         log.error(
             "Triage error for message",
             message_id=msg_id, error=fmt_exc(e),
@@ -762,19 +1051,41 @@ async def _apply_rule_provider_labels(
                     label_slug = pl_entry.get("label_slug", "")
                     if label_slug:
                         matched_provider_labels.add(label_slug)
-    for slug_pl in sorted(matched_provider_labels):
-        try:
-            await ctx.provider.apply_label(msg_id, slug_pl)
-        except NotImplementedError:
-            log.debug(
-                "provider.apply_label unsupported",
-                provider=getattr(ctx.provider, "name", "?"),
-            )
-        except Exception as _pl_exc:
-            log.warning(
-                "provider label apply failed",
-                message_id=msg_id, label=slug_pl,
-                error=fmt_exc(_pl_exc),
-            )
-    if matched_provider_labels:
-        entry["provider_labels_applied"] = sorted(matched_provider_labels)
+    if not matched_provider_labels:
+        return
+    # §164.502(e) egress gate via the SSOT — in HIPAA mode the provider
+    # write is skipped so a PHI-adjacent label string never leaves the
+    # perimeter. The gate input goes through the one resolver (message
+    # stamp + system flag + per-account flag, most-restrictive) so it
+    # can't drift vs LabelAction / AddLabelAction.
+    from email_triage.actions.provider_labels import (
+        push_provider_labels,
+        resolve_label_hipaa,
+    )
+
+    hipaa = resolve_label_hipaa(message=message, account=ctx.acct)
+    applied, skipped, errors = await push_provider_labels(
+        ctx.provider, msg_id, sorted(matched_provider_labels), hipaa=hipaa,
+    )
+    if applied:
+        entry["provider_labels_applied"] = applied
+    if skipped and hipaa:
+        entry["provider_labels_skipped_hipaa"] = skipped
+        # PHI-free log: message_id (opaque uid) + label slugs only — no
+        # sender/subject fields here (do not add any; this site does not
+        # route through build_action_log_extras' HIPAA redaction).
+        log.info(
+            "rule provider labels skipped (HIPAA mode)",
+            message_id=msg_id, labels=skipped,
+        )
+    elif skipped:
+        log.debug(
+            "provider.apply_label unsupported",
+            provider=getattr(ctx.provider, "name", "?"),
+            labels=skipped,
+        )
+    for _lbl, _detail, _exc in errors:
+        log.warning(
+            "provider label apply failed",
+            message_id=msg_id, label=_lbl, error=_detail,
+        )

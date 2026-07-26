@@ -121,6 +121,35 @@ push:
 #     events: [triage.completed]
 #     secret_key: WEBHOOK_SECRET          # Key name in secrets store
 
+# Audit-identity — trusted reverse-proxy CIDRs.
+#
+# When email-triage sits BEHIND a reverse proxy (nginx / Tailscale
+# Funnel / cloud LB), `request.client.host` on every inbound request
+# is the PROXY IP, not the real client. Audit rows in `log_entries`
+# would then all read the proxy IP → zero identity trail on the
+# §164.312(b) audit chain.
+#
+# Populate `audit.trusted_proxies` with the CIDRs the reverse proxy
+# reaches us from. When a direct-peer IP matches one of these CIDRs,
+# the audit SSOT walks the rightmost `X-Forwarded-For` entry (or
+# falls back to the direct peer on all-malformed XFF — fail-CLOSED,
+# per N-337). Additionally, uvicorn's `proxy_headers=True` kwarg
+# fires ONLY when this list is non-empty (see `cli.py`), which is
+# how `is_request_https(request)` learns the request was HTTPS at
+# the edge (via `X-Forwarded-Proto`) so `Set-Cookie ... Secure`
+# ships correctly.
+#
+# LEAVE EMPTY (default) if this install is direct-to-the-client
+# (no reverse proxy). Any topology fronting email-triage with
+# nginx / cloud LB / Funnel needs this populated.
+#
+# the deploy host-typical (nginx on loopback fronting a podman container on
+# the default bridge):
+# audit:
+#   trusted_proxies:
+#     - 127.0.0.1/32       # loopback (nginx on the same host)
+#     - 10.88.0.0/16       # podman default bridge
+
 # Calendar subsystem + meeting-request intercept (Phase 4) — no
 # config-file knobs. Per-account "Enable Calendar" lives on the
 # Accounts page (Gmail device-code re-auth or O365 MSAL prompt);

@@ -35,6 +35,10 @@ a future #277b/c sub-task when ≥2 modules legitimately need them.
 
 from __future__ import annotations
 
+from email_triage._isotime import now_utc_iso
+
+from email_triage.db._helpers import dump_json_col, load_json_col
+
 import sqlite3
 import threading
 from typing import Any
@@ -226,7 +230,7 @@ CREATE INDEX IF NOT EXISTS idx_hipaa_boundary_scope ON hipaa_boundary_events(sco
 # event_type:
 #   "login_otp"          -- standard email-OTP login.
 #   "login_dev_keypair"  -- admin-managed Ed25519 keypair login.
-#   "login_webauthn"     -- per-user FIDO2 hardware key.
+#   "login_webauthn"     -- per-user FIDO2 passkey.
 #
 # key_id is NULL for OTP (no key); for the other two, it points to
 # dev_keys.id or hardware_keys.id respectively. outcome is
@@ -329,13 +333,18 @@ CREATE INDEX IF NOT EXISTS idx_api_key_events_target ON api_key_events(target_us
 # request, not only triage-pipeline writes. The middleware in
 # web/app.py records here on every request whose path matches a
 # PHI-touch prefix (/classify, /triage/run, /accounts/<id>/{messages,
-# digest, folders, discover, bulk}, /api/openclaw, /runs/<id>).
+# digest, folders, discover, bulk}, /api/v1, /runs/<id>).
 #
 # No PHI is persisted: route + method + status + actor are stamped;
 # the request body is never logged. account_id and message_id are
 # extracted from the URL path when present so the auditor can answer
 # "who looked at this account / message, and when?" without scraping
 # the path themselves.
+# NOTE: this is the ORIGINAL-install shape only. Later web/db.py migrations add
+# columns NOT shown here — request_id, and auth_source / auth_key_id
+# (present but NOT written by record_access_event, hence excluded from the chain
+# canonical tuple). The live schema is the migrated one; do not read this inline
+# DDL as the authoritative column set.
 _ACCESS_LOG_DDL = """\
 CREATE TABLE IF NOT EXISTS access_log (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,6 +397,79 @@ CREATE INDEX IF NOT EXISTS idx_discover_runs_created ON discover_runs(created_at
 
 _AUDIT_CHAIN_ANCHOR_KEY = "audit:chain_anchor"
 
+#  / N-15 — the canonical-field SSOT for the audit-event HMAC chains.
+#
+# Maps each chained audit-event table to the ORDERED tuple of column names whose
+# values feed ``_canonical_audit_row`` (and therefore ``row_hash``). The keys of
+# this dict ARE the set of chained audit tables — ``get_last_audit_row_hash`` /
+# ``_chain_insert`` validate the table name against it (allow-list; the table
+# name is interpolated into SQL, so this is also the injection guard).
+#
+# OPTION A (SME/DA design review wf_7af575de-5d8, unanimous): the field tuple
+# holds only the IMMUTABLE creation fields. ``hipaa_access_events`` is the ONLY
+# table with an in-place UPDATE (``update_hipaa_access_event`` finalises
+# outcome+detail), so it EXCLUDES ``outcome`` + ``detail`` — that makes the
+# finalise UPDATE chain-transparent (it touches no hashed column, so row_hash is
+# unchanged and the chain needs no O(n) re-link). The inverse pin
+# (test_audit_chain_pin.py) asserts this exclusion so a future dev cannot
+# silently add a hashed mutable field. The other 7 tables are append-only
+# (verified: no UPDATE statements at HEAD), so every immutable content column is
+# hashed.
+#
+# FIELD ORDER IS A FROZEN CONTRACT: reordering re-hashes the chain. These chains
+# have no pre-#26 history (every existing row is a prechain row_hash=''), so the
+# order is fixed from the first chained write forward.
+_AUDIT_CHAIN_CANONICAL_FIELDS: dict[str, tuple[str, ...]] = {
+    # who (actor_user_id) / whose-account (account_id) / what (operation) / when
+    # (ts) — the access FACT. outcome+detail EXCLUDED (mutable; Option A).
+    "hipaa_access_events": ("ts", "actor_user_id", "account_id", "operation"),
+    "hipaa_boundary_events": ("ts", "scope", "direction", "actor_id", "reason"),
+    "auth_events": (
+        "ts", "event_type", "user_id", "email", "key_id", "ip",
+        "user_agent", "outcome", "detail",
+    ),
+    "user_status_events": (
+        "ts", "target_user_id", "actor_user_id", "event", "reason",
+    ),
+    "api_key_events": (
+        "ts", "event", "key_id", "actor_user_id", "target_user_id",
+        "name", "expires_at", "source",
+    ),
+    # access_log is append-only (no UPDATE) so all WRITTEN columns are hashed.
+    # auth_source/auth_key_id columns exist but record_access_event never
+    # populates them (always NULL) — excluded because they are not in the
+    # writer's data dict; request_id IS written and is hashed.
+    "access_log": (
+        "ts", "actor_user_id", "method", "route", "account_id",
+        "message_id", "status_code", "outcome", "detail", "request_id",
+    ),
+    "discover_runs": (
+        "account_id", "account_name", "actor_user_id", "scanned_count",
+        "errors_count", "folders", "elapsed_secs", "created_at",
+    ),
+    # §164.502(e) cloud-PHI-egress accounting trail. was_cloud = the egress
+    # signal; recipient_hash = a correlatable per-contact digest (already
+    # hashed, no PHI plaintext) — both immutable, both hashed for full
+    # tamper-evidence on the disclosure record.
+    "style_distill_events": (
+        "ts", "account_id", "actor_user_id", "backend_id", "backend_type",
+        "was_cloud", "outcome", "latency_ms", "layer1_drops",
+        "layer2_matches", "layer3_entities", "scrubber_degraded",
+        "error_class", "kind", "recipient_hash",
+    ),
+    #  — regulatory clock transitions. APPEND-ONLY (every transition is a new
+    # row; no in-place UPDATE — a correction is a new determination_corrected
+    # event), so EVERY written column is immutable and hashed; no Option-A
+    # mutable-field exclusion. (`id` autoincrement + the 4 chain cols are not
+    # data.) Chain columns added in migration v47 — the dedicated chained table
+    # SUPERSEDES the design's "chain into the pruned log_entries" projection
+    # model (pruning would breach §164.316(b)(2)(i) retention; see _v47).
+    "regulatory_clock_event": (
+        "instance_id", "event_kind", "actor_user_id", "from_state", "to_state",
+        "escalation_rung", "delivered_to_ref", "detail", "created_at",
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Row-shape helpers — duplicated from web/db.py:529-547 per #277a Decision B.
@@ -395,14 +477,8 @@ _AUDIT_CHAIN_ANCHOR_KEY = "audit:chain_anchor"
 # modules legitimately need them.
 # ---------------------------------------------------------------------------
 
-def _rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    """Map a ``fetchall()`` result to a list of plain dicts."""
-    return [dict(row) for row in rows]
-
-
-def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    """Map a ``fetchone()`` result to a plain dict, or ``None``."""
-    return None if row is None else dict(row)
+# N-235 R23 — collapsed onto db/_helpers.py (was 3 byte-identical SSOTs).
+from email_triage.db._helpers import _row, _rows  # noqa: E402,F401 — re-export
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +528,22 @@ def insert_log_entry(
     provisioned (D1 fail-closed; see :func:`compute_log_row_hash`).
     """
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    extra_json = json.dumps(extra or {})
+    now = now_utc_iso()
+    # census run17 #1 — route this writer through the persisted-log redaction
+    # SSOT BEFORE the hash preimage is built (hash == store). phi_allowlist=False
+    # = SECRET-STRIP ONLY: this writer's sole production caller (the CLI
+    # admin-op audit, cli.py) already curates its payload via _SAFE_ARG_KEYS, so
+    # the full PHI ALLOWLIST would destroy the §164.312(b) audit-row CONTENT
+    # (admin action name / flags / error_class → redacted) without removing any
+    # leak (devils-advocate diff-review, 2026-06-27). The full PHI allowlist
+    # guards the UNCURATED raw-getLogger sink (SQLiteLogHandler.emit). Lazy
+    # import avoids an import cycle (triage_logging late-imports web.db).
+    from email_triage import triage_logging as _tlog
+    extra_json = json.dumps(
+        _tlog.redact_persisted_extra(
+            extra or {}, hipaa=_tlog._hipaa_mode, phi_allowlist=False
+        )
+    )
     prev_hash = get_last_log_row_hash(conn)
     # H-02a: stamp the current HMAC version on the row + compute under
     # the current HMAC subkey. _get_current_hmac_version() returns None
@@ -521,7 +610,7 @@ def list_log_entries(
     result = []
     for r in rows:
         d = dict(r)
-        extra = json.loads(d.pop("extra_json", "{}"))
+        extra = load_json_col(d.pop("extra_json", "{}"), default={})
         # Render-time legacy unpack: rows emitted before the
         # ec06f21 fix landed with shape {"_extra": "<stringified
         # dict>"} (the SQLite handler's old emit() walked
@@ -571,7 +660,6 @@ def _capture_chain_anchor(conn: sqlite3.Connection) -> None:
 
     No-op when the table is empty post-prune (nothing to anchor).
     """
-    from datetime import datetime, timezone
     # Late-bind the settings-table helpers from web/db. The dep is
     # unidirectional (db.audit -> web.db) so no cycle; the late-bind
     # keeps this module load-order-independent and matches the existing
@@ -597,7 +685,7 @@ def _capture_chain_anchor(conn: sqlite3.Connection) -> None:
         "head_prev_hash": head["prev_hash"] or "",
         "head_hash_alg": head["hash_alg"] or "sha256",
         "head_master_key_version": int(head["master_key_version"] or 0),
-        "anchored_at": datetime.now(timezone.utc).isoformat(),
+        "anchored_at": now_utc_iso(),
     }
     # Inline UPSERT — avoid set_setting() because that helper auto-commits
     # and we need the anchor write to share the prune transaction.
@@ -608,7 +696,7 @@ def _capture_chain_anchor(conn: sqlite3.Connection) -> None:
         "ON CONFLICT(key) DO UPDATE SET "
         "value_json = excluded.value_json, "
         "updated_at = excluded.updated_at",
-        (_AUDIT_CHAIN_ANCHOR_KEY, _json.dumps(anchor), anchor["anchored_at"]),
+        (_AUDIT_CHAIN_ANCHOR_KEY, dump_json_col(anchor), anchor["anchored_at"]),
     )
     # Keep the in-process settings cache coherent with this
     # transactional write. The cache otherwise serves a stale value
@@ -698,6 +786,167 @@ def prune_log_entries_by_age_and_count(
 
 
 # ---------------------------------------------------------------------------
+# N-349b Item 1 — HMAC clobber bypass consumption audit emitter (2026-07-07)
+# ---------------------------------------------------------------------------
+# The 2026-07-05 N-349 hybrid SME panel surfaced a §164.312(b) gap: the ARM
+# event for `secrets allow-hmac-clobber-once` emits a `@_cli_audit("secrets")`
+# row (visible in the HMAC-chained `log_entries` envelope), but the CONSUME
+# event — the watch-HMAC hydration path in `get_or_mint_secret` observing
+# `bypass_check()==True` on an unreadable row and MINTING a fresh secret —
+# previously fired only a stdlib `logger.warning` from `secrets.py`. That
+# warning routes through `SQLiteLogHandler.emit` in production (also chained
+# per  + H-02a) but the correlation between the ARM CLI row and the
+# CONSUME `SQLiteLogHandler` row was implicit (both go into `log_entries` via
+# different paths). An investigator sweeping the security-key lifecycle
+# needs an EXPLICIT emitter-owned CONSUME event tagged as a bypass consumption
+# so an arm-without-consume (or consume-without-arm) fires an obvious diff.
+#
+# This helper is the emitter-shaped counterpart: `@db_write` OUTER +
+# `@audit_emitter` INNER, routing through the `insert_log_entry` chain-
+# aware primitive. A write failure fires a matching `audit_gap_events` row
+# via `db_writelock._wrap` per the redaction-map entry below.
+#
+# HIPAA §164.312(b) audit-controls + §164.308(a)(4)(ii)(C) access-establish/
+# modification (the ARM→CONSUME lifecycle ties operator authorization to
+# the actual break-glass event). Register row N-3xx filed same-commit.
+
+
+@db_write
+@audit_emitter  # N-349b Item 1 R31 (2026-07-07) — gap-event on write failure
+def record_hmac_clobber_bypass_consumed(
+    conn: sqlite3.Connection,
+    *,
+    secret_key: str,
+    actor_user_id: int | None = None,
+    watch_id: str | None = None,
+) -> None:
+    """N-349b Item 1 R31 (2026-07-07) — HMAC-chained audit row at
+    operator-armed HMAC-clobber-bypass consumption.
+
+    Called from ``get_or_mint_secret`` (via a caller-supplied
+    ``bypass_audit_emit`` closure) after ``bypass_check()`` returned
+    True AND the fresh mint + ``.set()`` succeeded — that is, after the
+    break-glass lever fully fired. The row participates in the same
+    ``log_entries`` HMAC chain as the CLI ARM row + the same-file
+    `logger.warning` sibling, giving an investigator ONE tamper-evident
+    envelope covering the whole ARM→CONSUME lifecycle.
+
+    Args are keyword-only + bounded:
+
+    * ``secret_key`` — the settings key (e.g. ``watch_hmac:<uuid>``);
+      operator-chosen namespaced string, no PHI.
+    * ``actor_user_id`` — the request-context user id iff callers plumb
+      it (currently ``None`` at all 3 sites; plumbing is a follow-up).
+    * ``watch_id`` — the watch UUID whose HMAC the mint replaced.
+
+    All 3 are IN-class in ``_AUDIT_EMITTER_REDACTION_MAP`` (Safe-Harbor —
+    typed IDs / operator-namespaced strings) so a gap-event row would
+    carry them verbatim.
+    """
+    now = now_utc_iso()
+    # Route through the chain-aware primitive so the row lands in the
+    # SAME `log_entries` envelope the CLI arm-audit row + the
+    # SQLiteLogHandler warning sibling occupy — one chain, one seek
+    # per verifier sweep.
+    insert_log_entry(
+        conn,
+        now,
+        "WARNING",
+        "email_triage.secrets.n349_hybrid",
+        "HMAC clobber bypass CONSUMED — fresh secret minted after operator-armed one-shot",
+        extra={
+            "event": "hmac_clobber_bypass_consumed",
+            "secret_key": secret_key,
+            "actor_user_id": actor_user_id,
+            "watch_id": watch_id,
+        },
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# N-157 — CLI admin-op chain-write emitter (2026-07-09)
+# ---------------------------------------------------------------------------
+# The H-03-auto CLI audit auto-emit path at ``cli.py::_emit_cli_audit_event``
+# previously wrote directly through ``insert_log_entry`` — a raw chain-
+# primitive call that bypasses the ``@audit_emitter`` gap-event sentinel
+# (audit_gap_events, per  Deliverable 3). If the ``@db_write`` wrapper
+# rolled back on a SQLITE_MISUSE / cursor-corruption inside the CLI-op
+# emit path, the failure had no tamper-evident record — §164.312(b) Audit
+# Controls gap.
+#
+# ``record_cli_admin_op`` is the emitter-shaped SSOT: ``@db_write`` OUTER +
+# ``@audit_emitter`` INNER, routing through ``insert_log_entry`` so the
+# row lands in the SAME ``log_entries`` HMAC-chained envelope every
+# other emitter uses.  Redaction-map entry below marks the 3 typed IN
+# fields (Safe-Harbor bounded strings) with ``extra`` split OUT (it is
+# a nested pre-redacted dict — the caller has already applied the
+# ``_SAFE_ARG_KEYS`` allow-list at ``cli.py:197-227``, so the raw hash
+# below captures the payload without re-storing it in the gap row).
+#
+# The CLI actuator at ``_emit_cli_audit_event`` is responsible for the
+# fail-loud policy (operator-directed 2026-07-08 AskUserQuestion:
+# "Fail-loud with recovery flag"): default = raise on emit failure
+# BEFORE the wrapped handler runs (phase='start'); `--allow-unaudited`
+# preserves the H-03-auto fail-soft posture the operator relies on
+# mid-incident.  ``record_cli_admin_op`` itself just records the row —
+# the gate-decision lives at the actuator per PD #9 (gate at the
+# ACTUATOR, not the writer).
+
+
+@db_write
+@audit_emitter  # N-157 (2026-07-09) — gap-event on write failure
+def record_cli_admin_op(
+    conn: sqlite3.Connection,
+    *,
+    ts: str,
+    command: str,
+    phase: str,
+    extra: dict,
+    allow_unaudited: bool = False,
+) -> None:
+    """N-157 (§164.312(b)) — chain-write for CLI admin-op start/end.
+
+    Routes through ``insert_log_entry`` so the row lands in the
+    ``log_entries`` HMAC-chained envelope alongside every other
+    audit-emitter surface. A write failure fires an
+    ``audit_gap_events`` row via ``db_writelock._wrap`` per the
+    redaction-map entry.
+
+    Keyword-only arguments are pre-redacted by the caller at
+    ``cli.py::_emit_cli_audit_event`` (the ``_SAFE_ARG_KEYS`` allow-list
+    strips any argparse Namespace field not on the audit-safe list).
+    ``command`` + ``phase`` are bounded operator-namespaced strings
+    (Safe-Harbor IN); ``ts`` is an ISO timestamp (IN); ``extra`` is a
+    nested dict of already-redacted fields — kept OUT to keep the
+    redacted payload compact (raw hash still binds it so an investigator
+    can cross-match against the ``log_entries`` row a successful write
+    would have produced).
+
+    ``allow_unaudited`` is the fail-loud gate bypass flag (Safe-Harbor
+    typed bool — 1 bit, no PHI vector) — DA fold N-157 Fix #2 promoted
+    it to a dedicated top-level IN field on the gap-row so an
+    investigator can determine the fail-loud policy state at the moment
+    of the failed emit without cross-matching against external CLI-
+    invocation logs (shell history / journalctl / system audit).
+    HIPAA-sme calibration 2026-07-09: §164.502(b) NET-REDUCTION of the
+    investigation surface (bypass bit stays inside the HMAC-chained
+    envelope, not spread across external logs) + §164.312(b) audit-
+    integrity strengthened.  Redundant on the SUCCESS path (``extra``
+    carries the same field via ``_SAFE_ARG_KEYS``) — LOAD-BEARING on the
+    FAILURE path (the gap-row is where the bypass signal now lands).
+    """
+    insert_log_entry(
+        conn,
+        ts,
+        "INFO",
+        "email_triage.cli.audit",
+        f"cli admin op: {command} ({phase})",
+        extra=extra,
+    )
+
+
+# ---------------------------------------------------------------------------
 # User-status events (disabled/enabled audit + session-epoch bump)
 # ---------------------------------------------------------------------------
 
@@ -711,19 +960,21 @@ def record_user_status_event(
     reason: str = "",
 ) -> int:
     """Record a user-status change (disabled/enabled).  Returns the new row id."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO user_status_events "
-        "(ts, target_user_id, actor_user_id, event, reason) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (now, target_user_id, actor_user_id, event, reason or ""),
-    )
+    now = now_utc_iso()
+    #  — chained audit write (SSOT). Own-commit emitter.
+    row_id = _chain_insert(conn, "user_status_events", {
+        "ts": now,
+        "target_user_id": target_user_id,
+        "actor_user_id": actor_user_id,
+        "event": event,
+        "reason": reason or "",
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 @db_write
+@audit_emitter  # A2 (census 2026-06-09) — gap-event on write failure (§164.312(b))
 def set_user_disabled(
     conn: sqlite3.Connection,
     target_user_id: int,
@@ -736,7 +987,6 @@ def set_user_disabled(
     Returns True if the flag actually changed, False if it was already
     in the requested state (no-op, no event recorded).
     """
-    from datetime import datetime, timezone
     row = conn.execute(
         "SELECT disabled FROM users WHERE id = ?", (target_user_id,),
     ).fetchone()
@@ -746,7 +996,7 @@ def set_user_disabled(
     if current == bool(disabled):
         return False
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     event = "disabled" if disabled else "enabled"
     try:
         conn.execute("BEGIN")
@@ -767,12 +1017,15 @@ def set_user_disabled(
                 "disabled_by_user_id = NULL WHERE id = ?",
                 (target_user_id,),
             )
-        conn.execute(
-            "INSERT INTO user_status_events "
-            "(ts, target_user_id, actor_user_id, event, reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (now, target_user_id, actor_user_id, event, reason or ""),
-        )
+        #  — chained audit write (SSOT), txn-aware: NO commit here; the
+        # explicit COMMIT below makes the users flip + the audit row atomic.
+        _chain_insert(conn, "user_status_events", {
+            "ts": now,
+            "target_user_id": target_user_id,
+            "actor_user_id": actor_user_id,
+            "event": event,
+            "reason": reason or "",
+        })
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -852,18 +1105,21 @@ def record_auth_event(
     Standard pattern: log at WARNING and proceed (auth succeeded;
     audit drift is a degraded condition, not a denial).
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO auth_events "
-        "(ts, event_type, user_id, email, key_id, ip, user_agent, "
-        " outcome, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (now, event_type, user_id, email, key_id, ip, user_agent,
-         outcome, detail),
-    )
+    now = now_utc_iso()
+    #  — chained audit write (SSOT). Own-commit emitter.
+    row_id = _chain_insert(conn, "auth_events", {
+        "ts": now,
+        "event_type": event_type,
+        "user_id": user_id,
+        "email": email,
+        "key_id": key_id,
+        "ip": ip,
+        "user_agent": user_agent,
+        "outcome": outcome,
+        "detail": detail,
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 def list_auth_events(
@@ -912,38 +1168,45 @@ def record_hipaa_boundary(
     "before this point PHI may be present / after this point it is
     scrubbed" dividers.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO hipaa_boundary_events "
-        "(ts, scope, direction, actor_id, reason) VALUES (?, ?, ?, ?, ?)",
-        (now, scope, direction, actor_id, reason),
-    )
+    now = now_utc_iso()
+    #  — chained audit write (SSOT). Own-commit emitter. The SECOND writer of
+    # this table (db/accounts.py set_account_hipaa, in-txn) routes through the
+    # same SSOT — both are pinned by the table-keyed inverse pin.
+    row_id = _chain_insert(conn, "hipaa_boundary_events", {
+        "ts": now,
+        "scope": scope,
+        "direction": direction,
+        "actor_id": actor_id,
+        "reason": reason,
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 def list_hipaa_boundary_events(
     conn: sqlite3.Connection,
     since: str | None = None,
     limit: int = 200,
+    offset: int = 0,
 ) -> list[dict]:
-    """List boundary events newest-first, optionally filtered by timestamp."""
+    """List boundary events newest-first, optionally filtered by timestamp.
+
+    ``offset`` pages the mode-toggle trail."""
     if since:
         rows = conn.execute(
             "SELECT be.*, u.email AS actor_email "
             "FROM hipaa_boundary_events be "
             "LEFT JOIN users u ON u.id = be.actor_id "
-            "WHERE be.ts >= ? ORDER BY be.ts DESC LIMIT ?",
-            (since, limit),
+            "WHERE be.ts >= ? ORDER BY be.ts DESC LIMIT ? OFFSET ?",
+            (since, limit, int(offset)),
         ).fetchall()
     else:
         rows = conn.execute(
             "SELECT be.*, u.email AS actor_email "
             "FROM hipaa_boundary_events be "
             "LEFT JOIN users u ON u.id = be.actor_id "
-            "ORDER BY be.ts DESC LIMIT ?",
-            (limit,),
+            "ORDER BY be.ts DESC LIMIT ? OFFSET ?",
+            (limit, int(offset)),
         ).fetchall()
     return _rows(rows)
 
@@ -1005,6 +1268,34 @@ def latest_hipaa_boundaries_for_accounts(
 # HIPAA access event helpers (§164.312(b) access-audit trail)
 # ---------------------------------------------------------------------------
 
+def phi_access_audit_required(
+    *,
+    account_hipaa: bool,
+    actor_user_id: int | None,
+    owner_id: int | None,
+) -> bool:
+    """PD#14 gate SSOT — does this access need a §164.312(b) access-event row?
+
+    True iff the account is HIPAA-flagged AND the actor is NOT the owner.
+
+    - **System actor (`actor_user_id is None`) STILL requires the row** — a
+      null principal is not the owner (``None != owner_id``), so it is a
+      non-owner PHI access. Do NOT add an ``actor_user_id is not None`` guard:
+      that was the N-72 bug — it silently dropped system-initiated PHI reads
+      (scheduled bulk-triage / back-scan on a HIPAA mailbox) from the audit
+      trail. This is the single source of truth for that decision so the
+      bookend helper (``audit_phi_access``) and the start/finalise bracket
+      sites (triage_runner / triage_runner_bulk / topic_backscan) cannot drift
+      apart in their gate logic.
+    - **Owner self-access** (``actor_user_id == owner_id``) is the §164.502(a)
+      self-disclosure carve-out and is exempt.
+    - **Non-HIPAA account**: never required.
+    """
+    if not account_hipaa:
+        return False
+    return actor_user_id != owner_id
+
+
 @db_write
 @audit_emitter  #  D3 — gap-event on write failure
 def record_hipaa_access_event(
@@ -1032,31 +1323,257 @@ def record_hipaa_access_event(
     ``"error"``. ``detail`` is a short free-text field — never PHI
     (used for error classes, count of messages touched, etc.).
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO hipaa_access_events "
-        "(ts, actor_user_id, account_id, operation, outcome, detail) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (now, actor_user_id, account_id, operation, outcome, detail),
-    )
+    now = now_utc_iso()
+    #  — the headline PHI-access boundary log, now HMAC-chained (SSOT). outcome
+    # + detail are STORED but EXCLUDED from the canonical hash (Option A) because
+    # update_hipaa_access_event finalises them in place; the chain hashes only the
+    # immutable access FACT (ts/actor/account/operation), so the finalise UPDATE
+    # is chain-transparent. Own-commit emitter.
+    row_id = _chain_insert(conn, "hipaa_access_events", {
+        "ts": now,
+        "actor_user_id": actor_user_id,
+        "account_id": account_id,
+        "operation": operation,
+        "outcome": outcome,
+        "detail": detail,
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 @db_write
+@audit_emitter  # §164.312(b) finalise-gap — gap-event on UPDATE failure
 def update_hipaa_access_event(
     conn: sqlite3.Connection,
     event_id: int,
     outcome: str,
     detail: str | None = None,
 ) -> None:
-    """Update outcome/detail on an event recorded at the start of an operation."""
+    """Finalise outcome/detail on an event recorded at op-START.
+
+    ``record_hipaa_access_event`` (an ``@audit_emitter``) emits the row at
+    op-start with ``outcome="in_progress"``; this UPDATE finalises the SAME
+    row to its terminal outcome. All 6 finalise call sites wrap this in a
+    best-effort ``try/except`` that only ``log.warning(...)``s — so a FAILED
+    finalise-UPDATE (e.g. lock contention) would silently leave the row
+    frozen at ``in_progress``, the audit record affirmatively LYING about the
+    operation outcome with nothing recording the loss.
+
+    Decorating with ``@audit_emitter`` closes that §164.312(b) gap: the
+    ``@db_write`` wrapper's except clause writes a chained ``audit_gap_events``
+    row keyed by this helper's name when the UPDATE raises, THEN re-raises (the
+    call sites swallow the re-raise to a warning → the operation still
+    completes; the finalise is best-effort, but the loss is now VISIBLE +
+    §164.312(c)(1) tamper-evident). The START-side emitter gap-covered the row
+    CREATION, not this finalise — this completes the bracket.
+
+    Gap-row triage note (DA hedge-check on N-58): a gap row for this helper
+    ALSO fires when the write is SHED at the writer-queue boundary
+    (``WriterQueueFull`` /  DEFECT-B) — in that case the UPDATE never ran
+    and the row is simply still at ``in_progress``; the gap signals
+    backpressure, NOT audit corruption. An operator/runbook reading a
+    ``helper_name=update_hipaa_access_event`` gap row must treat it as
+    possibly-backpressure, not definitely-integrity-loss.
+
+     / N-15 CHAIN-TRANSPARENCY CONTRACT (Option A — BINDING, hipaa-sme).
+    ``hipaa_access_events`` rows are HMAC-chained (``_chain_insert``), but the
+    canonical hash covers ONLY the immutable creation fields
+    (``_AUDIT_CHAIN_CANONICAL_FIELDS["hipaa_access_events"]`` = ts, actor_user_id,
+    account_id, operation). ``outcome`` + ``detail`` are deliberately EXCLUDED so
+    THIS in-place UPDATE is chain-transparent — it touches no hashed column, so
+    ``row_hash`` stays valid and the chain needs no O(n) re-link. **If you ever
+    add a column to this UPDATE, that column MUST stay OUT of the canonical field
+    tuple** — adding a hashed mutable field would make this UPDATE silently break
+    the chain. The tuple-exclusion is enforced by
+    ``tests/test_audit_chain_pin.py::test_hipaa_access_events_excludes_mutable_fields``.
+    The §164.306(d)(3)(ii)(B) bounded-coverage decision (outcome/detail not
+    tamper-evident on a SUCCESSFUL overwrite; a FAILED finalise already gap-rows)
+    is recorded in the §164.316 register (N-15).
+    """
     conn.execute(
         "UPDATE hipaa_access_events SET outcome = ?, detail = ? WHERE id = ?",
         (outcome, detail, event_id),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Regulatory clock transition events — chained audit-event emitters.
+#
+# `regulatory_clock_event` is a DEDICATED HMAC-chained audit table (chain
+# columns added in migration v47). These two helpers are its ONLY legitimate
+# writers — the inverse-INSERT pin (tests/test_audit_chain_pin.py, registry-
+# keyed) catches any raw INSERT that bypasses `_chain_insert`. Every transition
+# is a NEW chained row (append-only; a correction is a new
+# `determination_corrected` event with actor + reason, never an in-place edit —
+# 21 CFR Part 11 audit-trail semantics). This SUPERSEDES the design's "chain
+# into log_entries, project here" model (log_entries is pruned → would breach
+# §164.316(b)(2)(i) retention; see migration `_v47`).
+# ---------------------------------------------------------------------------
+
+# The 9 legal transition kinds (mirrors the regulatory_clock_event CHECK in
+# migration v46). The human-disposition subset MUST name the acting human —
+# record_clock_ack enforces it (propose-then-confirm; the LLM never auto-files).
+_CLOCK_EVENT_KINDS = frozenset({
+    "detected", "determined", "awareness_set", "escalated", "acked",
+    "submitted", "dismissed", "breached", "determination_corrected",
+})
+# Kinds a HUMAN must own (record_clock_ack requires a non-null actor for these).
+# PHASE-2 ROUTING NOTE: the design's high-confidence "auto-arm" band (D2 / design
+# §168) may have the SYSTEM emit a `determined` event with NO human actor. That
+# path MUST call record_clock_event(event_kind="determined", actor_user_id=None
+# or a config actor), NOT record_clock_ack — record_clock_ack deliberately
+# REJECTS a null actor, so routing a system auto-determination through it is a
+# bug. Human-confirmed determinations go through record_clock_ack; system
+# auto-determinations go through record_clock_event.
+_CLOCK_HUMAN_DISPOSITION_KINDS = frozenset({
+    "determined", "awareness_set", "acked", "submitted", "dismissed",
+    "determination_corrected",
+})
+
+
+def _clock_event_chain_row(
+    *, instance_id, event_kind, actor_user_id, from_state, to_state,
+    escalation_rung, delivered_to_ref, detail,
+) -> dict:
+    """Validate + build the ``regulatory_clock_event`` chain-insert data dict.
+
+    Shared by the standalone own-commit ``record_clock_event`` and the
+    txn-aware ``emit_clock_event_txn`` so the event-kind validation + the
+    canonical column set live in ONE place (PD#5 — no mirrored copies)."""
+    if event_kind not in _CLOCK_EVENT_KINDS:
+        raise ValueError(
+            f"clock event: unknown event_kind {event_kind!r} "
+            f"(legal kinds: {sorted(_CLOCK_EVENT_KINDS)})"
+        )
+    return {
+        "instance_id": instance_id,
+        "event_kind": event_kind,
+        "actor_user_id": actor_user_id,
+        "from_state": from_state,
+        "to_state": to_state,
+        "escalation_rung": escalation_rung,
+        "delivered_to_ref": delivered_to_ref,
+        "detail": detail,
+        "created_at": now_utc_iso(),
+    }
+
+
+def require_human_clock_actor(event_kind: str, actor_user_id: int | None) -> None:
+    """Fail-closed guard for a HUMAN-disposition clock transition: it MUST name
+    the acting human (propose-then-confirm — the LLM never auto-files/auto-
+    closes), and the kind must be a disposition kind. Raises ``ValueError`` on a
+    null actor or a system-only kind. Shared by ``record_clock_ack`` and the
+    Phase-2 lifecycle helpers (db/regulatory_clock.py)."""
+    if actor_user_id is None:
+        raise ValueError(
+            f"clock disposition {event_kind!r} requires a non-null "
+            f"actor_user_id (use the system path for automatic transitions)"
+        )
+    if event_kind not in _CLOCK_HUMAN_DISPOSITION_KINDS:
+        raise ValueError(
+            f"{event_kind!r} is not a human-disposition kind "
+            f"({sorted(_CLOCK_HUMAN_DISPOSITION_KINDS)})"
+        )
+
+
+def emit_clock_event_txn(
+    conn: sqlite3.Connection,
+    *,
+    instance_id: int,
+    event_kind: str,
+    actor_user_id: int | None = None,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    escalation_rung: int | None = None,
+    delivered_to_ref: str | None = None,
+    detail: str | None = None,
+) -> int:
+    """TXN-AWARE chained clock-event emit — validates + ``_chain_insert``, does
+    NOT commit. Use INSIDE the caller's open transaction when the event must be
+    atomic with a state mutation on ``regulatory_clock_instance``: the caller
+    does its UPDATE(s) + this emit, then ONE ``conn.commit()`` (rollback on any
+    error), so the state flip + the chained audit row land or roll back together
+    (same atomic-state-flip-plus-audit-row guarantee as
+    ``db/accounts.set_account_hipaa``). The caller owns commit/rollback;
+    ``record_clock_event`` is the own-commit standalone wrapper. Returns the new
+    row id."""
+    return _chain_insert(conn, "regulatory_clock_event", _clock_event_chain_row(
+        instance_id=instance_id, event_kind=event_kind,
+        actor_user_id=actor_user_id, from_state=from_state, to_state=to_state,
+        escalation_rung=escalation_rung, delivered_to_ref=delivered_to_ref,
+        detail=detail,
+    ))
+
+
+@db_write
+@audit_emitter  #  D3 — gap-event on write failure
+def record_clock_event(
+    conn: sqlite3.Connection,
+    *,
+    instance_id: int,
+    event_kind: str,
+    actor_user_id: int | None = None,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    escalation_rung: int | None = None,
+    delivered_to_ref: str | None = None,
+    detail: str | None = None,
+) -> int:
+    """Record a regulatory-clock transition as a chained audit-event row.
+
+    THE single STANDALONE writer for ``regulatory_clock_event`` — routes through
+    ``_chain_insert`` so every transition is HMAC-chained + tamper-evident
+    (§164.312(c)(1)), retained (dedicated table, never pruned), and fail-closed
+    (``_chain_insert`` RuntimeErrors if no HMAC key is provisioned — never an
+    unsigned audit row, Directive 12). Own-commit emitter; use this when there is
+    no coupled state mutation (e.g. the sweep's ``escalated``/``breached``). For
+    a transition that must be atomic with a ``regulatory_clock_instance`` UPDATE,
+    use ``emit_clock_event_txn`` inside the caller's ``BEGIN…COMMIT``.
+
+    ``actor_user_id`` is the human for a disposition event, or ``None`` for a
+    system/sweep transition (``detected``/``escalated``/``breached``). ``detail``
+    is short free-text that MAY carry PHI → redacted-at-write in the gap-event
+    payload (the ``_AUDIT_EMITTER_REDACTION_MAP`` "out" set); the stored value is
+    encrypted at rest with the rest of the SQLCipher DB. Returns the new row id.
+    """
+    row_id = emit_clock_event_txn(
+        conn, instance_id=instance_id, event_kind=event_kind,
+        actor_user_id=actor_user_id, from_state=from_state, to_state=to_state,
+        escalation_rung=escalation_rung, delivered_to_ref=delivered_to_ref,
+        detail=detail,
+    )
+    conn.commit()
+    return row_id
+
+
+def record_clock_ack(
+    conn: sqlite3.Connection,
+    *,
+    instance_id: int,
+    event_kind: str,
+    actor_user_id: int,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    detail: str | None = None,
+) -> int:
+    """Record a standalone HUMAN-disposition clock transition (acked / … ).
+
+    Thin fail-closed specialization of :func:`record_clock_event`: enforces
+    ``require_human_clock_actor`` (non-null actor + a disposition kind), then
+    delegates the chained write to ``record_clock_event`` (ONE chain-writer, ONE
+    redaction-map entry — the gap fires under ``record_clock_event``). Returns
+    the new row id."""
+    require_human_clock_actor(event_kind, actor_user_id)
+    return record_clock_event(
+        conn,
+        instance_id=instance_id,
+        event_kind=event_kind,
+        actor_user_id=actor_user_id,
+        from_state=from_state,
+        to_state=to_state,
+        detail=detail,
+    )
 
 
 @db_write
@@ -1083,26 +1600,20 @@ def record_discover_run(
     Discover content is proposals in review, not actions taken.
     """
     import json as _json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO discover_runs "
-        "(account_id, account_name, actor_user_id, scanned_count, "
-        " errors_count, folders, elapsed_secs, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            account_id,
-            account_name or "",
-            actor_user_id,
-            int(scanned_count),
-            int(errors_count),
-            _json.dumps(list(folders or [])),
-            float(elapsed_secs),
-            now,
-        ),
-    )
+    now = now_utc_iso()
+    #  — chained audit write (SSOT). Own-commit emitter.
+    row_id = _chain_insert(conn, "discover_runs", {
+        "account_id": account_id,
+        "account_name": account_name or "",
+        "actor_user_id": actor_user_id,
+        "scanned_count": int(scanned_count),
+        "errors_count": int(errors_count),
+        "folders": _json.dumps(list(folders or [])),
+        "elapsed_secs": float(elapsed_secs),
+        "created_at": now,
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 def list_discover_runs(
@@ -1110,8 +1621,13 @@ def list_discover_runs(
     account_id: int | None = None,
     actor_user_id: int | None = None,
     limit: int = 100,
+    offset: int = 0,
 ) -> list[dict]:
-    """List discover runs newest-first with optional filters."""
+    """List discover runs newest-first with optional filters.
+
+    ``offset`` pages through the trail — the
+    compliance page's "load older" pager passes it so the full audit
+    record is accessible, not just the newest ``limit``."""
     where: list[str] = []
     params: list = []
     if account_id is not None:
@@ -1127,8 +1643,9 @@ def list_discover_runs(
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY dr.created_at DESC LIMIT ?"
+    sql += " ORDER BY dr.created_at DESC LIMIT ? OFFSET ?"
     params.append(limit)
+    params.append(int(offset))
     rows = conn.execute(sql, params).fetchall()
     return _rows(rows)
 
@@ -1139,8 +1656,12 @@ def list_hipaa_access_events(
     actor_user_id: int | None = None,
     since: str | None = None,
     limit: int = 500,
+    offset: int = 0,
 ) -> list[dict]:
-    """List access events newest-first with optional filters."""
+    """List access events newest-first with optional filters.
+
+    ``offset`` pages the §164.312(b) PHI-access trail (
+    reachability)."""
     where: list[str] = []
     params: list = []
     if account_id is not None:
@@ -1160,8 +1681,9 @@ def list_hipaa_access_events(
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ae.ts DESC LIMIT ?"
+    sql += " ORDER BY ae.ts DESC LIMIT ? OFFSET ?"
     params.append(limit)
+    params.append(int(offset))
     rows = conn.execute(sql, params).fetchall()
     return _rows(rows)
 
@@ -1190,28 +1712,33 @@ def record_api_key_event(
     NOT a foreign key — revoked api_keys rows are deleted, but we want
     the audit row to survive.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO api_key_events "
-        "(ts, event, key_id, actor_user_id, target_user_id, name, expires_at, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (now, event, key_id, actor_user_id, target_user_id, name, expires_at, source),
-    )
+    now = now_utc_iso()
+    #  — chained audit write (SSOT). Own-commit emitter.
+    row_id = _chain_insert(conn, "api_key_events", {
+        "ts": now,
+        "event": event,
+        "key_id": key_id,
+        "actor_user_id": actor_user_id,
+        "target_user_id": target_user_id,
+        "name": name,
+        "expires_at": expires_at,
+        "source": source,
+    })
     conn.commit()
-    return cur.lastrowid
+    return row_id
 
 
 def list_api_key_events(
     conn: sqlite3.Connection,
     limit: int = 100,
+    offset: int = 0,
 ) -> list[dict]:
     """Return recent api_key_events newest-first, joined with user emails.
 
     Both actor and target user emails are looked up so the compliance UI
     can render readable rows even after either user is deleted (the FK
     is ON DELETE SET NULL so the row survives the user record).
-    """
+    ``offset`` pages the key-lifecycle trail."""
     rows = conn.execute(
         "SELECT ake.*, "
         "       au.email AS actor_email, "
@@ -1219,8 +1746,8 @@ def list_api_key_events(
         "FROM api_key_events ake "
         "LEFT JOIN users au ON au.id = ake.actor_user_id "
         "LEFT JOIN users tu ON tu.id = ake.target_user_id "
-        "ORDER BY ake.id DESC LIMIT ?",
-        (limit,),
+        "ORDER BY ake.id DESC LIMIT ? OFFSET ?",
+        (limit, int(offset)),
     ).fetchall()
     return _rows(rows)
 
@@ -1261,19 +1788,30 @@ def record_access_event(
     audit source of truth. If you need an "audit must not crash the
     request" boundary, put it at the caller, not here.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
+    #  — chained audit write via the SSOT. access_log is append-only, so every
+    # written column is hashed. PERF NOTE: _chain_insert does one PK-indexed
+    # `get_last_audit_row_hash` SELECT per call; on this hot per-request path a
+    # cached tail (mirroring SQLiteLogHandler._last_row_hash: prime once, advance
+    # in-mem, reset-to-cold on write error) would avoid it. Deferred as a scoped
+    # perf follow-up (a module-level cache would break the multi-DB test
+    # isolation the suite relies on; the correct home is a per-connection/
+    # per-middleware cache) — raised to db-sme in the  implementation review.
     try:
-        cur = conn.execute(
-            "INSERT INTO access_log "
-            "(ts, actor_user_id, method, route, account_id, message_id, "
-            " status_code, outcome, detail, request_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (now, actor_user_id, method, route, account_id, message_id,
-             int(status_code), outcome, detail, request_id),
-        )
+        row_id = _chain_insert(conn, "access_log", {
+            "ts": now,
+            "actor_user_id": actor_user_id,
+            "method": method,
+            "route": route,
+            "account_id": account_id,
+            "message_id": message_id,
+            "status_code": int(status_code),
+            "outcome": outcome,
+            "detail": detail,
+            "request_id": request_id,
+        })
         conn.commit()
-        return cur.lastrowid
+        return row_id
     except sqlite3.IntegrityError as e:
         # FK violation -- typically because the URL referenced an
         # account_id (or actor_user_id) that no longer exists in
@@ -1300,17 +1838,23 @@ def record_access_event(
         if stale_bits:
             tail = " ".join(stale_bits)
             merged_detail = f"{merged_detail} | {tail}".strip(" |") if merged_detail else tail
-        cur = conn.execute(
-            "INSERT INTO access_log "
-            "(ts, actor_user_id, method, route, account_id, message_id, "
-            " status_code, outcome, detail, request_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (now, coerced_actor, method, route, coerced_account,
-             message_id, int(status_code), outcome, merged_detail,
-             request_id),
-        )
+        # The first _chain_insert raised on the INSERT (constraint), so nothing
+        # committed and the chain tail is unchanged; this retry reads the same
+        # tail and chains the FK-coerced row cleanly. Chain integrity preserved.
+        row_id = _chain_insert(conn, "access_log", {
+            "ts": now,
+            "actor_user_id": coerced_actor,
+            "method": method,
+            "route": route,
+            "account_id": coerced_account,
+            "message_id": message_id,
+            "status_code": int(status_code),
+            "outcome": outcome,
+            "detail": merged_detail,
+            "request_id": request_id,
+        })
         conn.commit()
-        return cur.lastrowid
+        return row_id
 
 
 def list_access_events(
@@ -1318,8 +1862,11 @@ def list_access_events(
     limit: int = 100,
     actor_user_id: int | None = None,
     account_id: int | None = None,
+    offset: int = 0,
 ) -> list[dict]:
-    """Return recent access_log rows newest-first, joined with actor email."""
+    """Return recent access_log rows newest-first, joined with actor email.
+
+    ``offset`` pages the §164.312(b) PHI-route trail."""
     where = []
     params: list = []
     if actor_user_id is not None:
@@ -1330,6 +1877,7 @@ def list_access_events(
         params.append(account_id)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
+    params.append(int(offset))
     rows = conn.execute(
         "SELECT al.*, "
         "       u.email AS actor_email, "
@@ -1338,10 +1886,65 @@ def list_access_events(
         "LEFT JOIN users u ON u.id = al.actor_user_id "
         "LEFT JOIN email_accounts ea ON ea.id = al.account_id "
         f"{where_sql} "
-        "ORDER BY al.id DESC LIMIT ?",
+        "ORDER BY al.id DESC LIMIT ? OFFSET ?",
         params,
     ).fetchall()
     return _rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Audit-table totals
+#
+# The compliance page renders each audit table with a hard LIMIT (100 /
+# 50). Once a table exceeds its cap the oldest rows silently vanish and
+# the operator reads a subset as the whole trail — a compliance-
+# visibility gap (silent-truncation audit, row ). These COUNT(*)
+# helpers give the true denominator so the page can say
+# "showing 100 of 4,213 — older entries not shown". Each mirrors its
+# ``list_*`` sibling's base table; the compliance page calls them
+# unfiltered (matching its unfiltered list_* calls), so they take no
+# predicate — add filter params here AND to the list sibling together
+# if a filtered count is ever needed (keep the two in lockstep).
+# ---------------------------------------------------------------------------
+
+def count_hipaa_access_events(conn: sqlite3.Connection) -> int:
+    """Total rows in ``hipaa_access_events`` (the PHI access trail)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM hipaa_access_events"
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def count_api_key_events(conn: sqlite3.Connection) -> int:
+    """Total rows in ``api_key_events`` (key create/revoke trail)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM api_key_events"
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def count_discover_runs(conn: sqlite3.Connection) -> int:
+    """Total rows in ``discover_runs`` (folder-discovery audit)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM discover_runs"
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def count_access_events(conn: sqlite3.Connection) -> int:
+    """Total rows in ``access_log`` (PHI-route access trail)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM access_log"
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def count_hipaa_boundary_events(conn: sqlite3.Connection) -> int:
+    """Total rows in ``hipaa_boundary_events`` (mode-toggle trail)."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM hipaa_boundary_events"
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1390,7 +1993,7 @@ def _compute_log_row_hash_sha256(
     forever per §164.316(b)(2)(i) 6-year retention until the v0.2.0
     sunset removes this branch (operator must explicitly opt in via
     ``config.audit.permit_legacy_sha256_chain = true`` to retain it
-    past v0.2.0; v0.3.0 removes the flag and this branch entirely).
+    past a future release; removal of the flag + this branch entirely is deferred pending explicit operator directive — the earlier "v0.3.0 removes" version-anchor was AI-invented, not authorized; corrected 2026-07-06).
 
     See :func:`_canonical_log_row` for the canonical-form contract.
     """
@@ -1398,6 +2001,76 @@ def _compute_log_row_hash_sha256(
     return hashlib.sha256(
         _canonical_log_row(prev_hash, ts, level, logger, message, extra_json)
     ).hexdigest()
+
+
+def _apply_chain_hmac(
+    canonical: bytes,
+    *,
+    hash_alg: str = "hmac-sha256-v1",
+    master_key_version: int | None = None,
+    _what: str = "compute_audit_row_hash",
+) -> str:
+    """Apply the keyed-hash dispatch to an ALREADY-canonicalized row.
+
+     / N-15 — the SSOT for the ``(hash_alg, master_key_version)`` dispatch
+    shared by every audit chain (PD#5/#6). It operates STRICTLY above the
+    canonicalization line: each chain owns its own canonical BYTE form
+    (``_canonical_log_row`` = pipe-join / NO NFC; ``_canonical_gap_row`` and
+    ``_canonical_audit_row`` = newline-join / NFC) and those forms are FROZEN —
+    NOT unified here — because unifying them would silently re-hash 6-year-
+    retained history and break the fail-closed verifier (the 2026-05-31 incident
+    shape; guarded by ``tests/test_audit_chain_byte_identity_freeze.py``). This
+    helper only chooses the keyed primitive + key version.
+
+    ``_what`` names the caller in the fail-closed error message so the pre-#26
+    message contract (``compute_log_row_hash`` / ``compute_gap_row_hash``)
+    survives the dedup.
+
+    Raises:
+        RuntimeError: D1 fail-closed per §164.312(c)(1) Required-spec — HMAC was
+            requested but no key is provisioned for the version. Real-deployment
+            startup wires the registry via :func:`set_hmac_keys` (secrets
+            bootstrap); tests via :func:`_set_hmac_key_for_test`.
+        ValueError: unknown ``hash_alg``.
+    """
+    if hash_alg == "sha256":
+        import hashlib
+        return hashlib.sha256(canonical).hexdigest()
+    if hash_alg == "hmac-sha256-v1":
+        version = (
+            master_key_version
+            if master_key_version is not None
+            else _get_current_hmac_version()
+        )
+        if version is None:
+            raise RuntimeError(
+                f"H-02a (§164.312(c)(1) Required-spec): {_what} requested "
+                f"HMAC-SHA256 but no HMAC key has been provisioned. "
+                f"Real-deployment startup must call db.audit.set_hmac_keys() "
+                f"after deriving subkeys via "
+                f"secrets.derive_audit_chain_hmac_key(); test fixtures must "
+                f"call db.audit._set_hmac_key_for_test(). Fail-closed per "
+                f"hipaa-sme-2 + DA-3 verdicts 2026-05-23."
+            )
+        key = _get_hmac_key(version)
+        if key is None:
+            raise RuntimeError(
+                f"H-02a (§164.312(c)(1) Required-spec): {_what} requested "
+                f"HMAC-SHA256 under master_key_version={version} but that "
+                f"version has no key in the HMAC registry. Either the "
+                f"master_key_history row was deleted from secrets_store, OR the "
+                f"lifespan failed to load all historical versions. Operator "
+                f"must restore the missing history row before any further "
+                f"chained audit writes succeed. Fail-closed per hipaa-sme-2 + "
+                f"DA-3 verdicts 2026-05-23."
+            )
+        import hmac
+        import hashlib
+        return hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    raise ValueError(
+        f"{_what}: unknown hash_alg={hash_alg!r}. "
+        f"Expected one of: 'sha256' (legacy), 'hmac-sha256-v1' (H-02a)."
+    )
 
 
 def compute_log_row_hash(
@@ -1451,50 +2124,15 @@ def compute_log_row_hash(
         ValueError: if ``hash_alg`` is not one of the recognized values
             (``'sha256'``, ``'hmac-sha256-v1'``).
     """
-    canonical = _canonical_log_row(
-        prev_hash, ts, level, logger, message, extra_json,
-    )
-    if hash_alg == "sha256":
-        # Legacy primitive — only used by the verifier on pre-H-02a
-        # rows. Helper exists for symmetry; new rows use the HMAC
-        # path below.
-        import hashlib
-        return hashlib.sha256(canonical).hexdigest()
-    if hash_alg == "hmac-sha256-v1":
-        version = (
-            master_key_version
-            if master_key_version is not None
-            else _get_current_hmac_version()
-        )
-        if version is None:
-            raise RuntimeError(
-                "H-02a (§164.312(c)(1) Required-spec): "
-                "compute_log_row_hash requested HMAC-SHA256 but no HMAC "
-                "key has been provisioned. Real-deployment startup must "
-                "call db.audit.set_hmac_keys() after deriving subkeys "
-                "via secrets.derive_audit_chain_hmac_key(); test "
-                "fixtures must call db.audit._set_hmac_key_for_test(). "
-                "Fail-closed per hipaa-sme-2 + DA-3 verdicts 2026-05-23."
-            )
-        key = _get_hmac_key(version)
-        if key is None:
-            raise RuntimeError(
-                f"H-02a (§164.312(c)(1) Required-spec): "
-                f"compute_log_row_hash requested HMAC-SHA256 under "
-                f"master_key_version={version} but that version has no "
-                f"key in the HMAC registry. Either the master_key_history "
-                f"row was deleted from secrets_store, OR the lifespan "
-                f"failed to load all historical versions. Operator must "
-                f"restore the missing history row before any further "
-                f"log_entries writes succeed. Fail-closed per hipaa-sme-2 "
-                f"+ DA-3 verdicts 2026-05-23."
-            )
-        import hmac
-        import hashlib
-        return hmac.new(key, canonical, hashlib.sha256).hexdigest()
-    raise ValueError(
-        f"compute_log_row_hash: unknown hash_alg={hash_alg!r}. "
-        f"Expected one of: 'sha256' (legacy), 'hmac-sha256-v1' (H-02a)."
+    #  — dispatch extracted to the shared _apply_chain_hmac SSOT. The
+    # canonical BYTE form (_canonical_log_row: pipe-join, NO NFC) is FROZEN and
+    # passed in; only the keyed-hash dispatch is shared. Byte-identity guarded
+    # by tests/test_audit_chain_byte_identity_freeze.py.
+    return _apply_chain_hmac(
+        _canonical_log_row(prev_hash, ts, level, logger, message, extra_json),
+        hash_alg=hash_alg,
+        master_key_version=master_key_version,
+        _what="compute_log_row_hash",
     )
 
 
@@ -1507,6 +2145,232 @@ def get_last_log_row_hash(conn: sqlite3.Connection) -> str:
         "ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return (row["row_hash"] if row else "") or ""
+
+
+# ---------------------------------------------------------------------------
+#  / N-15 — generalized audit-EVENT chain (hipaa_access_events + 7 siblings).
+# Reuses the EQM-05 HMAC key + the shared _apply_chain_hmac dispatch; the
+# canonical byte form is the modern newline+NFC shape (NOT the log_entries
+# pipe form). See _AUDIT_CHAIN_CANONICAL_FIELDS for the per-table field SSOT.
+# ---------------------------------------------------------------------------
+
+def _canonical_audit_row(prev_hash: str, fields: tuple) -> bytes:
+    """Canonical byte form for a chained audit-EVENT row.
+
+    Form: ``prev_hash`` then each field, NFC-normalised, newline-joined, utf-8 —
+    the same shape as :func:`_canonical_gap_row` (the modern audit form). A
+    ``None`` value becomes ``""`` (explicit, so a numeric ``0`` is preserved and
+    not folded to empty as ``f or ""`` would). Field order is fixed by the
+    table's entry in :data:`_AUDIT_CHAIN_CANONICAL_FIELDS` and is a FROZEN
+    contract — reordering re-hashes the chain.
+
+    Intentionally distinct from :func:`_canonical_log_row` (pipe-join, NO NFC);
+    the two forms are NOT unified (see :func:`_apply_chain_hmac`).
+    """
+    import unicodedata as _ud
+    parts = [prev_hash, *fields]
+    return "\n".join(
+        _ud.normalize("NFC", "" if f is None else str(f)) for f in parts
+    ).encode("utf-8")
+
+
+def compute_audit_row_hash(
+    prev_hash: str,
+    fields: tuple,
+    *,
+    hash_alg: str = "hmac-sha256-v1",
+    master_key_version: int | None = None,
+) -> str:
+    """Compute the chain hash for a new chained audit-event row.
+
+    Reuses the EQM-05 HMAC key + the shared :func:`_apply_chain_hmac` dispatch
+    (same key as ``log_entries`` / ``audit_gap_events``; no new key surface).
+    """
+    return _apply_chain_hmac(
+        _canonical_audit_row(prev_hash, fields),
+        hash_alg=hash_alg,
+        master_key_version=master_key_version,
+        _what="compute_audit_row_hash",
+    )
+
+
+def get_last_audit_row_hash(conn: sqlite3.Connection, table: str) -> str:
+    """Return the newest chain-aware ``row_hash`` for an audit-event table.
+
+    Generalises :func:`get_last_log_row_hash` / :func:`get_last_gap_row_hash`
+    over the chained audit tables. ``table`` MUST be a key of
+    :data:`_AUDIT_CHAIN_CANONICAL_FIELDS` — that allow-list is also the
+    SQL-injection guard for the interpolated table name. Skips prechain rows
+    (``row_hash = ''``, i.e. every pre-v43 row) so the migration boundary is not
+    a false break (mirrors the ``WHERE row_hash != ''`` filter of the two live
+    chains).
+    """
+    if table not in _AUDIT_CHAIN_CANONICAL_FIELDS:
+        raise ValueError(
+            f"get_last_audit_row_hash: {table!r} is not a chained audit table"
+        )
+    row = conn.execute(
+        f"SELECT row_hash FROM {table} "
+        f"WHERE row_hash != '' "
+        f"ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return (row["row_hash"] if row else "") or ""
+
+
+def _chain_insert(
+    conn: sqlite3.Connection,
+    table: str,
+    data: dict[str, Any],
+) -> int:
+    """INSERT a chained audit-event row — the SSOT for every chained audit write.
+
+     / N-15. ``data`` maps DATA column name -> value (NOT the chain columns).
+    The helper (1) reads the chain tail (:func:`get_last_audit_row_hash`),
+    (2) computes ``row_hash`` over the table's canonical field tuple
+    (:data:`_AUDIT_CHAIN_CANONICAL_FIELDS` — a ``KeyError`` here means a writer
+    omitted a canonical field, surfaced loudly rather than silently unhashed),
+    (3) INSERTs ``data`` + the 4 chain columns.
+
+    FAIL-CLOSED (PD#8/): always requests ``hmac-sha256-v1``; if no HMAC key
+    is provisioned, :func:`_apply_chain_hmac` raises RuntimeError BEFORE any row
+    is written. An audit-event write is a PRIMARY control — never the secretless
+    SHA-256 fallback that only the gap-event RECOVERY path (inside an exception
+    handler) is permitted.
+
+    TRANSACTION-AWARE (db-sme hard constraint): does NOT commit. The caller owns
+    commit timing, so this composes with the in-txn writers ``set_user_disabled``
+    (audit.py) and ``set_account_hipaa`` (db/accounts.py), each of which INSERTs
+    its audit row inside an explicit ``BEGIN...COMMIT`` atomic with a state
+    mutation — a self-committing helper would break that atomicity. Returns the
+    new row id (``cur.lastrowid``).
+    """
+    if table not in _AUDIT_CHAIN_CANONICAL_FIELDS:
+        raise ValueError(
+            f"_chain_insert: {table!r} is not a chained audit table"
+        )
+    field_names = _AUDIT_CHAIN_CANONICAL_FIELDS[table]
+    canonical_values = tuple(data[name] for name in field_names)
+    prev_hash = get_last_audit_row_hash(conn, table)
+    version = _get_current_hmac_version()
+    hash_alg = "hmac-sha256-v1"
+    row_hash = compute_audit_row_hash(
+        prev_hash, canonical_values,
+        hash_alg=hash_alg, master_key_version=version,
+    )
+    cols = [
+        *data.keys(), "prev_hash", "row_hash", "hash_alg", "master_key_version",
+    ]
+    vals = [*data.values(), prev_hash, row_hash, hash_alg, version]
+    placeholders = ", ".join(["?"] * len(cols))
+    cur = conn.execute(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+        vals,
+    )
+    return cur.lastrowid
+
+
+def verify_audit_chain(conn: sqlite3.Connection, table: str) -> dict:
+    """Verify one chained audit-event table's HMAC chain. Read-only, idempotent.
+
+     / N-15 — generalises :func:`verify_log_chain` over the audit-event
+    tables. Walks rows id-ascending; for each chain-aware row (``row_hash !=
+    ''``) recomputes the row hash from the RUNNING expected-prev (the previous
+    chain row's ``row_hash``) + the table's canonical field tuple
+    (:data:`_AUDIT_CHAIN_CANONICAL_FIELDS`) and compares to the stored
+    ``row_hash``. Recomputing against the running expected-prev (NOT the stored
+    ``prev_hash``) means ONE comparison catches all three tamper shapes: a
+    mutated hashed field, a deleted predecessor, and a forged/re-ordered row.
+
+    Per-row dispatch on ``(hash_alg, master_key_version)``: a row whose key
+    version is no longer provisioned surfaces as a break ("hash recompute
+    failed"), operator-detectable, not silent (mirrors verify_log_chain).
+
+    Prechain rows (``row_hash = ''`` — every pre-v43 row) are counted + skipped,
+    never flagged: tamper-evidence is prospective from the v43 deploy, a bounded
+    limitation recorded in the §164.316 register.
+
+    Returns: table, chain_length, rows_checked, valid_through_id, first_break_id,
+    first_break_reason, prechain_count, intact (bool).
+    """
+    if table not in _AUDIT_CHAIN_CANONICAL_FIELDS:
+        raise ValueError(
+            f"verify_audit_chain: {table!r} is not a chained audit table"
+        )
+    field_names = _AUDIT_CHAIN_CANONICAL_FIELDS[table]
+    select_cols = [
+        "id", "prev_hash", "row_hash", "hash_alg", "master_key_version",
+        *field_names,
+    ]
+    rows = conn.execute(
+        f"SELECT {', '.join(select_cols)} FROM {table} ORDER BY id ASC"
+    ).fetchall()
+
+    expected_prev = ""
+    chain_length = prechain_count = rows_checked = 0
+    valid_through_id: int | None = None
+    first_break_id: int | None = None
+    first_break_reason: str | None = None
+
+    for r in rows:
+        row_hash = (r["row_hash"] or "")
+        if row_hash == "":
+            prechain_count += 1
+            continue
+        chain_length += 1
+        rows_checked += 1
+        canonical_values = tuple(r[name] for name in field_names)
+        hash_alg = r["hash_alg"] or "hmac-sha256-v1"
+        try:
+            recomputed = compute_audit_row_hash(
+                expected_prev, canonical_values,
+                hash_alg=hash_alg,
+                master_key_version=r["master_key_version"],
+            )
+        except Exception as e:  # missing key version, unknown alg, …
+            recomputed = None
+            if first_break_id is None:
+                from email_triage._errfmt import fmt_exc
+                first_break_id = r["id"]
+                first_break_reason = (
+                    f"hash recompute failed: {fmt_exc(e, with_class=True)}"
+                )
+        if recomputed is not None and recomputed == row_hash:
+            valid_through_id = r["id"]
+        elif first_break_id is None:
+            first_break_id = r["id"]
+            first_break_reason = (
+                "row_hash mismatch — row tampered, a predecessor was deleted, "
+                "or a row was forged/re-ordered"
+            )
+        # Advance the running chain value to THIS row's stored hash so a single
+        # break does not cascade-flag every following row.
+        expected_prev = row_hash
+
+    return {
+        "table": table,
+        "chain_length": chain_length,
+        "rows_checked": rows_checked,
+        "valid_through_id": valid_through_id,
+        "first_break_id": first_break_id,
+        "first_break_reason": first_break_reason,
+        "prechain_count": prechain_count,
+        "intact": first_break_id is None,
+    }
+
+
+def verify_all_audit_chains(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Verify every chained audit-event table. Returns ``{table: result}``.
+
+     — count-agnostic: iterates :data:`_AUDIT_CHAIN_CANONICAL_FIELDS`, so a
+    future chained table is verified automatically with no edit here. Convenience
+    for the /compliance surface + operator audits. ``log_entries`` and
+    ``audit_gap_events`` keep their own verifiers (:func:`verify_log_chain`,
+    distinct anchor/watermark semantics).
+    """
+    return {
+        table: verify_audit_chain(conn, table)
+        for table in _AUDIT_CHAIN_CANONICAL_FIELDS
+    }
 
 
 def verify_log_chain(
@@ -1902,6 +2766,15 @@ _AUDIT_EMITTER_REDACTION_MAP: dict[str, dict[str, set[str]]] = {
         "in":  {"actor_user_id", "account_id", "operation", "outcome"},
         "out": {"detail"},
     },
+    # §164.312(b) finalise-gap (hipaa-sme + db-sme). update_hipaa_access_event
+    # finalises a record_hipaa_access_event-emitted row. ``detail`` is the SAME
+    # free-text-may-contain-PHI field as on the creation event → OUT/hash-only
+    # (mirror the split exactly). ``event_id`` (typed numeric id) + ``outcome``
+    # (bounded-enum) are Safe-Harbor-class → IN.
+    "update_hipaa_access_event": {
+        "in":  {"event_id", "outcome"},
+        "out": {"detail"},
+    },
     "record_discover_run": {
         "in":  {"account_id", "actor_user_id", "scanned_count",
                 "errors_count", "elapsed_secs"},
@@ -1922,6 +2795,69 @@ _AUDIT_EMITTER_REDACTION_MAP: dict[str, dict[str, set[str]]] = {
                 "status_code", "outcome"},
         # message_id + detail + request_id are PHI-adjacent — hash-only.
         "out": {"message_id", "detail", "request_id"},
+    },
+    # A2 (census 2026-06-09; hipaa-sme re-ruling) — two emitters completed.
+    # set_user_disabled writes user_status_events (PIN-2 audit table); its
+    # redaction split mirrors record_user_status_event (same table). Note
+    # ``disabled`` (the bool arg) is the IN field, NOT ``event`` (a derived
+    # local that never binds).
+    "set_user_disabled": {
+        "in":  {"target_user_id", "actor_user_id", "disabled"},
+        "out": {"reason"},
+    },
+    # record_style_distill_event writes style_distill_events — "one audit row
+    # per distillation, sibling to hipaa_access_events" (§164.502(e) cloud
+    # PHI-egress accounting). ``was_cloud`` is the egress signal and MUST be
+    # readable in the gap row. recipient_hash is a correlatable per-contact
+    # identifier → hash-only (Minimum Necessary).
+    "record_style_distill_event": {
+        "in":  {"account_id", "actor_user_id", "backend_id", "backend_type",
+                "was_cloud", "outcome", "kind", "scrubber_degraded",
+                "error_class", "latency_ms", "layer1_drops",
+                "layer2_matches", "layer3_entities"},
+        "out": {"recipient_hash"},
+    },
+    #  — regulatory clock transition emitter. instance_id/event_kind/actor/
+    # state/rung are typed ids + bounded enums; delivered_to_ref is a non-PHI
+    # contact id → all IN (readable in the gap row). `detail` is short free-text
+    # that MAY carry PHI → OUT (hash-only). record_clock_ack delegates to
+    # record_clock_event, so a gap fires under THIS name for both.
+    "record_clock_event": {
+        "in":  {"instance_id", "event_kind", "actor_user_id", "from_state",
+                "to_state", "escalation_rung", "delivered_to_ref"},
+        "out": {"detail"},
+    },
+    # N-349b Item 1 R31 (2026-07-07) — HMAC clobber bypass consumption
+    # emitter. All 3 fields are Safe-Harbor-class: `secret_key` is an
+    # operator-namespaced settings key ("watch_hmac:<uuid>"),
+    # `actor_user_id` is a typed row id, `watch_id` is a UUID. No PHI
+    # egress path even in the gap row. No OUT-fields.
+    "record_hmac_clobber_bypass_consumed": {
+        "in":  {"secret_key", "actor_user_id", "watch_id"},
+        "out": set(),
+    },
+    # N-157 (2026-07-09) — CLI admin-op chain-write emitter. `ts` is an
+    # ISO timestamp, `command` is an operator-namespaced dotted CLI verb
+    # ("user.create", "secrets.rotate-master-key"), `phase` is a bounded
+    # enum ("start", "end"). All three are Safe-Harbor-class → IN.
+    # `allow_unaudited` is the fail-loud gate bypass flag — a bounded
+    # bool (1 bit, Safe-Harbor by construction, no PHI vector) promoted
+    # to a dedicated top-level IN field per DA fold Fix #2 +
+    # hipaa-sme §164.502(b) calibration 2026-07-09 (NET-REDUCTION of
+    # the investigation surface — bypass bit stays inside the HMAC-
+    # chained envelope, not spread across external CLI-invocation logs).
+    # `extra` is a NESTED pre-redacted dict — the caller at
+    # `cli.py::_emit_cli_audit_event` has already applied the
+    # `_SAFE_ARG_KEYS` allow-list (bounded-string / typed-int / bool /
+    # path-as-string). Kept OUT for a conservative gap-row posture — the
+    # raw hash still binds it so an investigator can cross-match against
+    # the log_entries row a successful write would have produced. The
+    # SAFE_ARG_KEYS allow-list is the SSOT for what may appear inside
+    # `extra` — a new key added there without a redaction-map review is
+    # the CIDI-drift class Prime Directive #5 catches.
+    "record_cli_admin_op": {
+        "in":  {"ts", "command", "phase", "allow_unaudited"},
+        "out": {"extra"},
     },
 }
 
@@ -1964,9 +2900,26 @@ def _bind_args_to_emitter_signature(
         for i, v in enumerate(pos):
             if i < len(keys):
                 out[keys[i]] = v
+    elif helper_name == "set_user_disabled":
+        # A2 (census 2026-06-09) — positional after ``conn``:
+        # (target_user_id, disabled, actor_user_id, reason).
+        keys = ["target_user_id", "disabled", "actor_user_id", "reason"]
+        for i, v in enumerate(pos):
+            if i < len(keys):
+                out[keys[i]] = v
+    elif helper_name == "update_hipaa_access_event":
+        # §164.312(b) finalise-gap — positional after ``conn``:
+        # (event_id, outcome, detail). The 6 finalise call sites all pass
+        # positionally via ``db_call(update_hipaa_access_event, conn,
+        # audit_event_id, outcome, detail)``.
+        keys = ["event_id", "outcome", "detail"]
+        for i, v in enumerate(pos):
+            if i < len(keys):
+                out[keys[i]] = v
     # record_auth_event / record_discover_run / record_api_key_event /
-    # record_access_event are all keyword-only after ``conn`` (the
-    # ``*,`` in their signature) — pos[] is empty, only kwargs apply.
+    # record_access_event / record_style_distill_event are all keyword-only
+    # after ``conn`` (the ``*,`` in their signature) — pos[] is empty, only
+    # kwargs apply.
     return out
 
 
@@ -2095,40 +3048,17 @@ def compute_gap_row_hash(
     so an attacker cannot forge a gap row without holding the same
     HMAC key that protects the log_entries chain.
     """
-    canonical = _canonical_gap_row(
-        prev_hash, ts, helper_name,
-        original_args_redacted, original_args_hash, exc_type, exc_msg,
-    )
-    if hash_alg == "sha256":
-        return _hashlib.sha256(canonical).hexdigest()
-    if hash_alg == "hmac-sha256-v1":
-        version = (
-            master_key_version
-            if master_key_version is not None
-            else _get_current_hmac_version()
-        )
-        if version is None:
-            # Same fail-closed semantics as compute_log_row_hash.
-            raise RuntimeError(
-                "compute_gap_row_hash requested HMAC-SHA256 but no "
-                "HMAC key has been provisioned. The gap-event write "
-                "is a recovery path inside an exception handler; the "
-                "caller (db_write.wrapper) catches and swallows so "
-                "the original exception still propagates — but a "
-                "missing key means the deploy is not §164.312(c)(1)-"
-                "compliant. Operator must restore HMAC keys."
-            )
-        key = _get_hmac_key(version)
-        if key is None:
-            raise RuntimeError(
-                f"compute_gap_row_hash requested HMAC-SHA256 under "
-                f"master_key_version={version} but that version has "
-                f"no key in the HMAC registry."
-            )
-        import hmac as _hmac
-        return _hmac.new(key, canonical, _hashlib.sha256).hexdigest()
-    raise ValueError(
-        f"compute_gap_row_hash: unknown hash_alg={hash_alg!r}"
+    #  — dispatch extracted to the shared _apply_chain_hmac SSOT. The
+    # canonical BYTE form (_canonical_gap_row: newline-join, WITH NFC) is FROZEN
+    # and passed in. Byte-identity guarded by the freeze test.
+    return _apply_chain_hmac(
+        _canonical_gap_row(
+            prev_hash, ts, helper_name,
+            original_args_redacted, original_args_hash, exc_type, exc_msg,
+        ),
+        hash_alg=hash_alg,
+        master_key_version=master_key_version,
+        _what="compute_gap_row_hash",
     )
 
 
@@ -2158,13 +3088,15 @@ def _write_audit_gap_event(
     inside the same `conn.execute(INSERT)` transaction so the chain
     advances atomically.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     helper = helper_name or "<unknown>"
     redacted = _redact_args(helper, args, kwargs)
     arg_hash = _hash_args(args, kwargs)
     exc_type = type(exc).__name__
-    exc_msg = str(exc)[:500] if exc else ""
+    # N-42: exc_msg INSERTs into the HMAC-chained audit_gap_events table —
+    # scrub PHI shapes before they enter the un-expungeable chain.
+    from email_triage._errfmt import redact_exc
+    exc_msg = redact_exc(str(exc))[:500] if exc else ""
     prev_hash = get_last_gap_row_hash(conn)
     version = _get_current_hmac_version()
     hash_alg = "hmac-sha256-v1" if version is not None else "sha256"

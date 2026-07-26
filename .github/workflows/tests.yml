@@ -1,0 +1,127 @@
+name: Unit + Pin Suite
+
+# The unit / structural-pin suite — `pytest tests/` (the default addopts
+# `--ignore=tests/e2e` keeps the browser tier in its own e2e.yml job). This
+# is where all ~53 count-agnostic structural pins live. Until this job
+# existed the pins were a run-it-yourself lint: nothing pulled the trigger
+# on a push, so a pin could go red at HEAD and sit unnoticed (the recurring
+# "broad green" miss). This job is the trigger — make it a REQUIRED check.
+#
+# sqlcipher: x86_64 installs the prebuilt `sqlcipher3-binary` wheel exactly
+# as the Containerfile amd64 leg does (proven on python:3.12-slim in prod),
+# so the encrypted-DB / encrypted-backup tests (otherwise importorskip-gated
+# and never run in CI) actually execute here. Python is pinned to 3.12 to
+# match the deploy host runtime + that proven sqlcipher install.
+#
+# Actions pinned to the Node-24 majors the other workflows use
+# (checkout@v5 / setup-python@v6 / upload-artifact@v4).
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+  # Callable as a release gate: release.yml `uses:` this before build-and-push,
+  # so a tag/release REFUSES to build on a red pin suite (/goal Phase 1 #1).
+  workflow_call:
+
+# A newer push to the same ref cancels an in-flight run (the suite is ~minutes).
+concurrency:
+  # ${{ github.workflow }} is included so the STANDALONE run and the
+  # Release-embedded workflow_call (release.yml `uses:` this file) land in
+  # DIFFERENT groups — with a shared `unit-<ref>` group, every main push
+  # spawned both instances into one cancel-in-progress group and the loser
+  # of the race got cancelled (2026-07-24: standalone run 30088541708
+  # cancelled 1s in, turning the required "pytest tests/ (unit + pins)"
+  # check red while the suite itself passed inside the Release run).
+  # Rapid same-branch pushes still cancel their own stale runs.
+  group: unit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Layer-3 of the v0.2.0 CIDI-drift defense (Drive 3): fail-close when a
+  # new FastAPI route or Jinja template ships without a matching Playwright
+  # walk under tests/e2e/walk/. Runs BEFORE pytest so a missing walk
+  # short-circuits the PR without spending the pytest budget.
+  feature-add-e2e-gate:
+    name: feature-add-e2e-gate (walks required for new routes/templates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need full history so the base rev (origin/main or the PR base)
+          # is fetchable for the diff.
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run feature-add-e2e-gate
+        env:
+          # Base for the diff scan:
+          #   1. Pull-request events → PR base sha (walks required for the PR
+          #      diff, which is what a reviewer cares about).
+          #   2. Push events → github.event.before = the branch tip BEFORE
+          #      this push (incremental — only checks walks for routes added
+          #      IN THIS PUSH, not the accumulated branch backlog).
+          #   3. Fallback origin/main when neither is set (first-push, cron,
+          #      manual dispatch) — the script will exit 2 setup-error if
+          #      the ref is unresolvable rather than fail-close on all-zeros.
+          # Rationale: the aggregate branch-vs-main missing-walks debt is a
+          # DRIVE-plan concern (retrofit backfill), not a per-push gate — the
+          # gate is designed to prevent NEW drift, not backfill known debt.
+          # Merge-to-main PR trigger still enforces the full-branch check
+          # via case (1). See DA panel-2 MF5 (2026-07-16).
+          E2E_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: python scripts/workflows/feature-add-e2e-gate.py
+
+  pytest:
+    name: pytest tests/ (unit + pins)
+    # Self-hosted runner on the deploy host (podman-containerized). gcc + libffi-dev
+    # baked into the runner image; sqlcipher3-binary wheel resolves without
+    # source build. Runner user has NO sudo.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+          cache-dependency-path: requirements.lock
+
+      - name: Install project + dev + encryption (sqlcipher)
+        # Lockfile first (pinned transitive deps), then the project itself,
+        # then the dev + encryption extras. `.[dev,encryption]` resolves the
+        # x86_64 `sqlcipher3-binary>=0.5.4,<0.6` wheel via its platform marker
+        # — identical to the Containerfile amd64 leg, so the encrypted-DB
+        # tests run instead of importorskip-skipping.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install --no-deps -e .
+          pip install -e '.[dev,encryption]'
+
+      - name: Confirm sqlcipher is importable (fail loud if the wheel didn't land)
+        run: python -c "import sqlcipher3; v=sqlcipher3.dbapi2.connect(':memory:').execute('PRAGMA cipher_version').fetchone(); print('sqlcipher', v); assert v and str(v[0]).startswith('4.'), v"
+
+      - name: Run the unit + pin suite
+        # the backlog  (2026-07-11 drain-helper root-cause fix)
+        # closes the audit-write drain wall-clock deadline as an
+        # event-driven signal via ``app.state._audit_pending_signal``
+        # fired from ``attach_audit_done_callback`` — wake latency
+        # drops from ~20ms fixed poll to microseconds under xdist_load
+        # scheduler starvation on the 4-vCPU self-hosted the deploy host runner.
+        # db-sme F1 (2026-07-11) — the ``-n 2`` interim from PUNCH-
+        # LIST  STAYS for now. The drain-helper fix eliminates
+        # the audit-write flake class #1-#4 but OTHER wall-clock
+        # deadlines in ``tests/test_web/`` (test_291_writer_queuefull
+        # drains, test_290 concurrent lock timing, test_db_threadpool,
+        # test_288 concurrent connection) can still starve under
+        # ``-n auto`` on this hardware. Flip to ``-n auto`` in a
+        # follow-up after 5 CI cycles green under ``-n 2`` OR after
+        # those other deadlines are event-driven.
+        run: python -m pytest tests/ -n 2 -q

@@ -23,9 +23,14 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage.web._flash import scrub_exc  # N-179 R21_2 sub-3 SSOT
+from email_triage.web.error_html import error_chip
+
+from email_triage._isotime import to_utc_iso
 from email_triage.engine.models import Classification, EmailMessage, UserRole
-from email_triage.web.db import can_manage_account
+from email_triage.web.db import can_administer_account, can_manage_account
 from email_triage.web import settings_keys as _S
+from email_triage.mail_headers import canonical_email  # N-346 partial 4 R31
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
 from email_triage.web.auth import (
     SESSION_COOKIE_NAME,
@@ -45,35 +50,19 @@ from email_triage.web.dependencies import (
     RequireUser,
     RequireUserFragment,
     get_session_secret,
+    is_admin as _is_admin,  # N-222g R22 SSOT — local var `is_admin` shadows the callable, so import under alias
     require_auth,
     require_role,
 )
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
+from email_triage._int_utils import parse_int_or_none  # N-219c R23
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.accounts")
 
 router = APIRouter()
-
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 
 from . import _shared
@@ -86,13 +75,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -164,8 +172,16 @@ def _build_ai_backend_selector_context(
         else:
             sel_exp = sel.get("baa_expires_at")
             if sel.get("baa_certified") and sel_exp:
-                try:
-                    sel_d = date.fromisoformat(str(sel_exp)[:10])
+                # N-263b R31 fromisoformat sweep — route through
+                # `_isotime.parse_iso_date` SSOT (returns None on
+                # unparseable, behavior-preserving vs prior try/except).
+                from email_triage._isotime import parse_iso_date
+                sel_d = parse_iso_date(sel_exp)
+                if sel_d is None:
+                    # Unparseable expiry — fall back to the "in force"
+                    # copy (same posture as the pre-N-263b try/except).
+                    chip = f"Vendor agreement in force until {sel_exp}."
+                else:
                     days = (sel_d - date.today()).days
                     if days < 0:
                         chip = (
@@ -180,8 +196,6 @@ def _build_ai_backend_selector_context(
                         )
                     else:
                         chip = f"Vendor agreement in force until {sel_exp}."
-                except (TypeError, ValueError):
-                    chip = f"Vendor agreement in force until {sel_exp}."
             elif sel.get("baa_certified"):
                 chip = "Vendor agreement in force (no expiry set)."
             else:
@@ -288,7 +302,7 @@ async def accounts_create(request: Request, user: RequireUserFragment):
     form = await request.form()
     db = get_db(request)
     secrets = get_secrets(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
 
     name = form.get("name", "").strip()
     ptype = form.get("provider_type", "imap")
@@ -315,14 +329,14 @@ async def accounts_create(request: Request, user: RequireUserFragment):
         cap = get_max_mailboxes_per_account(app_config)
         selected = list(config.get("mailboxes") or [])
         if len(selected) > cap:
-            from urllib.parse import urlencode
-            params = urlencode({
-                "error": (
-                    f"Too many folders selected ({len(selected)} > cap of {cap}). "
-                    "Most IMAP servers limit concurrent connections per user."
-                ),
-            })
-            return RedirectResponse(f"/accounts?{params}", status_code=303)
+            # N-232 R22 Arm A: route through the flash-key SSOT so a
+            # future rename of `error=` doesn't decouple this writer from
+            # the flash-reader.
+            from email_triage.web.routers._redirect import err_qs
+            return RedirectResponse(
+                f"/accounts?{err_qs(f'Too many folders selected ({len(selected)} > cap of {cap}). Most IMAP servers limit concurrent connections per user.')}",
+                status_code=303,
+            )
 
     # Per-account HIPAA flag. When system HIPAA is on, the create helper
     # sticky-inherits the flag regardless; otherwise the admin opts in
@@ -409,7 +423,7 @@ async def accounts_edit_form(
     # handler renders the operator-facing page or JSON).
     user, acct, db, secrets = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
 
     from email_triage.triage_logging import (
         is_account_hipaa, is_account_hipaa_locked,
@@ -530,7 +544,7 @@ async def accounts_edit_form(
     # HTMX swaps the bare partial into the row on the manage page.
     # Direct browser GET (no HX-Request header) gets the full-page
     # wrapper so base.html (nav + Pico CSS + theme) renders.
-    if request.headers.get("HX-Request") == "true":
+    if _shared.is_htmx(request):
         return await _render(templates, request, "accounts/_edit.html", ctx)
     return await _render(templates, request, "accounts/edit_page.html", ctx)
 
@@ -551,7 +565,7 @@ async def accounts_row(
     """
     user, _acct, _db, _secrets = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
 
     # OwnedAccount already proved the account exists + is manageable;
     # re-fetch through the enricher for the chip-bearing snapshot the
@@ -563,6 +577,69 @@ async def accounts_row(
     return await _render(templates, request, "accounts/_row.html", {
         "acct": acct, "is_admin": is_admin,
     })
+
+
+@router.post(
+    "/accounts/{account_id}/backfill-capped/dismiss",
+    response_class=HTMLResponse,
+)
+async def accounts_backfill_capped_dismiss(
+    request: Request, account_id: int, owned: OwnedAccount,
+):
+    """ — dismiss the bounded-backfill-saturation chip.
+
+    The operator acknowledges the cursor-expiry gap (typically after
+    running a whole-mailbox triage to backfill the missed messages).
+    Gated by ``OwnedAccount`` so only a manager of THIS account can
+    clear its chip. Returns an empty body — the row's HTMX swap
+    (``hx-target=#backfill-chip-<id>``, ``hx-swap=outerHTML``) removes
+    the chip in place.
+
+    The dismiss is AUDITED (§164.312(b)): clearing the chip without a
+    trail would turn a *known* un-triage gap into a silent one. The
+    access-log row records who acknowledged the gap, when, and the
+    recovered/cap counts the chip carried — so a later review can see
+    the gap was acknowledged (and by whom) rather than simply vanished.
+    """
+    from email_triage.web._backfill_chip import (
+        get_backfill_capped, clear_backfill_capped,
+    )
+    from email_triage.web.db import record_access_event
+    user, _acct, db, _secrets = owned
+
+    def _dismiss_work():
+        chip = get_backfill_capped(db, account_id) or {}
+        detail = (
+            "backfill_capped dismissed "
+            f"(kind={chip.get('kind', '?')} "
+            f"recovered={chip.get('recovered', '?')} "
+            f"cap={chip.get('cap', '?')} "
+            f"window={chip.get('window', '?')})"
+        )
+        # census run17 #3 — route the best-effort audit write through the SSOT
+        # web._audit.safe_audit_write: a failure is LOGGED (visible to /health's
+        # audit-failure drift check), never silently dropped. The prior comment
+        # claimed the access-audit middleware also logs this POST — FALSE at HEAD
+        # (backfill-capped is not a PHI route, so this is the ONLY access_log
+        # write for it; a bare `except: pass` made the miss totally invisible).
+        from email_triage.web._audit import safe_audit_write
+        safe_audit_write(
+            lambda: record_access_event(
+                db, actor_user_id=user.get("id"), method="POST",
+                route=f"/accounts/{account_id}/backfill-capped/dismiss",
+                account_id=account_id, message_id=None,
+                status_code=200, outcome="ok", detail=detail,
+            ),
+            description=f"backfill_capped_dismiss account_id={account_id}",
+        )
+        # N-211c R23: operator-initiated dismiss — cross-scope clear is
+        # intentional (user clicks "dismiss" regardless of which mailbox
+        # raised it). Pass explicit `source_mailbox=None` to declare the
+        # cross-scope intent + satisfy the N-211c pin.
+        clear_backfill_capped(db, account_id, source_mailbox=None)
+
+    await db_call(_dismiss_work)
+    return HTMLResponse("")
 
 
 @router.post(
@@ -595,11 +672,12 @@ async def recipient_digest_send_now(
             "first.</small>"
         )
 
-    # Resolve via the helper so IMAP accounts (config["username"])
-    # work alongside Gmail / O365 (config["account"]). Open-coding
-    # the lookup here was the bug operators reported as
+    # Resolve via the account_email SSOT (census run17 ) so IMAP accounts
+    # (config["username"]) work alongside Gmail / O365 (config["account"]).
+    # Open-coding the lookup here was the bug operators reported as
     # "Account has no email address" on every IMAP-backed account.
-    to_addr = (acct.get("email_address") or "").strip()
+    from email_triage.db.accounts import account_email
+    to_addr = account_email(acct)
     if not to_addr:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -610,10 +688,10 @@ async def recipient_digest_send_now(
     from email_triage.actions.recipient_digest import (
         gather_digest_rows, send_recipient_digest, mark_sent,
     )
-    from email_triage.triage_logging import is_hipaa_mode
+    from email_triage.triage_logging import account_hipaa_effective
 
     now_utc = datetime.now(timezone.utc)
-    since_iso = (now_utc - timedelta(hours=24)).isoformat()
+    since_iso = to_utc_iso(now_utc - timedelta(hours=24))
     #  — gather_digest_rows reads the shared connection; dispatch
     # it off the event loop through db_call.
     rows = await db_call(
@@ -627,10 +705,24 @@ async def recipient_digest_send_now(
             "nothing to send.</small>"
         )
 
-    hipaa = is_hipaa_mode() or bool(acct.get("hipaa", False))
+    hipaa = account_hipaa_effective(account=acct)
 
+    from email_triage.secrets import SecretsDecryptError, read_secret
+    # A5: explicit decrypt-error handling — an unreadable secret store
+    # (master-key mismatch) must fail closed, not blank-password send.
     try:
-        smtp_password = secrets.get("SMTP_PASSWORD") or ""
+        smtp_password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+    except SecretsDecryptError:
+        _log.error(
+            "Recipient digest test-send aborted — SMTP password unreadable "
+            "(corrupt secret row / master-key mismatch)",
+            account_id=account_id,
+        )
+        return HTMLResponse(
+            "<small style='color:var(--pico-del-color);'>"
+            "Send failed: secret store unreadable (master-key mismatch)</small>"
+        )
+    try:
         await asyncio.to_thread(
             send_recipient_digest,
             smtp_host=smtp.host,
@@ -644,7 +736,7 @@ async def recipient_digest_send_now(
             rows=rows,
             hipaa=hipaa,
             use_tls=smtp.use_tls,
-            fallback_dt_iso=now_utc.isoformat(),
+            fallback_dt_iso=to_utc_iso(now_utc),
         )
         def _digest_sent_db_work() -> None:
             """/ — last-sent stamp + audit row in one hop,
@@ -655,9 +747,14 @@ async def recipient_digest_send_now(
             # the next HH:10 firing within 23h.
             mark_sent(db, account_id, now_utc, len(rows))
             # Audit row mirroring the scheduler's path.
-            try:
-                from email_triage.web.db import record_access_event
-                record_access_event(
+            # census run17 #3 — route the access_log row through the SSOT
+            # web._audit.safe_audit_write so an emit failure is LOGGED (visible
+            # to /health's audit-failure drift check), never silently dropped
+            # (was a bare `except Exception: pass`).
+            from email_triage.web.db import record_access_event
+            from email_triage.web._audit import safe_audit_write
+            safe_audit_write(
+                lambda: record_access_event(
                     db,
                     actor_user_id=user["id"],
                     method="POST",
@@ -670,18 +767,53 @@ async def recipient_digest_send_now(
                     status_code=200,
                     outcome="recipient_digest_sent",
                     detail=(
-                        f"row_count={len(rows)} hipaa={hipaa} "
-                        f"to={to_addr} manual=true"
+                        # to_addr deliberately EXCLUDED — db/audit contract:
+                        # account_id is the column, never an email in a detail
+                        # string (mirrors the scheduled sender, digest.py:696).
+                        f"row_count={len(rows)} hipaa={hipaa} manual=true"
+                    ),
+                ),
+                description=(
+                    f"recipient_digest_sent manual access_log "
+                    f"account_id={account_id}"
+                ),
+            )
+            # N-73 / §164.312(b) — a HIPAA recipient-digest send is a PHI
+            # EXFILTRATION; it must write a hipaa_access_events row (not just
+            # access_log), exactly as the scheduled sender does (digest.py:683).
+            # Operator-initiated, so the actor is the triggering user. Its OWN
+            # try/except (db-sme run15 #8) so an access_log write failure cannot
+            # SUPPRESS the §164.312(b) row, and a recurring failure is VISIBLE
+            # (warning) — fail-soft parity with the scheduled sender (digest.py:692).
+            if hipaa:
+                # census run17 #3 — route the §164.312(b) PHI-access row through
+                # the SSOT (safe_audit_write): preserves the N-125 fail-soft (an
+                # access_log failure can't suppress this row; a failure here is
+                # LOGGED, not silent) but via the ONE audit-failure funnel so
+                # /health's drift check sees it uniformly (was an ad-hoc warning).
+                from email_triage.web.db import record_hipaa_access_event
+                from email_triage.web._audit import safe_audit_write
+                safe_audit_write(
+                    lambda: record_hipaa_access_event(
+                        db,
+                        user["id"],
+                        int(account_id),
+                        "recipient_digest_sent",
+                        "ok",
+                        f"row_count={len(rows)} manual=true",
+                    ),
+                    description=(
+                        f"recipient_digest_sent manual hipaa account_id={account_id}"
                     ),
                 )
-            except Exception:
-                pass
 
         await db_call(_digest_sent_db_work)
+        import html as _html
+        # N-83: to_addr is a DB-stored email address; escape before HTML interpolation.
         return HTMLResponse(
             "<small style='color:var(--pico-ins-color);'>"
             f"&#10003; Sent {len(rows)} row digest to "
-            f"<code>{to_addr}</code></small>"
+            f"<code>{_html.escape(to_addr)}</code></small>"
         )
     except Exception as e:
         _log.error(
@@ -689,8 +821,7 @@ async def recipient_digest_send_now(
             account_id=account_id, error=fmt_exc(e),
         )
         return HTMLResponse(
-            "<small style='color:var(--pico-del-color);'>"
-            f"Send failed: {fmt_exc(e)}</small>"
+            error_chip(e, prefix='Send failed: ', purpose='provider')  # N-179 SSOT
         )
 
 
@@ -720,6 +851,42 @@ async def digest_create_stub(
     )
 
 
+async def _digest_label_options(db, secrets, acct) -> list[dict]:
+    """Discovered provider labels for the digest label-filter picker.
+
+    Thin wrapper over :func:`list_provider_labels_for_account`. That helper
+    does **no** auth/HIPAA gating — the ACCESS BOUNDARY is the control: the
+    caller resolves ``acct`` via ``OwnedAccountOrLogin`` (can_manage_account),
+    so only an authorized manager of THIS account reaches it. There is
+    intentionally NO is_account_hipaa gate (removed 2026-06-06 per the
+    §160.103 use-vs-disclosure SME ruling — surfacing an account's own
+    labels to its authorized manager is an intra-entity USE, not a
+    disclosure; owner self-access is §164.502(b)(2)-exempt). Retained
+    defense-in-depth: the helper never logs label names. See
+    reference_labels_phi_use_vs_disclosure_2026-06-06. The extra try/except
+    is belt-and-braces so a provider round-trip hiccup can never 500 the
+    digest editor; the picker just degrades to the free-text override.
+
+    IMAP gate: for IMAP the provider-label helper returns FOLDER names,
+    which the digest's folders picker already covers — and the digest
+    ``tags`` filter is about IMAP keywords/flags (not enumerable), NOT
+    folders. So we only surface the label multi-select for Gmail / O365,
+    where the provider labels ARE the tags. IMAP keeps the free-text
+    keyword override.
+    """
+    if not acct or acct.get("provider_type") == "imap":
+        return []
+    from email_triage.providers.provider_labels import (
+        list_provider_labels_for_account,
+    )
+    try:
+        return await list_provider_labels_for_account(
+            db=db, secrets=secrets, account_id=int(acct["id"]),
+        )
+    except Exception:  # noqa: BLE001 — never let label discovery break the editor
+        return []
+
+
 @router.get(
     "/accounts/{account_id}/digests/new/edit",
     response_class=HTMLResponse,
@@ -734,7 +901,10 @@ async def digest_editor_new(
         return owned
     user, acct, db, secrets = owned
     templates = get_templates(request)
-    ctx = _digest_editor_context(db, request, account_id, dcfg=None)
+    labels = await _digest_label_options(db, secrets, acct)
+    ctx = _digest_editor_context(
+        db, request, account_id, dcfg=None, provider_labels=labels,
+    )
     ctx["user"] = user
     return await _render(templates, request, "accounts/_digest_editor.html", ctx)
 
@@ -765,7 +935,10 @@ async def digest_editor(
     dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse("Digest not found", status_code=404)
-    ctx = _digest_editor_context(db, request, account_id, dcfg=dcfg)
+    labels = await _digest_label_options(db, secrets, acct)
+    ctx = _digest_editor_context(
+        db, request, account_id, dcfg=dcfg, provider_labels=labels,
+    )
     ctx["user"] = user
     ctx["is_preset"] = (dcfg.id == PRESET_ID)
     return await _render(templates, request, "accounts/_digest_editor.html", ctx)
@@ -811,8 +984,10 @@ async def digest_save(
 
     errors = validate(cfg)
     if errors:
+        labels = await _digest_label_options(db, secrets, acct)
         ctx = await db_call(
             _digest_editor_context, db, request, account_id, dcfg=cfg,
+            provider_labels=labels,
         )
         ctx["user"] = user
         ctx["is_preset"] = (cfg.id == PRESET_ID)
@@ -877,7 +1052,6 @@ async def digest_test_send(
     same UX whether they're testing the preset or a custom
     digest.
     """
-    from datetime import datetime, timezone
     from email_triage.actions.digest_configs import (
         get_digest_config,
     )
@@ -892,7 +1066,9 @@ async def digest_test_send(
             "<small style='color:var(--pico-del-color);'>"
             "SMTP not configured.</small>"
         )
-    to_addr = (acct.get("email_address") or "").strip()
+    # census run17  — account_email SSOT, not the open-coded key.
+    from email_triage.db.accounts import account_email
+    to_addr = account_email(acct)
     if not to_addr:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
@@ -906,8 +1082,8 @@ async def digest_test_send(
             "Digest not found.</small>", status_code=404,
         )
 
-    from email_triage.triage_logging import is_hipaa_mode
-    hipaa = is_hipaa_mode() or bool(acct.get("hipaa", False))
+    from email_triage.triage_logging import account_hipaa_effective
+    hipaa = account_hipaa_effective(account=acct)
     now_utc = datetime.now(timezone.utc)
     try:
         rows_sent = await _fire_one_digest(
@@ -945,9 +1121,12 @@ async def digest_test_send(
         is_newsletter = dcfg.format.render_as in (
             "newsletter", "newsletter_classic",
         )
+        import html as _html
+        # N-83: to_addr is a DB-stored email address; escape before HTML interpolation.
+        _to_esc = _html.escape(to_addr)
         if is_newsletter:
             msg = (
-                f"✓ Sent to {to_addr} ({rows_sent} message"
+                f"✓ Sent to {_to_esc} ({rows_sent} message"
                 f"{'s' if rows_sent != 1 else ''}). "
                 "Newsletter formats can take a minute or two to "
                 "build — if the email doesn't arrive shortly, "
@@ -955,7 +1134,7 @@ async def digest_test_send(
             )
         else:
             msg = (
-                f"✓ Sent to {to_addr} ({rows_sent} message"
+                f"✓ Sent to {_to_esc} ({rows_sent} message"
                 f"{'s' if rows_sent != 1 else ''})"
             )
         return HTMLResponse(
@@ -968,8 +1147,7 @@ async def digest_test_send(
             error=fmt_exc(e),
         )
         return HTMLResponse(
-            "<small style='color:var(--pico-del-color);'>"
-            f"Send failed: {fmt_exc(e)}</small>"
+            error_chip(e, prefix='Send failed: ', purpose='provider')  # N-179 SSOT
         )
 
 
@@ -995,15 +1173,25 @@ async def digest_candidates(
     real send, so a list of 22 sources = ~10-30 min preview / send
     wall time. Operator can decide whether to wait for the full
     Preview or just trust the structured shape.
+
+     reachability — pages the FULL match set (apply_cap=False), so
+    every match is reachable, not just the first ``max_rows`` that would
+    send. NOTE: this is a live dry-run, NOT a stable snapshot — the
+    candidate set is recomputed on every page turn, so if mail arrives
+    between "Show matches" and a "load older" click the total can shift.
+    That's tolerable for a preview (no persistence consequence); the
+    actual SEND path (``_render_digest_payload``) still caps at
+    ``max_rows`` via the default ``apply_cap=True``.
     """
-    from datetime import datetime, timezone
     from email_triage.actions.digest_configs import (
         get_digest_config,
     )
     from email_triage.web.app import _filter_digest_candidates
+    from email_triage.web._pagination import page_window, clamp_offset
 
     #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
+    templates = get_templates(request)
     dcfg = await db_call(get_digest_config, db, account_id, digest_id)
     if dcfg is None:
         return HTMLResponse(
@@ -1011,15 +1199,22 @@ async def digest_candidates(
             "Digest not found.</small>", status_code=404,
         )
 
+    #  reachability — the pager hx-POSTs this endpoint with the
+    # offset (form data). Default 0 on the first "Show matches" click.
+    form = await request.form()
+    raw_offset = form.get("offset")
+
     now_utc = datetime.now(timezone.utc)
     try:
         #  — _filter_digest_candidates does a synchronous DB read on
         # the shared connection; route it through db_call so it runs off
-        # the event loop under the process-wide DB lock.
-        rows = await db_call(
+        # the event loop under the process-wide DB lock. apply_cap=False
+        # returns the FULL filtered set so the dry-run can page through
+        # EVERY match, not just the first max_rows that would send.
+        all_rows, total_matched = await db_call(
             _filter_digest_candidates,
             db=db, acct=acct, dcfg=dcfg,
-            now_utc=now_utc, last_sent=None,
+            now_utc=now_utc, last_sent=None, apply_cap=False,
         )
     except Exception as e:
         _log.error(
@@ -1028,12 +1223,10 @@ async def digest_candidates(
             error=fmt_exc(e),
         )
         return HTMLResponse(
-            "<small style='color:var(--pico-del-color);'>"
-            f"Candidate lookup failed: {fmt_exc(e)}</small>"
+            error_chip(e, prefix='Candidate lookup failed: ', purpose='misc')  # N-179 SSOT
         )
 
-    n = len(rows)
-    if n == 0:
+    if total_matched == 0:
         return HTMLResponse(
             "<small style='color:var(--pico-muted-color);'>"
             "No matching messages in the selected window. "
@@ -1041,47 +1234,66 @@ async def digest_candidates(
             "Show matches again.</small>"
         )
 
-    # ETA hint for newsletter formats. Other formats render in
-    # under a second so the hint is irrelevant.
+    # Page size = the digest's row limit (so page 1 == exactly what
+    # would send); default to 50 if unset. Pages reveal the rest.
+    max_rows = int(getattr(dcfg.format, "max_rows", 0) or 0)
+    page_size = max_rows if max_rows > 0 else 50
+    off = clamp_offset(raw_offset, page_size, total_matched)
+    rows = all_rows[off:off + page_size]
+    win = page_window(
+        total=total_matched, offset=off, limit=page_size, shown=len(rows),
+    )
+
+    # ETA hint for newsletter formats (other formats render < 1s).
     is_newsletter = dcfg.format.render_as in (
         "newsletter", "newsletter_classic",
     )
     eta_line = ""
     if is_newsletter:
-        # ~30-90s per source — give the range so the operator
-        # can plan around it.
-        low_min = max(1, (n * 30) // 60)
-        high_min = max(1, (n * 90) // 60)
+        low_min = max(1, (total_matched * 30) // 60)
+        high_min = max(1, (total_matched * 90) // 60)
         eta_line = (
             f" Newsletter render uses AI to summarize each "
             f"source — estimated wait if you Preview or Send: "
             f"~{low_min}–{high_min} minutes."
         )
 
-    # Build a small table — keep it scannable, no body preview.
-    import html as _html
-    parts = [
-        "<div style='font-size:0.85em;'>",
-        f"<p style='margin:0.3rem 0;'><strong>{n} message"
-        f"{'s' if n != 1 else ''}</strong> would be included."
-        f"{eta_line}</p>",
-        "<table style='font-size:0.85em;'>",
-        "<thead><tr>"
-        "<th>When</th><th>Sender</th>"
-        "<th>Subject</th><th>Category</th>"
-        "</tr></thead><tbody>",
-    ]
-    for r in rows:
-        parts.append(
-            "<tr>"
-            f"<td>{_html.escape(str(r.get('date') or '—'))[:16]}</td>"
-            f"<td>{_html.escape(str(r.get('sender') or '—'))}</td>"
-            f"<td>{_html.escape(str(r.get('subject') or '—'))}</td>"
-            f"<td>{_html.escape(str(r.get('category') or '—'))}</td>"
-            "</tr>"
+    # When more matched than the digest will actually send, say which
+    # ones send (the newest max_rows) so paging beyond isn't confusing.
+    send_note = ""
+    if max_rows and total_matched > max_rows:
+        send_note = (
+            f"The newest {max_rows} of these will actually send; raise "
+            f"this digest's row limit to send more. The rest are shown "
+            f"here for reference."
         )
-    parts.append("</tbody></table></div>")
-    return HTMLResponse("".join(parts))
+
+    # HIPAA display policy — N-172 threaded a viewer-INDEPENDENT display-min
+    # gate; the follow-on owner-self-preview design point (operator ruling
+    # 2026-07-01 = viewer-AWARE) unredacts sender + subject when the ACTOR IS
+    # THE ACCOUNT OWNER (they authored the mail into their own mailbox — no
+    # min-necessary rationale for hiding their OWN PHI from themselves). A
+    # managing NON-OWNER still sees [redacted] (§164.502(b)/§164.514(d)(1)).
+    # actor≠owner is the separate AUDIT gate (db/audit.py:1116) — decoupled.
+    # The DELIVERED digest (recipient_digest.render_html, to the authorized
+    # recipient) is a SEPARATE surface and out of scope here.
+    from email_triage.triage_logging import account_hipaa_effective
+    effective_hipaa = account_hipaa_effective(account=acct)
+    viewer_is_owner = user["id"] == acct["user_id"]
+
+    return await _render(templates, request, "accounts/_digest_candidates.html", {
+        "rows": rows,
+        "win": win,
+        "eta_line": eta_line,
+        "send_note": send_note,
+        "effective_hipaa": effective_hipaa,
+        "viewer_is_owner": viewer_is_owner,
+        "cand_url": str(request.url.path),
+        # The pager re-targets its own [data-cand-wrap] wrapper (relative),
+        # so it works under BOTH the preset (#recipient-digest-result-N) and
+        # custom (#digest-result-<id>) result containers — no per-digest
+        # target id needed (live Playwright review, 2026-06-12).
+    })
 
 
 @router.post(
@@ -1105,7 +1317,6 @@ async def digest_preview(
     so the digest's CSS doesn't fight the editor page's CSS.
     Subject line + row count surface above the iframe.
     """
-    from datetime import datetime, timezone
     from email_triage.actions.digest_configs import (
         get_digest_config,
     )
@@ -1121,14 +1332,29 @@ async def digest_preview(
             "Digest not found.</small>", status_code=404,
         )
 
-    from email_triage.triage_logging import is_hipaa_mode
-    hipaa = is_hipaa_mode() or bool(acct.get("hipaa", False))
+    from email_triage.triage_logging import account_hipaa_effective
+    hipaa = account_hipaa_effective(account=acct)
     now_utc = datetime.now(timezone.utc)
     try:
-        subject, html_body, _plain, rows = await _render_digest_payload(
+        (
+            subject, html_body, _plain, rows, total_matched,
+        ) = await _render_digest_payload(
             db=db, secrets=secrets, acct=acct, dcfg=dcfg,
             hipaa=hipaa, now_utc=now_utc, last_sent=None,
             config=config,
+            # N-174 + owner-self-preview design point (operator ruling
+            # 2026-07-01 = viewer-AWARE): this preview is reachable by a
+            # managing NON-OWNER (OwnedAccount→can_manage_account), so the
+            # digest BODY's sender + subject must be display-min-redacted
+            # for a NON-owner — but the OWNER viewing THEIR OWN preview
+            # sees verbatim (no min-necessary rationale for hiding their
+            # own PHI from themselves; matches the sibling
+            # _digest_candidates gate). ``hipaa`` here is the viewer-
+            # INDEPENDENT account_hipaa_effective account flag; combined
+            # with the actor==owner check → the viewer-AWARE display gate.
+            # The DELIVERED send (_fire_one_digest) omits redact_pii →
+            # verbatim to the account's own authorized mailbox.
+            redact_pii=hipaa and user["id"] != acct["user_id"],
         )
     except Exception as e:
         _log.error(
@@ -1137,8 +1363,7 @@ async def digest_preview(
             error=fmt_exc(e),
         )
         return HTMLResponse(
-            "<small style='color:var(--pico-del-color);'>"
-            f"Preview failed: {fmt_exc(e)}</small>"
+            error_chip(e, prefix='Preview failed: ', purpose='misc')  # N-179 SSOT
         )
 
     if not rows:
@@ -1161,6 +1386,18 @@ async def digest_preview(
 
     import html as _html
     n = len(rows)
+    #  — preview reflects the same max_rows cap; show the gap so
+    # the operator knows the rendered body is the capped subset.
+    omitted = max(0, total_matched - n)
+    cap_note = ""
+    if omitted:
+        # int() wraps mark these as numeric for the N-83 styled-fragment pin.
+        cap_note = (
+            f" <span style='color:var(--pico-del-color);'>"
+            f"({int(total_matched)} matched — {int(omitted)} omitted by the "
+            f"row limit; an in-body notice tells the recipient.)"
+            f"</span>"
+        )
     # iframe srcdoc sandboxes the digest's own styles. Use double
     # quotes around srcdoc + escape the HTML content for safety.
     iframe_src = _html.escape(html_body, quote=True)
@@ -1169,7 +1406,7 @@ async def digest_preview(
         "<p style='margin:0.3rem 0;'>"
         "<strong>Preview — not sent.</strong> "
         f"Subject: <code>{_html.escape(subject)}</code> · "
-        f"{n} message{'s' if n != 1 else ''} included."
+        f"{n} message{'s' if n != 1 else ''} included.{cap_note}"
         "</p>"
         f"<iframe srcdoc=\"{iframe_src}\" "
         "style='width:100%;height:600px;border:1px solid "
@@ -1216,8 +1453,7 @@ async def digest_validate_query(
         )
     except Exception as e:
         return HTMLResponse(
-            "<small style='color:var(--pico-del-color);'>"
-            f"✗ {fmt_exc(e)}</small>"
+            error_chip(e, prefix='✗ ', purpose='misc')  # N-179 SSOT
         )
 
 
@@ -1277,7 +1513,7 @@ async def accounts_update(
     # same file (Bundles C / G / L all touch ui.py too).
     user, acct, db, secrets = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
 
     from email_triage.web.db import get_email_account, update_email_account
 
@@ -1370,7 +1606,9 @@ async def accounts_update(
             # Sync is best-effort — the legacy fields still drive the
             # Phase 4 migration on first read, and the preset config
             # is always re-derivable from them. Log + move on.
-            from email_triage._errfmt import fmt_exc
+            # N-323 R30 (task ): nested `from ... import fmt_exc`
+            # REMOVED — module-level import at :57 is authoritative.
+            # Same defect class as N-269b + N-319.
             _log.warning(
                 "digest preset sync failed",
                 account_id=account_id, error=fmt_exc(e),
@@ -1412,10 +1650,10 @@ async def accounts_update(
     # explicitly can NOT change the flag (blast-radius op: toggling
     # off downgrades audit posture for an account that may carry
     # PHI). Skip the whole block when a delegate posts the form —
-    # the rest of the save still applies.
-    _hipaa_owner_or_admin = (
-        acct["user_id"] == user["id"] or is_admin
-    )
+    # the rest of the save still applies. (2026-06-11: the inlined
+    # owner-or-admin decision now routes through the
+    # can_administer_account SSOT — the no-delegate sensitive-op gate.)
+    _hipaa_owner_or_admin = can_administer_account(db, user, acct)
     if "hipaa_submitted" in form and _hipaa_owner_or_admin:
         desired = "hipaa" in form
         # 2026-05-11 — capture pre-save HIPAA state so we can detect a
@@ -1444,7 +1682,13 @@ async def accounts_update(
                     config=request.app.state.config,
                 )
                 bad_acct = dict(bad_acct or {})
-                bad_acct["_hipaa_error"] = str(e)
+                #  (Census v3 re-run error-surface HIGH): route the
+                # PermissionError through `scrub_exc` (form purpose —
+                # informational, PHI-shape strip only). The lock guard's
+                # hardcoded message ("Cannot unset HIPAA flag …") has no
+                # PHI today but a future guard revision could — the
+                # SSOT closes the class.
+                bad_acct["_hipaa_error"] = scrub_exc(e, purpose="form")
                 return "permission_error", bad_acct
             # Auto-off on flip 0→1: when an account becomes HIPAA, force
             # the AI-learns toggle off so future renders reflect the
@@ -1503,13 +1747,11 @@ async def accounts_update(
             record_hipaa_access_event,
             set_account_style_learning_backend,
         )
+        from email_triage.web._audit import safe_audit_write
         raw_bid = (form.get("style_learning_backend_id") or "").strip()
         new_bid: int | None
         if raw_bid:
-            try:
-                new_bid = int(raw_bid)
-            except (TypeError, ValueError):
-                new_bid = None
+            new_bid = parse_int_or_none(raw_bid)  # N-219c R23: SSOT
         else:
             new_bid = None
 
@@ -1525,17 +1767,32 @@ async def accounts_update(
                 # HIPAA gate — match the dropdown filter so a stale
                 # cached page (or a hand-crafted POST) can't bypass.
                 if is_account_hipaa(cur_acct):
-                    from datetime import date
+                    # Census N-63 — route this selector gate through the SAME
+                    # BAA-validity SSOT the runtime load_backend chokepoint
+                    # uses (was an inline hand-roll → drift surface). Boundary
+                    # is preserved at the date granularity: the SSOT refuses
+                    # when expiry <= today, matching the prior string compare.
+                    # (Edge: a stored expiry WITH a time component — e.g.
+                    # '2026-06-10T15:00' — was allowed by the old string
+                    # compare on the expiry day but is now parsed-to-date and
+                    # refused; the change is in the safer fail-closed direction.)
+                    from email_triage.baa_expiry import (
+                        is_backend_baa_valid_for_phi,
+                    )
                     if (
-                        not backend.get("baa_certified")
-                        or not backend.get("baa_expires_at")
-                        or str(backend["baa_expires_at"])
-                            <= date.today().isoformat()
-                        or not backend.get("enabled")
+                        not backend.get("enabled")
+                        or not is_backend_baa_valid_for_phi(
+                            baa_certified=backend.get("baa_certified"),
+                            baa_expires_at=backend.get("baa_expires_at"),
+                        )
                     ):
                         accept = False
-                        try:
-                            record_hipaa_access_event(
+                        # census run17 #3 — route through the safe_audit_write
+                        # SSOT so an emit failure is LOGGED to /health's
+                        # audit-failure drift counter (was a swallowing
+                        # `except Exception` that only warned ad-hoc).
+                        safe_audit_write(
+                            lambda: record_hipaa_access_event(
                                 db,
                                 actor_user_id=user["id"],
                                 account_id=account_id,
@@ -1549,14 +1806,12 @@ async def accounts_update(
                                     f"baa_expires_at={backend.get('baa_expires_at')} "
                                     f"enabled={backend.get('enabled')}"
                                 ),
-                            )
-                        except Exception as audit_err:
-                            _log.warning(
-                                "style_learning_backend refused-audit "
-                                "failed",
-                                account_id=account_id,
-                                error=fmt_exc(audit_err),
-                            )
+                            ),
+                            description=(
+                                "style_learning_backend_selection_refused "
+                                f"account_id={account_id} backend_id={new_bid}"
+                            ),
+                        )
                 elif not backend.get("enabled"):
                     accept = False
         if accept:
@@ -1565,29 +1820,45 @@ async def accounts_update(
             # selected what + when, with the BAA state captured at
             # selection time.
             if is_account_hipaa(cur_acct):
+                # census run17 #3 — route both emits through safe_audit_write so
+                # an emit failure reaches /health's audit-failure drift counter.
+                # The try/except is KEPT: it still guards the get_ai_backend read
+                # in the else-branch (a non-emit statement).
                 try:
                     if new_bid is None:
-                        record_hipaa_access_event(
-                            db,
-                            actor_user_id=user["id"],
-                            account_id=account_id,
-                            operation="style_learning_backend_set",
-                            outcome="install_default",
-                            detail="cleared FK",
+                        safe_audit_write(
+                            lambda: record_hipaa_access_event(
+                                db,
+                                actor_user_id=user["id"],
+                                account_id=account_id,
+                                operation="style_learning_backend_set",
+                                outcome="install_default",
+                                detail="cleared FK",
+                            ),
+                            description=(
+                                "style_learning_backend_set cleared "
+                                f"account_id={account_id}"
+                            ),
                         )
                     else:
                         b = get_ai_backend(db, new_bid)
-                        record_hipaa_access_event(
-                            db,
-                            actor_user_id=user["id"],
-                            account_id=account_id,
-                            operation="style_learning_backend_set",
-                            outcome="ok",
-                            detail=(
-                                f"backend_id={new_bid} "
-                                f"name={b['name']!r} "
-                                f"baa_certified={b.get('baa_certified')} "
-                                f"baa_expires_at={b.get('baa_expires_at')}"
+                        safe_audit_write(
+                            lambda: record_hipaa_access_event(
+                                db,
+                                actor_user_id=user["id"],
+                                account_id=account_id,
+                                operation="style_learning_backend_set",
+                                outcome="ok",
+                                detail=(
+                                    f"backend_id={new_bid} "
+                                    f"name={b['name']!r} "
+                                    f"baa_certified={b.get('baa_certified')} "
+                                    f"baa_expires_at={b.get('baa_expires_at')}"
+                                ),
+                            ),
+                            description=(
+                                "style_learning_backend_set "
+                                f"account_id={account_id} backend_id={new_bid}"
                             ),
                         )
                 except Exception as audit_err:
@@ -1622,19 +1893,24 @@ async def accounts_update(
     # the refused attempt. The HIPAA flag flip above (owner-or-admin)
     # is a separate decision: admin can flip the policy bit, but only
     # the data subject can opt their own knobs in.
-    _is_owner = acct["user_id"] == user["id"]
+    from email_triage.web.account_scope import is_account_owner
+    _is_owner = is_account_owner(acct, user["id"])
 
     def _m1m2_optin_db_work() -> None:
         """/ — re-read account + (HIPAA) M-1+M-2 opt-in write +
         audit, all in one threadpool hop.
         """
+        from email_triage.triage_logging import is_account_hipaa as _iah_m1m2
         cur_acct = get_email_account(db, account_id)
-        if cur_acct and bool(cur_acct.get("hipaa")):
+        # N-81: is_account_hipaa folds system flag (system-HIPAA install
+        # with cur_acct["hipaa"]=0 still triggers the opt-in gate).
+        if cur_acct and _iah_m1m2(cur_acct):
             if _is_owner:
                 from email_triage.web.db import (
                     record_hipaa_access_event,
                     set_style_knobs_hipaa_allow,
                 )
+                from email_triage.web._audit import safe_audit_write
                 desired_optin = ("style_knobs_hipaa_allow" in form)
                 set_style_knobs_hipaa_allow(
                     db, account_id,
@@ -1644,8 +1920,11 @@ async def accounts_update(
                 # doesn't waive the audit trail). Outcome key is the
                 # final state so the auditor can read "who set the
                 # flag to what + when" off a single row.
-                try:
-                    record_hipaa_access_event(
+                # census run17 #3 — route through safe_audit_write so an emit
+                # failure reaches /health's audit-failure drift counter (was a
+                # swallowing `except Exception` that only warned ad-hoc).
+                safe_audit_write(
+                    lambda: record_hipaa_access_event(
                         db,
                         actor_user_id=user["id"],
                         account_id=account_id,
@@ -1654,49 +1933,91 @@ async def accounts_update(
                         detail=(
                             "enabled" if desired_optin else "disabled"
                         ),
-                    )
-                except Exception as audit_err:
-                    _log.warning(
-                        "style_knobs_hipaa_allow audit row failed",
-                        account_id=account_id,
-                        error=fmt_exc(audit_err),
-                    )
+                    ),
+                    description=(
+                        "style_knobs_hipaa_allow_set "
+                        f"account_id={account_id}"
+                    ),
+                )
             elif "style_knobs_hipaa_allow" in form:
                 # Non-owner POSTed the opt-in field on a HIPAA account
                 # they don't own. Silently refuse (no setting write)
                 # but record the attempt — the audit row is the
                 # paper trail.
                 from email_triage.web.db import record_hipaa_access_event
+                from email_triage.web._audit import safe_audit_write
                 _log.info(
                     "style_knobs_hipaa_allow tick refused — actor != owner",
                     account_id=account_id,
                     actor_user_id=user["id"],
                     owner_user_id=acct["user_id"],
                 )
-                try:
-                    record_hipaa_access_event(
+                # census run17 #3 — route through safe_audit_write so an emit
+                # failure reaches /health's audit-failure drift counter (was a
+                # swallowing `except Exception` that only warned ad-hoc).
+                safe_audit_write(
+                    lambda: record_hipaa_access_event(
                         db,
                         actor_user_id=user["id"],
                         account_id=account_id,
                         operation="style_knobs_hipaa_allow_set",
                         outcome="refused_non_owner",
                         detail="actor != owner; owner-only opt-in",
-                    )
-                except Exception as audit_err:
-                    _log.warning(
-                        "style_knobs_hipaa_allow refused-audit failed",
-                        account_id=account_id,
-                        error=fmt_exc(audit_err),
-                    )
+                    ),
+                    description=(
+                        "style_knobs_hipaa_allow_set refused_non_owner "
+                        f"account_id={account_id}"
+                    ),
+                )
 
     await db_call(_m1m2_optin_db_work)
+
+    # is_active lifecycle transition (Loop-5 census). An account going
+    # active→inactive must TEAR DOWN live ingestion (cancel IDLE/poll
+    # tasks + leave push registrations dormant behind the actuator gates),
+    # and inactive→active must RESTART it. This is a DIFFERENT shape from
+    # the config-change bounce below (which stops-then-unconditionally-
+    # starts): a deactivation must NOT restart. So we route the is_active
+    # edge through the dedicated funnel FIRST, and only fall through to
+    # the config-change bounce when the account is (and stays) active —
+    # never double-acting. ``acct`` here is the pre-update row from the
+    # OwnedAccount dep, so ``acct["is_active"]`` is the OLD value.
+    old_is_active = bool(acct.get("is_active", True))
+    is_active_changed = old_is_active != bool(is_active)
+    if watcher_mgr is not None and is_active_changed:
+        try:
+            await watcher_mgr.apply_account_active_state(
+                account_id, bool(is_active),
+            )
+            _log.info(
+                "Account active-state applied after edit",
+                account_id=account_id, active=bool(is_active),
+            )
+        except Exception as e:
+            _log.warning(
+                "apply_account_active_state failed",
+                account_id=account_id, active=bool(is_active),
+                error=fmt_exc(e),
+            )
 
     # Watcher bounce: if either the push/poll flags, the poll cadence,
     # or (for IMAP) the mailbox list changed, tear down and re-start
     # so the change takes effect without a service restart. This is
     # the same pattern #9 established for mailbox changes, now
     # generalised to the three new ingestion knobs.
-    if watcher_mgr is not None:
+    #
+    # Skip the bounce when the is_active edge already handled this save:
+    #   * active→inactive — the funnel just stopped everything; a bounce
+    #     would stop-then-start (start is refused by the is_active gate,
+    #     but it's wasteful + confusing).
+    #   * inactive→active — the funnel just (re)started per the config;
+    #     re-bouncing immediately would needlessly cancel + restart.
+    # When is_active is unchanged-and-active, a config-flag change still
+    # bounces normally. When unchanged-and-inactive, the account isn't
+    # running anyway and the funnel didn't fire — the bounce's own start
+    # is refused by the is_active gate, so it's a harmless no-op; we let
+    # the existing predicate run unchanged for that case.
+    if watcher_mgr is not None and not is_active_changed:
         bounce = False
         reason = ""
         old_cfg = existing_config or {}
@@ -1767,7 +2088,7 @@ async def accounts_delegate_add(
     """
     db = get_db(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
     from email_triage.web.db import (
         get_email_account, add_account_delegate, list_account_delegates,
     )
@@ -1776,13 +2097,14 @@ async def accounts_delegate_add(
     if acct is None:
         return HTMLResponse("Not found", status_code=404)
     # Owner-or-admin only — delegates can't grant further delegation.
-    if acct["user_id"] != user["id"] and not is_admin:
+    # (2026-06-11: routed through the can_administer_account SSOT.)
+    if not can_administer_account(db, user, acct):
         return HTMLResponse("Forbidden", status_code=403)
     form = await request.form()
     # Hybrid grant UX: admin dropdown posts user_id; owner free-text
     # posts user_email. Honour either.
     target_user_id = (form.get("user_id") or "").strip()
-    target_email = (form.get("user_email") or "").strip().lower()
+    target_email = canonical_email(form.get("user_email") or "")
     if not target_email and not target_user_id:
         return HTMLResponse("missing user_id or user_email",
                             status_code=400)
@@ -1842,7 +2164,7 @@ async def accounts_delegate_add(
             return {
                 "acct": acct,
                 "delegates": list_account_delegates(db, account_id),
-                "error": fmt_exc(e),
+                "error": scrub_exc(e, purpose="misc"),  # N-179 R21_2
                 "is_admin": is_admin,
                 "user": user,
                 "grantable_users": _grantable(),
@@ -1877,7 +2199,7 @@ async def accounts_delegate_remove(
     """Revoke a delegate. Owner-or-admin only."""
     db = get_db(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
     from email_triage.web.db import (
         get_email_account, remove_account_delegate, list_account_delegates,
     )
@@ -1885,7 +2207,9 @@ async def accounts_delegate_remove(
     acct = await db_call(get_email_account, db, account_id)
     if acct is None:
         return HTMLResponse("Not found", status_code=404)
-    if acct["user_id"] != user["id"] and not is_admin:
+    # Owner-or-admin only — delegates can't revoke delegation.
+    # (2026-06-11: routed through the can_administer_account SSOT.)
+    if not can_administer_account(db, user, acct):
         return HTMLResponse("Forbidden", status_code=403)
     #  — fold the @db_write remove_account_delegate helper plus the
     # post-write delegate-list + grantable-users re-render reads into a
@@ -1931,7 +2255,7 @@ async def accounts_alias_add(
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
     from email_triage.web.db import (
         AliasValidationError,
         account_email,
@@ -1941,7 +2265,7 @@ async def accounts_alias_add(
     )
 
     form = await request.form()
-    new_address = (form.get("address") or "").strip().lower()
+    new_address = canonical_email(form.get("address") or "")
     new_label = (form.get("label") or "").strip()
 
     existing = list(acct.get("aliases") or [])
@@ -1985,18 +2309,26 @@ async def accounts_alias_remove(
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin")
     from email_triage.web.db import (
         get_email_account,
         update_email_account_aliases,
     )
 
     form = await request.form()
-    target = (form.get("address") or "").strip().lower()
+    target = canonical_email(form.get("address") or "")
     existing = list(acct.get("aliases") or [])
+    # Census wf_56d1585d 2026-07-09  — §164.312(a)(1) actuator fix:
+    # BOTH sides of the compare must go through `canonical_email` so an
+    # IDN alias (`Name <a@münchen.de>`) or a display-wrapped alias
+    # (`John <john@x.com>`) matches its stored form. Previously the
+    # target used `canonical_email` but the stored side used
+    # `.strip().lower()` — the two normalisations diverge on IDN /
+    # display-wrapped aliases and revoke silently no-op'd (fail-
+    # forward-OPEN on a HIPAA-scoped permission op).
     kept = [
         e for e in existing
-        if str((e or {}).get("address") or "").strip().lower() != target
+        if canonical_email(str((e or {}).get("address") or "")) != target
     ]
     if len(kept) != len(existing):
         def _alias_remove_snapshot(db, account_id, kept):
@@ -2020,30 +2352,100 @@ async def accounts_delete(
     request: Request, account_id: int, user: RequireUserFragment,
 ):
     db = get_db(request)
-    is_admin = user["role"] == "admin"
 
-    from email_triage.web.db import get_email_account, delete_email_account
+    from email_triage.web.db import get_email_account
 
-    def _accounts_delete_snapshot(db, account_id, user_id, is_admin):
-        """ phase 2 — fetch + auth check + delete in one hop. Returns
-        ('ok' | 'not_found' | 'forbidden')."""
+    def _accounts_delete_snapshot(db, account_id):
+        """ phase 2 — fetch + auth check ONLY in one hop.
+
+        Returns ('ok', acct) | ('not_found', None) | ('forbidden', None).
+        The actual DELETE is done AFTER the watcher/purge funnel in the
+        async caller so that watcher teardown + secrets purge happen
+        before the row is gone (the purge funnel reads the account for
+        the watch preference; it also needs the id to build secret keys).
+
+        Account deletion is owner-or-admin only — a delegate must NOT be
+        able to destroy the account (2026-06-11: routed through the
+        can_administer_account SSOT; ``user`` is captured from the route).
+        """
         acct = get_email_account(db, account_id)
         if acct is None:
-            return "not_found"
-        if acct["user_id"] != user_id and not is_admin:
-            return "forbidden"
-        delete_email_account(db, account_id)
-        return "ok"
+            return "not_found", None
+        if not can_administer_account(db, user, acct):
+            return "forbidden", None
+        return "ok", acct
 
-    status = await db_call(
-        _accounts_delete_snapshot, db, account_id, user["id"], is_admin,
+    status, _acct = await db_call(
+        _accounts_delete_snapshot, db, account_id,
     )
     if status == "not_found":
         return HTMLResponse("Not found", status_code=404)
     if status == "forbidden":
         return HTMLResponse("Forbidden", status_code=403)
 
-    return HTMLResponse("")  # Remove the row from DOM
+    # L1 + L2 — tear down the live watcher + PURGE settings/secrets BEFORE the
+    # row delete (apply_account_deleted: best-effort watcher stop + the
+    # §164.310(d)(2)(i) credential purge; clears the watch:{id} preference).
+    # Fail CLOSED: if the purge raises, do NOT delete the row — that would
+    # orphan the credentials in secrets_store (the very defect this fixes); the
+    # operator retries. Watcher-stop is best-effort inside the funnel, so only
+    # a real purge failure trips this gate.
+    from email_triage.db.accounts import purge_account_local_state
+    watcher_mgr = getattr(request.app.state, "watcher_manager", None)
+    try:
+        if watcher_mgr is not None:
+            await watcher_mgr.apply_account_deleted(
+                account_id, actor_user_id=user["id"],
+            )
+        else:
+            # No watcher manager (test / lifespan-off) — run the purge directly.
+            secrets = getattr(request.app.state, "secrets", None)
+            await db_call(purge_account_local_state, db, account_id, secrets)
+    except Exception as _e:
+        _log.error(
+            "accounts_delete: local-state purge FAILED — aborting delete to "
+            "avoid orphaning stored credentials",
+            account_id=account_id,
+            error=fmt_exc(_e),
+        )
+        return HTMLResponse(
+            "Delete failed: stored credentials could not be purged. The "
+            "account was NOT deleted — please retry.",
+            status_code=500,
+        )
+
+    # Soft-deactivate, NEVER hard-delete (operator ruling 2026-06-20, N-108): a
+    # DELETE FROM email_accounts cascade-deletes the account's hipaa_access_events
+    # (account_id ON DELETE CASCADE) — the SAME §164.312(b)/(c)(1) audit
+    # destruction the  ruling forbade for users. Credentials are purged above
+    # (§164.310(d)(2)(i) disposal); the row + ALL audit history are RETAINED.
+    from email_triage.db.accounts import set_account_active
+    await db_call(set_account_active, db, account_id, False)
+
+    # Re-render the row in its deactivated state (the admin keeps managing it,
+    # like a disabled user — it does not vanish).
+    templates = get_templates(request)
+    secrets = getattr(request.app.state, "secrets", None)
+    watcher_mgr = getattr(request.app.state, "watcher_manager", None)
+    is_admin = _is_admin(user)  # N-222g R22 (was: user["role"] == "admin") — RequireUserFragment is never None
+
+    def _deactivated_row_snapshot() -> dict | None:
+        a = get_email_account(db, account_id)
+        if a is None:  # narrow post-commit race — never under the no-hard-delete invariant
+            return None
+        _enrich_account(a, secrets)
+        _enrich_account_chips(
+            a, db, secrets, watcher_mgr=watcher_mgr,
+            config=request.app.state.config,
+        )
+        return a
+
+    acct2 = await db_call(_deactivated_row_snapshot)
+    if acct2 is None:
+        return HTMLResponse("")  # row already gone — blank it (no 500)
+    return await _render(templates, request, "accounts/_row.html", {
+        "acct": acct2, "user": user, "is_admin": is_admin,
+    })
 
 
 @router.post("/accounts/{account_id}/test", response_class=HTMLResponse)
@@ -2053,9 +2455,18 @@ async def accounts_test(
     """Test an account's connection using its saved config + secrets."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, secrets = owned
-    is_admin = user["role"] == "admin"
 
     ok, msg = await _test_account_connection(acct, secrets)
+
+    if ok:
+        # A successful connection test proves the credential is alive → clear
+        # any prior auth_stale chip. The Test action was one of the two sites
+        # the canary explicitly named as a missing clear (the other was the
+        # push consumer). Census 2026-06-09 #1. (Test FAILURE is shown to the
+        # operator directly, so it does not need to set the chip — the
+        # continuous poll/push paths own the SET edge.)
+        from email_triage.web.app import record_provider_outcome
+        await db_call(record_provider_outcome, db, acct, None)
 
     # 23b nudge: when Test succeeds but real-time watch is off, point the
     # user at the Start button so they don't have to hunt for it. Gmail
@@ -2128,7 +2539,6 @@ async def accounts_folders(
     """List available folders/labels for an account (JSON fragment or HTML)."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, _, secrets = owned
-    is_admin = user["role"] == "admin"
 
     try:
         provider = _create_provider_from_account(acct, secrets)
@@ -2138,7 +2548,7 @@ async def accounts_folders(
         folders = []
     except Exception as e:
         return HTMLResponse(
-            f'<small style="color:var(--pico-del-color);">Error listing folders: {e}</small>'
+            error_chip(e, prefix='Error listing folders: ')
         )
 
     # Return as JSON if requested via Accept header, else HTML options.
@@ -2147,11 +2557,16 @@ async def accounts_folders(
         from fastapi.responses import JSONResponse
         return JSONResponse({"folders": folders})
 
-    # Return as <option> elements for a <select>.
-    html = "\n".join(
-        f'<option value="{f}">{f}</option>' for f in folders
+    # Return as <option> elements for a <select>. A8 (SME DA): escape the
+    # IMAP folder name — a hostile/compromised mail server can return a
+    # folder named ``"><script>…`` that would break out of the option and
+    # execute in the operator's authenticated, PHI-bearing admin session.
+    import html as _html
+    options_html = "\n".join(
+        f'<option value="{_html.escape(f)}">{_html.escape(f)}</option>'
+        for f in folders
     )
-    return HTMLResponse(html)
+    return HTMLResponse(options_html)
 
 
 @router.post("/accounts/{account_id}/folders/create", response_class=HTMLResponse)
@@ -2161,7 +2576,6 @@ async def accounts_folder_create(
     """Create a new folder on the account's mail server."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, _, secrets = owned
-    is_admin = user["role"] == "admin"
 
     form = await request.form()
     folder_name = form.get("folder", "").strip()
@@ -2190,8 +2604,21 @@ async def accounts_folder_create(
         )
     except Exception as e:
         return HTMLResponse(
-            f'<small style="color:var(--pico-del-color);">Error: {e}</small>'
+            error_chip(e, prefix='Error: ')
         )
+
+    # N-277 R29: fresh folder just landed → invalidate the 5-min-TTL
+    # provider-labels cache so the response's "Available in the move-
+    # folder picker now" line is TRUTHFUL. Without this, the picker
+    # served stale (pre-create) labels for up to 5 min — the LIVE UX
+    # defect the R29 census flagged.
+    try:
+        from email_triage.providers.provider_labels import (
+            invalidate_cache_for_account,
+        )
+        invalidate_cache_for_account(int(account_id))
+    except Exception:
+        pass
 
     # Emit a hidden marker (#et-new-folder data-name="<full_path>")
     # so the routes-table JS can append a new option to every per-row
@@ -2224,7 +2651,6 @@ async def accounts_folder_prefs_page(
         return owned
     user, acct, db, secrets = owned
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
 
     from email_triage.web.db import get_folder_prefs
 
@@ -2236,7 +2662,18 @@ async def accounts_folder_prefs_page(
         all_folders = await provider.list_folders()
         await provider.close()
     except Exception as e:
-        error = f"Could not list folders: {e}"
+        #  tail — provider errors from IMAP/OAuth may echo secret
+        # fragments (OAuth WWW-Authenticate: Bearer error_description
+        # can leak client-secret fragments + tokens per HIPAA-SME
+        # N-179). DB-SME F1 on 2026-07-11 batched panel: use
+        # ``purpose='provider'`` (SENSITIVE — takes the fail-closed
+        # generic-message branch of scrub_exc). The raw exception is
+        # already captured privileged-side via the log below.
+        _log.warning(
+            "list_folders failed",
+            extra={"error": str(e), "account_id": account_id},
+        )
+        error = f"Could not list folders: {scrub_exc(e, purpose='provider')}"
 
     #  phase 2 — folder-prefs read off the loop.
     prefs = await db_call(get_folder_prefs, db, account_id)
@@ -2263,7 +2700,6 @@ async def accounts_folder_prefs_save(
     """Save folder include/exclude preferences."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
-    is_admin = user["role"] == "admin"
 
     from email_triage.web.db import save_folder_prefs
 

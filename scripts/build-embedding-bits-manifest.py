@@ -252,6 +252,33 @@ def regenerate(
         total_files += 1
         total_bytes += size
 
+    # Arch-specific wheels.
+    # Each arch's binary wheels (torch / tokenizers / …) are refreshed the
+    # same way as the neutral ``wheels`` list. Cached under a per-arch
+    # subdir so the same-named-but-different-arch wheels don't collide in
+    # the download cache. A connected (any-arch) machine can fill BOTH
+    # arches — fetching an aarch64 wheel only downloads bytes, it doesn't
+    # run them.
+    for arch, entries in (manifest.get("wheels_by_arch") or {}).items():
+        print(f"\nWheels[{arch}] ({len(entries)} entries):", file=sys.stderr)
+        for entry in entries:
+            label = f"{entry['name']}=={entry['version']} [{arch}]"
+            url = _resolve_wheel_url(entry)
+            sha, size = _process_file(
+                cache_dir=cache_dir / arch,
+                url=url,
+                filename=entry["filename"],
+                expected_sha256=entry.get("sha256"),
+                label=label,
+            )
+            if entry.get("sha256") != sha or entry.get("size_bytes") != size:
+                updated += 1
+            entry["sha256"] = sha
+            entry["size_bytes"] = size
+            entry["url"] = url
+            total_files += 1
+            total_bytes += size
+
     # Models (nested files-within-model shape)
     print(f"\nModels ({len(manifest.get('models', []))} entries):",
           file=sys.stderr)

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user. The consolidated "Security" tab of My
+                Settings — account-security actions (sign out all
+                sessions), passkeys, and API access
+                tokens, gathered in one place.
+   TECH-SKILL:  computer-literate professional. Not terminal users.
+   COPY RULES:  plain English; no admin-only paths; no protocol
+                jargon (see feedback_no_admin_path_in_user_copy.md,
+                feedback_audience_per_page.md).
+   WHY one page: these three surfaces are all "who/what can get into
+                my account" controls. They used to be scattered — a
+                page-header sign-out button shown on every tab, plus
+                standalone Passkeys + API Keys tabs. Consolidated
+                2026-06-07 so account security lives in one obvious
+                place.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}My Settings - Security - Email Triage{% endblock %}
+{% block content %}
+
+<h2>My Settings</h2>
+
+{% set active = "security" %}
+{% include "_settings_tabs.html" %}
+
+{# ── Account security: sign out everywhere ─────────────────────
+   Standalone form — POSTs to its own action, deliberately NOT nested
+   in any other form. #}
+<section id="account-security">
+<h3>Account security</h3>
+<form method="post" action="/profile/sign-out-all"
+      style="margin-bottom:0.5rem;"
+      onsubmit="return confirm('Sign out of every device, including this one? You will be returned to the login page.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="secondary outline" style="width:auto;">
+        Sign out all sessions
+    </button>
+</form>
+<small style="color:var(--pico-muted-color);">
+    Revokes every active session for your account — including this
+    one. Use it if you suspect a device or a copied session is
+    compromised; ordinary log-out only clears the current device.
+</small>
+</section>
+
+{# ── Passkeys ───────────────────────────────────────────────────────
+   Section vars scoped here so its `keys` doesn't collide with the
+   API Keys section below. #}
+{% with keys=hw_keys, visible_owners=hw_visible_owners, owner_filter=hw_owner_filter, is_admin=is_admin %}
+    {% include "profile/_hardware_keys_section.html" %}
+{% endwith %}
+
+{# ── API access tokens ──────────────────────────────────────────── #}
+{% with keys=api_keys, all_users=api_all_users, new_key_open=False, is_admin=is_admin %}
+    {% include "accounts/_api_keys_section.html" %}
+{% endwith %}
+
+<p style="margin-top:2rem;">
+    <a href="/dashboard" role="button" class="outline">&larr; Dashboard</a>
+</p>
+
+{% endblock %}

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# commit-msg — reject defer-language in commit messages.
+#
+# Part of defer_gate v3 (2026-07-15) per design_defer_gate_v3_prose_and_commit_
+# scan_2026-07-15. Enforces feedback_dont_over_defer on the commit-message
+# surface (v1/v2 defer_gate did not cover this — Alex's known-gap #4).
+#
+# INSTALL (one-shot per clone):
+#     git config core.hooksPath scripts/git-hooks
+#
+# BYPASS: include a `Defer-Approval-Proof: <base64>` trailer in the message
+# (server-side defer_gate.py::check_range verifies the trailer signature). To
+# produce the trailer:
+#     pwsh ~/.the AI assistant/hooks/op-approve.ps1 defer-file $(git rev-parse --short HEAD)
+#
+# EMERGENCY BYPASS (operator only): `--no-verify` on git commit; auditable.
+#
+# Fail-OPEN on infrastructure error (missing python, missing _defer_phrases.py)
+# with a stderr warning. A broken commit-msg hook must not wedge every commit;
+# matches defer_gate.py posture.
+
+set -u
+MSG_FILE="${1:-}"
+
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+    exit 0
+fi
+
+# Locate _defer_phrases.py: hook lives in scripts/git-hooks/, phrases live in
+# scripts/hooks/ — both under the repo root git executes from.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+PHRASES_DIR="$REPO_ROOT/scripts/hooks"
+
+if [ ! -f "$PHRASES_DIR/_defer_phrases.py" ]; then
+    echo "[commit-msg] WARNING: _defer_phrases.py not found at $PHRASES_DIR — allowing (fail-OPEN)" >&2
+    exit 0
+fi
+
+PY="$(command -v python3 || command -v python || echo python)"
+if ! "$PY" -c "import sys" >/dev/null 2>&1; then
+    echo "[commit-msg] WARNING: python not runnable — allowing (fail-OPEN)" >&2
+    exit 0
+fi
+
+"$PY" - "$MSG_FILE" "$PHRASES_DIR" <<'PY'
+import sys, os
+
+msg_path = sys.argv[1]
+phrases_dir = sys.argv[2]
+sys.path.insert(0, phrases_dir)
+
+try:
+    from _defer_phrases import find_defer_phrases
+except Exception as e:
+    sys.stderr.write(f"[commit-msg] WARNING: could not import _defer_phrases ({e!r}) — allowing\n")
+    sys.exit(0)
+
+try:
+    with open(msg_path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+except Exception as e:
+    sys.stderr.write(f"[commit-msg] WARNING: could not read message ({e!r}) — allowing\n")
+    sys.exit(0)
+
+# Strip git-comment lines (prefixed with '#') per git convention.
+scan = "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("#"))
+
+# Bypass — server-side verifies the trailer signature.
+if "Defer-Approval-Proof:" in scan:
+    sys.exit(0)
+
+hits = find_defer_phrases(scan)
+if not hits:
+    sys.exit(0)
+
+seen = []
+for h in hits:
+    if h not in seen:
+        seen.append(h)
+    if len(seen) >= 5:
+        break
+
+# v3.1: log refuse events for the learner (fail-open).
+try:
+    from _defer_phrases import write_event
+    for h in seen:
+        write_event(h, scan, tool="git-commit-msg", path=msg_path,
+                    sha="", surface="commit-msg")
+except Exception:
+    pass
+
+sys.stderr.write("\n")
+sys.stderr.write("commit-msg gate: DEFER-LANGUAGE detected in commit message.\n")
+sys.stderr.write("Per feedback_dont_over_defer + defer_gate v3, the intended default is\n")
+sys.stderr.write("to DO the work now rather than document a defer in the message.\n\n")
+sys.stderr.write("Phrases detected:\n")
+for h in seen:
+    sys.stderr.write(f"  - {h!r}\n")
+sys.stderr.write("\nTwo ways forward:\n")
+sys.stderr.write("  (a) DO the work now (preferred) — remove the defer prose + finish it.\n")
+sys.stderr.write("  (b) Sign a defer-file nonce and add a Defer-Approval-Proof: trailer:\n")
+sys.stderr.write("        pwsh ~/.the AI assistant/hooks/op-approve.ps1 defer-file $(git rev-parse --short HEAD)\n")
+sys.stderr.write("      then re-write the commit message including the returned trailer line.\n")
+sys.exit(1)
+PY

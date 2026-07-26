@@ -12,7 +12,7 @@ description: >
 
 # email-triage — mail + calendar + triage
 
-Thin HTTP wrapper around the email-triage `/api/openclaw/*` surface
+Thin HTTP wrapper around the email-triage `/api/v1/*` surface
 (27 subcommands: 24 server-facing + 3 local file-ops -- `register-me`,
 `forget-me`, `list-aliases`). Every server-facing action goes through
 email-triage which owns credentials, HIPAA gating, rate limits, and
@@ -342,6 +342,15 @@ respond) print `ok: <what happened>`.
 
 Use `register-me` only when the user explicitly hands you a fresh
 `et_...` token from the email-triage web UI and asks you to save it.
+
+**Backend-aware:** when the install uses a secret backend (a credential
+helper is configured), `register-me` stores the token in that backend
+instead of plaintext — or, if only the read helper is set, it **refuses**
+and tells the operator to store the token in their backend directly. That
+refusal is expected, not an error to retry; relay its message verbatim. The
+token is sourced on demand from the backend on every call, so once stored
+there nothing more is needed. Plaintext `users.json` still works but emits a
+deprecation warning. See `internal documentation`.
 
 ## Defaults you should respect
 

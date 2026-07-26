@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from email_triage.ai_backends.base import BackendAdapter
+from email_triage.ai_backends.base import BackendAdapter, meter_chat_complete
 
 
 # Default install-wide Ollama configuration when load_backend(None, ...)
@@ -56,21 +56,40 @@ class OllamaAdapter(BackendAdapter):
         model: str | None = None,
         api_key: str | None = None,  # noqa: ARG002 — accepted for uniform loader signature
         local_url_suffixes: list[str] | None = None,
+        backup_models: list[str] | None = None,
         **_: Any,
     ) -> None:
         # Lazy import keeps the classify package out of the import
         # graph for callers that only need other adapter types.
         from email_triage.classify.ollama import OllamaClassifier
 
+        #  — thread the per-account / install backup-model list into the
+        # wrapped classifier so the style-learning complete() path gets the
+        # SAME bounded capability/resource failover as classify (same endpoint,
+        # no BAA boundary crossed). Empty = no failover (today's behaviour).
+        # N-378 (2026-07-08): this adapter is a thin wrapper on the
+        # ``load_backend`` path — it takes its kwargs from a loader signature
+        # (endpoint / model / api_key / local_url_suffixes / backup_models)
+        # and does NOT read from ``config.classifier``. The `ollama_think`
+        # + `ollama_no_think_marker` config knobs therefore stay at the
+        # OllamaClassifier defaults (None / False) on this path, which
+        # matches the pre-N-378 posture (no `think` sent). If a future
+        # migration routes this adapter through the classifier config
+        # surface, thread both kwargs here — the N-378 pin
+        # (`tests/test_n378_ollama_think_knob_ssot.py`) only fires on
+        # sites that already read `config.classifier.*` so it will not
+        # catch this trap at that time; add a same-hunk pin update.
         self._client = OllamaClassifier(
             model=model or DEFAULT_OLLAMA_MODEL,
             base_url=endpoint or DEFAULT_OLLAMA_BASE_URL,
             local_url_suffixes=list(local_url_suffixes or ()),
+            backup_models=list(backup_models or ()),
         )
         # is_local mirrors the wrapped classifier so the BAA gate sees
         # the same answer regardless of which surface it inspects.
         self.is_local = self._client.is_local
 
+    @meter_chat_complete  # N-194b R21_9: et_llm_chat_seconds metric
     async def chat_complete(
         self,
         messages: list[dict[str, str]],

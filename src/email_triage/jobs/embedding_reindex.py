@@ -52,9 +52,11 @@ import logging
 import math
 import sqlite3
 import struct
-from datetime import datetime, timezone
 from typing import Any
 
+from email_triage.db._helpers import dump_json_col, load_json_col  # N-205 R22: dump_json_col added for json-col SSOT
+from email_triage._int_utils import bounded_int, parse_int_or_none  # N-219c R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.embedding_bits import is_runtime_ready
 from email_triage.web.db import (
     bump_triage_job_counters,
@@ -64,14 +66,29 @@ from email_triage.web.db import (
     get_triage_job,
 )
 
-log = logging.getLogger("email_triage.jobs.embedding_reindex")
+log = get_logger("email_triage.jobs.embedding_reindex")  # N-196b R21_4
 
 BATCH_SIZE = 100
-# Yield to the event loop between batches so a long-running reindex
-# doesn't starve other tasks (the embed backend's asyncio.to_thread
-# already yields per-embed, but the row-loop is otherwise CPU-bound
-# under the GIL).
-INTER_BATCH_SLEEP_SECS = 0.0
+# Yield to the event loop AND to the single-writer lock between batches.
+# Beyond not starving the event loop (the embed backend's asyncio.to_thread
+# already yields per-embed), the >0 sleep is a WRITE-LOCK FAIRNESS yield: a
+# multi-account reindex is a sustained heavy-write workload, and on the
+# SQLCipher-encrypted DB each batched UPDATE+commit carries ~2× the per-page
+# encrypt+fsync cost of plaintext (and ~2× again for 768-dim e5 vectors vs
+# 384-dim MiniLM). The 2026-05-31 SQLCipher lock-storm (WAL contention that
+# forced audit-handler flush_interval=1) is a known live failure mode on this
+# box; a small inter-batch yield lets concurrent live-triage audit writers
+# acquire the write lock between heavy reindex lock-holds. ( design §
+# "write-lock availability"; §164.308(a)(7) Contingency.) Was 0.0.
+INTER_BATCH_SLEEP_SECS = 0.05
+
+#  reliability gate: a reindex of PHI-derived vectors that errors on a
+# LARGE fraction of attempted rows must NOT finish 'done' — that would let a
+# half-embedded corpus pass as success with no operator alarm (the read path
+# silently returns degraded recall). Above this error fraction (errors /
+# (processed+errors)) the job finishes 'failed' so the operator re-enqueues.
+# The pre-existing all-errored-none-succeeded case is the degenerate 1.0.
+HIGH_ERROR_FAIL_FRACTION = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +103,8 @@ def _pack_vec(vec: list[float]) -> bytes:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    from email_triage._isotime import now_utc_iso
+    return now_utc_iso()
 
 
 # ---------------------------------------------------------------------------
@@ -97,31 +115,43 @@ def enqueue_embedding_reindex(
     conn: sqlite3.Connection,
     account_id: int,
     actor_user_id: int | None,
+    *,
+    target: dict | None = None,
 ) -> str:
     """Insert a queued ``embedding_reindex`` triage_jobs row.
 
-    Returns the job_id. The query column carries a JSON descriptor of
-    the target backend at enqueue time so a worker that restarts on
-    a later container generation still knows which backend to reembed
-    against (otherwise a config swap between enqueue + run would
-    silently re-embed against the new-NEW backend).
+    Returns the job_id.
 
-    Audit + admin gating live in the route handler — this function
-    is a pure queue-write helper. Callers MUST confirm the actor is
-    admin before calling.
+     (N-91a fix, 2026-06-13): ``target`` pins the intended embedding target
+    — ``{"backend_type": ..., "model": ...}`` — into the job payload. This lets
+    a later model change SUPERSEDE an in-flight job whose pinned target is now
+    stale (see :func:`supersede_or_enqueue_reindex`), instead of the old dedupe
+    which merely *skipped* an account with an in-flight job and so left it
+    stranded at the start-time stamp when the model changed mid-run. Prefer
+    :func:`supersede_or_enqueue_reindex` over calling this directly so the
+    supersede/dedupe decision is made in one place.
+
+    The worker still embeds against the LIVE ``app.state.embedding_model`` at
+    run time; the pin is used for the supersede DECISION, and the worker's
+    per-batch cancel-check stops a superseded job at the next batch boundary.
+
+    Audit + admin gating live in the route handler — this is a pure queue-write
+    helper. Callers MUST confirm the actor is admin before calling.
     """
-    payload = {
+    payload: dict = {
         "account_id": int(account_id),
-        # Target-backend hint is informational — the worker re-reads
-        # app.state.embedding_backend at run time so a hot-reload
-        # path (future) would still use the live config.
         "enqueued_at": _now_iso(),
     }
+    if target:
+        payload["target"] = {
+            "backend_type": str(target.get("backend_type") or ""),
+            "model": str(target.get("model") or ""),
+        }
     return create_triage_job(
         conn,
         account_id=int(account_id),
         actor_user_id=actor_user_id,
-        query=json.dumps(payload),
+        query=dump_json_col(payload),  # N-205 R22: route through json-col SSOT
         # Reindex is CPU-bound on the embed backend; tune defaults
         # conservatively. The bulk-runner-supervised rate limit /
         # concurrency aren't really meaningful for reindex (one
@@ -132,6 +162,179 @@ def enqueue_embedding_reindex(
         concurrency=1,
         kind="embedding_reindex",
     )
+
+
+def _job_pinned_target(job_row: dict) -> dict:
+    """Extract the pinned ``{backend_type, model}`` from a reindex job's
+    payload (the ``query`` JSON column). Returns ``{}`` for a legacy/unpinned
+    job or an unparseable payload — an unknown target is treated as STALE by
+    the supersede logic (we can't prove it's current)."""
+    # load_json_col SSOT (census #16b): the ``query`` JSON column degrades to
+    # {} on a legacy/unpinned/corrupt/wrong-shape payload (an unknown target is
+    # treated as STALE), replacing the prior json.loads + ValueError/TypeError
+    # guard — the dict accessors below are isinstance-guarded and never raise.
+    payload = load_json_col(
+        job_row.get("query"), default={}, label="triage_jobs.query",
+    )
+    t = payload.get("target")
+    if isinstance(t, dict):
+        return {
+            "backend_type": str(t.get("backend_type") or ""),
+            "model": str(t.get("model") or ""),
+        }
+    return {}
+
+
+def supersede_or_enqueue_reindex(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int,
+    actor_user_id: int | None,
+    target: dict,
+) -> str:
+    """SSOT for enqueueing a reindex. Enqueue a job for ``account_id``
+    pinned to ``target``, handling an in-flight job per its PHASE:
+
+      * no in-flight job                  -> enqueue            (``"enqueued"``)
+      * in-flight QUEUED job              -> skip               (``"skipped"``)
+        — it hasn't read the live model yet, so it self-corrects to the latest
+        target when it starts (this is the old D-A3 idempotency, preserved)
+      * in-flight RUNNING job already at
+        the new target                    -> skip               (``"skipped"``)
+      * in-flight RUNNING job at a
+        DIFFERENT / unknown (legacy)
+        target                            -> cancel it + enqueue a fresh pinned
+                                             job                 (``"superseded"``)
+
+    The RUNNING-supersede is the N-91a fix. The worker reads
+    ``app.state.embedding_model`` ONCE at job start, so a job that is already
+    RUNNING when the model changes would otherwise finish against — and leave
+    the account stranded at — the OLD stamp, with nothing to re-trigger it.
+    Cancelling it makes the worker's per-batch cancel-check stop it at the next
+    batch boundary; the fresh job re-embeds against the new target. A QUEUED job
+    needs no supersede (it reads the live model when it starts). Both the
+    model-change fan-out (admin) and the manual single-account reindex route
+    through here, so the decision lives in ONE place.
+    """
+    from email_triage.web.db import request_triage_job_cancel
+    existing = conn.execute(
+        "SELECT job_id, query, status FROM triage_jobs "
+        "WHERE account_id = ? AND kind = 'embedding_reindex' "
+        "AND status IN ('queued', 'running') "
+        "ORDER BY created_at DESC LIMIT 1",
+        (int(account_id),),
+    ).fetchone()
+    if existing is not None:
+        if existing["status"] == "queued":
+            # Not started yet -> it self-corrects to the live model on start.
+            return "skipped"
+        # RUNNING: it read the live model at start; it may be stranded now.
+        pinned = _job_pinned_target(dict(existing))
+        # SAME only when the running job has a KNOWN model that matches the new
+        # target; a legacy/unpinned running job (no model) is treated as stale.
+        same_target = bool(pinned.get("model")) and not needs_reindex(
+            current_backend=pinned, target_backend=target,
+        )
+        if same_target:
+            return "skipped"
+        request_triage_job_cancel(conn, existing["job_id"])
+        enqueue_embedding_reindex(conn, account_id, actor_user_id, target=target)
+        return "superseded"
+    enqueue_embedding_reindex(conn, account_id, actor_user_id, target=target)
+    return "enqueued"
+
+
+#: Job statuses that mean "no longer making progress".
+_TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
+
+
+def aggregate_reindex_progress(
+    conn: sqlite3.Connection,
+    *,
+    account_ids,
+) -> dict:
+    """Roll up the embedding-reindex WAVE across accounts.
+
+    A model change enqueues one ``embedding_reindex`` job per active account;
+    the per-job page shows each in isolation, but there was no single "X of Y
+    accounts reindexed / NN% of all messages" view. This computes it, scoped to
+    ``account_ids`` (the caller's manageable set — never cross-user).
+
+    "The wave" = the current burst: if any reindex job in scope is non-terminal,
+    the wave is every reindex job created at-or-after the OLDEST still-active
+    job's ``created_at`` (so the already-finished siblings from the same enqueue
+    burst count toward "done", but a previous, fully-finished wave does not). If
+    NOTHING is active, returns ``{"active": False, ...}`` so the UI fragment can
+    render empty and stop polling.
+
+    Per-account dedupe keeps the NEWEST job (a re-enqueue supersedes). Returns a
+    plain dict (JSON/template-friendly): ``active``, ``accounts``, ``done``,
+    ``processed``, ``total``, ``pct`` (0-100 int), ``status_counts``, and
+    ``rows`` (one ``{account_id, status, processed, total, pct}`` per account,
+    sorted by account_id).
+    """
+    empty = {
+        "active": False, "accounts": 0, "done": 0, "processed": 0,
+        "total": 0, "pct": 0, "status_counts": {}, "rows": [],
+    }
+    ids = [int(a) for a in (account_ids or [])]
+    if not ids:
+        return empty
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT account_id, status, total_processed, cursor, created_at "
+        f"FROM triage_jobs WHERE kind = 'embedding_reindex' "
+        f"AND account_id IN ({placeholders}) "
+        f"ORDER BY created_at DESC LIMIT 500",
+        ids,
+    ).fetchall()
+    jobs = [dict(r) for r in rows]
+    active = [j for j in jobs if (j.get("status") or "") not in _TERMINAL_STATUSES]
+    if not active:
+        return empty
+
+    # ISO-8601 created_at sorts lexicographically == chronologically.
+    floor = min((j.get("created_at") or "") for j in active)
+    wave = [j for j in jobs if (j.get("created_at") or "") >= floor]
+
+    # Dedupe to the newest job per account (wave is created_at DESC).
+    by_account: dict[int, dict] = {}
+    for j in wave:
+        aid = int(j["account_id"])
+        if aid not in by_account:
+            by_account[aid] = j
+
+    out_rows: list[dict] = []
+    sum_p = sum_t = 0
+    status_counts: dict[str, int] = {}
+    for aid, j in by_account.items():
+        processed = int(j.get("total_processed") or 0)
+        total = bounded_int(j.get("cursor") or 0, default=0)  # N-219c/4 R23: SSOT
+        status = j.get("status") or "queued"
+        if total > 0:
+            pct = int(round(processed / total * 100))
+        else:
+            # No rows to embed → a terminal job is 100% by definition.
+            pct = 100 if status in _TERMINAL_STATUSES else 0
+        status_counts[status] = status_counts.get(status, 0) + 1
+        sum_p += processed
+        sum_t += total
+        out_rows.append({
+            "account_id": aid, "status": status,
+            "processed": processed, "total": total, "pct": pct,
+        })
+
+    overall = int(round(sum_p / sum_t * 100)) if sum_t > 0 else 0
+    return {
+        "active": True,
+        "accounts": len(out_rows),
+        "done": status_counts.get("done", 0),
+        "processed": sum_p,
+        "total": sum_t,
+        "pct": overall,
+        "status_counts": status_counts,
+        "rows": sorted(out_rows, key=lambda r: r["account_id"]),
+    }
 
 
 def needs_reindex(
@@ -162,10 +365,11 @@ def needs_reindex(
         if cb["model"] != tb["model"]:
             return True
     if cb.get("dimension") and tb.get("dimension"):
-        try:
-            if int(cb["dimension"]) != int(tb["dimension"]):
-                return True
-        except (TypeError, ValueError):
+        # N-219c/15 R23: parse both; either non-numeric OR they differ → True
+        # (mirrors pre-migration: parse-fail branch also returned True).
+        _cd = parse_int_or_none(cb["dimension"])
+        _td = parse_int_or_none(tb["dimension"])
+        if _cd is None or _td is None or _cd != _td:
             return True
     return False
 
@@ -220,6 +424,14 @@ async def run_embedding_reindex_job(
         )
         return
     target_model = getattr(app.state, "embedding_model", "") or ""
+    #  — the value stamped into / compared against embedding_model.
+    # Encodes the E5 prefix scheme so a model/scheme change invalidates
+    # old rows; no-op for non-E5 models. MUST match sent_mail_index's
+    # stamp + the retrieve filter.
+    from email_triage.engine.embedding_backend import (
+        e5_prefix, embedding_stamp,
+    )
+    target_stamp = embedding_stamp(target_model)
     target_backend_type = getattr(
         embedding_backend, "backend_type", "",
     )
@@ -229,6 +441,15 @@ async def run_embedding_reindex_job(
     #    entry), so the reindex is structurally a no-op. We finish
     #    'done' rather than 'failed' — the operator's intent was
     #    served, just trivially.
+    #
+    #    N-81: route through is_account_hipaa (folds the system flag).
+    #    The previous fork added ``acct.get("created_under_system_hipaa")``
+    #    as an extra condition — that column is a lock-guard indicator
+    #    (is_account_hipaa_locked), NOT a HIPAA-active indicator.
+    #    An account de-HIPAA'd after creation (system flag off,
+    #    acct["hipaa"]=0) CAN have sent_mail_index rows and should be
+    #    re-indexed; the old OR-branch over-skipped it.
+    from email_triage.triage_logging import is_account_hipaa as _iah_reindex
     acct = await db_call(get_email_account, conn, account_id)
     if acct is None:
         await db_call(
@@ -237,7 +458,7 @@ async def run_embedding_reindex_job(
             error_text="account not found",
         )
         return
-    if acct.get("hipaa") or acct.get("created_under_system_hipaa"):
+    if _iah_reindex(acct):
         log.info(
             "embedding_reindex: HIPAA account; trivially done",
             extra={"_extra": {"account_id": account_id}},
@@ -344,7 +565,7 @@ async def run_embedding_reindex_job(
             # resume on a restarted worker).
             if (
                 row["embedding_model"]
-                and row["embedding_model"] == target_model
+                and row["embedding_model"] == target_stamp
             ):
                 skipped += 1
                 continue
@@ -358,7 +579,11 @@ async def run_embedding_reindex_job(
                 continue
 
             try:
-                vec = await embedding_backend.embed_text(text_for_embedding)
+                #  — "passage: " prefix for E5 (symmetric with the
+                # "query: " prefix at retrieve); no-op for non-E5.
+                vec = await embedding_backend.embed_text(
+                    e5_prefix(target_model, "passage") + text_for_embedding
+                )
             except Exception as exc:  # noqa: BLE001
                 # Transient errors (Ollama unreachable mid-job, model
                 # warmup hiccup) — log + count + continue. The job
@@ -387,7 +612,7 @@ async def run_embedding_reindex_job(
             dimension = len(vec)
             now = _now_iso()
             pending_updates.append(
-                (packed, float(norm), target_model, dimension, now, row_id),
+                (packed, float(norm), target_stamp, dimension, now, row_id),
             )
 
         # Apply the batch's row updates + commit in one threadpool hop.
@@ -452,17 +677,28 @@ async def run_embedding_reindex_job(
             "target_backend": target_backend_type,
         }},
     )
+    #  reliability: fail the job if every row errored (the pre-existing
+    #  rule) OR if a HIGH fraction of *attempted* rows errored
+    # (HIGH_ERROR_FAIL_FRACTION) — silent partial-embedding of PHI-derived
+    # vectors reported as 'done' would leave the corpus half-searchable with
+    # no operator alarm. ``skipped`` rows (already-at-target / empty source)
+    # are NOT failures, so the fraction is over processed+errors only.
+    _attempted = processed + errors
+    _high_error = bool(
+        _attempted and (errors / _attempted) >= HIGH_ERROR_FAIL_FRACTION
+    )
     await db_call(
         finish_triage_job,
         conn, job_id,
-        # A run where every row errored and none succeeded is a
-        # failure, not a success — otherwise the operator never knows
-        # to re-enqueue. A partial run (some rows succeeded)
-        # stays "done"; error_text carries the partial-failure detail.
-        status="failed" if (errors and not processed) else "done",
+        status="failed" if ((errors and not processed) or _high_error) else "done",
         error_text=(
             f"{errors} row(s) failed to re-embed; "
             f"{processed} succeeded, {skipped} skipped"
+            + (
+                f" — error rate {errors / _attempted:.0%} ≥ "
+                f"{HIGH_ERROR_FAIL_FRACTION:.0%} threshold; re-enqueue."
+                if _high_error else ""
+            )
         ) if errors else None,
     )
 

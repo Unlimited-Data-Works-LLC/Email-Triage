@@ -1,0 +1,390 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate) tuning a Topic.
+                NOT developers.
+   TECH-SKILL:  low. Computer-literate professional (exec, doctor,
+                lawyer, researcher).
+   COPY RULES:
+     - No admin-only paths, no protocol jargon, "AI" not "LLM".
+     - "study registry" / "registry number", never "NCT API" / "v2
+       endpoint" / "ClinicalTrials.gov API".
+     - Disabled / not-found states speak for themselves — never
+       "ask your administrator".
+   ─────────────────────────────────────────────────────────────
+   NCT confirm card. HTMX-
+   swapped into #topic-search-result by the editor's "Internet Search"
+   button. This fragment NEVER overwrites the operator's Details — it
+   shows what the public registry returned and offers, by explicit
+   click, to Replace / Append into the Details textarea (or Cancel and
+   leave it untouched). The fields are rendered AS DATA, never as
+   instructions to the AI (the egress was only the user's typed
+   registry number — design §3d).
+
+   Consumes:
+     nct_id        normalised registry number (e.g. NCT00000419), or
+                   None when the typed query wasn't a registry number.
+     nct_result    whitelisted study fields, or None on a miss:
+                     .official_title  .status   .phase (list[str])
+                     .conditions (list[str])    .interventions (list[str])
+                     .lead_sponsor    .brief_summary
+     search_error  copy to show when there's no study to confirm
+                   (bad/unknown number, registry down, not configured).
+#}
+
+<div class="topic-nct-result">
+{% if nct_result %}
+    {# Reflect the canonical Study ID back into the lookup field SERVER-SIDE
+       via an out-of-band swap — robust even if the inline script below does
+       not run in the htmx swap. htmx pulls this element out of the response
+       and replaces #topic-search-query in place (value = the normalised id).
+       The attributes mirror the editor's query input so the form + future
+       lookups keep working. #}
+    <input id="topic-search-query" name="query" hx-swap-oob="true"
+           type="text" value="{{ nct_id }}"
+           placeholder="Public registry number, e.g. NCT00000419"
+           maxlength="200" style="margin:0;">
+    {# ── §3d confirm card — study found, awaiting the operator's choice.
+       Nothing is written to Details until a button below is clicked. #}
+    <article style="border-left:3px solid var(--pico-primary, #4a90d9);
+                    padding:0.6rem 1rem;margin:0;
+                    background:var(--pico-card-background-color);">
+        <header style="margin:0 0 0.5rem 0;">
+            <strong style="display:block;">
+                {{ nct_result.official_title or "Untitled study" }}
+            </strong>
+            <small style="color:var(--pico-muted-color);">
+                {{ nct_id }} · public study registry
+            </small>
+        </header>
+
+        <dl style="display:grid;grid-template-columns:auto 1fr;gap:0.2rem 0.8rem;
+                   margin:0 0 0.5rem 0;font-size:0.9em;">
+            {% if nct_result.status %}
+            <dt style="color:var(--pico-muted-color);">Status</dt>
+            <dd style="margin:0;">{{ nct_result.status }}</dd>
+            {% endif %}
+            {% if nct_result.phase %}
+            <dt style="color:var(--pico-muted-color);">Phase</dt>
+            <dd style="margin:0;">{{ nct_result.phase | join(', ') }}</dd>
+            {% endif %}
+            {% if nct_result.conditions %}
+            <dt style="color:var(--pico-muted-color);">Conditions</dt>
+            <dd style="margin:0;">{{ nct_result.conditions | join(', ') }}</dd>
+            {% endif %}
+            {% if nct_result.interventions %}
+            <dt style="color:var(--pico-muted-color);">Interventions</dt>
+            <dd style="margin:0;">{{ nct_result.interventions | join(', ') }}</dd>
+            {% endif %}
+            {% if nct_result.lead_sponsor %}
+            <dt style="color:var(--pico-muted-color);">Lead sponsor</dt>
+            <dd style="margin:0;">{{ nct_result.lead_sponsor }}</dd>
+            {% endif %}
+        </dl>
+
+        {% if nct_result.brief_summary %}
+        <p style="margin:0 0 0.6rem 0;font-size:0.9em;">
+            {{ nct_result.brief_summary }}
+        </p>
+        {% endif %}
+
+        {# The text that Replace / Append writes into Details. Built from
+           the SAME whitelisted fields above (data, not instructions),
+           stashed in a hidden field the buttons read — so the operator
+           sees exactly what will be inserted. #}
+        {# The summary LEADS with the registry number so the Study ID is
+           retained in Details (the operator's typed id was dropped before
+           — it never appeared in the filled text). The same id is also
+           added to Subjects (a precise match term) by the script below. #}
+        {% set _summary_block %}Study {{ nct_id }}: {{ nct_result.official_title or "" }}{% if nct_result.lead_sponsor %} (sponsor: {{ nct_result.lead_sponsor }}){% endif %}.{% if nct_result.conditions %} Conditions: {{ nct_result.conditions | join(', ') }}.{% endif %}{% if nct_result.interventions %} Interventions: {{ nct_result.interventions | join(', ') }}.{% endif %}{% if nct_result.phase %} {{ nct_result.phase | join(', ') }}.{% endif %}{% if nct_result.status %} Status: {{ nct_result.status }}.{% endif %}{% if nct_result.brief_summary %} {{ nct_result.brief_summary }}{% endif %}{% endset %}
+        <textarea id="topic-nct-fill-text" hidden>{{ _summary_block | trim }}</textarea>
+        <input id="topic-nct-id-value" type="hidden" value="{{ nct_id or '' }}">
+
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+            <button type="button" id="topic-nct-replace"
+                    class="outline"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Replace Details{{ m.help("Replaces everything currently in the Details box with this study summary. You can still edit it afterward — nothing is saved until you press Save Topic.") }}
+            </button>
+            <button type="button" id="topic-nct-append"
+                    class="outline secondary"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Append{{ m.help("Adds this study summary to the end of whatever is already in the Details box, keeping your existing text.") }}
+            </button>
+            <button type="button" id="topic-nct-cancel"
+                    class="outline secondary"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;
+                           color:var(--pico-muted-color);">
+                Cancel
+            </button>
+        </div>
+        <small style="color:var(--pico-muted-color);display:block;margin-top:0.4rem;">
+            Nothing changes until you choose. Review before saving.
+        </small>
+    </article>
+
+    <script>
+    (function () {
+        /* Wire Replace / Append / Cancel to the editor's Details textarea
+           CLIENT-SIDE — no server round-trip (the design: the lookup
+           offers, the operator decides, the textarea stays editable, and
+           nothing persists until Save). The textarea has no id of its
+           own, so select it by name within the editor form. */
+        var fill = document.getElementById("topic-nct-fill-text");
+        var idEl = document.getElementById("topic-nct-id-value");
+        var nctId = idEl ? idEl.value.trim() : "";
+        var panel = document.querySelector(".topic-nct-result");
+        var details = document.querySelector(
+            "#topic-editor-form textarea[name='details']"
+        );
+        if (!fill || !panel) return;
+        var text = fill.value;
+
+        /* Keep the canonical Study ID IN the lookup field — the operator
+           expected the id to stay visible there after a lookup (and a
+           slightly-off typed id, e.g. "nct 419", is normalised to
+           NCT00000419). Runs on a found study; a miss leaves the field as
+           typed. */
+        var queryField = document.getElementById("topic-search-query");
+        if (queryField && nctId) queryField.value = nctId;
+
+        function wire(id, fn) {
+            var btn = document.getElementById(id);
+            if (btn) btn.addEventListener("click", fn);
+        }
+        /* Retain the Study ID as a Subject (a precise match term) — fill
+           the first empty subject input, else add a new chip row. Skips if
+           the id is already present. This is why a lookup "retains" the
+           number: it lands in both Details (above) and Subjects. */
+        function addStudyIdSubject() {
+            if (!nctId) return;
+            var list = document.getElementById("topic-subjects-list");
+            if (!list) return;
+            var inputs = list.querySelectorAll('input[name="subjects"]');
+            for (var i = 0; i < inputs.length; i++) {
+                if (inputs[i].value.trim().toLowerCase() === nctId.toLowerCase()) {
+                    return;
+                }
+            }
+            for (var j = 0; j < inputs.length; j++) {
+                if (!inputs[j].value.trim()) { inputs[j].value = nctId; return; }
+            }
+            var tmpl = document.getElementById("topic-subject-row-template");
+            if (tmpl && tmpl.content && tmpl.content.firstElementChild) {
+                var clone = tmpl.content.firstElementChild.cloneNode(true);
+                var inp = clone.querySelector('input[name="subjects"]');
+                if (inp) inp.value = nctId;
+                list.appendChild(clone);
+                if (window.__topicSubjectsRefresh) window.__topicSubjectsRefresh();
+            }
+        }
+        wire("topic-nct-replace", function () {
+            if (details) {
+                details.value = text;
+                details.focus();
+            }
+            addStudyIdSubject();
+            panel.innerHTML = "";
+        });
+        wire("topic-nct-append", function () {
+            if (details) {
+                var cur = details.value.trim();
+                details.value = cur ? (cur + "\n\n" + text) : text;
+                details.focus();
+            }
+            addStudyIdSubject();
+            panel.innerHTML = "";
+        });
+        wire("topic-nct-cancel", function () {
+            panel.innerHTML = "";
+        });
+    })();
+    </script>
+
+{% elif web_summary %}
+    {# ── §3d free-text web path — AI summary (non-HIPAA, opt-in SearXNG).
+       A LOCAL LLM drafted these Details from the public web results (the
+       results were FENCED as untrusted data before the model saw them).
+       Shown for the operator to Replace / Append — never auto-applied. The
+       Sources list carries just the result URLs. #}
+    <input id="topic-search-query" name="query" hx-swap-oob="true"
+           type="text" value="{{ query }}"
+           placeholder="Public registry number, e.g. NCT00000419"
+           maxlength="200" style="margin:0;">
+    <article style="border-left:3px solid var(--pico-primary, #4a90d9);
+                    padding:0.6rem 1rem;margin:0;
+                    background:var(--pico-card-background-color);">
+        <header style="margin:0 0 0.5rem 0;">
+            <strong style="display:block;">Suggested Details</strong>
+            <small style="color:var(--pico-muted-color);">
+                Drafted by AI from public web results for “{{ query }}” —
+                review and edit before saving.
+            </small>
+        </header>
+        <p style="margin:0 0 0.6rem 0;font-size:0.9em;white-space:pre-wrap;">{{ web_summary }}</p>
+        <textarea id="topic-web-summary-fill" hidden>{{ web_summary }}</textarea>
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+            <button type="button" id="topic-web-summary-replace" class="outline"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Replace Details{{ m.help("Replaces the Details box with this AI summary. You can still edit it; nothing saves until you press Save Topic.") }}
+            </button>
+            <button type="button" id="topic-web-summary-append"
+                    class="outline secondary"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;">
+                Append{{ m.help("Adds this AI summary to the end of whatever is already in Details.") }}
+            </button>
+            <button type="button" id="topic-web-summary-cancel"
+                    class="outline secondary"
+                    style="padding:0.25rem 0.7rem;font-size:0.85em;margin:0;
+                           color:var(--pico-muted-color);">
+                Cancel
+            </button>
+        </div>
+        {% if web_results %}
+        <details style="margin-top:0.6rem;">
+            <summary style="cursor:pointer;font-size:0.85em;color:var(--pico-muted-color);">
+                Sources ({{ web_results | length }})
+            </summary>
+            <ul style="margin:0.4rem 0 0 0;padding-left:1.1rem;font-size:0.82em;">
+                {% for r in web_results %}
+                <li style="margin-bottom:0.2rem;">
+                    <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer nofollow"
+                       style="word-break:break-all;">{{ r.title or r.url }}</a>
+                </li>
+                {% endfor %}
+            </ul>
+        </details>
+        {% endif %}
+        <small style="color:var(--pico-muted-color);display:block;margin-top:0.5rem;">
+            AI-drafted from public web summaries — keep Details to public
+            information only. Nothing changes until you choose.
+        </small>
+    </article>
+
+    <script>
+    (function () {
+        /* Replace / Append / Cancel wire the AI summary into the editor's
+           Details textarea CLIENT-SIDE — nothing persists until Save. */
+        var fill = document.getElementById("topic-web-summary-fill");
+        var panel = document.querySelector(".topic-nct-result");
+        var details = document.querySelector(
+            "#topic-editor-form textarea[name='details']"
+        );
+        if (!fill || !panel) return;
+        var text = fill.value;
+        function wire(id, fn) {
+            var b = document.getElementById(id);
+            if (b) b.addEventListener("click", fn);
+        }
+        wire("topic-web-summary-replace", function () {
+            if (details) { details.value = text; details.focus(); }
+            panel.innerHTML = "";
+        });
+        wire("topic-web-summary-append", function () {
+            if (details) {
+                var cur = details.value.trim();
+                details.value = cur ? (cur + "\n\n" + text) : text;
+                details.focus();
+            }
+            panel.innerHTML = "";
+        });
+        wire("topic-web-summary-cancel", function () { panel.innerHTML = ""; });
+    })();
+    </script>
+
+{% elif web_results %}
+    {# ── §3d free-text web path (non-HIPAA, opt-in SearXNG). A LIST of
+       public web results; the operator picks any to Append into Details.
+       Rendered AS DATA (Jinja-escaped), never as instructions to the AI —
+       the only egress was the operator's typed query. Each result's
+       title/snippet/url is whitelisted + length-capped server-side. #}
+    {# Retain the typed query in the lookup field (server-side OOB swap). #}
+    <input id="topic-search-query" name="query" hx-swap-oob="true"
+           type="text" value="{{ query }}"
+           placeholder="Public registry number, e.g. NCT00000419"
+           maxlength="200" style="margin:0;">
+    <article style="border-left:3px solid var(--pico-primary, #4a90d9);
+                    padding:0.6rem 1rem;margin:0;
+                    background:var(--pico-card-background-color);">
+        <header style="margin:0 0 0.5rem 0;">
+            <strong style="display:block;">Web results</strong>
+            <small style="color:var(--pico-muted-color);">
+                Public web results for “{{ query }}”. Pick any to add to your
+                Details — nothing changes until you do, and you can edit it
+                afterward.
+            </small>
+        </header>
+        <ul style="list-style:none;padding:0;margin:0;display:flex;
+                   flex-direction:column;gap:0.6rem;">
+            {% for r in web_results %}
+            <li style="border-top:1px solid var(--pico-muted-border-color);
+                       padding-top:0.5rem;">
+                <div style="font-size:0.92em;font-weight:600;">{{ r.title }}</div>
+                {% if r.url %}
+                <div><small style="color:var(--pico-muted-color);word-break:break-all;">{{ r.url }}</small></div>
+                {% endif %}
+                {% if r.content %}
+                <p style="margin:0.25rem 0 0.4rem 0;font-size:0.88em;">{{ r.content }}</p>
+                {% endif %}
+                <button type="button" class="topic-web-append outline secondary"
+                        data-append="{{ r.title }}{% if r.content %} — {{ r.content }}{% endif %}{% if r.url %} ({{ r.url }}){% endif %}"
+                        style="padding:0.2rem 0.6rem;font-size:0.8em;margin:0;">
+                    Append to Details
+                </button>
+            </li>
+            {% endfor %}
+        </ul>
+        <small style="color:var(--pico-muted-color);display:block;margin-top:0.5rem;">
+            These are public web summaries — review and edit before saving.
+            Keep Details to public information only.
+        </small>
+    </article>
+
+    <script>
+    (function () {
+        /* Wire each "Append to Details" CLIENT-SIDE (no round-trip): append
+           the chosen result's text to the editor's Details textarea. The
+           textarea has no id; select it by name within the editor form. */
+        var details = document.querySelector(
+            "#topic-editor-form textarea[name='details']"
+        );
+        var btns = document.querySelectorAll(".topic-web-append");
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].addEventListener("click", function (ev) {
+                var text = ev.currentTarget.getAttribute("data-append") || "";
+                if (details && text) {
+                    var cur = details.value.trim();
+                    details.value = cur ? (cur + "\n\n" + text) : text;
+                    details.focus();
+                }
+                ev.currentTarget.disabled = true;
+                ev.currentTarget.textContent = "Added ✓";
+            });
+        }
+    })();
+    </script>
+
+{% else %}
+    {# ── §3d miss — no study to confirm. The textarea is untouched. ── #}
+    <article style="border-left:3px solid var(--pico-muted-border-color);
+                    padding:0.5rem 1rem;margin:0;
+                    background:var(--pico-card-background-color);">
+        <strong style="display:block;margin-bottom:0.25rem;">
+            {# Frame the miss by what was searched: a study number ⇒ "study",
+               free-text (the web path, incl. the not-configured state in
+               Image 1) ⇒ "results". #}
+            {% if nct_id %}No study found{% else %}No results found{% endif %}
+        </strong>
+        <small style="color:var(--pico-muted-color);">
+            {% if search_error %}
+                {{ search_error }}
+            {% elif nct_id %}
+                No public study found for {{ nct_id }} — check the number
+                or type Details by hand.
+            {% else %}
+                No public study found — check the number or type Details
+                by hand.
+            {% endif %}
+        </small>
+    </article>
+{% endif %}
+</div>

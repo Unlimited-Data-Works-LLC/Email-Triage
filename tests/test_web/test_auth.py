@@ -1,5 +1,6 @@
 """Tests for the email OTP auth module."""
 
+from _db_tracking import track
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,7 +21,7 @@ from email_triage.web.db import init_db
 
 @pytest.fixture
 def db():
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     # Seed a user.
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
@@ -73,6 +74,17 @@ class TestOTPStorage:
             ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),),
         )
         db.commit()
+        assert verify_otp(db, "alice@example.com", code) is False
+
+    def test_corrupt_expiry_fails_closed_not_500(self, db):
+        """Census N-65 — a corrupt/unparseable expires_at must NOT raise
+        (it used to 500 the OTP verify via raw fromisoformat); it now routes
+        through parse_iso → None → treated as expired/invalid (FAIL CLOSED)."""
+        code = "123456"
+        store_otp(db, "alice@example.com", code)
+        db.execute("UPDATE otp_codes SET expires_at = 'not-a-timestamp'")
+        db.commit()
+        # No exception, and the code is refused.
         assert verify_otp(db, "alice@example.com", code) is False
 
     def test_new_otp_invalidates_old(self, db):

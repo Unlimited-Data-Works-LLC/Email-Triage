@@ -29,7 +29,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from email_triage.web.app import get_db, get_templates
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import RequireUser, RequireUserFragment
-from email_triage.triage_logging import is_account_hipaa
 from email_triage._errfmt import fmt_exc
 from email_triage.triage_logging import get_logger
 
@@ -204,22 +203,15 @@ async def message_label_add(
         if not _shared.can_manage_account(db, user, acct):
             return 403, "Forbidden", False
 
-        # HIPAA audit — actor != owner on HIPAA account.
-        if (
-            is_account_hipaa(acct)
-            and user.get("id") != acct.get("user_id")
-        ):
-            try:
-                from email_triage.web.db import record_hipaa_access_event
-                record_hipaa_access_event(
-                    db, user["id"], account_id, "label_apply",
-                    "ok", f"slug={label_slug}",
-                )
-            except Exception as e:
-                _log.warning(
-                    "HIPAA label_apply audit row write failed",
-                    error=fmt_exc(e),
-                )
+        # HIPAA audit — actor != owner on HIPAA account (PD#14 SSOT).
+        _shared.audit_phi_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="label_apply",
+            outcome="ok",
+            detail=f"slug={label_slug}",
+        )
 
         inserted = apply_labels_to_message(
             db, message_id, account_id, [label_slug], user["id"],
@@ -270,25 +262,16 @@ async def message_label_remove(
         if not _shared.can_manage_account(db, user, acct):
             return 403, "Forbidden"
 
-        # HIPAA audit — actor != owner on HIPAA account. Mirrors the
-        # sibling message_label_add path; the audit row fires ONLY
-        # when the actor is not the account owner (owner self-access
-        # is exempt).
-        if (
-            is_account_hipaa(acct)
-            and user.get("id") != acct.get("user_id")
-        ):
-            try:
-                from email_triage.web.db import record_hipaa_access_event
-                record_hipaa_access_event(
-                    db, user["id"], account_id, "label_remove",
-                    "ok", f"slug={label_slug}",
-                )
-            except Exception as e:
-                _log.warning(
-                    "HIPAA label_remove audit row write failed",
-                    error=fmt_exc(e),
-                )
+        # HIPAA audit — actor != owner on HIPAA account (PD#14 SSOT).
+        # Owner self-access is exempt; the gate lives in audit_phi_access.
+        _shared.audit_phi_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="label_remove",
+            outcome="ok",
+            detail=f"slug={label_slug}",
+        )
 
         remove_label_from_message(db, message_id, label_slug)
         return 200, ""
@@ -347,29 +330,18 @@ async def messages_bulk_label_add(
         if not _shared.can_manage_account(db, user, acct):
             return 403, "Forbidden", 0
 
-        # HIPAA audit — actor != owner on HIPAA account. Same
-        # actor!=owner parity rule as the single-message
-        # message_label_add / message_label_remove siblings; the bulk
-        # path previously lacked it, a §164.312(b) audit hole. One row
-        # per bulk operation (a bulk-tag is one operator action) —
-        # ``bulk_n`` records how many messages it touched. Owner
-        # self-access is exempt.
-        if (
-            is_account_hipaa(acct)
-            and user.get("id") != acct.get("user_id")
-        ):
-            try:
-                from email_triage.web.db import record_hipaa_access_event
-                record_hipaa_access_event(
-                    db, user["id"], account_id, "label_apply",
-                    "ok",
-                    f"slug={label_slug} bulk_n={len(message_ids)}",
-                )
-            except Exception as e:
-                _log.warning(
-                    "HIPAA bulk label_apply audit row write failed",
-                    error=fmt_exc(e),
-                )
+        # HIPAA audit — actor != owner on HIPAA account.
+        # One row per bulk operation (a bulk-tag is one operator action);
+        # bulk_n records how many messages it touched. Owner self-access
+        # is exempt; the gate lives in audit_phi_access.
+        _shared.audit_phi_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="label_apply",
+            outcome="ok",
+            detail=f"slug={label_slug} bulk_n={len(message_ids)}",
+        )
 
         total_ = 0
         for mid in message_ids:
@@ -382,8 +354,11 @@ async def messages_bulk_label_add(
     if status != 200:
         return HTMLResponse(body, status_code=status)
 
+    # N-68 — label_slug is form-derived (form.get("label_slug")); escape it
+    # before it lands in the HTML body (reflected-XSS class).
+    import html as _html_mod
     return HTMLResponse(
         f'<span style="color:var(--pico-ins-color);">'
         f'Tagged {total} message{"s" if total != 1 else ""} '
-        f'with "{label_slug}".</span>'
+        f'with "{_html_mod.escape(label_slug)}".</span>'
     )

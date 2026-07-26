@@ -8,6 +8,7 @@ clean-chain path, tampered-row path, ``--since`` cutoff filtering,
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import logging
 import sqlite3
@@ -35,7 +36,7 @@ def _seed_chain(db_path: Path, count: int = 3, logger_name: str = "test.audit") 
     log rows via the production SQLiteLogHandler. Closes the connection
     so the file-on-disk chain is fully flushed before verification.
     """
-    conn = init_db(db_path)
+    conn = track(init_db(db_path))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     log = logging.getLogger(logger_name)
     log.addHandler(handler)
@@ -393,7 +394,7 @@ def _hipaa_install(tmp_path, *, hipaa: bool = True):
     bootstrap.set(cfg.secrets.master_key_name, DbSecrets.generate_master_key())
 
     # Init the DB schema so log_entries exists for the emitter.
-    conn = init_db(db_path)
+    conn = track(init_db(db_path))
     provider = bootstrap_secrets_from_config(conn, cfg)
     wire_audit_chain_hmac_keys(provider, cfg)
     conn.close()
@@ -658,21 +659,38 @@ persistence:
             )
 
 
-class TestCliAuditAutoEmitFailSoft:
-    def test_emission_failure_logs_warning_but_does_not_block_handler(
+class TestCliAuditAutoEmitFailLoudGate:
+    """N-157 (2026-07-09) — fail-loud gate default + `--allow-unaudited`
+    recovery flag.  Alex-directed close per AskUserQuestion 2026-07-08
+    ("Fail-loud with recovery flag").
+
+    DEFAULT: an emit failure at handler ENTRY (phase='start') raises
+    `CliAuditGateClosed` so the CLI exits non-zero with a specific
+    message naming the recovery lever.  The pre-N-157 fail-SOFT posture
+    is now the opt-in `--allow-unaudited` mode, preserving the
+    procedural H-03 closure (break-glass actions_taken) for legitimate
+    mid-incident break-glass use.
+    """
+
+    def test_emission_failure_default_fail_loud_at_start(
         self, _hipaa_config_file, capsys, caplog, monkeypatch,
     ):
-        """The defense-in-depth audit MUST NOT block the underlying CLI
-        op. The procedural H-03 closure (break-glass actions_taken in
-        INCIDENT_RESPONSE.md) remains the fallback per §164.312(b)'s
-        'and/or procedural' reading."""
-        import logging as _logging
+        """DEFAULT (--allow-unaudited NOT set): a phase='start' emit
+        failure raises ``CliAuditGateClosed`` so the handler NEVER runs
+        + the CLI exits non-zero — operator sees an obvious audit-gate
+        error instead of a silent WARN + successful op (§164.312(b)
+        Audit Controls anchor).
+        """
         from email_triage import cli as cli_mod
+        from email_triage.cli import CliAuditGateClosed
 
         yaml_path, _db_path, _cfg = _hipaa_config_file
 
-        # Sabotage the emit path. Patch insert_log_entry at the import
-        # site the decorator uses (it imports lazily inside the helper).
+        # Sabotage the emit path — `record_cli_admin_op` internally
+        # calls the chain-primitive `insert_log_entry`; patching the
+        # primitive turns every emit into a raise, which
+        # `safe_audit_write` surfaces as a None return, which the
+        # actuator gate turns into `CliAuditGateClosed` at phase='start'.
         from email_triage.db import audit as _audit_mod
 
         def _explode(*a, **kw):
@@ -683,23 +701,152 @@ class TestCliAuditAutoEmitFailSoft:
         args = _parse([
             "--config", str(yaml_path),
             "user", "create",
+            "--email", "loud@example.com",
+        ])
+        # Verify the default state matches the fail-CLOSED contract.
+        assert args.allow_unaudited is False, (
+            "N-157 default MUST be `--allow-unaudited=False` (fail-CLOSED)"
+        )
+
+        # Fail-CLOSED: handler MUST NOT run + exception MUST propagate.
+        with pytest.raises(CliAuditGateClosed) as excinfo:
+            cli_mod.cmd_user(args)
+        capsys.readouterr()
+
+        # The exception message names the recovery lever.
+        assert "--allow-unaudited" in str(excinfo.value), (
+            "N-157 fail-CLOSED exception MUST name --allow-unaudited as "
+            "the recovery lever so the operator sees how to unblock."
+        )
+
+    def test_emission_failure_with_allow_unaudited_preserves_fail_soft(
+        self, _hipaa_config_file, capsys, caplog, monkeypatch,
+    ):
+        """`--allow-unaudited` reverts to pre-N-157 fail-SOFT: WARN
+        logged, handler still runs, procedural H-03 break-glass closure
+        remains in force per §164.312(b)'s 'and/or procedural' reading.
+        """
+        import logging as _logging
+        from email_triage import cli as cli_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+
+        from email_triage.db import audit as _audit_mod
+
+        def _explode(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        monkeypatch.setattr(_audit_mod, "insert_log_entry", _explode)
+
+        args = _parse([
+            "--config", str(yaml_path),
+            "--allow-unaudited",
+            "user", "create",
             "--email", "soft@example.com",
         ])
+        assert args.allow_unaudited is True
 
         with caplog.at_level(_logging.WARNING, logger="email_triage.cli"):
             rc = cli_mod.cmd_user(args)
         capsys.readouterr()
 
-        # CLI op succeeded despite emit failure.
+        # Handler still runs to completion under the recovery flag.
         assert rc == 0
-        # WARNING was logged surfacing the auto-emit failure (operator
-        # can investigate; procedural fallback covers compliance posture).
+        # WARNING surfaces the auto-emit failure so the operator can
+        # investigate the audit gap after the break-glass op finishes.
         warn_msgs = [
             r.getMessage() for r in caplog.records
             if r.levelno >= _logging.WARNING
         ]
         assert any("H-03-auto" in m for m in warn_msgs), (
-            f"expected H-03-auto warning, got: {warn_msgs}"
+            f"expected H-03-auto warning under --allow-unaudited, "
+            f"got: {warn_msgs}"
+        )
+
+
+class TestCliMainSurfacesFailLoudGateAsCleanError:
+    """N-157 (2026-07-09) — DA fold Fix #1.  ``main()`` MUST catch
+    ``CliAuditGateClosed`` from a wrapped handler + surface a CLEAN CLI
+    error on stderr — no Python traceback — with a dedicated exit code
+    (3) an operator's shell script can discriminate.  Without this the
+    fail-loud gate reaches the operator as a Python stack trace, which
+    is a break-glass usability defect on the audit-recovery path.
+    """
+
+    def test_main_surfaces_clean_error_and_returns_3(
+        self, _hipaa_config_file, capsys, monkeypatch,
+    ):
+        """Sabotage the emit path + invoke `main()` directly.  The exit
+        code MUST be 3 (dedicated), stderr MUST name the recovery lever
+        `--allow-unaudited` verbatim, and Fix #1's clean-print line
+        MUST appear on stderr.  The Fix #1 contract is "no raw
+        `CliAuditGateClosed` traceback reaches the operator" — verified
+        via absence of the `RuntimeError: CLI audit emit failed` shape
+        that Python's default uncaught-exception handler would write
+        as the FINAL line if `main()` did NOT catch (the fingerprint
+        is scoped to that specific text so stdlib logging's own
+        `--- Logging error ---` self-diagnostic dumps that pytest
+        aggregates from earlier tests do NOT false-fire this check).
+        """
+        import logging as _logging
+        from email_triage import cli as cli_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+
+        from email_triage.db import audit as _audit_mod
+
+        def _explode(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        monkeypatch.setattr(_audit_mod, "insert_log_entry", _explode)
+
+        # Silence the stdlib logging module's own I/O-error self-
+        # diagnostic (the "--- Logging error ---" block) — that fires
+        # when pytest's stderr-capture teardown leaves earlier tests'
+        # StreamHandler pointing at a closed file, and it pollutes
+        # `err` with an unrelated traceback that has nothing to do
+        # with N-157's fail-loud path.  This flag ONLY suppresses the
+        # logging module's meta-diagnostic; real exceptions from our
+        # code still propagate normally.
+        monkeypatch.setattr(_logging, "raiseExceptions", False)
+
+        # Drive `main()` end-to-end so the wrapping `@_cli_audit` +
+        # top-level `try/except CliAuditGateClosed` are BOTH exercised.
+        rc = cli_mod.main([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "clean@example.com",
+        ])
+        _out, err = capsys.readouterr()
+
+        # Dedicated exit code — an operator's shell script MUST be able
+        # to discriminate this class from a generic handler error.
+        assert rc == 3, f"N-157 fail-loud MUST return rc=3; got {rc}"
+
+        # Recovery lever named verbatim on stderr.
+        assert "--allow-unaudited" in err, (
+            f"N-157 fail-loud MUST name --allow-unaudited on stderr; "
+            f"got stderr={err!r}"
+        )
+
+        # Fix #1's clean-print line MUST land — the try/except in main()
+        # produces exactly this shape via `print(f"error: {e}", ...)`.
+        assert "error: CLI audit emit failed" in err, (
+            f"N-157 fail-loud MUST surface the clean 'error: CLI audit "
+            f"emit failed …' line via main()'s try/except; got "
+            f"stderr={err!r}"
+        )
+
+        # NO raw-exception traceback shape — if Fix #1 were missing,
+        # Python's default uncaught-exception handler would write
+        # `RuntimeError: CLI audit emit failed …` as the FINAL stderr
+        # line (that's how base RuntimeError subclasses print).  This
+        # exact shape is what discriminates a clean-caught error from
+        # a bubbled-out exception, independent of any stdlib-logging
+        # noise pytest aggregates from earlier tests.
+        assert "RuntimeError: CLI audit emit failed" not in err, (
+            f"N-157 fail-loud MUST NOT surface the raw exception "
+            f"traceback shape; got stderr={err!r}"
         )
 
 

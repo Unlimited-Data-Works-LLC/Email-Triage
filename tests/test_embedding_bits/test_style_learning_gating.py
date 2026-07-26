@@ -65,7 +65,7 @@ def test_gate_passes_for_ollama():
 
 def test_gate_unknown_backend_blocks():
     g = resolve_embedding_gate(
-        live_backend_type=None, configured_backend_type="anthropic-via-cloud",
+        live_backend_type=None, configured_backend_type="AI provider-via-cloud",
     )
     assert g["required"] is True
     assert g["ready"] is False

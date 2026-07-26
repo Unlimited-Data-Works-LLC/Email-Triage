@@ -28,3 +28,15 @@ scripts/embedding-bits-manifest.json text eol=lf
 # literal "dev" placeholder and /health reported version "unknown". eol=lf so
 # the substituted SHA is not followed by CRLF on Windows checkouts.
 COMMIT text eol=lf export-subst
+
+# N-326-C5 trust-root SSOT: the checked-in FIDO2-sk allowed_signers file
+# AND its golden-hash companion MUST be byte-stable across Windows and
+# Linux checkouts. `test_repo_trust_root_matches_golden_hash` computes
+# `sha256(read_bytes())` and compares against the golden — same drift
+# class as the embedding-bits manifest above (CI on Linux sees LF blob
+# bytes; Windows CRLF-autocrlf checkout sees `\r\n` → different hash →
+# false-positive DRIFT). Pinning LF makes the on-disk bytes match the
+# blob bytes on every platform, so the golden hash is one canonical
+# value everywhere.
+.github/op-approve/allowed_signers text eol=lf
+tests/goldens/allowed_signers.sha256 text eol=lf

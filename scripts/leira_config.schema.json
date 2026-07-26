@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "email-triage/leira_config.schema.json",
+  "title": "llm-host offload wrapper config",
+  "description": "Schema for scripts/leira_config.json. Punch  (2026-07-17): catches silent-coerce drift class (typo in `strategy`, wrong type on `hosts.<name>.weight`, etc.) at import time via _load_config validation.",
+  "type": "object",
+  "properties": {
+    "_doc": {"type": "string"},
+    "default_host": {"type": "string"},
+    "hosts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "url": {"type": "string"},
+          "model": {"type": "string"},
+          "context_tokens_fallback": {"type": "integer", "minimum": 1},
+          "notes": {"type": "string"},
+          "weight": {"type": "integer", "minimum": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "url": {"type": "string"},
+    "model": {"type": "string"},
+    "context_tokens_fallback": {"type": "integer", "minimum": 1},
+    "timeout_s": {"type": "integer", "minimum": 1},
+    "temperature": {"type": "number", "minimum": 0.0, "maximum": 2.0},
+    "max_retries": {"type": "integer", "minimum": 0},
+    "base_backoff_s": {"type": "number", "minimum": 0.0},
+    "cooldown_on_fail_s": {"type": "integer", "minimum": 0},
+    "failover_hosts": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "strategy": {"enum": ["primary", "round_robin", "weighted"]},
+    "think": {"type": ["boolean", "null"]},
+    "keep_alive": {"type": ["integer", "string", "null"]}
+  },
+  "additionalProperties": {
+    "description": "Consumer sections (census_prepass, verify_prepass, ...) — free-form because each consumer has its own knob set. Only enforces the shared `host` field shape when present.",
+    "type": "object",
+    "properties": {
+      "host": {"type": "string"}
+    }
+  }
+}

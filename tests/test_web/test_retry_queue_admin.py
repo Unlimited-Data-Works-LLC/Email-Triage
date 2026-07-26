@@ -171,7 +171,7 @@ def _seed_retry_row(
     gmail_msg_id=None, o365_msg_id=None,
     error_class="ReadTimeout", error_msg="timed out",
     dead_reason=None, attempts=0, provider_type="imap",
-    updated_hours_ago=0,
+    updated_hours_ago=0, failure_kind=None,
 ) -> int:
     """INSERT a row against the canonical v30 ``watcher_retry_queue``
     schema (R-A). Column-name aliases here translate the kwargs
@@ -193,15 +193,15 @@ def _seed_retry_row(
         " gmail_msg_id, o365_msg_id, "
         " last_error_class, last_error_msg, last_error_at, "
         " state, attempt_count, next_attempt_at, dead_reason, "
-        " resolved_at, first_seen_at, created_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " resolved_at, first_seen_at, created_at, failure_kind"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             account_id, provider_type, mailbox,
             int(uid) if uid is not None else None,
             gmail_msg_id, o365_msg_id,
             error_class, error_msg, now,
             state, attempts, now, dead_reason,
-            resolved_at, now, now,
+            resolved_at, now, now, failure_kind,
         ),
     )
     db.commit()
@@ -237,6 +237,171 @@ class TestAdminRetryQueueIndex:
         assert "Retry queue" in r.text
         # Empty-state copy fires when there are no rows.
         assert "Nothing in this view" in r.text
+
+    def test_watch_delivery_failure_shows_plain_english_badge(
+        self, client, db, admin_cookies,
+    ):
+        """#7: a watcher delivery failure renders a plain-
+        English 'Delivery failure' flag (test the VIEW), not just the leaked
+        WatchDeliveryFailed qualname this admin page's audience header says
+        operators shouldn't have to read. failure_kind rides the row via
+        SELECT *; the badge + qualname-suppression are template-only."""
+        _make_account(db, account_id=1, name="Inbox A")
+        _seed_retry_row(
+            db, account_id=1, state="pending",
+            failure_kind="watch_delivery_failure",
+            error_class="WatchDeliveryFailed",
+        )
+        r = client.get("/admin/retry-queue", cookies=admin_cookies)
+        assert r.status_code == 200
+        body = r.text
+        assert "Delivery failure" in body
+        assert "WatchDeliveryFailed" not in body  # qualname suppressed
+
+    def test_non_delivery_row_has_no_badge_and_keeps_error_class(
+        self, client, db, admin_cookies,
+    ):
+        """A normal retry row (no delivery-failure kind) shows NO 'Delivery
+        failure' badge and still surfaces its real error class."""
+        _make_account(db, account_id=1, name="Inbox A")
+        _seed_retry_row(
+            db, account_id=1, state="pending",
+            failure_kind=None, error_class="ReadTimeout",
+        )
+        r = client.get("/admin/retry-queue", cookies=admin_cookies)
+        assert r.status_code == 200
+        body = r.text
+        assert "Delivery failure" not in body
+        assert "ReadTimeout" in body
+
+    def test_compound_edge_keeps_delivery_badge_no_qualname(
+        self, client, db, admin_cookies,
+    ):
+        """#9 BEHAVIORAL (db-sme + DA impl-review must-fix/should-fix): the
+        compound edge — a routed action errored (status=='e') AND a watch was
+        undelivered on the SAME message — drives a real two-enqueue sequence
+        (the  delivery-retry, then the generic status=='e' bump). Assert it
+        yields ONE row that KEEPS failure_kind='watch_delivery_failure' past the
+        generic NULL-kind bump (COALESCE-preserved), and the rendered row shows
+        the 'Delivery failure' badge with NO raw RuntimeError qualname. This pins
+        the load-bearing COALESCE + UPSERT-dedup + qualname-suppression that the
+        structural #9 ordering pin cannot see (a COALESCE removal or a template
+        regression would pass the ordering pin but fail HERE)."""
+        from email_triage.web.watcher_retry import (
+            enqueue_watch_delivery_retry,
+            enqueue_watcher_retry,
+        )
+        _make_account(db, account_id=1, name="Inbox A")
+        # (1) the moved  block enqueues the watch-delivery retry FIRST
+        rid = enqueue_watch_delivery_retry(
+            db, account_id=1, provider_type="imap",
+            failed_count=2, total_count=3,
+            mailbox="INBOX", uid=42, uidvalidity=1234567,
+        )
+        # (2) the status=='e' re-raise lands in the generic handler, which bumps
+        #     the SAME addressing tuple with failure_kind=None
+        rid2 = enqueue_watcher_retry(
+            db, account_id=1, provider_type="imap",
+            mailbox="INBOX", uid=42, uidvalidity=1234567,
+            error=RuntimeError("triage error"), failure_kind=None,
+        )
+        assert rid2 == rid, "the generic bump must hit the SAME row (UPSERT dedup)"
+        rows = db.execute(
+            "SELECT failure_kind, last_error_class FROM watcher_retry_queue "
+            "WHERE account_id=1"
+        ).fetchall()
+        assert len(rows) == 1, "compound edge must yield ONE physical row"
+        assert rows[0]["failure_kind"] == "watch_delivery_failure", (
+            "failure_kind must survive the generic NULL-kind bump (COALESCE)"
+        )
+        # the bump did refresh the class to the routed-action error…
+        assert rows[0]["last_error_class"] == "RuntimeError"
+        # …but the rendered row shows the badge and SUPPRESSES the raw qualname.
+        r = client.get("/admin/retry-queue", cookies=admin_cookies)
+        assert r.status_code == 200
+        body = r.text
+        assert "Delivery failure" in body
+        assert "RuntimeError" not in body
+
+    def test_count_retries_for_admin_matches_filter(self, db):
+        """ — count helper mirrors list_retries_for_admin's state
+        filter so the 'showing N of M' denominator is accurate."""
+        from email_triage.web.db import count_retries_for_admin
+        _install_ra_schema(db)
+        _make_account(db, account_id=1, name="Inbox A")
+        for _ in range(4):
+            _seed_retry_row(db, account_id=1, state="pending")
+        for _ in range(2):
+            _seed_retry_row(db, account_id=1, state="dead")
+        assert count_retries_for_admin(db, state="pending") == 4
+        assert count_retries_for_admin(db, state="dead") == 2
+        assert count_retries_for_admin(db) == 6  # no filter → all states
+
+    def test_over_cap_renders_showing_n_of_m(
+        self, client, db, admin_cookies, monkeypatch,
+    ):
+        """ — when the queue exceeds the page cap, the admin sees a
+        'showing first N of M' banner instead of a complete-looking list.
+        Cap is monkeypatched small so the test stays fast."""
+        import email_triage.web.routers.ui.retry_queue as rq
+        monkeypatch.setattr(rq, "_CAP_COMBINED", 2)
+        _install_ra_schema(db)
+        _make_account(db, account_id=1, name="Inbox A")
+        for _ in range(5):                      # 5 pending > cap of 2
+            _seed_retry_row(db, account_id=1, state="pending")
+        r = client.get(
+            "/admin/retry-queue", cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert r.status_code == 200
+        # Banner names the cap (2) and the true total (5).
+        assert "first" in r.text and "of 5" in r.text
+        assert "not shown" in r.text
+
+    def test_under_cap_no_banner(
+        self, client, db, admin_cookies, monkeypatch,
+    ):
+        """Under the cap → no 'showing N of M' banner (don't cry wolf)."""
+        import email_triage.web.routers.ui.retry_queue as rq
+        monkeypatch.setattr(rq, "_CAP_COMBINED", 50)
+        _install_ra_schema(db)
+        _make_account(db, account_id=1, name="Inbox A")
+        _seed_retry_row(db, account_id=1, state="pending")
+        r = client.get(
+            "/admin/retry-queue", cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert r.status_code == 200
+        assert "not shown" not in r.text
+
+    def test_single_state_pager_reaches_older(
+        self, client, db, admin_cookies, monkeypatch,
+    ):
+        """ reachability — a single-state view pages via ?offset= so
+        the full backlog past the cap is REACHABLE, not just counted.
+        Cap monkeypatched small to stay fast."""
+        import email_triage.web.routers.ui.retry_queue as rq
+        monkeypatch.setattr(rq, "_CAP_SINGLE", 2)
+        _install_ra_schema(db)
+        _make_account(db, account_id=1, name="Inbox A")
+        for _ in range(5):  # 5 dead > cap of 2
+            _seed_retry_row(db, account_id=1, state="dead")
+        # First page: pager + a reachable 'load older' link.
+        r = client.get(
+            "/admin/retry-queue?state=dead", cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert r.status_code == 200
+        assert "of 5" in r.text
+        assert "load older" in r.text
+        assert "offset=2" in r.text
+        # Older page: reachable, with a 'newer' link back.
+        r2 = client.get(
+            "/admin/retry-queue?state=dead&offset=4", cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert r2.status_code == 200
+        assert "newer" in r2.text
 
     def test_admin_lists_pending_rows(self, client, db, admin_cookies):
         _install_ra_schema(db)
@@ -415,14 +580,14 @@ class TestRetryQueueCSRFEnforcement:
     """When the install has CSRF enforcement on, POSTs without a
     token are rejected before reaching the handler."""
 
-    def test_post_without_csrf_rejected(self, client, db, admin_cookies, app):
+    def test_post_without_csrf_rejected(self, raw_client, db, admin_cookies, app):
         _install_ra_schema(db)
         _make_account(db, account_id=1)
         retry_id = _seed_retry_row(db, account_id=1)
         # Flip the install to enforce.
         app.state.csrf_enforce = True
         try:
-            r = client.post(
+            r = raw_client.post(
                 f"/admin/retry-queue/{retry_id}/abandon",
                 cookies=admin_cookies, follow_redirects=False,
             )

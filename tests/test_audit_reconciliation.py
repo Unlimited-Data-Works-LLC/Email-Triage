@@ -14,6 +14,7 @@ Covers the five scenarios per dispatch instruction:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import logging
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ def conn():
     log_entries rows participate in the H-02a chain without per-test
     setup.
     """
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     try:
         yield db
     finally:

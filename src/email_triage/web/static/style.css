@@ -65,8 +65,7 @@ html[data-theme="light"] #theme-toggle::before { content: "🌙"; }
 html[data-theme="dark"] #theme-toggle::before { content: "☀"; }
 
 /* ===========================================================
- * Dark mode tuning — nudge Pico's defaults toward a Claude-Code
- * feel: deeper near-black background, slightly warmer cards,
+ * Dark mode tuning — nudge Pico's defaults toward a AI development tooling* feel: deeper near-black background, slightly warmer cards,
  * dimmer borders. Pico's primary colour stays blue (matches the
  * uDataWorks logo) so we don't override it.
  * =========================================================== */
@@ -320,6 +319,41 @@ body.nav-sidebar footer.container {
 }
 #et-tooltip[hidden] {
     display: none !important;
+}
+
+/*
+ * help_details() — expandable inline help (native <details>/<summary>).
+ * Companion to the help() tooltip for content too long for a one-line tip
+ * (e.g. the #304 "what is an X25519 key + how to generate it" block). Native
+ * disclosure = zero JS, keyboard-operable, AT-announced. All colors are Pico v2
+ * tokens (AAA palette) so contrast is correct in light + dark.
+ */
+details.info-help {
+    margin: 0.4rem 0 0.75rem;
+    font-size: 0.9em;
+}
+details.info-help > summary {
+    cursor: pointer;
+    width: fit-content;
+    color: var(--pico-primary);
+}
+details.info-help > summary:focus-visible {
+    outline: 2px solid var(--pico-primary);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+details.info-help .info-help-body {
+    margin-top: 0.5rem;
+    padding-left: 0.6rem;
+    border-left: 2px solid var(--pico-muted-border-color);
+}
+details.info-help .info-help-body > :first-child { margin-top: 0; }
+details.info-help .info-help-body > :last-child { margin-bottom: 0; }
+/* Long openssl / gen-keypair command blocks: scroll, don't break the layout. */
+details.info-help .info-help-body pre {
+    overflow-x: auto;
+    font-size: 0.85em;
+    line-height: 1.4;
 }
 
 /* ─── Multi-select widget ─────────────────────

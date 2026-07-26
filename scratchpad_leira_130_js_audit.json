@@ -1,0 +1,11 @@
+{
+  "findings": [],
+  "verdict": "CONVERGED",
+  "_leira_meta": {
+    "model": "qwen3.6:35b",
+    "elapsed_s": 56.99,
+    "eval_tokens": 22,
+    "prompt_tokens": 2471
+  },
+  "_verdict_override_note": "Post-hoc override: llm-host returned 'CONVERGED' with empty findings \u2014 schema-hallucination pattern documented in the census script's methodology entry."
+}

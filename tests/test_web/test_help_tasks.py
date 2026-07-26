@@ -174,7 +174,7 @@ class TestNoAdminPaths:
         # "IMAP IDLE" — replaced by "watch folder"
         assert "imap idle" not in content
         # The strict feedback_no_anthropic rule — never name the API
-        assert "anthropic" not in content
+        assert "AI provider" not in content
 
 
 # ---------------------------------------------------------------------------

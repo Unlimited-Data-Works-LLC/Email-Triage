@@ -1,17 +1,69 @@
 #!/usr/bin/env bash
 #
-# pre-push: run pip-audit BEFORE the push lands on origin so CI
-# never has to fail on a CVE you could have caught locally.
+# pre-push guards (run BEFORE the push lands on origin so CI never has to
+# fail on something you could have caught locally):
+#   1. e2e real-browser suite  — when a UI/e2e surface changed
+#   2. pip-audit vuln scan      — when pip-audit is installed
+#   3. requirements.lock drift  — when pip-compile is installed
 #
-# Bypass with `git push --no-verify` ONLY in genuine emergencies
-# (the hook prints how when it fires). Bypassing is logged in the
-# user's local shell history; intentional bypass is auditable.
+# Each guard is conditional (skips cleanly if its tool isn't present) and
+# bypassable with `git push --no-verify` ONLY in genuine emergencies (the
+# hook prints how when it fires). Bypassing is logged in the user's local
+# shell history; intentional bypass is auditable.
 #
 # Activated by `scripts/install-git-hooks.sh` (runs `git config
 # core.hooksPath .githooks` so the repo-tracked hooks become live).
 set -euo pipefail
 
-# Only run if pip-audit is installed; nudge if not. We don't want to
+ROOT=$(git rev-parse --show-toplevel)
+
+# ---------------------------------------------------------------------------
+# Guard 1 — e2e real-browser suite. A spec (tests/e2e) that asserts the wrong
+# thing — or a UI/web change that breaks one — must not land RED in CI:
+# .github/workflows/e2e.yml is the ONLY GitHub job that runs pytest, so a red
+# e2e is otherwise unguarded. Runs ONLY when (a) Playwright is importable
+# locally AND (b) this push touches an e2e / web / template surface — docs and
+# non-UI pushes pay nothing. Placed FIRST so it runs independently of whether
+# pip-audit is installed (the pip-audit guard below `exit 0`s when absent).
+#   Origin (2026-06-20): an N-109 e2e spec asserted `.to_be_visible()` on a
+#   `data-multiselect`-HIDDEN <select> and was red in CI for hours, unnoticed,
+#   because the committed spec had never been run through the harness (which
+#   DOES run locally on Windows). This guard makes that class unpushable.
+PY=python; command -v python >/dev/null 2>&1 || PY=python3
+if "$PY" -c "import playwright" >/dev/null 2>&1; then
+    # What is being pushed? Commits on HEAD not yet on the upstream tracking
+    # ref. No upstream (new branch) → fall back to origin/main; if neither is
+    # resolvable, RUN (fail-safe toward catching).
+    RANGE=""
+    if UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null); then
+        RANGE="${UPSTREAM}..HEAD"
+    elif git rev-parse --verify origin/main >/dev/null 2>&1; then
+        RANGE="origin/main..HEAD"
+    fi
+    CHANGED=""
+    [ -n "$RANGE" ] && CHANGED=$(git diff --name-only "$RANGE" 2>/dev/null || true)
+    if [ -z "$RANGE" ] || printf '%s\n' "$CHANGED" \
+            | grep -qE '^tests/e2e/|^src/email_triage/web/|\.html$'; then
+        echo "pre-push: e2e real-browser suite (UI/e2e surface changed; --no-verify to bypass)"
+        if ! (cd "$ROOT" && "$PY" -m pytest tests/e2e --browser chromium -q -o addopts=""); then
+            cat >&2 <<'EOF'
+
+pre-push BLOCKED: tests/e2e failed (the real-browser suite CI runs).
+Fix the spec/UI before pushing — a red e2e lands red in CI (e2e.yml is the
+only GitHub job that runs pytest). Re-run locally:
+  python -m pytest tests/e2e --browser chromium -q -o addopts=""
+Bypass (rarely correct): git push --no-verify
+
+EOF
+            exit 1
+        fi
+    fi
+else
+    echo "pre-push: playwright not importable; skipping e2e guard (CI still runs it)."
+fi
+
+# ---------------------------------------------------------------------------
+# Guard 2 — pip-audit. Only run if installed; nudge if not. We don't want to
 # auto-install via the hook — operator opts in via the install script.
 if ! command -v pip-audit >/dev/null 2>&1; then
     echo "pre-push: pip-audit not installed; skipping vuln scan."
@@ -19,7 +71,6 @@ if ! command -v pip-audit >/dev/null 2>&1; then
     exit 0
 fi
 
-ROOT=$(git rev-parse --show-toplevel)
 SCRIPT="$ROOT/scripts/run-pip-audit.sh"
 if [ ! -x "$SCRIPT" ]; then
     echo "pre-push: $SCRIPT missing or not executable; skipping."
@@ -43,24 +94,31 @@ EOF
     exit 1
 fi
 
-# Lockfile-freshness guard. If pyproject.toml has dependency edits
+# ---------------------------------------------------------------------------
+# Guard 3 — lockfile-freshness. If pyproject.toml has dependency edits
 # that haven't been baked into requirements.lock, the Containerfile +
 # CI installs would silently fall back to whatever the resolver
 # picks today. Catch the drift before push so CI doesn't have to.
 # Skipped when pip-compile isn't available (operator-side optional).
 if command -v pip-compile >/dev/null 2>&1; then
     TMP_LOCK="$(mktemp)"
-    # Extras MUST match the ones the Containerfile installs; otherwise
-    # the lock excludes deps the runtime needs (aioimaplib, msal, etc.)
-    # and the container build silently ships a broken image.
-    # Run pip-compile from $ROOT with a relative pyproject path. When
-    # an absolute path is passed, pip-compile annotates each # via
-    # comment with the full path, which then drifts vs the committed
-    # lockfile (which is generated with relative paths). Same TMP file
-    # path either way; only the annotation source differs.
+    # Seed TMP with the COMMITTED lock so pip-compile does a MINIMAL
+    # update (honouring existing pins) rather than a from-scratch
+    # resolve. Without this seed, a fresh resolve bumps unrelated
+    # transitive deps to their latest (anyio, cbor2, certifi, …) and
+    # the guard FALSE-FAILS every normally-maintained lock — the bug
+    # that surfaced the day repo hooks were first activated (2026-06-20).
+    cp "$ROOT/requirements.lock" "$TMP_LOCK"
+    # Flags MUST match the canonical command recorded in the lock's own
+    # header — ``--extra=cache --extra=imap --extra=keyfile
+    # --extra=office365 --extra=openai --no-strip-extras``. Dropping any
+    # (e.g. ``cache``/redis or ``--no-strip-extras``) makes the regen
+    # diverge from the committed lock and false-fail. Run from $ROOT with
+    # a relative pyproject path so the ``# via`` annotations match the
+    # committed (relative-path) lock.
     if (cd "$ROOT" && pip-compile --quiet \
-            --extra=keyfile --extra=imap \
-            --extra=office365 --extra=openai \
+            --extra=cache --extra=imap --extra=keyfile \
+            --extra=office365 --extra=openai --no-strip-extras \
             --output-file="$TMP_LOCK" pyproject.toml) >/dev/null 2>&1; then
         # Strip the auto-comment header (mentions the output filename
         # which differs between the canonical lock and the tmp file)
@@ -88,8 +146,8 @@ if command -v pip-compile >/dev/null 2>&1; then
 pre-push BLOCKED: requirements.lock is stale vs pyproject.toml.
 
 Refresh:
-  pip-compile --extra=keyfile --extra=imap \\
-              --extra=office365 --extra=openai \\
+  pip-compile --extra=cache --extra=imap --extra=keyfile \\
+              --extra=office365 --extra=openai --no-strip-extras \\
               --output-file=requirements.lock pyproject.toml
   # then re-add the pywin32 marker (see existing comment in lock)
   git add requirements.lock

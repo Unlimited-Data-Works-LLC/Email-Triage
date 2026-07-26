@@ -9,6 +9,7 @@ and assert the count is ≤ a small constant rather than scaling with
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 from datetime import datetime, timezone
@@ -75,7 +76,7 @@ class _QueryCounter:
 
 def _make_db():
     """Spin up an in-memory SQLite DB with the test schema."""
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, {
         "work": "Work mail",
         "personal": "Personal mail",
@@ -389,9 +390,19 @@ def test_delete_account_settings_sweeps_every_known_key():
     set_setting(db, S.digest_schedules(aid), [{"x": 1}])
     set_setting(db, S.watch_hwm(aid), {"hwm": 1})
     set_setting(db, S.watch_hwm_mailbox(aid, "INBOX"), {"hwm": 9})
+    # run17  — newly-catalogued account-scoped keys (orphans before the fix);
+    # the two multi-segment shapes (digest_state / mailbox_routes) exercise the
+    # exact_match=False LIKE-with-colon-anchor branch.
+    set_setting(db, f"digest_configs:{aid}", [{"x": 1}])
+    set_setting(db, f"digest_state:{aid}:preset:daily_activity", {"last_sent_at": "t"})
+    set_setting(db, f"recipient_digest_state:{aid}", {"last_sent_at": "t"})
+    set_setting(db, f"mailbox_routes:{aid}:INBOX", {"r": 1})
+    set_setting(db, f"ratelimit:triage_preview:{aid}", 0.0)
     # And a different account that must NOT be touched.
     set_setting(db, S.watch(other), {"enabled": True})
     set_setting(db, S.watch_hwm_mailbox(other, "INBOX"), {"hwm": 1})
+    set_setting(db, f"digest_state:{other}:preset:daily_activity", {"k": 1})
+    set_setting(db, f"mailbox_routes:{other}:INBOX", {"r": 9})
 
     deleted = S.delete_account_settings(db, aid)
     assert deleted >= 5
@@ -402,10 +413,17 @@ def test_delete_account_settings_sweeps_every_known_key():
     assert get_setting(db, S.digest_schedules(aid)) is None
     assert get_setting(db, S.watch_hwm(aid)) is None
     assert get_setting(db, S.watch_hwm_mailbox(aid, "INBOX")) is None
+    assert get_setting(db, f"digest_configs:{aid}") is None
+    assert get_setting(db, f"digest_state:{aid}:preset:daily_activity") is None
+    assert get_setting(db, f"recipient_digest_state:{aid}") is None
+    assert get_setting(db, f"mailbox_routes:{aid}:INBOX") is None
+    assert get_setting(db, f"ratelimit:triage_preview:{aid}") is None
 
-    # Other account untouched.
+    # Other account untouched (incl. its multi-segment rows — colon-anchoring).
     assert get_setting(db, S.watch(other)) == {"enabled": True}
     assert get_setting(db, S.watch_hwm_mailbox(other, "INBOX")) == {"hwm": 1}
+    assert get_setting(db, f"digest_state:{other}:preset:daily_activity") == {"k": 1}
+    assert get_setting(db, f"mailbox_routes:{other}:INBOX") == {"r": 9}
 
 
 def test_delete_account_settings_anchors_colon_to_avoid_prefix_collision():

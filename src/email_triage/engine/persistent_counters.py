@@ -53,6 +53,13 @@ from __future__ import annotations
 
 from typing import Any
 
+# run17 / — the Redis-subsystem SSOT: the ``from_url`` factory + the ONE
+# shared fallback circuit-breaker. Before run17 this module was the 3rd Redis
+# consumer with NO breaker — a dead Redis re-paid the full 2 s socket timeout on
+# EVERY counter bump, no backoff. ``_redis`` imports nothing from ``email_triage``
+# (a leaf), so it can't cycle with the ``cache → persistent_counters`` edge.
+from email_triage.cache._redis import RedisFallbackBreaker, build_redis_client
+from email_triage._int_utils import parse_int_or_none  # N-219c/10 R23
 from email_triage.triage_logging import get_logger
 
 log = get_logger("engine.persistent_counters")
@@ -74,10 +81,18 @@ class RedisCounterBackend:
         self,
         url: str = "",
         key_prefix: str = _DEFAULT_KEY_PREFIX,
+        *,
+        breaker_ttl_secs: int = 60,
     ) -> None:
         self._url = (url or "").strip()
         self._prefix = key_prefix
         self._client: Any = None
+        # run17  — the missing consumer now carries the SHARED fallback
+        # breaker. After a Redis command fails the breaker opens for
+        # ``breaker_ttl_secs`` and every subsequent incr/fetch/reset
+        # short-circuits, so a dead Redis is no longer re-hammered (re-paying
+        # the 2 s socket timeout) on every counter bump.
+        self._breaker = RedisFallbackBreaker(ttl_secs=int(breaker_ttl_secs))
 
     @property
     def enabled(self) -> bool:
@@ -88,19 +103,23 @@ class RedisCounterBackend:
             return self._client
         if not self._url:
             return None
+        # run17  — build through the Redis-subsystem factory SSOT. An
+        # ``ImportError`` (no optional ``cache`` extra) is a permanent process
+        # condition — but a failed ``import redis`` re-runs the import finder
+        # (a filesystem scan, NOT a cached dict lookup) on every call, so TRIP
+        # the breaker to latch it into the TTL back-off window instead of
+        # re-attempting per incr/fetch/reset (DA run17 ). A from_url build
+        # error likewise trips so we don't re-attempt it every call.
         try:
-            import redis  # type: ignore[import-not-found]
-        except ImportError:
+            self._client = build_redis_client(self._url)
+        except ImportError as exc:
+            self._breaker.trip(f"import: {exc}")
             return None
-        try:
-            self._client = redis.Redis.from_url(
-                self._url,
-                decode_responses=True,
-                socket_timeout=2.0,
-                socket_connect_timeout=2.0,
-            )
         except Exception as exc:  # noqa: BLE001
-            log.debug("persistent counter backend init failed: %s", exc)
+            # ``log`` is a TriageLogger (msg-only; no printf args — style-guide
+            # PD#10), so the dynamic value goes in an f-string, not a %s arg.
+            log.debug(f"persistent counter backend init failed: {exc}")
+            self._breaker.trip(f"init: {exc}")
             self._client = None
         return self._client
 
@@ -113,7 +132,7 @@ class RedisCounterBackend:
         Silent on failure — the process-local counter the caller
         already incremented stays the live source of truth.
         """
-        if not self.enabled:
+        if not self.enabled or self._breaker.is_open():
             return
         client = self._get_client()
         if client is None:
@@ -121,14 +140,18 @@ class RedisCounterBackend:
         try:
             client.hincrby(self._key(namespace), field, by)
         except Exception as exc:  # noqa: BLE001
+            # TriageLogger is msg-only (PD#10) — f-string, not %s positional args.
             log.debug(
-                "persistent counter incr failed: %s.%s += %d (%s)",
-                namespace, field, by, exc,
+                f"persistent counter incr failed: {namespace}.{field} += {by} ({exc})"
             )
+            # run17  — back off so a dead Redis isn't re-hammered (re-paying
+            # the socket timeout) on every subsequent counter bump.
+            self._breaker.trip(f"incr: {exc}")
+            self._client = None
 
     def fetch(self, namespace: str) -> dict[str, int]:
         """``HGETALL`` returning ``{field: int}``. Empty on failure."""
-        if not self.enabled:
+        if not self.enabled or self._breaker.is_open():
             return {}
         client = self._get_client()
         if client is None:
@@ -136,24 +159,22 @@ class RedisCounterBackend:
         try:
             raw = client.hgetall(self._key(namespace)) or {}
         except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "persistent counter fetch failed: %s (%s)",
-                namespace, exc,
-            )
+            log.debug(f"persistent counter fetch failed: {namespace} ({exc})")
+            self._breaker.trip(f"fetch: {exc}")
+            self._client = None
             return {}
         out: dict[str, int] = {}
         for k, v in raw.items():
-            try:
-                out[str(k)] = int(v)
-            except (TypeError, ValueError):
-                continue
+            _iv = parse_int_or_none(v)  # N-219c/10 R23: SSOT
+            if _iv is not None:
+                out[str(k)] = _iv
         return out
 
     def reset(self, namespace: str) -> int:
         """Delete the namespace's HASH. Returns 1 on delete, 0 on miss
         or failure (best-effort; caller bumps a process-local "last
         reset" flag if they need to surface the action timestamp)."""
-        if not self.enabled:
+        if not self.enabled or self._breaker.is_open():
             return 0
         client = self._get_client()
         if client is None:
@@ -161,10 +182,9 @@ class RedisCounterBackend:
         try:
             return int(client.delete(self._key(namespace)) or 0)
         except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "persistent counter reset failed: %s (%s)",
-                namespace, exc,
-            )
+            log.debug(f"persistent counter reset failed: {namespace} ({exc})")
+            self._breaker.trip(f"reset: {exc}")
+            self._client = None
             return 0
 
     def close(self) -> None:

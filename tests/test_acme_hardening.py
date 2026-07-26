@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _db_tracking import track
 from email_triage import single_flight as sf
 from email_triage.config import AcmeConfig, Rfc2136Config
 from email_triage.single_flight import SingleFlightBusy
@@ -498,7 +499,7 @@ def _make_renewer(domains: list[str] | None = None) -> AcmeRenewer:
     secrets = MagicMock()
     secrets.get.return_value = None
     secrets.set.return_value = None
-    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db = track(sqlite3.connect(":memory:", check_same_thread=False))
     return AcmeRenewer(
         cfg=cfg, cert_dir="/tmp/test-acme",
         secrets_store=secrets, db=db,

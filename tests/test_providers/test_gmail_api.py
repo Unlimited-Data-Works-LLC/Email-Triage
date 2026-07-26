@@ -224,6 +224,41 @@ class TestHttpApi:
         assert msg.message_id == "m-1"
         assert msg.body_text == "Body"
         assert msg.thread_id == "t-1"
+        # Default (full) path must keep requesting format=full (unchanged).
+        assert provider._http.request.call_args.kwargs["params"]["format"] == "full"
+
+    async def test_fetch_message_headers_only_uses_metadata_format(self, provider):
+        # run17 #8 / §164.502(b): a headers_only fetch must NOT pull the PHI
+        # body — Gmail's format=metadata returns id + labels + headers only.
+        # Response carries NO payload body data (metadata format omits it).
+        provider._http.request = AsyncMock(return_value=_mock_resp({
+            "id": "m-2",
+            "threadId": "t-2",
+            "labelIds": ["INBOX"],
+            "internalDate": "1712500000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "From", "value": "alice@example.com"},
+                    {"name": "To", "value": "bob@example.com"},
+                    {"name": "Subject", "value": "Meta only"},
+                ],
+            },
+        }))
+        msg = await provider.fetch_message("m-2", headers_only=True)
+        # The minimum-necessary narrowing: format=metadata, not full.
+        assert provider._http.request.call_args.kwargs["params"]["format"] == "metadata"
+        # Metadata fields the caller needs still parse through EmailMessage...
+        assert msg.message_id == "m-2"
+        assert "alice@example.com" in msg.sender
+        assert msg.recipients == ["bob@example.com"]
+        assert msg.subject == "Meta only"
+        assert msg.thread_id == "t-2"
+        assert "INBOX" in msg.labels
+        # ...while the PHI body / attachments are empty (none requested).
+        assert msg.body_text == ""
+        assert msg.body_html == ""
+        assert msg.attachments == []
 
     async def test_move_message_sets_labels(self, provider):
         # First call: list_labels (label resolution).

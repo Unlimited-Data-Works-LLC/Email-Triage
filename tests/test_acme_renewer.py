@@ -39,7 +39,8 @@ from email_triage.tls import cert_mtime, generate_self_signed_cert
 
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
-    return init_db(str(tmp_path / "test.db"))
+    from _db_tracking import track
+    return track(init_db(str(tmp_path / "test.db")))
 
 
 class _MemSecrets:

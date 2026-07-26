@@ -27,7 +27,8 @@ the same note. The audit row still fires for the attempt.
 """
 from __future__ import annotations
 
-import logging
+from email_triage._isotime import now_utc_iso
+
 from typing import Any
 
 from fastapi import APIRouter, Form, Request
@@ -35,12 +36,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from email_triage.web.app import get_db, get_templates
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web._audit import safe_audit_write
 from email_triage._errfmt import fmt_exc
 
 
 # async-db: handlers route SQLite through db_call
-_log = logging.getLogger("email_triage.web.ui.retry_queue")
 
 router = APIRouter()
 
@@ -58,17 +58,8 @@ _STATE_FILTERS: tuple[str, ...] = (
 )
 
 
-def _require_admin(request: Request):
-    """Tiny inline admin gate. Same shape as ``_require_admin_user``
-    in ``_shared.py``; redefined here to keep this concern file
-    self-contained for cherry-pick purposes (no globals().update
-    dance needed)."""
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 def _audit(
@@ -82,10 +73,12 @@ def _audit(
     detail: str | None = None,
 ) -> None:
     """Write an access_log row. Never raises — audit failure must
-    not break the operator's workflow on this page."""
-    try:
+    not break the operator's workflow on this page. Routed through the
+    best-effort audit-write SSOT so the miss is visible to /health's
+    audit-failure drift counter (census run17 #3)."""
+    def _emit():
         from email_triage.web.db import record_access_event
-        record_access_event(
+        return record_access_event(
             db,
             actor_user_id=user.get("id"),
             method=method,
@@ -96,60 +89,96 @@ def _audit(
             outcome=outcome,
             detail=detail,
         )
-    except Exception as exc:  # pragma: no cover - failure-safe
-        _log.warning(
-            "retry_queue: audit write failed",
-            extra={"_extra": {
-                "route": route, "outcome": outcome,
-                "audit_error": fmt_exc(exc),
-            }},
-        )
+    safe_audit_write(
+        _emit, description=f"access_log {method} {route} outcome={outcome}",
+    )
+
+
+#  — admin retry-queue page caps. Combined pending+dead caps each
+# half at 200; a single-state filter caps at 400. Past the cap the
+# oldest rows silently vanish and the queue looks complete — surface
+# "showing first N of M" so a backlog larger than the cap is visible.
+_CAP_COMBINED = 200
+_CAP_SINGLE = 400
 
 
 def _load_rows(
-    db: Any, *, state_filter: str,
-) -> tuple[list[dict[str, Any]], str | None]:
+    db: Any, *, state_filter: str, offset: int = 0,
+):
     """Pull rows from R-A's helper, augment with HIPAA mailbox
-    suppression. Returns ``(rows, error_note)`` — error_note is a
-    plain-English string when R-A's helper is missing/raised."""
+    suppression. Returns ``(rows, error_note, page_win, cap_segments)``:
+
+    * ``error_note`` — a plain-English string when R-A's helper is
+      missing/raised, else None.
+    * ``page_win`` — a ``PageWindow`` for the SINGLE-state views
+      (pending / dead / all), which page via ``?offset=`` so the full
+      backlog past the cap is REACHABLE. None for the combined
+      ``pending_and_dead`` summary.
+    * ``cap_segments`` — for the combined view only, a per-half
+      ``{label, shown, total, cap, view_all_state}`` so the operator can
+      jump to the paginated single-state view to reach the full backlog.
+    """
+    from email_triage.web._pagination import page_window, clamp_offset
     try:
         from email_triage.web.db import (
-            list_retries_for_admin,
+            list_retries_for_admin, count_retries_for_admin,
         )
     except ImportError:
         return [], (
             "Retry queue not yet available on this install. The "
             "sweeper foundation lands on the next deploy; once it's "
             "live, queued retries will show up here."
-        )
+        ), None, []
 
+    cap_segments: list[dict[str, Any]] = []
+    page_win = None
     state_param: str | None
     if state_filter == "pending_and_dead":
         # R-A's helper takes a single state slug. Two calls + merge.
+        # The combined view is a summary (first cap of each); the full
+        # backlog is reached by clicking through to a single-state view,
+        # which paginates. So no offset here — just the per-half segments
+        # carrying a ``view_all_state`` for the "view all N →" link.
         try:
             pending = list_retries_for_admin(
-                db, state="pending", limit=200,
+                db, state="pending", limit=_CAP_COMBINED,
             )
             dead = list_retries_for_admin(
-                db, state="dead", limit=200,
+                db, state="dead", limit=_CAP_COMBINED,
             )
             rows = list(pending) + list(dead)
+            for label, shown_rows, st in (
+                ("pending", pending, "pending"),
+                ("dead", dead, "dead"),
+            ):
+                total = count_retries_for_admin(db, state=st)
+                if total > len(shown_rows):
+                    cap_segments.append({
+                        "label": label, "shown": len(shown_rows),
+                        "total": total, "cap": _CAP_COMBINED,
+                        "view_all_state": st,
+                    })
         except Exception as exc:
             return [], (
                 f"Could not read the retry queue ({fmt_exc(exc)}). "
                 "Try refreshing or check /health/detail."
-            )
+            ), None, []
     else:
         state_param = state_filter if state_filter != "all" else None
         try:
+            total = count_retries_for_admin(db, state=state_param)
+            off = clamp_offset(offset, _CAP_SINGLE, total)
             rows = list(list_retries_for_admin(
-                db, state=state_param, limit=400,
+                db, state=state_param, limit=_CAP_SINGLE, offset=off,
             ))
+            page_win = page_window(
+                total=total, offset=off, limit=_CAP_SINGLE, shown=len(rows),
+            )
         except Exception as exc:
             return [], (
                 f"Could not read the retry queue ({fmt_exc(exc)}). "
                 "Try refreshing or check /health/detail."
-            )
+            ), None, []
 
     # Augment each row with an ``account_label`` and HIPAA flag.
     # The DB query that backs ``list_retries_for_admin`` may or may
@@ -175,7 +204,10 @@ def _load_rows(
             except Exception:
                 acct_cache[acct_id] = {}
         acct = acct_cache.get(acct_id, {}) if acct_id else {}
-        is_hipaa = bool(acct.get("hipaa"))
+        # N-81: route through is_account_hipaa (folds system flag so
+        # a system-HIPAA install with acct["hipaa"]=0 still redacts).
+        from email_triage.triage_logging import is_account_hipaa as _iah_rq
+        is_hipaa = _iah_rq(acct) if acct else False
         row["account_label"] = (
             acct.get("name") or f"#{acct_id}" if acct_id else "(unknown)"
         )
@@ -196,7 +228,7 @@ def _load_rows(
         row["error_class_short"] = err_class
         augmented.append(row)
 
-    return augmented, None
+    return augmented, None, page_win, cap_segments
 
 
 @router.get("/admin/retry-queue", response_class=HTMLResponse)
@@ -213,10 +245,14 @@ async def retry_queue_index(request: Request):
     ).strip().lower()
     if state_filter not in _STATE_FILTERS:
         state_filter = "pending_and_dead"
+    #  — single-state views page via ?offset=; clamped in _load_rows.
+    raw_offset = request.query_params.get("offset")
 
-    def _index_db_work() -> tuple[list[dict[str, Any]], str | None]:
+    def _index_db_work():
         """/ — list load + audit write in one threadpool hop."""
-        rows_, error_note_ = _load_rows(db, state_filter=state_filter)
+        rows_, error_note_, page_win_, cap_segments_ = _load_rows(
+            db, state_filter=state_filter, offset=raw_offset,
+        )
         # Audit the read (HIPAA — admin viewing a list that names
         # accounts is a §164.312(b) auditable event).
         _audit(
@@ -225,9 +261,9 @@ async def retry_queue_index(request: Request):
             outcome="ok" if error_note_ is None else "degraded",
             detail=f"state={state_filter} rows={len(rows_)}",
         )
-        return rows_, error_note_
+        return rows_, error_note_, page_win_, cap_segments_
 
-    rows, error_note = await db_call(_index_db_work)
+    rows, error_note, page_win, cap_segments = await db_call(_index_db_work)
 
     # Defer to _shared._render for the BAA-banner injection +
     # hipaa_mode ctx + retry_queue_banner ctx (used by base.html
@@ -243,6 +279,8 @@ async def retry_queue_index(request: Request):
             "state_filter": state_filter,
             "state_filters": _STATE_FILTERS,
             "error_note": error_note,
+            "cap_segments": cap_segments,
+            "page_win": page_win,
         },
     )
 
@@ -301,8 +339,7 @@ async def retry_queue_retry_now(
         # Direct UPDATE on the column. This bypasses R-A's "compute next
         # attempt" backoff math intentionally — the operator-driven
         # retry-now bypasses the schedule by design.
-        from datetime import datetime, timezone
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = now_utc_iso()
         try:
             db.execute(
                 "UPDATE watcher_retry_queue SET next_attempt_at = ? "

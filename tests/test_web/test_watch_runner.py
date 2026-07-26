@@ -14,6 +14,7 @@ deps (e.g. respx) are needed.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 import hashlib
@@ -91,12 +92,15 @@ def _reset_module_webhook_client():
     """
     from email_triage.web import watch_runner
     yield
-    watch_runner._WEBHOOK_CLIENT._client = None
+    # -d: _WEBHOOK_CLIENT is now a lazy None-initialised singleton
+    # rebuilt by _get_webhook_client() on next use, so nuking the
+    # module ref restores per-test httpx patch interception.
+    watch_runner._WEBHOOK_CLIENT = None
 
 
 @pytest.fixture
 def db():
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     yield conn
     conn.close()
 
@@ -1160,8 +1164,17 @@ class TestWatchFireIdempotency:
                 lock = WR._watch_fire_locks.get(lock_key)
                 assert lock is not None
                 assert lock.locked(), "winner must hold the per-key lock"
-                # Give the loser a turn to reach `async with lock`.
-                await asyncio.sleep(0)
+                # Wait for the loser to reach `async with lock` and
+                # populate the asyncio.Lock internal `_waiters` deque.
+                # A single sleep(0) is one scheduler tick — not enough
+                # under CI runner load. Mirror the winner-side event
+                # barrier idiom with a bounded poll on the state we
+                # are about to assert. Root-cause-scope-adjacent to
+                # the refcount barrier fix below.
+                async def _loser_at_waiters():
+                    while not getattr(lock, "_waiters", None):
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(_loser_at_waiters(), timeout=5.0)
                 waiters = getattr(lock, "_waiters", None)
                 assert waiters, (
                     "the loser must be blocked waiting on the per-key "
@@ -1254,7 +1267,17 @@ class TestWatchFireIdempotency:
                 task_a = asyncio.create_task(_one())
                 task_b = asyncio.create_task(_one())
                 await asyncio.wait_for(winner_inside.wait(), timeout=5.0)
-                await asyncio.sleep(0)  # let the loser reach the lock.
+
+                # Wait for the loser to hit refcount++ inside
+                # _get_watch_fire_lock. A single asyncio.sleep(0)
+                # isn't enough under CI runner load (one scheduler
+                # tick may not schedule the loser far enough); mirror
+                # the winner-side event barrier idiom with a bounded
+                # poll on the state we're about to assert.
+                async def _loser_at_refcount():
+                    while WR._watch_fire_refcount.get(key) != 2:
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(_loser_at_refcount(), timeout=5.0)
 
                 # MID-FLIGHT: both runners are in the get/release span
                 # (winner holds, loser waits) — refcount must be 2 and
@@ -1327,3 +1350,146 @@ class TestTriageCompletedEmitter:
                 dispatcher, db, config, acct, run,
             )
         assert attempted is True
+
+
+# ---------------------------------------------------------------------------
+#  — auto-retire seam (proves the runner actually CALLS maybe_auto_retire,
+# and that retire is GROUP-grained, not per-account-row)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRetireSeam:
+    """ — the auto-retire seam in ``fire_watches_for_message``.
+
+    Guards two things the model-only tests can't:
+      * the runner ACTUALLY invokes ``maybe_auto_retire_watch`` on a delivered
+        fire (the ``incident_2026-06-11_topic_digest_dead_in_prod`` shape — a
+        green model test over a dead seam proves nothing);
+      * retire is GROUP-grained: a watch spanning N accounts retires at N TOTAL
+        matches and retires the WHOLE group atomically (the devils-advocate
+        must-fix — per-row counting would mean "N per account" + fragment the
+        group on delete).
+    """
+
+    def _add_account(self, db, acct_id, user_id):
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "INSERT INTO email_accounts "
+            "(id, user_id, name, provider_type, config_json, hipaa, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (acct_id, user_id, f"acct{acct_id}", "imap",
+             json.dumps({"notify_email": "ops@example.com"}), 0, now, now),
+        )
+        db.commit()
+        return {"id": acct_id, "user_id": user_id, "name": f"acct{acct_id}",
+                "provider_type": "imap", "hipaa": False,
+                "config": {"notify_email": "ops@example.com"}}
+
+    @pytest.mark.asyncio
+    async def test_runner_invokes_auto_retire_and_disables(
+        self, db, acct, config,
+    ):
+        """A single-account watch with ``after_n=2`` is disabled by the runner
+        on the 2nd delivered fire — and the result row is stamped."""
+        secrets = _Secrets({"SMTP_PASSWORD": "x"})
+        w = W.upsert_watch(db, W.EmailWatch(
+            name="retire-me", account_id=1,
+            filter=W.WatchFilter(from_addr="boss@"),
+            actions=W.WatchActions(
+                escalate=W.EscalateAction(
+                    enabled=True, notify_email="ops@example.com"),
+                auto_retire=W.AutoRetireAction(after_n=2, action="disable"),
+            ),
+        ))
+        with patch("email_triage.web.smtp_send.send_simple_smtp_email"):
+            r1 = await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="m1")
+            # 1 < 2 -> not retired yet.
+            assert not r1[0].get("auto_retired")
+            assert W.get_watch(db, w.watch_id).enabled is True
+            r2 = await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="m2")
+        assert r2[0]["auto_retired"] == "disabled"
+        got = W.get_watch(db, w.watch_id)
+        assert got is not None and got.enabled is False  # reversible
+
+    @pytest.mark.asyncio
+    async def test_group_retires_at_total_not_per_account(
+        self, db, acct, config,
+    ):
+        """A 2-account watch group with ``after_n=2`` retires at 2 TOTAL (one
+        match on each account), disabling BOTH rows — not 2-per-account."""
+        secrets = _Secrets({"SMTP_PASSWORD": "x"})
+        acct2 = self._add_account(db, 2, acct["user_id"])
+        gid = "grp-disable"
+        ar = W.WatchActions(
+            escalate=W.EscalateAction(
+                enabled=True, notify_email="ops@example.com"),
+            auto_retire=W.AutoRetireAction(after_n=2, action="disable"),
+        )
+        w1 = W.upsert_watch(db, W.EmailWatch(
+            name="g", account_id=1, watch_group_id=gid,
+            filter=W.WatchFilter(from_addr="boss@"), actions=ar))
+        w2 = W.upsert_watch(db, W.EmailWatch(
+            name="g", account_id=2, watch_group_id=gid,
+            filter=W.WatchFilter(from_addr="boss@"), actions=ar))
+        with patch("email_triage.web.smtp_send.send_simple_smtp_email"):
+            # 1 match on account 1 -> group total 1 < 2, nothing retired.
+            await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="a1")
+            assert W.get_watch(db, w1.watch_id).enabled is True
+            assert W.get_watch(db, w2.watch_id).enabled is True
+            # 1 match on account 2 -> group total 2 >= 2, retire the GROUP.
+            r = await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct2,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="b1")
+        assert r[0]["auto_retired"] == "disabled"
+        # BOTH rows disabled — atomic group retire, not just account 2's.
+        assert W.get_watch(db, w1.watch_id).enabled is False
+        assert W.get_watch(db, w2.watch_id).enabled is False
+
+    @pytest.mark.asyncio
+    async def test_group_delete_removes_all_rows(self, db, acct, config):
+        """``action="delete"`` at the group threshold removes EVERY row in the
+        group (not just the firing account's), and purges the group's fire log."""
+        secrets = _Secrets({"SMTP_PASSWORD": "x"})
+        acct2 = self._add_account(db, 2, acct["user_id"])
+        gid = "grp-delete"
+        ar = W.WatchActions(
+            escalate=W.EscalateAction(
+                enabled=True, notify_email="ops@example.com"),
+            auto_retire=W.AutoRetireAction(after_n=2, action="delete"),
+        )
+        w1 = W.upsert_watch(db, W.EmailWatch(
+            name="g", account_id=1, watch_group_id=gid,
+            filter=W.WatchFilter(from_addr="boss@"), actions=ar))
+        w2 = W.upsert_watch(db, W.EmailWatch(
+            name="g", account_id=2, watch_group_id=gid,
+            filter=W.WatchFilter(from_addr="boss@"), actions=ar))
+        with patch("email_triage.web.smtp_send.send_simple_smtp_email"):
+            await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="a1")
+            r = await fire_watches_for_message(
+                db=db, config=config, secrets=secrets, account=acct2,
+                sender="boss@example.com", subject="s", category="c",
+                message_id="b1")
+        assert r[0]["auto_retired"] == "deleted"
+        # Whole group gone — no fragmentation.
+        assert W.get_watch(db, w1.watch_id) is None
+        assert W.get_watch(db, w2.watch_id) is None
+        # The group's now-dead idempotency rows were purged.
+        remaining = db.execute(
+            "SELECT COUNT(*) FROM watch_fire_idempotency "
+            "WHERE watch_id IN (?, ?)", (w1.watch_id, w2.watch_id),
+        ).fetchone()[0]
+        assert remaining == 0

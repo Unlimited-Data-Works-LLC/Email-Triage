@@ -47,7 +47,8 @@ def _build_pubkey_text(priv: ed25519.Ed25519PrivateKey, comment: str = "test") -
 
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
-    return init_db(str(tmp_path / "test.db"))
+    from _db_tracking import track
+    return track(init_db(str(tmp_path / "test.db")))
 
 
 @pytest.fixture
@@ -206,6 +207,37 @@ class TestDevKeyDbHelpers:
         assert revoke_dev_key(db, kid, revoked_by_user_id=None) is False
         row = find_dev_key_by_fingerprint(db, fp)
         assert row["revoked_at"] is not None
+
+    def test_revoke_bumps_allowlisted_users_session_epoch(self, db, keypair):
+        #  / census run12 #2 — a dev-key authenticates as any allowlisted
+        # email, so revoking it must cut every such user's live sessions
+        # (bump session_epoch), fail-secure. The bump fires once, on the first
+        # (real) revoke only.
+        _, text = keypair
+        fp = fingerprint(parse_ssh_ed25519_pubkey(text))
+        db.execute(
+            "INSERT INTO users (email, name, role, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("a@b.com", "A", "user", "2020-01-01T00:00:00+00:00"),
+        )
+        db.commit()
+
+        def epoch():
+            return db.execute(
+                "SELECT session_epoch FROM users WHERE email = ?", ("a@b.com",),
+            ).fetchone()[0]
+
+        kid = add_dev_key(
+            db, name="x", public_key=text, fingerprint=fp,
+            email_allowlist=["a@b.com"], created_by_user_id=None,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        before = epoch()
+        assert revoke_dev_key(db, kid, revoked_by_user_id=None) is True
+        assert epoch() == before + 1, "revoke must bump the allowlisted user's epoch"
+        # Idempotent re-revoke (rowcount 0) must NOT bump again.
+        assert revoke_dev_key(db, kid, revoked_by_user_id=None) is False
+        assert epoch() == before + 1
 
     def test_mark_used_stamps_metadata(self, db, keypair):
         _, text = keypair

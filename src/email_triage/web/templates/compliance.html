@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Compliance - Email Triage{% endblock %}
 {% block content %}
+{# #299 reachability — each audit table below renders with a hard page #}
+{# cap; the shared pager surfaces "showing N–M of T" AND newer/older    #}
+{# links so the full §164.312(b) trail is reachable, not just counted.  #}
+{% from "_pager.html" import pager %}
+{% set _audit_pages = audit_pages if audit_pages is defined else {} %}
 <h2>Compliance</h2>
 <p>
     Spot-check HIPAA state across the install. System-wide flag is at the
@@ -104,6 +109,7 @@
 {% if not recent_events %}
 <p style="color:var(--pico-muted-color);">No boundary events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('recent_events'), 'boundary_offset', request, 'boundary events') }}
 <table>
     <thead>
         <tr>
@@ -142,6 +148,7 @@
 {% if not access_events %}
 <p style="color:var(--pico-muted-color);">No access events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('access_events'), 'access_offset', request, 'access events') }}
 <table>
     <thead>
         <tr>
@@ -189,6 +196,7 @@
 {% if not generic_access_events %}
 <p style="color:var(--pico-muted-color);">No generic access events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('generic_access_events'), 'generic_offset', request, 'PHI-route accesses') }}
 <table>
     <thead>
         <tr>
@@ -258,6 +266,39 @@
 </article>
 {% endif %}
 
+{# ── Audit-event chains: the same tamper-evidence over the PHI-access trail ── #}
+<h3 style="margin-top:1.5rem;">Audit-event chains (tamper-evidence)</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Each audit-event log — who accessed which HIPAA account, HIPAA mode flips,
+    sign-ins, account enable/disable, API-key lifecycle, Discover scans, and
+    cloud-egress style distillation — now carries its own HMAC chain, like the
+    activity log above. Deleting, altering, or forging a row breaks every
+    following row's recomputed hash. Read-only walk on each page load.
+    Tamper-evidence is prospective from this feature's deploy; rows written
+    before it are counted as pre-chain and not flagged.
+</p>
+{% set audit_chains_broken = audit_chains.values() | rejectattr('intact') | list %}
+{% if audit_chains_broken %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ {{ audit_chains_broken | length }} audit chain(s) show a break.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for c in audit_chains_broken %}
+        <li><code>{{ c.table }}</code>: first break at id
+            <code>{{ c.first_break_id }}</code> — {{ c.first_break_reason }}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% else %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>✓ All {{ audit_chains | length }} audit chains intact.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for name, c in audit_chains.items() %}
+        <li><code>{{ name }}</code>: {{ c.rows_checked }} row(s) verified{% if c.prechain_count %}, {{ c.prechain_count }} pre-chain skipped{% endif %}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endif %}
+
 {# ── API key lifecycle (audit trail for create/revoke) ── #}
 <h3 style="margin-top:1.5rem;">API key lifecycle</h3>
 <p style="font-size:0.9rem;color:var(--pico-muted-color);">
@@ -269,6 +310,7 @@
 {% if not api_key_events %}
 <p style="color:var(--pico-muted-color);">No API key events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('api_key_events'), 'apikey_offset', request, 'API-key events') }}
 <table>
     <thead>
         <tr>
@@ -300,7 +342,7 @@
             <td>{{ e.target_email or ('user#' ~ e.target_user_id if e.target_user_id else '—') }}</td>
             <td>{{ e.actor_email or ('user#' ~ e.actor_user_id if e.actor_user_id else '—') }}</td>
             <td><code>{{ e.source }}</code></td>
-            <td style="font-size:0.85rem;color:var(--pico-muted-color);">{{ e.expires_at or 'never' }}</td>
+            <td style="font-size:0.85rem;color:var(--pico-muted-color);">{% if e.expires_at %}<time datetime="{{ e.expires_at }}" data-us-datetime>{{ e.expires_at | us_datetime }}</time>{% else %}never{% endif %}</td>
         </tr>
         {% endfor %}
     </tbody>
@@ -318,6 +360,7 @@
 {% if not discover_runs %}
 <p style="color:var(--pico-muted-color);">No discover runs recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('discover_runs'), 'discover_offset', request, 'discover scans') }}
 <table>
     <thead>
         <tr>
@@ -332,7 +375,7 @@
     <tbody>
         {% for r in discover_runs %}
         <tr>
-            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ r.created_at }}</td>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{% if r.created_at %}<time datetime="{{ r.created_at }}" data-us-datetime>{{ r.created_at | us_datetime }}</time>{% else %}—{% endif %}</td>
             <td>{{ r.actor_email or '—' }}</td>
             <td>{{ r.account_name or ('#' ~ r.account_id) }}</td>
             <td style="font-size:0.85rem;color:var(--pico-muted-color);">

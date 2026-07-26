@@ -27,10 +27,14 @@ from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from email_triage import tls_csr
+from email_triage._int_utils import bounded_int  # N-219c R23
+from email_triage.web._audit import safe_audit_write_async
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web._flash import flash_redirect  # N-179 R20_1 sub-1
+from email_triage.web.routers._redirect import read_flash
 
-log = logging.getLogger("email_triage.web.routers.tls_csr")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.web.routers.tls_csr")  # N-196b R21_4
 router = APIRouter()
 
 
@@ -57,13 +61,8 @@ async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None
     return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
-def _require_admin(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: byte-identical UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 def _resolve_cert_dir(config) -> Path:
@@ -91,23 +90,22 @@ async def _audit(
     try:
         from email_triage.web.db import record_auth_event
         detail = json.dumps(metadata or {}, separators=(",", ":"))
-        await db_call(
-            record_auth_event,
-            db,
-            event_type=event_type,
-            email=email,
-            outcome=outcome,
-            detail=detail,
+        await safe_audit_write_async(
+            lambda: db_call(
+                record_auth_event,
+                db,
+                event_type=event_type,
+                email=email,
+                outcome=outcome,
+                detail=detail,
+            ),
+            description=f"tls_csr:{event_type}:{outcome}",
         )
     except Exception as e:
-        log.warning("TLS-CSR audit write failed: %s", e)
-
-
-def _qstr(s: str) -> str:
-    """Cheap query-string escape. We only ever pass short
-    operator-facing strings; full urllib.parse.quote_plus would be
-    fine but adds a micro-import for no real win."""
-    return s.replace("&", "%26").replace(" ", "+").replace("=", "%3D")
+        log.warning(
+            "TLS-CSR audit write failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +139,7 @@ async def admin_tls_csr_page(request: Request):
         "cert_dir": str(cert_dir),
         "active_cert": active_md,
         "saved": request.query_params.get("saved") == "1",
-        "error": request.query_params.get("err") or "",
+        "error": read_flash(request)[1] or "",
     })
 
 
@@ -183,17 +181,15 @@ async def admin_tls_csr_make(
             outcome="failure",
             metadata={"reason": "already_pending"},
         )
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except ValueError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except Exception as e:
-        log.error("CSR generation failed: %s", e, exc_info=e)
+        log.error(
+            "CSR generation failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_make",
@@ -250,10 +246,7 @@ async def admin_tls_csr_download(request: Request):
     try:
         csr_pem = tls_csr.read_pending_csr(cert_dir)
     except tls_csr.NoPendingCsrError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
 
     return Response(
         content=csr_pem,
@@ -328,9 +321,10 @@ async def admin_tls_csr_import(
         try:
             raw = await cert_file.read()
         except Exception as e:
-            return RedirectResponse(
-                f"/admin/tls/csr?err={_qstr(f'Upload read failed: {e}')}",
-                status_code=303,
+            return flash_redirect(
+                "/admin/tls/csr",
+                err=f"Upload read failed: {e}",
+                purpose="form",
             )
     else:
         raw = (cert_pem or "").strip().encode("utf-8")
@@ -344,15 +338,9 @@ async def admin_tls_csr_import(
     try:
         crt_path, key_path = tls_csr.import_signed_cert(cert_dir, raw)
     except tls_csr.NoPendingCsrError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except tls_csr.InvalidPemError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except tls_csr.KeyMismatchError as e:
         await _audit(
             db,
@@ -361,12 +349,13 @@ async def admin_tls_csr_import(
             outcome="failure",
             metadata={"reason": "key_mismatch"},
         )
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except Exception as e:
-        log.error("Cert import failed: %s", e, exc_info=e)
+        log.error(
+            "Cert import failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_import",
@@ -426,10 +415,7 @@ async def admin_tls_csr_self_sign(
     cert_dir = _resolve_cert_dir(config)
 
     sans_list = [s.strip() for s in extra_sans.split(",") if s.strip()]
-    try:
-        days = int(valid_days)
-    except (TypeError, ValueError):
-        days = 365
+    days = bounded_int(valid_days, default=365)  # N-219c R23: SSOT
     if days < 1:
         days = 365
 
@@ -441,7 +427,11 @@ async def admin_tls_csr_self_sign(
             valid_days=days,
         )
     except Exception as e:
-        log.error("Self-sign failed: %s", e, exc_info=e)
+        log.error(
+            "Self-sign failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_self_sign",

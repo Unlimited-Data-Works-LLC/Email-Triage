@@ -48,9 +48,10 @@ existing SMTP STARTTLS path.
 
 from __future__ import annotations
 
+from email_triage.db._helpers import load_json_col
+
 import html
 import json
-import smtplib
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -58,11 +59,13 @@ from email.utils import formatdate
 from typing import Any
 
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c/32 R23
 from email_triage._isotime import parse_iso
+from email_triage._textfmt import truncate
 from email_triage.mail_headers import (
     X_EMAIL_TRIAGE_HEADER, build_triage_header,
 )
-from email_triage.triage_logging import get_logger
+from email_triage.triage_logging import REDACTED_PLACEHOLDER, get_logger
 from email_triage.web.auth import format_from_header
 
 log = get_logger("actions.recipient_digest")
@@ -78,10 +81,15 @@ log = get_logger("actions.recipient_digest")
 #: ``last_recipient_digest_sent_at``, not the lookback length.
 WINDOW_HOURS = 24
 
-#: Idempotence guard: refuse to re-send within this window even if
-#: the scheduler tick fires inside the configured hour bucket
-#: multiple times.
-MIN_RESEND_INTERVAL_HOURS = 23
+#: Idempotence guard: refuse to re-send within this window even if the scheduler
+#: tick fires inside the configured hour bucket multiple times. The single
+#: definition + the elapsed-window check live in the digest_resend SSOT (census
+#: run15 #1 converged the duplicated constant + the opposite-operand tz-norm crash);
+#: re-exported here for back-compat with importers.
+from email_triage.actions.digest_resend import (  # noqa: E402
+    MIN_RESEND_INTERVAL_HOURS,
+    resend_too_soon,
+)
 
 #: Reason-redaction map for HIPAA mode (Option B). Keys match the
 #: ``classification.source`` field; falls through to the generic
@@ -118,13 +126,12 @@ def parse_send_at_hour(raw: str | None) -> int | None:
     """
     if not raw:
         return None
-    try:
-        h, _, _ = str(raw).strip().partition(":")
-        hour = int(h)
-        if 0 <= hour <= 23:
-            return hour
-    except (TypeError, ValueError):
-        pass
+    # N-219c/32 R23: str/partition non-raising for the shapes above; only
+    # int() could raise. Migrated to parse_int_or_none + range check.
+    h, _, _ = str(raw).strip().partition(":")
+    hour = parse_int_or_none(h)
+    if hour is not None and 0 <= hour <= 23:
+        return hour
     return None
 
 
@@ -148,22 +155,18 @@ def should_fire(
     )
     if target_hour is None:
         return False
-    # Compare in account/user-local terms via the timestamp the
-    # caller passed; the scheduler tick at app.py is responsible
-    # for converting to the user's local time before invoking.
+    # Compare in account/user-local terms via the timestamp the caller passed; the
+    # scheduler tick at app.py converts to the user's local time before invoking.
+    # ``now`` is an AWARE local datetime (datetime.now().astimezone()) — aware so
+    # the resend_too_soon elapsed math is correct cross-tz (a naive `now` would be
+    # mis-read as UTC; see the resend_too_soon CONTRACT).
     if now.hour != target_hour:
         return False
-    if last_sent_iso:
-        try:
-            last_dt = datetime.fromisoformat(last_sent_iso)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            last_dt = None
-        if last_dt is not None:
-            elapsed = (now - last_dt).total_seconds() / 3600.0
-            if elapsed < MIN_RESEND_INTERVAL_HOURS:
-                return False
+    # Idempotence window — route through the digest_resend SSOT (both operands
+    # normalized to aware-UTC; was a raw fromisoformat + last_dt-only tz-norm that
+    # crashed on a naive `now` — census run15 #1).
+    if resend_too_soon(last_sent_iso, now):
+        return False
     return True
 
 
@@ -193,7 +196,7 @@ def gather_digest_rows(
     out: list[dict[str, Any]] = []
     for r in rows:
         try:
-            results = json.loads(r["results_json"])
+            results = load_json_col(r["results_json"], default=[])
         except Exception:
             continue
         if not isinstance(results, list):
@@ -225,9 +228,11 @@ def _render_reason(entry: dict[str, Any], hipaa: bool) -> str:
         source = str(entry.get("source") or "")
         return HIPAA_REASON_BY_SOURCE.get(source, HIPAA_REASON_DEFAULT)
     raw = str(entry.get("reason") or "")
-    if len(raw) > REASON_TRUNCATE:
-        return raw[: REASON_TRUNCATE - 1] + "…"
-    return raw
+    # run18  — route through the truncate SSOT (was an open-coded
+    # ``raw[: REASON_TRUNCATE - 1] + "…"``). truncate(raw, REASON_TRUNCATE)
+    # is byte-identical: the result is REASON_TRUNCATE chars including the
+    # single-glyph ellipsis, only when len(raw) > REASON_TRUNCATE.
+    return truncate(raw, REASON_TRUNCATE)
 
 
 def _format_datetime(entry: dict[str, Any], fallback_iso: str) -> str:
@@ -235,12 +240,29 @@ def _format_datetime(entry: dict[str, Any], fallback_iso: str) -> str:
     header; falls back to the triage run's created_at when the
     provider's date wasn't carried through (legacy result rows
     pre-dating the writer's date persistence).
+
+    This is the datetime SSOT for the whole digest family. ``digest_render``
+    imports it (run18  collapsed its byte-identical duplicate) and the
+    "Show matches" candidate template renders it via the ``format_digest_dt``
+    Jinja filter (run18 ) instead of an inline ``[:16]`` ISO slice — so the
+    dry-run preview and the delivered digest agree on the space-separated
+    ``%Y-%m-%d %H:%M`` form rather than the ISO ``T`` separator.
     """
     raw = entry.get("date") or fallback_iso or ""
     dt = parse_iso(raw)
     if dt is None:
         return str(raw)[:16]
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+#: Public alias for the datetime SSOT — the ``web/app.py`` Jinja-filter
+#: registration imports this clean name (rather than the underscore-private
+#: ``_format_datetime``) so the ``_digest_candidates.html`` dry-run table can
+#: format dates through the SAME code the renderers use (run18 ). NOT a
+#: second ``FunctionDef`` (an alias assignment), so the  dedup pin — which
+#: bans re-DEFINING ``_format_datetime`` / ``_render_reason`` outside this
+#: module — does not flag it.
+format_digest_datetime = _format_datetime
 
 
 def render_html(
@@ -250,14 +272,34 @@ def render_html(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
-    """Render the table as HTML."""
+    """Render the table as HTML.
+
+    ``redact_pii`` (N-174) controls the sender + subject cells ONLY —
+    orthogonal to ``hipaa`` (which controls the classifier ``reason``).
+    Default ``False`` = the DELIVERED digest's verbatim behavior, because
+    the recipient is the account's OWN authorized mailbox where those
+    values already live (the design analysis at module top). The PREVIEW
+    handler (``digest_preview``) passes ``redact_pii=effective_hipaa``
+    because that surface is reachable by a MANAGING NON-OWNER
+    (can_manage_account = site-admin / delegate) — verbatim sender +
+    subject there is a §164.502(b) min-necessary / §164.514(d)(1) leak,
+    the sibling of the N-162 / N-172 display-min fixes. Viewer-INDEPENDENT
+    (even the owner sees ``[redacted]`` in the HIPAA-mode preview); the
+    actor≠owner audit gate is separate. Token matches the N-162 / N-172
+    on-line idiom (``triage_logging.REDACTED``).
+    """
     body_rows: list[str] = []
     for entry in rows:
         dt = html.escape(_format_datetime(entry, fallback_dt_iso))
-        sender = html.escape(str(entry.get("sender") or "—"))
+        if redact_pii:
+            sender = REDACTED_PLACEHOLDER
+            subject = REDACTED_PLACEHOLDER
+        else:
+            sender = html.escape(str(entry.get("sender") or "—"))
+            subject = html.escape(str(entry.get("subject") or "—"))
         category = html.escape(str(entry.get("category") or "—"))
-        subject = html.escape(str(entry.get("subject") or "—"))
         why = html.escape(_render_reason(entry, hipaa))
         body_rows.append(
             "<tr>"
@@ -267,7 +309,20 @@ def render_html(
             "</tr>"
         )
     hipaa_banner = ""
-    if hipaa:
+    if hipaa and redact_pii:
+        # PREVIEW context (N-174): sender + subject ARE redacted here.
+        hipaa_banner = (
+            '<p style="font-size:0.85em;color:#666;">'
+            "HIPAA mode (preview): sender + subject are redacted to "
+            "the display minimum-necessary because this preview is "
+            "reachable by a managing non-owner. Classifier reasoning "
+            "is also redacted to a fixed phrase. The DELIVERED digest "
+            "shows sender + subject verbatim to the account's own "
+            "authorized mailbox."
+            "</p>"
+        )
+    elif hipaa:
+        # DELIVERED context (unchanged): sender + subject verbatim.
         hipaa_banner = (
             '<p style="font-size:0.85em;color:#666;">'
             "HIPAA mode: classifier reasoning is redacted to a "
@@ -306,15 +361,29 @@ def render_plain(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
-    """Render the same table as plaintext (fallback part)."""
+    """Render the same table as plaintext (fallback part).
+
+    ``redact_pii`` mirrors ``render_html`` (N-174) — sender + subject
+    cells only, default ``False`` (delivered-path verbatim).
+    """
     lines = [
         f"Daily Triage Digest — {account_name}",
         f"Activity for {account_email} in the last {WINDOW_HOURS} hours: "
         f"{len(rows)} messages classified.",
         "",
     ]
-    if hipaa:
+    if hipaa and redact_pii:
+        lines.append(
+            "HIPAA mode (preview): sender + subject are redacted to the "
+            "display minimum-necessary (reachable by a managing "
+            "non-owner). Classifier reasoning is also redacted. The "
+            "delivered digest shows them verbatim to the account's own "
+            "mailbox.",
+        )
+        lines.append("")
+    elif hipaa:
         lines.append(
             "HIPAA mode: classifier reasoning is redacted to a fixed "
             "phrase per classifier source. Subject + sender are "
@@ -323,10 +392,12 @@ def render_plain(
         lines.append("")
     for entry in rows:
         dt = _format_datetime(entry, fallback_dt_iso)
+        _sender = REDACTED_PLACEHOLDER if redact_pii else entry.get("sender", "—")
+        _subject = REDACTED_PLACEHOLDER if redact_pii else entry.get("subject", "—")
         lines.append(
-            f"  {dt} | {entry.get('sender', '—')} | "
+            f"  {dt} | {_sender} | "
             f"{entry.get('category', '—')} | "
-            f"{entry.get('subject', '—')} | "
+            f"{_subject} | "
             f"{_render_reason(entry, hipaa)}"
         )
     lines.append("")
@@ -395,7 +466,11 @@ def build_custom_digest_subject(dcfg, now_local) -> str:
             body = f"{first} +{len(cats) - 1}"
     else:
         body = (getattr(dcfg, "name", "") or "Email").strip()
-    date_str = now_local.strftime("%A, %B %d, %Y")
+    # N-269 R28 + N-287 R30: SSOT for the digest date-header format;
+    # pass the caller-supplied `now_local` through so tests /
+    # deterministic seams see the intended reference-time.
+    from email_triage._isotime import now_local_date_header
+    date_str = now_local_date_header(when=now_local)
     # Em dash (U+2014) matches the legacy newsletter subject shape
     # the operator was used to seeing pre-multi-digest refactor.
     return f"Your {cadence} {body} Digest — {date_str}"
@@ -453,21 +528,28 @@ def send_recipient_digest(
         )
     )
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = format_from_header(from_addr, from_name)
-    msg["To"] = to_addr
-    msg["Date"] = formatdate(localtime=True)
-    msg[X_EMAIL_TRIAGE_HEADER] = build_triage_header("recipient_digest")
-    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    # N-272 R28: route through the MIME envelope SSOT — sets Subject/
+    # From/To/Date/Message-Id/X-Email-Triage in ONE place. Owns the
+    # RFC 2046 plain-then-HTML attach order + `Message-Id` (which
+    # every pre-N-272 site was missing, breaking MUA threading).
+    from email_triage.web._mime_builder import build_alternative_message
+    msg = build_alternative_message(
+        subject=subject,
+        from_addr=from_addr,
+        from_name=from_name,
+        to=to_addr,
+        plain_body=plain_body,
+        html_body=html_body,
+        source_tag="recipient_digest",
+    )
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        if use_tls:
-            server.starttls()
-        if smtp_user:
-            server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+    # Census 2026-06-09 #2: route through the smtplib-transport SSOT instead of
+    # re-rolling the connect/starttls/login/send dance.
+    from email_triage.web.smtp_send import send_smtp_message
+    send_smtp_message(
+        msg, smtp_host=smtp_host, smtp_port=smtp_port,
+        smtp_user=smtp_user, smtp_password=smtp_password, use_tls=use_tls,
+    )
 
 
 # ---------------------------------------------------------------------------

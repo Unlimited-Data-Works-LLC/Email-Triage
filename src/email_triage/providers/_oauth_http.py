@@ -30,7 +30,8 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable
 
-logger = logging.getLogger("email_triage.providers._oauth_http")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.providers._oauth_http")  # N-196b R21_4
 
 
 def refresh_lock_for(provider) -> asyncio.Lock:

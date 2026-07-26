@@ -43,7 +43,8 @@ class TestBuildDiscoverPrompt:
 
     def test_injection_guard_present(self):
         prompt = build_discover_prompt(_make_email())
-        assert "EMAIL DATA ONLY" in prompt
+        assert "<<<UNTRUSTED_DATA>>>" in prompt
+        assert "<<<END_UNTRUSTED_DATA>>>" in prompt
 
     def test_slug_format_instructions(self):
         prompt = build_discover_prompt(_make_email())

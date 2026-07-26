@@ -328,7 +328,9 @@ class TestWizardStep5:
         loc = r.headers.get("location", "")
         # Wizard completion lands on /accounts with a success banner;
         # changed from /dashboard?wizard=done in the auto-chain pass.
-        assert loc.startswith("/accounts?success=")
+        # N-232b R25: routed through `_redirect.msg_qs` so the flash is
+        # readable via `read_flash`; wire shape is `?msg=<url-encoded>`.
+        assert loc.startswith("/accounts?msg=")
 
         cfg = json.loads(db.execute(
             "SELECT config_json FROM email_accounts WHERE id = ?",

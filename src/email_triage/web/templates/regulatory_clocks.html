@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (the research clinician / site-PI who owns
+                the mailbox). NOT developers, NOT admins-as-operators.
+   TECH-SKILL:  computer-literate clinician.
+   COPY RULES:  no dev/protocol jargon; no admin-only links; advisory
+                framing, never "server-authoritative" (see
+                feedback_audience_per_page.md + feedback_no_admin_path_in_user_copy.md).
+   #34 Regulatory clock awareness — label + days-left + state ONLY
+   (HIPAA-minimal; no case reference, no deadline phrase shown here).
+   ──────────────────────────────────────────────────────────── #}
+{% block title %}Regulatory deadlines{% endblock %}
+{% block content %}
+<main class="container">
+  <hgroup>
+    <h1>Regulatory deadlines</h1>
+    <p>Reminders based on your configured policy —
+       <strong>verify each against your SOP</strong>.
+       These are advisory, not an official record.</p>
+  </hgroup>
+
+  {% include "_clocks_table.html" %}
+</main>
+{% endblock %}

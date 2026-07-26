@@ -1126,22 +1126,39 @@ class TestAdminUI:
     """
 
     def test_template_renders_redis_section(self):
-        """Static template-render smoke: the Classification cache
-        section appears in the integrations admin page template."""
+        """Static source check on the Classification cache section of the
+        integrations admin template.
+
+        Field *rendering* (the actual ``name="redis_cache_url"`` attribute
+        in the HTTP response) is owned by the render test
+        ``test_web/test_integrations_redis_section.py::test_section_present``.
+        This static check owns what static analysis is good at: the section
+        is wired and — the privacy invariant — no operator hostname leaks
+        into the shipped template source.
+        """
         from pathlib import Path
+        # The admin config UI was split into per-tab partials (1cbfe6e); the
+        # integrations tab (with the Classification-cache section) lives under
+        # admin/config_tabs/ now.
         tpl = Path(__file__).resolve().parents[1].parent / (
-            "src/email_triage/web/templates/admin/integrations.html"
+            "src/email_triage/web/templates/admin/config_tabs/integrations.html"
         )
         text = tpl.read_text(encoding="utf-8")
         assert "Classification cache" in text
-        assert 'name="redis_cache_url"' in text
+        # The URL field is wired through the m.combo_input datalist macro
+        #, so the source carries the field name as a
+        # macro argument, not a literal ``name="..."`` attribute (that's in
+        # the rendered HTML — see the render test referenced above).
+        assert '"redis_cache_url"' in text
         assert 'name="redis_cache_ttl_secs"' in text
-        # Flush form present.
+        # Flush form present. The config-tabs refactor (1cbfe6e) dropped this
+        # form, orphaning the still-live /cache/flush route from the UI; it
+        # was restored into this tab next to the cache settings.
         assert "/admin/integrations/cache/flush" in text
         # Privacy: generic placeholder, NOT an operator host.
         assert "the filter host" not in text.lower()
         assert "examplerealm" not in text.lower()
-        assert "your-redis-host.example.local" in text
+        assert "your-lan-host" in text
 
 
 # ---------------------------------------------------------------------------

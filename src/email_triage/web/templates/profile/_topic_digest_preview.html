@@ -1,0 +1,259 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate) tuning a Topic.
+                NOT developers.
+   TECH-SKILL:  low. Computer-literate professional (exec, doctor,
+                lawyer, researcher).
+   COPY RULES:
+     - No admin-only paths, no protocol jargon, "AI" not "LLM".
+     - No raw account_id in user-rendered text — mailbox names only
+       (feedback_no_account_id_alone.md).
+     - A why-matched chip cites the user's OWN public Topic-terms
+       (which of THEIR subject/details words the mail hit), NEVER a
+       quote from the message body (§3d / §5 / R6). Confidence is a
+       3-band glyph, never a raw number.
+   ─────────────────────────────────────────────────────────────
+   PREVIEW fragment. HTMX-swapped into #topic-preview
+   by the editor's "Preview matches" form. Display-only + the R3
+   "include this" promote-to-hit + a remove ×. NO deep-link into
+   provider webmail, NO in-app reader (R5 — smallest certifiable
+   surface).
+
+   Consumes:
+     hits             iterable of preview rows. Each exposes:
+                        .topic_id          owning Topic (for the action URLs)
+                        .account_id        mailbox id (action URL only, never shown)
+                        .account_name      mailbox display name (shown)
+                        .message_id        durable RFC Message-ID (action URL)
+                        .when              pre-humanized arrival time (display)
+                        .sender            From display (display)
+                        .subject           subject line (display; possibly PHI —
+                                           ephemeral, never stored)
+                        .confidence_band   'strong' | 'likely' | 'weak'
+                        .matched_terms     list[str] of the user's own public
+                                           Topic-terms this mail hit
+                        .included          bool — already promoted to a stored hit
+     match_count      int — total matches (defaults to hits|length)
+     mailbox_count    int — distinct mailboxes represented
+     lookback_days    int — preview window (defaults to 30)
+     group_by_account bool — render grouped (default) vs flat
+#}
+
+{% set _match_count = match_count if match_count is defined else (hits | length) %}
+{% set _lookback = lookback_days if lookback_days is defined else 30 %}
+{% set _group = group_by_account if group_by_account is defined else true %}
+{# mode: 'keyword' = Step-1 fast keyword scan (default); 'details' = Step-2
+   LLM-tested-against-the-full-Details pass (operator 2026-06-12). #}
+{% set _mode = mode if mode is defined else 'keyword' %}
+
+{# Reusable row macro so grouped + flat paths share one shape. The
+   "digest column vocabulary" — When · Sender · Headline (subject) —
+   mirrors the digest editor's column_field_labels. #}
+{% macro hit_row(hit) -%}
+<tr id="topic-hit-row-{{ hit.account_id }}-{{ hit.message_id | replace('@','-') | replace('.','-') }}">
+    <td style="white-space:nowrap;color:var(--pico-muted-color);font-size:0.85em;">
+        {{ hit.when }}
+    </td>
+    <td>{{ hit.sender }}</td>
+    <td>{{ hit.subject }}</td>
+    <td>
+        {# Why-matched chip — 3-band glyph + the user's own public
+           Topic-terms. Never a body quote. #}
+        {% set _band = hit.confidence_band or 'weak' %}
+        {% set _glyph = {'strong': '●●●', 'likely': '●●○', 'weak': '●○○'} %}
+        {% set _band_label = {'strong': 'Strong match', 'likely': 'Likely match', 'weak': 'Weak match'} %}
+        <span class="topic-why-chip topic-why-{{ _band }}"
+              title="{{ _band_label.get(_band, 'Match') }}{% if hit.matched_terms %} — matched: {{ hit.matched_terms | join(', ') }}{% endif %}">
+            <span class="topic-why-glyph" aria-hidden="true">{{ _glyph.get(_band, '●○○') }}</span>
+            {% if hit.matched_terms %}
+            <span class="topic-why-terms">{{ hit.matched_terms | join(', ') }}</span>
+            {% else %}
+            <span class="topic-why-terms">{{ _band_label.get(_band, 'Match') }}</span>
+            {% endif %}
+        </span>
+    </td>
+    <td style="white-space:nowrap;text-align:right;">
+        {# Thumbs feedback (operator 2026-06-12 "curation + reinforcement").
+           👍 Keep = include this message in the digest AND tell the Topic this
+           sender is relevant. 👎 Drop = soft-remove it AND MUTE this sender for
+           this Topic going forward (the back-scan + Preview auto-drop it). The
+           sender rides base64 (a raw From header breaks JSON-in-attr). Both
+           swap a confirmation into this cell. #}
+        {% if hit.included %}
+        <small style="color:var(--pico-ins-color);">&#x1F44D; Kept</small>
+        {% else %}
+        <button type="button"
+                hx-post="/profile/topic-digest/{{ hit.topic_id }}/hits/feedback"
+                hx-vals='{"vote": "up", "account_id": "{{ hit.account_id }}", "message_id": "{{ hit.message_id }}", "sender_b64": "{{ hit.sender_b64 }}"}'
+                hx-target="closest td"
+                hx-swap="innerHTML"
+                class="outline secondary"
+                title="Keep — include in the digest"
+                aria-label="Keep this match"
+                style="padding:0.1rem 0.5rem;font-size:0.85rem;margin:0;">
+            &#x1F44D;{{ m.help("Keep this match: include it in the digest and tell the Topic this sender is relevant.") }}
+        </button>
+        <button type="button"
+                hx-post="/profile/topic-digest/{{ hit.topic_id }}/hits/feedback"
+                hx-vals='{"vote": "down", "account_id": "{{ hit.account_id }}", "message_id": "{{ hit.message_id }}", "sender_b64": "{{ hit.sender_b64 }}"}'
+                hx-target="closest td"
+                hx-swap="innerHTML"
+                class="outline"
+                title="Drop — remove it and stop showing this sender for this Topic"
+                aria-label="Drop this match and mute the sender"
+                style="padding:0.1rem 0.5rem;font-size:0.85rem;margin:0 0 0 0.25rem;
+                       color:var(--pico-del-color);border-color:var(--pico-del-color);">
+            &#x1F44E;{{ m.help("Drop this match and stop showing mail from this sender for this Topic from now on (you can undo it in the Topic's feedback list).") }}
+        </button>
+        {% endif %}
+    </td>
+</tr>
+{%- endmacro %}
+
+{% macro hits_table(rows) -%}
+<table style="margin:0;">
+    <thead>
+        <tr>
+            <th>When</th>
+            <th>Sender</th>
+            <th>Headline</th>
+            <th>Why it matched{{ m.help("Which of your own Topic words this message hit, and how strong the match is. ●●● strong, ●●○ likely, ●○○ weak. These are your subject and details words — never a quote from the email itself.") }}</th>
+            <th style="text-align:right;">Curate</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for hit in rows %}
+        {{ hit_row(hit) }}
+        {% endfor %}
+    </tbody>
+</table>
+{%- endmacro %}
+
+<div class="topic-preview-result">
+    {# No silent caps (operator 2026-06-12): if the keyword scan hit its ceiling
+       or details-mode ran past the AI budget, say so — shown even with 0 matches
+       (a cap hit can be the reason nothing appeared). #}
+    {% if truncated or llm_budget_hit %}
+    <div role="status" style="border-left:3px solid var(--pico-primary, #4a90d9);
+                background:var(--pico-card-background-color);
+                padding:0.4rem 0.75rem;margin:0 0 0.6rem 0;font-size:0.85em;">
+        {% if truncated %}
+        &#9888; Showing the first {{ keyword_cap }} matches per mailbox in this
+        window. Narrow the window or refine your Subject terms, or use
+        <strong>Re-Triage now</strong> for the full Topic.
+        {% endif %}
+        {% if llm_budget_hit %}{% if truncated %}<br>{% endif %}
+        &#9888; AI-tested the first {{ llm_cap }} candidates per mailbox; the rest
+        are shown as keyword candidates (not yet AI-tested).
+        {% endif %}
+    </div>
+    {% endif %}
+    {% if _match_count %}
+    <div style="display:flex;justify-content:space-between;align-items:start;
+                gap:0.75rem;flex-wrap:wrap;margin:0 0 0.75rem 0;">
+        <p style="margin:0;">
+            <strong>{{ _match_count }}</strong>
+            {% if _mode == 'details' %}match{{ "es" if _match_count != 1 else "" }}{% else %}keyword candidate{{ "s" if _match_count != 1 else "" }}{% endif %}
+            across
+            <strong>{{ mailbox_count if mailbox_count is defined else 1 }}</strong>
+            mailbox{{ "es" if (mailbox_count if mailbox_count is defined else 1) != 1 else "" }}
+            <small style="color:var(--pico-muted-color);">(last {{ _lookback }} days)</small>
+            <br>
+            <small style="color:var(--pico-muted-color);">
+                {% if _mode == 'details' %}
+                Tested against the full Topic (Subject + Details) by AI — this is
+                what the Topic actually catches.
+                {% else %}
+                Fast search of your <strong>Subject terms</strong> across every
+                folder in the window. Use &ldquo;Test Details&rdquo; to run the
+                AI over the full Topic (Subject + Details) on these candidates.
+                {% endif %}
+            </small>
+        </p>
+        {% if _mode != 'details' and topic.id %}
+        {# Step-2: LLM-confirm these keyword candidates against the full Details.
+           Re-submits the SAME window + grouping, swaps back into #topic-preview. #}
+        <button type="button"
+                hx-post="/profile/topic-digest/{{ topic.id }}/test-details"
+                hx-vals='{"lookback_days": "{{ _lookback }}", "group_by_account": "{{ "1" if _group else "" }}"}'
+                hx-target="#topic-preview"
+                hx-swap="innerHTML"
+                hx-indicator="#topic-testdetails-spinner"
+                class="outline secondary"
+                style="white-space:nowrap;padding:0.3rem 0.7rem;font-size:0.85em;margin:0;">
+            Test Details{{ m.help("Runs the AI matcher over these keyword candidates using your Topic's full Details, so you can see what the Topic really catches and tune the Details. Slower than the keyword scan because it reads each candidate.") }}
+            <span id="topic-testdetails-spinner" class="htmx-indicator" aria-hidden="true">&nbsp;<span aria-busy="true"></span></span>
+        </button>
+        {% endif %}
+    </div>
+
+    {% if _group %}
+    {# Grouped-by-mailbox (default) — operator reasons "which mailbox
+       is noisy." ``hits`` is expected pre-grouped via groupby on
+       account_name; Jinja's groupby keeps it template-side with no
+       handler change. #}
+    {% for account_name, group_rows in hits | groupby('account_name') %}
+    <section style="margin-bottom:1rem;">
+        <h4 style="margin:0 0 0.35rem 0;font-size:0.95rem;">
+            {{ account_name }}
+            <small style="color:var(--pico-muted-color);font-weight:normal;">
+                ({{ group_rows | list | length }})
+            </small>
+        </h4>
+        {{ hits_table(group_rows) }}
+    </section>
+    {% endfor %}
+    {% else %}
+    {{ hits_table(hits) }}
+    {% endif %}
+
+    {% else %}
+    <article style="border-left:3px solid var(--pico-muted-border-color);
+                    padding:0.5rem 1rem;margin:0;
+                    background:var(--pico-card-background-color);">
+        <strong style="display:block;margin-bottom:0.25rem;">No matches yet</strong>
+        <small style="color:var(--pico-muted-color);">
+            {% if _mode == 'details' %}
+            None of the keyword candidates matched the full Topic (Subject +
+            Details). Broaden the Details, or rely on the keyword Preview.
+            {% else %}
+            Nothing in the last {{ _lookback }} days matched this Topic's
+            <strong>Subject terms</strong>. Add or widen your Subject terms, try
+            a longer window, or use &ldquo;Test Details&rdquo; to run the AI over
+            the full Topic.
+            {% endif %}
+        </small>
+    </article>
+    {% endif %}
+</div>
+
+<style>
+.topic-why-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.05rem 0.5rem;
+    border-radius: 0.7rem;
+    font-size: 0.78rem;
+    border: 1px solid var(--pico-muted-border-color);
+    cursor: help;
+    max-width: 22rem;
+}
+.topic-why-glyph {
+    letter-spacing: 0.05em;
+    font-size: 0.7rem;
+    line-height: 1;
+}
+.topic-why-terms {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+/* 3 bands — colour reinforces the glyph (glyph carries it for
+   colour-blind / no-colour contexts; never a raw number). */
+.topic-why-strong { border-color: var(--pico-ins-color); }
+.topic-why-strong .topic-why-glyph { color: var(--pico-ins-color); }
+.topic-why-likely .topic-why-glyph { color: var(--pico-primary, #4a90d9); }
+.topic-why-weak { color: var(--pico-muted-color); }
+.topic-why-weak .topic-why-glyph { color: var(--pico-muted-color); }
+</style>

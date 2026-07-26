@@ -58,7 +58,8 @@ from email_triage.web.db import (
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 class _InMemorySecrets:
@@ -170,7 +171,11 @@ class _MockBackend:
 
 def _install_mock_backend(monkeypatch, backend: _MockBackend) -> None:
     """Monkeypatch the per-contact module's load_backend symbol."""
-    def fake_loader(backend_id, *, db_conn, secrets=None, config=None):
+    def fake_loader(backend_id, *, db_conn, secrets=None, config=None,
+                    require_baa_certified=False):
+        # Mirror the real load_backend signature (census N-63 added the
+        # require_baa_certified chokepoint kwarg) so this boundary mock can't
+        # drift from the seam it stands in for.
         return backend
     monkeypatch.setattr(per_contact_mod, "load_backend", fake_loader)
 

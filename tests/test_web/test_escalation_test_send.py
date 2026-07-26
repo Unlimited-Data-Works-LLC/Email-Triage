@@ -43,7 +43,7 @@ class _FakeSMTP:
     raise_on_send: type[Exception] | None = None
     raise_message: str = ""
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, timeout=None):
         type(self).captured["host"] = host
         type(self).captured["port"] = port
 

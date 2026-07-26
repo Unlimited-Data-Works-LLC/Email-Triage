@@ -68,6 +68,16 @@ class TestApiKeyStorage:
         user = verify_api_key(db, raw_key)
         assert user is None
 
+    def test_verify_corrupt_expiry_fails_closed_not_500(self, db, admin_user):
+        """Census N-65 — a corrupt expires_at on a key must NOT raise (raw
+        fromisoformat used to 500 every bearer-token check); parse_iso → None
+        → key rejected (FAIL CLOSED)."""
+        raw_key = generate_api_key()
+        store_api_key(db, hash_api_key(raw_key), "corrupt", admin_user["id"],
+                      expires_at="garbage-not-iso")
+        # No exception, and the key does not authenticate.
+        assert verify_api_key(db, raw_key) is None
+
     def test_verify_updates_last_used(self, db, admin_user):
         raw_key = generate_api_key()
         key_id = store_api_key(db, hash_api_key(raw_key), "key", admin_user["id"])

@@ -45,6 +45,8 @@ import asyncio
 import functools
 import inspect
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import sqlite3
 import threading
 import time
@@ -62,7 +64,7 @@ from typing import (
 from fastapi import HTTPException
 
 
-_log = logging.getLogger(__name__)
+_log = get_logger(__name__)  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +159,17 @@ def single_flight(
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def in_flight(key: str) -> bool:
+    """True if a ``single_flight(key)`` unit is currently running.
+
+    Best-effort, lock-free read for a PRE-DISPATCH "already in flight" check
+    (e.g. the backup-trigger endpoint returning 409 before scheduling). The
+    decorator's own ``lock.locked()`` fast-fail remains the authoritative guard;
+    this just lets a caller respond cleanly without scheduling a doomed task."""
+    lock = _locks.get(key)
+    return lock is not None and lock.locked()
 
 
 def _reset_for_tests() -> None:

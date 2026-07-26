@@ -20,6 +20,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timezone
@@ -56,7 +57,7 @@ def _conn_at_v36() -> sqlite3.Connection:
     mig_mod.MIGRATIONS.clear()
     mig_mod.MIGRATIONS.extend(m for m in saved if m.version <= 36)
     try:
-        c = init_db(":memory:")
+        c = track(init_db(":memory:"))
     finally:
         mig_mod.MIGRATIONS.clear()
         mig_mod.MIGRATIONS.extend(saved)

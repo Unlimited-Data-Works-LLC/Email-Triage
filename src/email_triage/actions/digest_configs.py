@@ -315,8 +315,12 @@ def to_dict(cfg: DigestConfig) -> dict[str, Any]:
 
 
 def _new_id() -> str:
-    """Mint an opaque id for a new digest config."""
-    return f"digest_{uuid.uuid4().hex[:12]}"
+    """Mint an opaque id for a new digest config.
+
+    N-244b R25: SSOT — `_ids.new_short_id`. Byte-identical wire shape.
+    """
+    from email_triage._ids import new_short_id
+    return new_short_id("digest")
 
 
 # ---------------------------------------------------------------------------

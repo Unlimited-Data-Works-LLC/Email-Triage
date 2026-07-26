@@ -115,7 +115,8 @@ def test_subject_cadence_reflects_schedule():
 
 @pytest.fixture
 def db():
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_run(

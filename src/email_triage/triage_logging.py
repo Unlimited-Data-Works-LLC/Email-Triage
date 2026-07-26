@@ -29,6 +29,10 @@ import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
+
+from email_triage._secret_scrub import SECRET_TOKEN_KEYS as _SECRET_TOKEN_KEYS
+from email_triage._errfmt import redact_exc
 from typing import Any, Iterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -36,6 +40,85 @@ if TYPE_CHECKING:
 
 # Module-level flag — set once at startup via setup_logging().
 _hipaa_mode: bool = False
+
+
+# Canonical PHI-redaction sentinel (A3, divergence census 2026-06-09). The
+# same logical "this field was PHI-stripped" marker had drifted to TWO
+# spellings — ``[redacted]`` (the PHI sites + the watcher reason-guard) and
+# ``[REDACTED]`` (sent_mail_index's HIPAA-subject branch). They never crossed
+# to leak (the guard checks a reason, the index writes a subject), but the
+# divergence is a latent hazard: a future path routing the uppercase value to
+# the lowercase guard would leak PHI. One spelling, enforced by
+# tests/test_redaction_sentinel_pin.py.
+# NOTE: this is the PHI sentinel. The SECRET-redaction marker used in
+# web/db.py (passwords/keys scrubbed from error strings) is a DISTINCT concern
+# with its own shape — NOT this constant.
+REDACTED = "[redacted]"
+
+
+# N-338 R31 (2026-07-04 hipaa-sme + DA follow-up on N-300 tranche  gap):
+# ``Safe`` is the explicit caller-guaranteed non-PHI marker for the
+# positional-args HIPAA gate. Wrap a string arg in ``Safe(...)`` when the
+# caller GUARANTEES the value carries no §164.514(b) 18-identifier content
+# (e.g. a compile-time literal, a well-known category name, a bounded
+# provider constant). In HIPAA mode ``_gate_positional_args`` unwraps
+# ``Safe`` to the underlying string; every OTHER string redacts to
+# ``<redacted>`` (fail-CLOSED). N-300 previously allow-listed any
+# ``len(s) <= 64 and "@" not in s and ":" not in s`` string — that
+# predicate silently passes phone / SSN / DOB / MRN / patient-name / ZIP /
+# ICD-10 shapes, i.e. the identifier set §164.514(b) targets.
+#
+# Usage:
+#     from email_triage.triage_logging import Safe, get_logger
+#     log = get_logger("engine.flow")
+#     log.info("stage=%s reason=%s", Safe("classify"), Safe(reason_code))
+class Safe:
+    """Explicit non-PHI marker for TriageLogger positional string args.
+
+    ``Safe(value)`` unwraps to ``value`` inside ``_gate_positional_args``
+    when HIPAA mode is on. Constructor validates ``value`` is ``str`` so
+    a stray ``Safe(patient_email)`` at least surfaces the caller's intent
+    (the wrapper is DELIBERATE — a caller who wraps commits to the
+    PHI-free claim).
+    """
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        if not isinstance(value, str):
+            raise TypeError(
+                f"Safe wraps str only; got {type(value).__name__}"
+            )
+        # Compile-time slip defence (hipaa-sme N-338 fix 2, 2026-07-04):
+        # a stray ``Safe(patient_email)`` or ``Safe(subject_line)`` at a
+        # call site would silently egress PHI into the msg body. The
+        # constructor refuses the two coarsest PHI-shape smells so a
+        # slip fails LOUD (TypeError) instead of quiet. Not exhaustive
+        # — the caller is the enforceable owner; this is a cheap net.
+        if "@" in value:
+            raise TypeError(
+                "Safe refuses email-shaped values ('@' present); "
+                "this is a PHI-leak defence — pass an opaque scalar "
+                "or wrap a known-safe literal"
+            )
+        if len(value) > 128:
+            raise TypeError(
+                f"Safe refuses long strings ({len(value)} > 128 chars); "
+                "long strings are the PHI-body shape"
+            )
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"Safe({self.value!r})"
+
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        """Cross-process pickle support (db-sme N-338 D1, 2026-07-04):
+        ``__slots__`` blocks the default pickle __dict__ path. Without an
+        explicit ``__reduce__`` a caller that submits ``Safe(...)`` args
+        to a ``ProcessPoolExecutor`` sees a ``PicklingError`` at run
+        time. No current caller crosses processes with a ``Safe``, but
+        the round-trip is cheap defence.
+        """
+        return (self.__class__, (self.value,))
 
 
 # Process-wide request correlation ID. ASGI middleware sets this on
@@ -55,10 +138,14 @@ def get_request_id() -> str:
 
 
 def _new_id() -> str:
-    """Mint a short request_id. UUID4 truncated to 12 hex chars —
-    plenty of namespace for a single-instance install, short enough
-    to grep comfortably in journalctl."""
-    return uuid.uuid4().hex[:12]
+    """Mint a short request_id. 12 hex chars — plenty of namespace for
+    a single-instance install, short enough to grep comfortably in
+    journalctl.
+
+    N-244b R25: SSOT `_ids.new_short_id("")` returns the bare hex tail.
+    """
+    from email_triage._ids import new_short_id
+    return new_short_id("")
 
 
 @contextmanager
@@ -125,6 +212,68 @@ def is_account_hipaa_locked(account: Any) -> bool:
     return bool(created_under)
 
 
+def account_hipaa_effective(
+    *,
+    account: Any = None,
+    message: Any = None,
+) -> bool:
+    """SSOT: is THIS PHI operation subject to HIPAA handling right now?
+
+    Most-restrictive-wins over three independent axes (PD#8 /
+    feedback_most_restrictive_wins).  HIPAA applies if ANY of:
+
+    * The **system flag** is on  (``is_hipaa_mode()`` — global install-wide
+      override; covers every account whether per-account flag is set or not).
+    * The **per-account flag** is set on the account in scope
+      (``account.hipaa`` / ``account["hipaa"]`` — a non-HIPAA install may
+      have individual HIPAA-flagged mailboxes).
+    * The **message stamp** is True  (``message.hipaa`` — stamped at fetch
+      time from ``system_hipaa OR account.hipaa``; accepted as a convenience
+      so action-layer callers do not have to thread the account separately).
+
+    Call sites in the per-account PHI layer MUST pass at least one of
+    ``account=`` or ``message=``.  Passing *neither* returns the install-wide
+    flag only — that branch exists for the genuinely install-wide fallback
+    callers, NOT as a license to call this bare on a PHI path.  The invariant
+    "no PHI-decision site invokes this context-free" is enforced
+    STRUCTURALLY, not by convention: ``tests/test_account_hipaa_scope_pin.py``
+    bans a bare/aliased ``is_hipaa_mode()`` in the per-account PHI layers, so a
+    new PHI site that reaches for the global flag (or calls this with no
+    context) is caught in CI.  Otherwise most-restrictive-wins: a ``message``
+    stamped ``hipaa=True`` (or the system flag on) returns True even when
+    ``account`` is None.
+
+    This is the **only authorised answer** to "is this PHI subject to HIPAA
+    handling right now?" for per-account PHI decisions (redaction, egress
+    gating, audit triggers, per-message branches).  Install-wide decisions
+    (boot enforcement, admin config display, BAA-ack, breach posture) stay
+    on ``is_hipaa_mode()`` directly — they are correctly install-scoped.
+
+    N-77 / class-fix: before this helper, ~54 per-account PHI decision sites
+    called ``is_hipaa_mode()`` alone, silently skipping the per-account flag
+    on non-HIPAA installs.  Route every category-B PHI-decision site through
+    here; leave category-A (install-wide) sites on ``is_hipaa_mode()``.
+    """
+    # Axis 1: system-wide flag (cheapest check — short-circuit). Read the
+    # module global ``_hipaa_mode`` DIRECTLY (not is_hipaa_mode()) — identical
+    # value, but it keeps this SSOT out of its own bare-is_hipaa_mode() ban and
+    # matches the tests that monkeypatch ``_tl._hipaa_mode``.
+    if _hipaa_mode:
+        return True
+    # Axis 2: per-message stamp (stamped at fetch from system OR account flag)
+    if message is not None and bool(getattr(message, "hipaa", False)):
+        return True
+    # Axis 3: per-account flag
+    if account is not None:
+        try:
+            val = account["hipaa"]
+        except (KeyError, TypeError, IndexError):
+            val = getattr(account, "hipaa", False)
+        if bool(val):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # JSON formatter
 # ---------------------------------------------------------------------------
@@ -143,7 +292,9 @@ class _JsonFormatter(logging.Formatter):
         if hasattr(record, "_extra"):
             entry.update(record._extra)
         if record.exc_info and record.exc_info[1] is not None:
-            entry["error"] = str(record.exc_info[1])
+            # N-42: the exc_info exception text is the SEPARATE leak leg (a log
+            # call with exc_info=True, not via fmt_exc) — value-scrub it too.
+            entry["error"] = redact_exc(record.exc_info[1])
             entry["error_type"] = type(record.exc_info[1]).__name__
         return json.dumps(entry, default=str)
 
@@ -158,7 +309,7 @@ class _TextFormatter(logging.Formatter):
             for k, v in record._extra.items():
                 parts.append(f"{k}={v}")
         if record.exc_info and record.exc_info[1] is not None:
-            parts.append(f"error={record.exc_info[1]}")
+            parts.append(f"error={redact_exc(record.exc_info[1])}")  # N-42 scrub
         return " ".join(parts)
 
 
@@ -174,6 +325,18 @@ class TriageLogger:
         "sender", "senders", "recipients", "subject", "body",
         "body_text", "body_html", "links", "attachment", "attachments",
         "reason", "classification_reason", "headers",
+        # census run17 #1 — LLM-over-PHI output + free-text content keys. The
+        # model's verbatim response (the classify debug logs) is the highest-
+        # density PHI; these are stripped on the TriageLogger console/file leg.
+        # The un-expungeable HMAC log_entries SINK is additionally guarded by
+        # the fail-closed ALLOWLIST ``redact_persisted_extra`` (defence-in-depth
+        # — a denylist alone is fail-OPEN: "raw" was absent from this set, which
+        # is exactly how run17 #1 leaked).
+        # Conservative: only UNAMBIGUOUS LLM-output keys (a key like "response"
+        # /"content" collides with benign operator fields — e.g. invite.py logs
+        # the calendar accept/decline as `response=` — so it stays OFF the
+        # denylist; the sink ALLOWLIST is the fail-closed net for those).
+        "raw", "prompt", "completion", "llm_response",
     })
 
     # Fields that are ALWAYS stripped — both modes — because their
@@ -189,12 +352,11 @@ class TriageLogger:
     # install. Treat as a security-critical change; do not add
     # operator-debug fields to this set — only secret-shape
     # values that should never have been at the call site.
-    _TOKEN_KEYS = frozenset({
-        "authorization", "access_token", "refresh_token", "id_token",
-        "code", "auth_code", "client_secret", "bearer_token",
-        "api_key", "password", "smtp_password", "imap_password",
-        "session_token",
-    })
+    #: Token-shaped extra-field keys stripped from every log record.
+    #: SSOT-converged onto _secret_scrub.SECRET_TOKEN_KEYS (census #6) so the
+    #: log-redaction key list and the persisted-error-text scrub key list
+    #: can't drift apart.
+    _TOKEN_KEYS = _SECRET_TOKEN_KEYS
 
     def __init__(self, logger: logging.Logger):
         self._logger = logger
@@ -247,20 +409,259 @@ class TriageLogger:
             (),
             resolved_exc_info,
         )
+        # N-208 R22 CI fix (2026-07-02): callers that pass `extra={"_extra":
+        # {inner_fields}}` (a defense-in-depth double-wrap used by
+        # `db_writelock.py` to survive stdlib's LogRecord dropping unknown
+        # top-level fields) round-trip through `_merge_extra` as
+        # `{"_extra": inner_fields}` at this point. The stored-record contract
+        # is `rec._extra == inner_fields` (a flat dict of the emitted fields),
+        # so unwrap the outer layer when we see the pattern. Preserves the
+        # pre-fix behaviour for callers that pass a flat `extra={...}`.
+        if isinstance(safe.get("_extra"), dict) and len(safe) <= 2:  # allow request_id alongside
+            _unwrapped = dict(safe["_extra"])
+            if "request_id" in safe and "request_id" not in _unwrapped:
+                _unwrapped["request_id"] = safe["request_id"]
+            safe = _unwrapped
         record._extra = safe  # type: ignore[attr-defined]
+        # N-196b R21_4 (operator ruling 2026-07-02): ALSO promote the sanitised
+        # extra kwargs onto the LogRecord as top-level attributes — mirrors
+        # stdlib's `logging.Logger._log(extra=...)` semantics so tests that
+        # assert on `record.<field>` (matching the stdlib contract) don't break
+        # on the TriageLogger swap. Guard against clobbering LogRecord's own
+        # attribute set.
+        #
+        # N-353 R31 (2026-07-05 trust-repair fix-forward per PHASE3 audit_hmac
+        # d8df4a24 finding + the backlog  = TASK ): mirror stdlib's FULL
+        # reserved-attr set explicitly. The `k in record.__dict__` clause below
+        # catches the init-set attrs dynamically so no live PHI leak exists,
+        # but defence-in-depth wants an explicit named set: (a) documents
+        # intent; (b) survives a future Python release adding a new LogRecord
+        # init-attr the codebase hasn't yet imported. Source: stdlib
+        # `logging.LogRecord.__init__` — the enumerated attrs it sets, plus
+        # `message` (set by `LogRecord.getMessage`) and `asctime` (set by the
+        # formatter). Full set: 22 keys. Do NOT prune — every entry is a
+        # LogRecord field a caller's `extra={key: v}` would clobber if the
+        # dynamic check ever regressed.
+        _reserved = {
+            "name", "msg", "args", "levelname", "levelno",
+            "pathname", "filename", "module", "exc_info", "exc_text",
+            "stack_info", "lineno", "funcName", "created", "msecs",
+            "relativeCreated", "thread", "threadName", "processName",
+            "process", "message", "asctime",
+            # Python 3.12+ added taskName (asyncio task context) —
+            # `tests/test_n353_triage_logger_reserved_set_complete.py`'s
+            # behavioural teeth caught this by probing `LogRecord.__init__`
+            # directly. Do NOT drop this on a Python-version downgrade;
+            # the guard is fail-open on absence.
+            "taskName",
+        }
+        if safe:
+            for k, v in safe.items():
+                if k in _reserved or k in record.__dict__:
+                    continue  # never clobber a LogRecord built-in
+                record.__dict__[k] = v
         self._logger.handle(record)
 
-    def debug(self, msg: str, **extra: Any) -> None:
-        self._log(logging.DEBUG, msg, extra)
+    def _merge_extra(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """N-196b R21_4 (2026-07-02): also accept stdlib-style `extra=<dict>`
+        alongside the TriageLogger `**extra` shape. Callers migrated from
+        `logging.getLogger` typically write `.info("msg", extra={...})` and
+        expect the dict's keys to appear as LogRecord attributes (stdlib
+        semantics). Merge the `extra=` kwarg into the top-level `**extra`
+        pack so both shapes populate the same sanitised extras dict."""
+        merged = dict(kwargs)
+        nested_extra = merged.pop("extra", None)
+        if isinstance(nested_extra, dict):
+            for k, v in nested_extra.items():
+                merged.setdefault(k, v)
+        return merged
 
-    def info(self, msg: str, **extra: Any) -> None:
-        self._log(logging.INFO, msg, extra)
+    def _format_msg(self, msg: str, args: tuple[Any, ...]) -> str:
+        """N-196b R21_4 (2026-07-02): accept stdlib-style `%`-formatted
+        positional args so `log.info("foo %s bar", value)` works — matches
+        stdlib's `logging.Logger.info(msg, *args)` semantics.
 
-    def warning(self, msg: str, **extra: Any) -> None:
-        self._log(logging.WARNING, msg, extra)
+        N-300 R30 (2026-07-03 HIPAA-SME + DA follow-up on N-196b): in
+        HIPAA mode, positional args are TYPE-GATED to bounded-scalar
+        shapes (int / float / bool / None / short opaque strings) BEFORE
+        interpolation. A caller writing `log.info("account %s",
+        patient_email)` in a HIPAA-mode process previously interpolated
+        the value into `record.msg` past `_sanitise` (which only
+        filters the extras DICT, not positional args). The gate now
+        redacts non-scalar / long-string positional args to
+        `<redacted>` so the msg body stays PHI-safe.
 
-    def error(self, msg: str, exc_info: Any = None, **extra: Any) -> None:
-        self._log(logging.ERROR, msg, extra, exc_info=exc_info)
+        Silent on `msg % args` errors (preserve stdlib's "lazy
+        formatting" fail-open behaviour). Errored fallback repr()s
+        every arg — the same HIPAA-mode gate applies before repr() so
+        the fail-open branch cannot egress PHI either.
+        """
+        if not args:
+            return msg
+        safe_args = self._gate_positional_args(args)
+        try:
+            return msg % safe_args
+        except (TypeError, ValueError):  # pragma: no cover — bad format
+            return msg + " " + " ".join(repr(a) for a in safe_args)
+
+    def _gate_positional_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
+        """N-338 R31 (2026-07-04) — HIPAA gate on positional-args
+        interpolation, fail-CLOSED on strings.
+
+        Allow-list: ``None`` + numeric scalars (int / float / bool). String
+        args require an explicit :class:`Safe` wrapper — bare strings
+        redact to ``<redacted>``. Everything else redacts too. Effectively
+        a no-op outside ``_hipaa_mode``.
+
+        Supersedes N-300 R30 (rejected by hipaa-sme + DA panel 2026-07-03):
+        the prior ``len<=64 and '@' not in a and ':' not in a`` predicate
+        allow-listed the exact identifier shapes §164.514(b) targets —
+        phone / SSN / DOB / MRN / patient-name / ZIP / ICD-10 codes /
+        short clinical subject strings all sailed through. Fail-open on
+        the 18-identifier set. Fix moves to an EXPLICIT-opt-in marker so
+        every string in HIPAA mode either (a) carries a
+        ``Safe(...)`` claim from the caller or (b) redacts.
+        """
+        if not _hipaa_mode:
+            return args
+        gated: list[Any] = []
+        for a in args:
+            if a is None or isinstance(a, (int, float, bool)):
+                gated.append(a)
+            elif isinstance(a, Safe):
+                gated.append(a.value)
+            else:
+                gated.append("<redacted>")
+        return tuple(gated)
+
+    def debug(self, msg: str, *args: Any, **extra: Any) -> None:
+        self._log(logging.DEBUG, self._format_msg(msg, args), self._merge_extra(extra))
+
+    def info(self, msg: str, *args: Any, **extra: Any) -> None:
+        self._log(logging.INFO, self._format_msg(msg, args), self._merge_extra(extra))
+
+    def warning(self, msg: str, *args: Any, **extra: Any) -> None:
+        self._log(logging.WARNING, self._format_msg(msg, args), self._merge_extra(extra))
+
+    def error(self, msg: str, *args: Any, exc_info: Any = None, **extra: Any) -> None:
+        self._log(logging.ERROR, self._format_msg(msg, args), self._merge_extra(extra), exc_info=exc_info)
+
+    def exception(self, msg: str, *args: Any, **extra: Any) -> None:
+        """N-196b R21_4 (2026-07-02 CI fix): stdlib `Logger.exception(msg)`
+        parity — equivalent to `error(msg, exc_info=True)`. Called by code
+        paths that catch an exception and want the traceback in the log
+        without threading `exc_info=True` manually. Post-N-196b migration,
+        `embedding_bits/__init__.py:1316` (and other pre-existing
+        `logger.exception(...)` callers) broke CI without this."""
+        self._log(logging.ERROR, self._format_msg(msg, args), self._merge_extra(extra), exc_info=True)
+
+    def critical(self, msg: str, *args: Any, exc_info: Any = None, **extra: Any) -> None:
+        """N-196b R21_4 (2026-07-02 CI fix): stdlib `Logger.critical(msg)`
+        parity — same semantics as `error`, one severity higher."""
+        self._log(logging.CRITICAL, self._format_msg(msg, args), self._merge_extra(extra), exc_info=exc_info)
+
+    def log(self, level: int, msg: str, *args: Any, exc_info: Any = None, **extra: Any) -> None:
+        """N-196b R21_4 (2026-07-02 CI fix): stdlib `Logger.log(level, msg)`
+        parity — passthrough to `_log` with caller-chosen level. Used by
+        code that dispatches severity dynamically."""
+        self._log(level, self._format_msg(msg, args), self._merge_extra(extra), exc_info=exc_info)
+
+
+# ---------------------------------------------------------------------------
+# Persisted-log redaction SSOT (census run17 #1)
+# ---------------------------------------------------------------------------
+# The ``log_entries`` table is HMAC-hash-chained and write-once: a persisted PHI
+# value can never be expunged without breaking the §164.312(c)(1) integrity
+# chain. The PHI field-strip used to live ONLY on the TriageLogger path
+# (``_sanitise``), so a raw ``logging.getLogger`` bypassed it and free-text PHI
+# rode into the chain (run17 #1). This is the FAIL-CLOSED chokepoint applied at
+# EVERY persisted-log sink (``SQLiteLogHandler.emit`` + ``db.audit.insert_log_entry``)
+# BEFORE the row is hashed+stored — so the strip is enforced regardless of how
+# the logger was obtained, and the hash preimage == the stored value.
+#
+# It is an ALLOWLIST, not a denylist, per the 3-SME panel (hipaa-sme + db-sme +
+# devils-advocate, 2026-06-27): on an un-expungeable table a denylist is
+# fail-OPEN by construction (a new PHI-shaped key — "raw"/"prompt"/… — that
+# nobody added to the denylist leaks). Only known-safe operator-debug + plumbing
+# keys persist their value; every other key keeps its NAME (so the /logs viewer
+# still shows the field existed) but its value is replaced with a placeholder.
+# Secret-shaped (_TOKEN_KEYS) values are stripped in BOTH modes (a secret is
+# never a legitimate log payload); the PHI allowlist applies in HIPAA mode.
+
+#: Operator-debug + plumbing keys that may PERSIST their value into the HMAC
+#: log_entries table. Curated for the /logs viewer's needs (the N-42 pill
+#: renderer hoists error/account/account_id/flow_id). Add a key here only after
+#: confirming it is never a PHI/free-text carrier. Guarded by a /logs render
+#: round-trip test + the sink-redaction behavioural pin.
+_PERSIST_SAFE_KEYS = frozenset({
+    "request_id", "flow_id", "message_id", "subscription_id", "watch_id",
+    "job_id", "task_id", "thread_id", "uid",
+    "account_id", "account", "account_name", "owner", "owner_id", "user_id",
+    "category", "status", "outcome", "state", "kind", "action", "event",
+    "phase", "step", "provider", "folder_role",
+    "error", "error_type", "error_kind", "error_code", "exc_type",
+    "count", "counts", "n", "total", "num", "attempt", "retries", "limit",
+    "elapsed_ms", "duration_ms", "ms", "seconds", "size", "bytes",
+    "level", "logger", "name", "method", "status_code", "request_path", "route",
+    # Added per the run17 #1 SME diff-review (db-sme + devils-advocate): the
+    # /logs renderer's declared priority_keys + e.extra.* reads (logs.html) and
+    # non-PHI surrogate IDs — confirmed live emitters, all opaque IDs/classes/
+    # durations, never message content. The survival pin DERIVES the required
+    # set from logs.html so this list can't silently fall behind the view.
+    "run_id", "elapsed_secs", "error_class", "error_msg", "provider_type",
+    "topic_id", "draft_id", "previous_external_id", "external_id",
+})
+
+#: Replaces a non-allowlisted value at the persisted-log sink. Keeps the field
+#: NAME (operator sees the key existed) but never the value.
+#:
+#: N-217 R23 (2026-07-02): also the SSOT display-placeholder for every
+#: caller-side redaction site (digest, digest_render, recipient_digest,
+#: profile, email_watches, triage_classify, triage_one). Callers import as
+#: `from email_triage.triage_logging import REDACTED_PLACEHOLDER` (public
+#: alias) — the leading-underscore form is kept for backward-compat only.
+_REDACTED_PLACEHOLDER = "[redacted]"
+REDACTED_PLACEHOLDER = _REDACTED_PLACEHOLDER  # public alias for callers
+
+
+def redact_persisted_extra(
+    extra: dict[str, Any], *, hipaa: bool, phi_allowlist: bool = True
+) -> dict[str, Any]:
+    """Fail-CLOSED redaction for the un-expungeable HMAC ``log_entries`` sink.
+
+    The ONE chokepoint both persisted-log sinks call BEFORE building/hashing
+    ``extra_json`` (so the hash preimage == the stored value). Token-shaped
+    keys (:data:`SECRET_TOKEN_KEYS`) are placeholdered in EVERY mode + regardless
+    of ``phi_allowlist`` (a secret is never a legitimate log payload).
+
+    ``phi_allowlist`` (default True) applies the full PHI ALLOWLIST for the
+    UNCURATED raw-``logging.getLogger`` hot path (``SQLiteLogHandler.emit``): in
+    HIPAA mode every key not in :data:`_PERSIST_SAFE_KEYS` is placeholdered
+    (fail-closed on the write-once chain, per the run17 #1 SME panel).
+
+    CURATED callers pass ``phi_allowlist=False`` → secret-strip ONLY. The sole
+    production caller of ``insert_log_entry`` is the CLI admin-op audit, which
+    already passes its own ``_SAFE_ARG_KEYS``-curated payload (no PHI). Applying
+    the PHI allowlist THERE would (a) destroy the §164.312(b) audit-row CONTENT
+    — the admin action name / flags / error_class → ``[redacted]`` — without
+    removing any leak (a regression in the wrong OCR direction, asymmetric
+    across the pre/post-``setup_logging`` boundary), and (b) fork a 2nd PHI
+    allowlist that drifts from ``_SAFE_ARG_KEYS`` (PD#5). So curated callers get
+    the secret strip only. (devils-advocate diff-review, 2026-06-27.)
+
+    The field NAME is preserved; only the value is replaced.
+    """
+    if extra is None:
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in extra.items():
+        if k in _SECRET_TOKEN_KEYS:
+            out[k] = _REDACTED_PLACEHOLDER
+        elif phi_allowlist and hipaa and k not in _PERSIST_SAFE_KEYS:
+            out[k] = _REDACTED_PLACEHOLDER
+        else:
+            out[k] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +700,44 @@ def setup_logging(config: LoggingConfig) -> None:
         root.info("HIPAA logging mode active -- PHI excluded from logs")
 
 
+_LOGGER_NAMESPACE = "email_triage"
+_LOGGER_NAMESPACE_PREFIX = f"{_LOGGER_NAMESPACE}."
+
+
+def _normalize_logger_name(name: str) -> str:
+    """Canonicalize a logger name to single-prefix under the ``email_triage`` namespace.
+
+    Idempotent: passing an already-fully-qualified name (``"email_triage.X"``)
+    returns it unchanged; passing the short form (``"X"``) prepends the
+    namespace; passing the bare namespace (``"email_triage"``) returns it
+    verbatim. The prefix check requires the trailing dot, so a no-dot
+    lookalike (``"email_triage_export"``) still gets the namespace prepended.
+
+    This is the single source of truth for the logger-name transform. Both
+    ``get_logger`` (runtime) and ``tests/test_no_double_prefix_get_logger_pin.py``
+    (build-time structural pin) import and reuse this helper — PD-6 (pins
+    obey the SSOT rule too).
+    """
+    if name == _LOGGER_NAMESPACE:
+        return _LOGGER_NAMESPACE
+    if name.startswith(_LOGGER_NAMESPACE_PREFIX):
+        return name
+    return f"{_LOGGER_NAMESPACE_PREFIX}{name}"
+
+
 def get_logger(name: str) -> TriageLogger:
-    """Return a PHI-aware logger under the ``email_triage`` namespace."""
-    return TriageLogger(logging.getLogger(f"email_triage.{name}"))
+    """Return a PHI-aware logger under the ``email_triage`` namespace.
+
+    Idempotent via ``_normalize_logger_name``: a caller may pass either the
+    short form (``"actions.move"``, the canonical style) OR an already-
+    fully-qualified name (``"email_triage.actions.move"``) and the emitted
+    logger name will be single-prefix in both cases. The un-idempotent
+    version drifted in prod into ``email_triage.email_triage.X`` on ~24
+    sites tagged ``# N-196b R21_4`` that passed the fully-qualified form;
+    the pin ``tests/test_no_double_prefix_get_logger_pin.py`` enforces this
+    contract at build time so the drift can't recur.
+    """
+    return TriageLogger(logging.getLogger(_normalize_logger_name(name)))
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +815,15 @@ class SQLiteLogHandler(logging.Handler):
                 value = getattr(record, key)
                 if key == "_extra" and isinstance(value, dict):
                     # Hoist nested keys to top-level so /logs sees them.
+                    # N-42 (db-sme M1) — the COUNT-AGNOSTIC sink: every _extra
+                    # value persists into the HMAC-chained log_entries HERE, so
+                    # value-scrub each one. Any caller that put str(exc) (or a
+                    # mailbox path) into _extra is covered at this single point,
+                    # without chasing the ~239 individual render sites.
                     for inner_k, inner_v in value.items():
-                        extra[inner_k] = str(inner_v)
+                        extra[inner_k] = redact_exc(str(inner_v))
                 else:
-                    extra[key] = str(value)
+                    extra[key] = redact_exc(str(value))
 
             # Preserve exception info when the caller used logger.error(...,
             # exc_info=e, ...). Mirrors _JsonFormatter / _TextFormatter so the
@@ -391,9 +832,20 @@ class SQLiteLogHandler(logging.Handler):
             # exc_info-bearing log line landed in /logs without its exception
             # detail — making failures like "Failed to move message" opaque.
             if record.exc_info and record.exc_info[1] is not None:
-                extra["error"] = str(record.exc_info[1])
+                # N-42: this is the SQLite /logs + persisted log_entries leg —
+                # the exc_info text lands in the HMAC-chained, un-expungeable
+                # table, so value-scrub it (the str() render here was the real
+                # leak the formatter-only fix missed).
+                extra["error"] = redact_exc(record.exc_info[1])
                 extra["error_type"] = type(record.exc_info[1]).__name__
 
+            # census run17 #1 — FAIL-CLOSED PHI/secret strip at the persisted
+            # sink, applied BEFORE the hash preimage (extra_json) is built so
+            # hash == store and the chain stays intact. Catches any raw
+            # ``logging.getLogger`` path that bypassed TriageLogger._sanitise
+            # (the field-strip used to live ONLY there). _hipaa_mode is the
+            # process-global set by setup_logging.
+            extra = redact_persisted_extra(extra, hipaa=_hipaa_mode)
             extra_json = _json.dumps(extra) if extra else "{}"
 
             #  — hash-chain. logging.Handler.emit is serialized
@@ -526,7 +978,7 @@ class SQLiteLogHandler(logging.Handler):
                 pass
             try:
                 import json as _json
-                _sentinel_ts = datetime.now(timezone.utc).isoformat()
+                _sentinel_ts = now_utc_iso()
                 with self._maybe_lock():
                     # async-db-ok: guarded by self._maybe_lock() — locks the shared-connection (in-memory/test) path per ; the file-backed path owns a dedicated connection and needs no lock
                     self._conn.execute(

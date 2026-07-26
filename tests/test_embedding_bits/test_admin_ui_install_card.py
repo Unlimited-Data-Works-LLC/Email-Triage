@@ -27,6 +27,9 @@ def jinja_env():
     # Stub the csrf_input macro the template references
     env.globals["csrf_input"] = lambda req: ""
     env.globals["request"] = object()
+    # Register the us_datetime filter (SSOT — same call as web/app.py).
+    from email_triage._us_datetime import install_filter as _install_us_datetime
+    _install_us_datetime(env)
     return env
 
 

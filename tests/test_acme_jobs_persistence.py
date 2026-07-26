@@ -14,6 +14,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -31,7 +32,7 @@ from email_triage.web.db import init_db
 
 @pytest.fixture
 def db(tmp_path):
-    conn = init_db(str(tmp_path / "acme_jobs_test.db"))
+    conn = track(init_db(str(tmp_path / "acme_jobs_test.db")))
     yield conn
     conn.close()
 

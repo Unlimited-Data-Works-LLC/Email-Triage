@@ -13,7 +13,8 @@ from typing import Any
 from email_triage.actions.base import Action
 from email_triage.config import RouteConfig
 
-logger = logging.getLogger("email_triage.actions.registry")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.registry")  # N-196b R21_4
 
 
 class ActionRegistry:
@@ -57,7 +58,10 @@ class Router:
         """Return the actions for ``category``, falling back to _default."""
         route = self._routes.get(category) or self._routes.get("_default")
         if route is None:
-            logger.warning("No route for category '%s' and no _default", category)
+            logger.warning(
+                "No route for category and no _default",
+                extra={"category": category},
+            )
             return []
 
         actions = []
@@ -65,8 +69,8 @@ class Router:
             action = self._registry.get(action_name)
             if action is None:
                 logger.warning(
-                    "Route for '%s' references unknown action '%s'",
-                    category, action_name,
+                    "Route references unknown action",
+                    extra={"category": category, "action": action_name},
                 )
                 continue
             actions.append(action)

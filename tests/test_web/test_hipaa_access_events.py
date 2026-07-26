@@ -180,9 +180,14 @@ class TestTriageRunRecording:
         rows = list_hipaa_access_events(db, account_id=acct_id)
         assert rows == []
 
-    def test_hipaa_discover_records_event(
+    def test_hipaa_discover_owner_self_exempt(
         self, client, db, admin_cookies, admin_user
     ):
+        """N-80: an OWNER discovering their OWN HIPAA account is exempt
+        (§164.502(a) self-disclosure carve-out) — no hipaa_access_events row.
+        actor≠owner recording is pinned at the predicate level
+        (test_audit_phi_access_pin: phi_access_audit_required truth-table)."""
+        # admin_user owns AND discovers → owner-self.
         acct_id = _make_account(db, admin_user["id"], hipaa=True, name="PHI Inbox")
 
         client.post(
@@ -195,6 +200,6 @@ class TestTriageRunRecording:
             cookies=admin_cookies,
         )
         rows = list_hipaa_access_events(db, account_id=acct_id)
-        assert len(rows) == 1
-        assert rows[0]["operation"] == "discover"
-        assert rows[0]["actor_user_id"] == admin_user["id"]
+        assert len(rows) == 0, (
+            "owner-self discover must NOT write a hipaa_access_events row (N-80)"
+        )

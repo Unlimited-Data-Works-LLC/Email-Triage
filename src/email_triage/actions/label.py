@@ -14,9 +14,9 @@ from email_triage.engine.models import (
     FlowState,
 )
 from email_triage.providers.base import EmailProvider
-from email_triage._errfmt import fmt_exc
 
-logger = logging.getLogger("email_triage.actions.label")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.label")  # N-196b R21_4
 
 
 class LabelAction(Action):
@@ -65,50 +65,59 @@ class LabelAction(Action):
                 fallback = f"{cfg['label_prefix']}/{fallback}"
             labels_to_apply = [fallback]
 
-        applied: list[str] = []
-        skipped_unsupported = False
-        last_error: Exception | None = None
-
         from email_triage.actions.base import record_idempotent_done
+        from email_triage.actions.provider_labels import (
+            push_provider_labels,
+            resolve_label_hipaa,
+        )
 
-        for label in labels_to_apply:
-            # Per-call closure pins the per-iteration label into
-            # every log emission.
-            def _extras(**more: Any) -> dict[str, Any]:
-                return build_action_log_extras(
-                    flow, message, classification, provider,
-                    label=label, **more,
-                )
-            try:
-                # apply_label is idempotent on every provider, so
-                # we don't gate on prior-run state. record_idempotent
-                # _done stamps action_results so /flows surfaces the
-                # outcome with the same shape other actions use.
-                await provider.apply_label(message.message_id, label)
-                logger.info("Label applied", extra=_extras())
-                await record_idempotent_done(
-                    flow, message, self.name, external_id=label,
-                )
-                applied.append(label)
-            except NotImplementedError:
-                logger.info(
-                    "Provider %s does not support labels, skipping",
-                    provider.name,
-                    extra=_extras(),
-                )
-                skipped_unsupported = True
-            except Exception as e:
-                logger.error(
-                    "Failed to apply label",
-                    exc_info=e,
-                    extra=_extras(),
-                )
-                last_error = e
+        # §164.502(e) egress gate (via the provider-label SSOT): in
+        # HIPAA mode the classification category is NOT pushed up to the
+        # provider mailbox — a PHI-adjacent label string stays inside the
+        # perimeter. Same gate AddLabelAction has always had; this action
+        # was missing it (divergence census 2026-06-09 #5). The gate
+        # input goes through the one resolver so it can't drift.
+        hipaa = resolve_label_hipaa(message=message)
+
+        applied, skipped, errors = await push_provider_labels(
+            provider, message.message_id, labels_to_apply, hipaa=hipaa,
+        )
+
+        def _extras(**more: Any) -> dict[str, Any]:
+            return build_action_log_extras(
+                flow, message, classification, provider, **more,
+            )
+
+        # apply_label is provider-level idempotent, so a crash-recovery
+        # rerun re-issues the same apply with no duplicate effect;
+        # record_idempotent_done stamps action_results so /flows surfaces
+        # the outcome with the same shape other actions use.
+        for label in applied:
+            logger.info("Label applied", extra=_extras(label=label))
+            await record_idempotent_done(
+                flow, message, self.name, external_id=label,
+            )
+        if hipaa and skipped:
+            logger.info(
+                "Provider labels skipped (HIPAA mode)",
+                extra=_extras(skipped=skipped),
+            )
+        elif skipped:
+            logger.info(
+                f"Provider {provider.name} does not support labels, skipping",
+                **_extras(skipped=skipped),
+            )
+        for lbl, detail, exc in errors:
+            logger.error(
+                "Failed to apply label",
+                exc_info=exc, extra=_extras(label=lbl, error=detail),
+            )
+        err_str = "; ".join(f"{lbl}: {detail}" for lbl, detail, _ in errors)
 
         # Outcome aggregation across the (one or many) label apply
         # attempts. Mirror the single-label behaviour when only one
         # label is in play; surface partial outcomes when multiple.
-        if applied and last_error is None:
+        if applied and not errors:
             return ActionOutput(
                 result=ActionResult.COMPLETED,
                 data={
@@ -116,23 +125,28 @@ class LabelAction(Action):
                     "labels": applied,
                 },
             )
-        if applied and last_error is not None:
+        if applied and errors:
             # Partial success — count as FAILED so the operator
             # surface flags it, but carry the applied list for audit.
             return ActionOutput(
                 result=ActionResult.FAILED,
-                error=fmt_exc(last_error),
+                error=err_str,
                 data={"labels_applied": applied},
             )
-        if skipped_unsupported and not applied and last_error is None:
+        if hipaa and skipped and not applied and not errors:
+            return ActionOutput(
+                result=ActionResult.SKIPPED,
+                data={"reason": "hipaa_mode"},
+            )
+        if skipped and not applied and not errors:
             return ActionOutput(
                 result=ActionResult.SKIPPED,
                 data={"reason": f"Provider '{provider.name}' does not support labels"},
             )
-        if last_error is not None:
+        if errors:
             return ActionOutput(
                 result=ActionResult.FAILED,
-                error=fmt_exc(last_error),
+                error=err_str,
             )
         # All labels skipped + no error + no apply (shouldn't reach
         # here since the fallback always supplies at least one

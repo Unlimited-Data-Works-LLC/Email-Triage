@@ -37,6 +37,8 @@ from fastapi import FastAPI
 
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import bounded_int  # N-219c/23 R23
+from email_triage._isotime import to_utc_iso
 
 #: Logger record name preserved as "web.app" for byte-identical push logs.
 log = get_logger("web.app")
@@ -76,12 +78,53 @@ async def _gmail_push_consumer(app: FastAPI) -> None:
                 await _process_push_item(app, item)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.error(
                 "Push consumer: item processing failed",
                 error=fmt_exc(e),
                 item=item,
             )
+            # N-213b R23 (2026-07-02): route failure through the
+            # WatchStatusRecorder SSOT so `/watch/status` reflects the
+            # non-IMAP ingestion sibling's error state. Fail-open — a
+            # None manager (test seams / boot) becomes a no-op.
+            try:
+                from email_triage.web._watch_status_recorder import (
+                    record_message_result,
+                )
+                _account_id = int(item.get("account_id", 0)) if isinstance(item, dict) else 0
+                _mailbox = str(item.get("mailbox", "INBOX")) if isinstance(item, dict) else "INBOX"
+                _source = "o365-push" if provider_kind == "office365" else "gmail-push"
+                _manager = getattr(app.state, "watcher_manager", None)
+                if _account_id > 0:
+                    record_message_result(
+                        _manager, _account_id, _mailbox, _source,
+                        success=False, error=e,
+                    )
+            except Exception:  # noqa: BLE001
+                pass  # telemetry write must not shadow the original error
+        else:
+            # N-213c R23 (2026-07-02): success path — no exception raised
+            # from either provider's _process_*_push_item. Record success
+            # telemetry so /watch/status reflects the non-IMAP ingestion
+            # sibling's healthy state (previously reported processed=0
+            # regardless of throughput). Skips inside _process_push_item
+            # (owner-disabled, watch-none, stale historyId) still count as
+            # "success" here — they exercised the handler without erroring.
+            try:
+                from email_triage.web._watch_status_recorder import (
+                    record_message_result,
+                )
+                _account_id = int(item.get("account_id", 0)) if isinstance(item, dict) else 0
+                _mailbox = str(item.get("mailbox", "INBOX")) if isinstance(item, dict) else "INBOX"
+                _source = "o365-push" if provider_kind == "office365" else "gmail-push"
+                _manager = getattr(app.state, "watcher_manager", None)
+                if _account_id > 0:
+                    record_message_result(
+                        _manager, _account_id, _mailbox, _source, success=True,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             try:
                 app.state.push_queue.task_done()
@@ -94,7 +137,7 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
     # helper (40+ consumers) that STAYS in web/app.py; importing at
     # module top would cycle (app.py re-exports the names defined
     # here). Mirrors the watcher/#277c late-import precedent.
-    from email_triage.web.app import _acct_log_extras
+    from email_triage.web.app import _acct_log_extras, record_provider_outcome
     from email_triage.web.db import (
         get_email_account, get_gmail_watch, update_gmail_watch_history,
         list_account_routes, record_triage_run,
@@ -111,7 +154,7 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
         GmailApiError, GmailApiProvider, GmailHistoryExpiredError,
     )
     import httpx
-    from email_triage.triage_logging import is_account_hipaa, is_hipaa_mode
+    from email_triage.triage_logging import account_hipaa_effective
 
     db = app.state.db
     config = app.state.config
@@ -133,12 +176,8 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
     # Idempotency: Pub/Sub can deliver the same historyId more than
     # once, and the webhook may enqueue multiple items during a burst.
     # Compare as ints — Gmail historyIds are monotonic integers.
-    try:
-        stored_hid_int = int(watch["history_id"])
-        incoming_hid_int = int(incoming_history_id)
-    except (TypeError, ValueError):
-        stored_hid_int = 0
-        incoming_hid_int = 0
+    stored_hid_int = bounded_int(watch["history_id"], default=0)  # N-219c/23 R23: SSOT
+    incoming_hid_int = bounded_int(incoming_history_id, default=0)  # N-219c/23 R23: SSOT
     if incoming_hid_int and incoming_hid_int <= stored_hid_int:
         log.debug(
             "Push consumer: stale historyId, skipping",
@@ -164,21 +203,36 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
         return
 
     # Fail-closed: skip push processing for accounts whose owner is
-    # disabled. We still advance the history cursor to avoid re-processing
-    # the same backlog when the user is re-enabled.
+    # disabled. Do NOT advance the history cursor (N-62 DA HIGH-1): the
+    # Gmail historyId is a WHOLE-MAILBOX watermark, so advancing it to
+    # ``incoming_history_id`` on a SKIP would push the un-fetched mail of
+    # THIS notification below the cursor — permanently lost (never
+    # re-walked) when the owner is re-enabled. Leaving the cursor put means
+    # re-enable re-walks every delta since the last REAL processed point;
+    # the ``triaged_messages`` dedup no-ops anything already done, and a
+    # long disable that ages out the history hits the existing
+    # GmailHistoryExpiredError re-seed path. Re-walk is SAFE; advance LOSES.
     owner_id = acct.get("user_id")
     if _owner_disabled:
         log.warning(
             "Push consumer: skipping (owner disabled)",
             account_id=account_id, owner_id=owner_id,
         )
-        try:
-            await db_call(
-                update_gmail_watch_history, db, account_id,
-                incoming_history_id,
-            )
-        except Exception:
-            pass
+        return
+
+    # Fail-closed is_active gate (Loop-5 census, N-62). A deactivated
+    # account must not be classified/acted on. Do NOT advance the history
+    # cursor (DA HIGH-1) — same whole-mailbox-watermark reasoning as the
+    # owner-disabled branch above: advancing on a skip loses the mail that
+    # arrived during the inactive window. Re-activation re-walks from the
+    # last real processed point (dedup-safe); O365's consumer below makes
+    # the same do-not-advance choice. Default True so a row missing the
+    # column isn't silently paused.
+    if not acct.get("is_active", True):
+        log.warning(
+            "Push consumer: skipping (account inactive)",
+            account_id=account_id, owner_id=owner_id,
+        )
         return
 
     provider = _create_provider_from_account(acct, secrets)
@@ -210,17 +264,30 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             # draft_reply / move / etc. for messages we've already
             # processed under a fresher cursor.
             #
-            # 200 is a deliberate cap: a runaway backfill on a high-
-            # volume mailbox would otherwise re-classify thousands of
-            # messages and burn LLM quota. The operator can re-run a
-            # full classify-from-scratch via the dedicated /classify
-            # admin tool if they actually want everything.
+            # BACKFILL_CAP is a deliberate cap: a runaway backfill on a
+            # high-volume mailbox would otherwise re-classify thousands
+            # of messages and burn LLM quota. The operator can re-run a
+            # full classify-from-scratch via a whole-mailbox triage if
+            # they actually want everything.
+            from email_triage.web._backfill_chip import (
+                BACKFILL_CAP, mark_backfill_capped,
+            )
             log.warning(
                 "Push consumer: history_id expired, recovering via "
                 "bounded backfill",
                 **_acct_log_extras(acct), stale_history_id=start_hid,
             )
-            recent_ids = await provider.search("newer_than:7d", limit=200)
+            #  — fetch BACKFILL_CAP+1 as a saturation PROBE.
+            # ``search(limit=N)`` returns AT MOST N, so a gap of exactly
+            # CAP returns CAP and lost nothing; only > CAP proves the gap
+            # overflowed. Process at most CAP (the cost bound); the extra
+            # probe id is covered by the chip + the operator's full
+            # backfill, so dropping it here is not a new silent loss.
+            probe_ids = await provider.search(
+                "newer_than:7d", limit=BACKFILL_CAP + 1,
+            )
+            saturated = len(probe_ids) > BACKFILL_CAP
+            recent_ids = probe_ids[:BACKFILL_CAP]
             delta = {
                 "history": [
                     {"messagesAdded": [
@@ -229,12 +296,48 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
                 ] if recent_ids else [],
                 "historyId": incoming_history_id,
             }
+            # If the bounded walk SATURATED the cap, more mail than we
+            # enumerated may sit in the gap; the cursor is about to be
+            # reseeded to "now", so that excess is never re-walked. Emit a
+            # DISTINCT warning + raise an operator-visible chip so the gap
+            # isn't silent. A non-saturated recovery enumerated everything
+            # in the window → clear any stale chip.
+            if saturated:
+                log.warning(
+                    "Push consumer: history-expired backfill CAPPED — "
+                    "older mail in the gap may be un-triaged "
+                    "(history_backfill_capped)",
+                    **_acct_log_extras(acct),
+                    stale_history_id=start_hid,
+                    recovered_count=len(recent_ids),
+                    cap=BACKFILL_CAP, window="newer_than:7d",
+                )
+                await db_call(
+                    mark_backfill_capped, db, account_id,
+                    kind="gmail_history", window="last 7 days",
+                    recovered=BACKFILL_CAP,
+                    source_mailbox="INBOX",  # N-211c R23: Gmail push = INBOX-scope
+                )
+            else:
+                from email_triage.web._backfill_chip import (
+                    clear_backfill_capped,
+                )
+                await db_call(clear_backfill_capped, db, account_id,
+                              source_mailbox="INBOX")  # N-211c R23
             log.info(
                 "Push consumer: history-expired recovery complete",
                 **_acct_log_extras(acct),
                 stale_history_id=start_hid,
                 recovered_count=len(recent_ids),
             )
+
+        # The Gmail history fetch succeeded → the OAuth credential is alive;
+        # clear any prior auth_stale chip here (before we branch on delta
+        # contents) so BOTH the empty-delta early return below and the full
+        # path clear it. The push path previously never cleared, so an account
+        # the poll path had flagged stayed stuck on the re-auth chip once it
+        # recovered via push (divergence census 2026-06-09, finding #1).
+        await db_call(record_provider_outcome, db, acct, None)
 
         # Collect new message ids from the delta. Dedupe — the same
         # message can appear under both messageAdded and labelAdded
@@ -257,6 +360,14 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             await db_call(
                 update_gmail_watch_history, db, account_id,
                 str(delta.get("historyId") or incoming_history_id),
+            )
+            # N-256b R27: push consumer received + acknowledged a
+            # notification → the Gmail watch is live. Clear any prior
+            # errored state via the SSOT lifecycle funnel.
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=None,
             )
             return
 
@@ -316,13 +427,13 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             _cal_provider, _mp = await db_call(_calendar_ctx)
         except Exception:
             _mp = None
-        # IMAP accounts store the address as config["username"];
-        # use the resolved field synthesized in db.get_email_account
-        # so loop-prevention works for IMAP too.
-        _self_email = acct.get("email_address", "")
+        # IMAP accounts store the address as config["username"]; use the
+        # account_email SSOT (census run17 ) so loop-prevention resolves
+        # for IMAP too without open-coding the materialized key.
         #  — alias-aware self-address set so action-side recipient
         # matching can take the union of primary + configured aliases.
-        from email_triage.web.db import account_addresses as _aa
+        from email_triage.web.db import account_addresses as _aa, account_email
+        _self_email = account_email(acct)
         _self_email_addresses = _aa(acct)
 
         results: list[dict] = []
@@ -333,10 +444,7 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             is_self_origin as _is_self_origin,
         )
         from email_triage.web.db import is_triaged, mark_triaged
-        from email_triage.web.triage_inflight import (
-            mark_inflight as _mark_inflight,
-            release_inflight as _release_inflight,
-        )
+        from email_triage.web.triage_inflight import claim as _inflight_claim
         # Resolve install-wide self-from once per delta; cheap dict
         # lookup, but no point doing it per-message. ( secondary
         # check.)
@@ -443,7 +551,7 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             account_addrs=list(_self_email_addresses),
             self_from_addr=_self_from_addr,
             dry_run=_dry_run,
-            account_hipaa=is_hipaa_mode() or is_account_hipaa(acct),
+            account_hipaa=account_hipaa_effective(account=acct),
             actor_user_id=None,
             durable_dedup=True,
             mark_triaged_on_success=True,
@@ -462,143 +570,141 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             # push consumer can race on the same UID/message-id when
             # a Gmail history delta arrives while an aioimaplib watch
             # cycle is mid-fetch.
-            if not _mark_inflight(app.state, account_id, mid):
-                log.info(
-                    "Skipping concurrent triage cycle (in_flight)",
-                    message_id=mid, account_id=account_id,
-                    skip_reason="in_flight",
-                )
-                continue
-            try:
-                message, _vanished = await _fetch_with_retry(mid)
-                if _vanished:
-                    skipped_vanished += 1
-                    continue
-                _res = await triage_single_message(
-                    _push_ctx, message, mid,
-                )
-                if _res.status == "e":
-                    # Route the error through the existing per-message
-                    # except so the retry-queue enqueue fires unchanged.
-                    raise RuntimeError(
-                        _res.entry.get("error", "triage error")
+            with _inflight_claim(app.state, account_id, mid) as _won:
+                if not _won:
+                    log.info(
+                        "Skipping concurrent triage cycle (in_flight)",
+                        message_id=mid, account_id=account_id,
+                        skip_reason="in_flight",
                     )
-                #  — Gmail push site watch-fire delivery retry.
-                if _res.unretried_watch_failures > 0:
+                    continue
+                try:
+                    message, _vanished = await _fetch_with_retry(mid)
+                    if _vanished:
+                        skipped_vanished += 1
+                        continue
+                    _res = await triage_single_message(
+                        _push_ctx, message, mid,
+                    )
+                    if _res.status == "e":
+                        # Route the error through the existing per-message
+                        # except so the retry-queue enqueue fires unchanged.
+                        raise RuntimeError(
+                            _res.entry.get("error", "triage error")
+                        )
+                    #  — Gmail push site watch-fire delivery retry.
+                    if _res.unretried_watch_failures > 0:
+                        try:
+                            from email_triage.web.watcher_retry import (
+                                enqueue_watch_delivery_retry as _wdr,
+                            )
+                            await db_call(
+                                _wdr,
+                                app.state.db,
+                                account_id=int(account_id),
+                                provider_type=acct.get(
+                                    "provider_type", "gmail_api",
+                                ),
+                                failed_count=_res.unretried_watch_failures,
+                                total_count=len(
+                                    _res.entry.get("watches_fired") or []
+                                ),
+                                gmail_msg_id=str(mid),
+                            )
+                        except Exception as exc:
+                            # #8: a failed enqueue means the
+                            # undelivered watch is NOT queued for re-fire — surface
+                            # it (fail VISIBLE, PD#8) rather than silently swallow.
+                            log.warning(
+                                "watch-delivery retry enqueue FAILED (gmail push) "
+                                "— the undelivered watch is NOT queued for re-fire",
+                                gmail_msg_id=str(mid),
+                                error=fmt_exc(exc),
+                            )
+                    results.append(_res.entry)
+                except Exception as e:
+                    errors.append({"message_id": mid, "error": fmt_exc(e)})
+                    log.error(
+                        "Push consumer: per-message error",
+                        **_acct_log_extras(acct), message_id=mid,
+                        error=fmt_exc(e),
+                    )
+                    #  — an LLM-unreachable failure must stamp
+                    # ``failure_kind='llm_unreachable'`` so the retry
+                    # drainer's LLM-breaker gate can skip the doomed
+                    # classify round-trip while the breaker is open.
+                    # triage_single_message re-raises
+                    # LLMBackendUnreachableError unchanged, so the bare
+                    # ``except`` here receives the real exception type.
+                    from email_triage.llm_health import (
+                        LLMBackendUnreachableError,
+                    )
+                    _is_llm_down = isinstance(e, LLMBackendUnreachableError)
+                    # Durable per-message retry queue. Gmail push site:
+                    # pass the gmail message id as the addressing tuple.
+                    # Auth-revoked -> enqueue + immediately dead.
+                    _enqueued = False
                     try:
                         from email_triage.web.watcher_retry import (
-                            enqueue_watch_delivery_retry as _wdr,
+                            enqueue_watcher_retry as _wr_enqueue_g,
                         )
-                        await db_call(
-                            _wdr,
+                        #  — enqueue_watcher_retry writes a retry row on
+                        # the shared connection; dispatch off the push
+                        # consumer's loop thread via db_call.
+                        _rid = await db_call(
+                            _wr_enqueue_g,
                             app.state.db,
                             account_id=int(account_id),
                             provider_type=acct.get(
                                 "provider_type", "gmail_api",
                             ),
-                            failed_count=_res.unretried_watch_failures,
-                            total_count=len(
-                                _res.entry.get("watches_fired") or []
-                            ),
                             gmail_msg_id=str(mid),
+                            error=e,
+                            failure_kind=(
+                                "llm_unreachable" if _is_llm_down else None
+                            ),
                         )
+                        _enqueued = _rid is not None
                     except Exception:
-                        pass
-                results.append(_res.entry)
-            except Exception as e:
-                errors.append({"message_id": mid, "error": fmt_exc(e)})
-                log.error(
-                    "Push consumer: per-message error",
-                    **_acct_log_extras(acct), message_id=mid,
-                    error=fmt_exc(e),
-                )
-                #  — an LLM-unreachable failure must stamp
-                # ``failure_kind='llm_unreachable'`` so the retry
-                # drainer's LLM-breaker gate can skip the doomed
-                # classify round-trip while the breaker is open.
-                # triage_single_message re-raises
-                # LLMBackendUnreachableError unchanged, so the bare
-                # ``except`` here receives the real exception type.
-                from email_triage.llm_health import (
-                    LLMBackendUnreachableError,
-                )
-                _is_llm_down = isinstance(e, LLMBackendUnreachableError)
-                # Durable per-message retry queue. Gmail push site:
-                # pass the gmail message id as the addressing tuple.
-                # Auth-revoked -> enqueue + immediately dead.
-                _enqueued = False
-                try:
-                    from email_triage.web.watcher_retry import (
-                        enqueue_watcher_retry as _wr_enqueue_g,
-                    )
-                    #  — enqueue_watcher_retry writes a retry row on
-                    # the shared connection; dispatch off the push
-                    # consumer's loop thread via db_call.
-                    _rid = await db_call(
-                        _wr_enqueue_g,
-                        app.state.db,
-                        account_id=int(account_id),
-                        provider_type=acct.get(
-                            "provider_type", "gmail_api",
-                        ),
-                        gmail_msg_id=str(mid),
-                        error=e,
-                        failure_kind=(
-                            "llm_unreachable" if _is_llm_down else None
-                        ),
-                    )
-                    _enqueued = _rid is not None
-                except Exception:
-                    _enqueued = False
-                if not _enqueued:
-                    #  — hold the cursor back so this delta is
-                    # re-walked on the next webhook.
-                    retry_enqueue_failed = True
-                    log.warning(
-                        "Push consumer: retry enqueue failed — "
-                        "history cursor will not advance this delta",
-                        **_acct_log_extras(acct), message_id=mid,
-                    )
-            finally:
-                # Release the in-flight slot. Idempotent.
-                _release_inflight(app.state, account_id, mid)
+                        _enqueued = False
+                    if not _enqueued:
+                        #  — hold the cursor back so this delta is
+                        # re-walked on the next webhook.
+                        retry_enqueue_failed = True
+                        log.warning(
+                            "Push consumer: retry enqueue failed — "
+                            "history cursor will not advance this delta",
+                            **_acct_log_extras(acct), message_id=mid,
+                        )
 
         elapsed = time.time() - t0
-        run_id = f"push_{account_id}_{int(time.time())}"
+        from email_triage._ids import new_run_id
+        run_id = new_run_id("push", account_id)
+        #  tail — route through the `complete_triage_run` SSOT so this
+        # Gmail-push terminal RECORDS the run row AND EMITS the
+        # `et_triage_runs_total{trigger,outcome}` counter AND fires the
+        # outbound webhook in one call. Pre-fix, `record_triage_run` +
+        # `fire_triage_completed` were called separately and the counter
+        # never fired for gmail-push — Prometheus IS-activity-review
+        # (§164.308(a)(1)(ii)(D)) silently under-reported.
+        dispatcher = getattr(app.state, "event_dispatcher", None)
+        from email_triage.web.events import complete_triage_run
         try:
-            await db_call(
-                record_triage_run,
-                db,
-                account_id=account_id,
-                account_name=acct.get("name", ""),
+            await complete_triage_run(
+                dispatcher, db, config, acct,
+                run_id=run_id,
                 query="gmail_push",
+                trigger="push",
                 total_messages=len(message_ids),
                 results=results,
                 errors=errors,
                 elapsed_secs=elapsed,
             )
-        except Exception:
-            pass
-
-        # Outbound webhook (HIPAA + quiet-hours gated).
-        dispatcher = getattr(app.state, "event_dispatcher", None)
-        if dispatcher is not None:
-            from email_triage.web.events import fire_triage_completed
-            try:
-                await fire_triage_completed(
-                    dispatcher, db, config, acct,
-                    {
-                        "run_id": run_id,
-                        "query": "gmail_push",
-                        "total_messages": len(message_ids),
-                        "results": results,
-                        "errors": errors,
-                        "elapsed_secs": elapsed,
-                    },
-                    trigger="push",
-                )
-            except Exception as _e:
-                log.warning("push: triage.completed dispatch failed", error=str(_e))
+        except Exception as _e:
+            log.warning(
+                "push: complete_triage_run outer (webhook/emit) failed",
+                error=str(_e),
+            )
 
         # Advance cursor to the latest historyId from the delta —
         # UNLESS a per-message failure could not be durably enqueued
@@ -615,6 +721,14 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             )
         else:
             await db_call(update_gmail_watch_history, db, account_id, final_hid)
+            # N-256b R27: main push-consumer success path — messages
+            # processed + cursor advanced → clear any prior errored
+            # watch state via the SSOT.
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=None,
+            )
 
         log.info(
             "Push consumer: processed delta",
@@ -626,6 +740,30 @@ async def _process_push_item(app: FastAPI, item: dict) -> None:
             cursor_advanced=not retry_enqueue_failed,
             elapsed=f"{elapsed:.1f}s",
         )
+    except Exception as _push_exc:
+        # An auth-revoked failure on the push path must surface the re-auth
+        # chip — the push consumer previously set nothing, so a dead OAuth
+        # token looked healthy ("Watching") instead of "Re-authenticate
+        # required". Record (needle-filtered, so a transient/5xx error is
+        # ignored) then re-raise so the caller's retry/error handling is
+        # unchanged. Census 2026-06-09 #1.
+        try:
+            await db_call(record_provider_outcome, db, acct, _push_exc)
+        except Exception:
+            pass
+        # Census run23 #1 — mirror the SET half of the lifecycle SSOT the
+        # sibling renewer failure branches at :1494 already wire. Pre-fix
+        # the auth_stale chip flipped but `gmail_watches.status` stayed
+        # 'active' on /health for hours until the next renewer sweep.
+        try:
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=fmt_exc(_push_exc),
+            )
+        except Exception:
+            pass
+        raise
     finally:
         try:
             await provider.close()
@@ -668,9 +806,10 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
     # helper (40+ consumers) that STAYS in web/app.py; importing at
     # module top would cycle (app.py re-exports the names defined
     # here). Mirrors the watcher/#277c late-import precedent.
-    from email_triage.web.app import _acct_log_extras
+    from email_triage.web.app import _acct_log_extras, record_provider_outcome
     from email_triage.web.db import (
         get_email_account, get_o365_subscription,
+        record_o365_subscription_outcome,
         record_triage_run, update_o365_subscription_delta_link,
     )
     from email_triage.web.routers.ui import (
@@ -684,7 +823,7 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
     from email_triage.providers.office365 import (
         Office365Provider, GraphDeltaResyncRequiredError, GraphError,
     )
-    from email_triage.triage_logging import is_account_hipaa, is_hipaa_mode
+    from email_triage.triage_logging import account_hipaa_effective
 
     db = app.state.db
     config = app.state.config
@@ -732,6 +871,24 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
         )
         return
 
+    # Fail-closed is_active gate (Loop-5 census). Mirror the owner-
+    # disabled branch EXACTLY: just return, do NOT advance the delta
+    # cursor. O365's delta feed is re-walked fresh on each webhook (the
+    # cursor is NOT advanced on skip — see the owner-disabled comment
+    # above and the module docstring), and the dedup table catches any
+    # message already processed under a fresher cursor — so leaving the
+    # cursor put means re-activation re-discovers the backlog cleanly.
+    # This is the deliberate ASYMMETRY with the Gmail consumer above
+    # (Gmail advances; O365 does not) — each mirrors ITS OWN provider's
+    # owner-disabled handling. Default True so a missing column doesn't
+    # silently pause the account.
+    if not acct.get("is_active", True):
+        log.warning(
+            "Office365 push consumer: skipping (account inactive)",
+            account_id=account_id, owner_id=owner_id,
+        )
+        return
+
     stored_delta_link = (
         (sub_row or {}).get("delta_link") if sub_row else None
     )
@@ -766,12 +923,40 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
                 stored_delta_link or None,
             )
         except GraphDeltaResyncRequiredError:
+            from email_triage.web._backfill_chip import (
+                BACKFILL_CAP, mark_backfill_capped, clear_backfill_capped,
+            )
             log.warning(
                 "Office365 push consumer: delta cursor expired, "
                 "recovering via bounded backfill",
                 **_acct_log_extras(acct),
             )
-            message_ids = await provider.search("ALL", limit=200)
+            #  — CAP+1 probe (search returns ≤N; only >CAP is real
+            # saturation). Process at most CAP; the probe id is covered
+            # by the chip + the operator's full backfill.
+            _probe_ids = await provider.search("ALL", limit=BACKFILL_CAP + 1)
+            saturated = len(_probe_ids) > BACKFILL_CAP
+            message_ids = _probe_ids[:BACKFILL_CAP]
+            # Saturated cap ⇒ mail beyond the bound is never enumerated
+            # and the cursor reseeds past it. Distinct warning + operator
+            # chip; clear it on a non-saturated recovery.
+            if saturated:
+                log.warning(
+                    "Office365 push consumer: resync backfill CAPPED — "
+                    "older mail in the gap may be un-triaged "
+                    "(resync_backfill_capped)",
+                    **_acct_log_extras(acct),
+                    recovered_count=len(message_ids), cap=BACKFILL_CAP,
+                )
+                await db_call(
+                    mark_backfill_capped, db, account_id,
+                    kind="o365_resync", window="most recent",
+                    recovered=BACKFILL_CAP,
+                    source_mailbox="INBOX",  # N-211c R23: O365 push = INBOX-scope
+                )
+            else:
+                await db_call(clear_backfill_capped, db, account_id,
+                              source_mailbox="INBOX")  # N-211c R23
             # After the backfill, kick a fresh delta walk to seed the
             # cursor for the next webhook delivery. We don't need its
             # ids (the search above already gave us recent ones), only
@@ -785,6 +970,25 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
                     **_acct_log_extras(acct), error=fmt_exc(e),
                 )
                 next_delta_link = ""
+
+        # The Graph delta walk succeeded → the OAuth credential is alive;
+        # clear any prior auth_stale chip before branching on delta contents
+        # (covers the empty-delta early return below and the full path). The
+        # O365 push path previously never cleared. Census 2026-06-09 #1.
+        await db_call(record_provider_outcome, db, acct, None)
+        # N-69 — delta walk succeeded → clear the subscription status to
+        # 'active'. Before this, a subscription that had previously errored
+        # (e.g. during renewal) stayed 'errored' on /health even after the
+        # first successful push delivery, because no success path cleared it.
+        try:
+            await db_call(
+                record_o365_subscription_outcome,
+                db,
+                account_id=account_id,
+                error_text=None,
+            )
+        except Exception:
+            pass
 
         if not message_ids:
             log.info(
@@ -851,10 +1055,11 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
             _cal_provider, _mp = await db_call(_calendar_ctx)
         except Exception:
             _mp = None
-        _self_email = acct.get("email_address", "")
+        # census run17  — account_email SSOT, not the open-coded key.
         #  — alias-aware self-address set so action-side recipient
         # matching takes the union of primary + configured aliases.
-        from email_triage.web.db import account_addresses as _aa
+        from email_triage.web.db import account_addresses as _aa, account_email
+        _self_email = account_email(acct)
         _self_email_addresses = _aa(acct)
         #  secondary self-skip — install-wide self-from address.
         _self_from_addr = getattr(
@@ -863,10 +1068,7 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
 
         results: list[dict] = []
         errors: list[dict] = []
-        from email_triage.web.triage_inflight import (
-            mark_inflight as _mark_inflight,
-            release_inflight as _release_inflight,
-        )
+        from email_triage.web.triage_inflight import claim as _inflight_claim
         #  — the O365 Graph-push consumer now runs the SAME
         # per-message body as every other ingestion path
         # (triage_single_message / ). Before  it ran a
@@ -918,7 +1120,7 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
             account_addrs=list(_self_email_addresses),
             self_from_addr=_self_from_addr,
             dry_run=_dry_run,
-            account_hipaa=is_hipaa_mode() or is_account_hipaa(acct),
+            account_hipaa=account_hipaa_effective(account=acct),
             actor_user_id=None,
             durable_dedup=True,
             mark_triaged_on_success=True,
@@ -934,158 +1136,154 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
         for mid in message_ids:
             # In-flight dedup gate — the push consumer and the
             # unified poll loop can race on the same Graph message id.
-            if not _mark_inflight(app.state, account_id, mid):
-                log.info(
-                    "Skipping concurrent triage cycle (in_flight)",
-                    message_id=mid, account_id=account_id,
-                    skip_reason="in_flight",
-                )
-                continue
-            try:
-                # 404 means the message was deleted between the delta
-                # walk + the per-message fetch — common when an
-                # operator clears their Inbox while the webhook is
-                # in flight. Mirror Gmail's vanished-message handling:
-                # log + skip, don't fail the whole delta.
-                try:
-                    message = await provider.fetch_message(mid)
-                except GraphError as ge:
-                    if ge.status == 404:
-                        log.info(
-                            "Office365 push: message vanished before "
-                            "fetch (404)",
-                            **_acct_log_extras(acct),
-                            message_id=mid,
-                        )
-                        continue
-                    raise
-                _res = await triage_single_message(
-                    _push_ctx, message, mid,
-                )
-                if _res.status == "e":
-                    # Route the error through the per-message except so
-                    # the retry-queue enqueue fires unchanged.
-                    raise RuntimeError(
-                        _res.entry.get("error", "triage error")
+            with _inflight_claim(app.state, account_id, mid) as _won:
+                if not _won:
+                    log.info(
+                        "Skipping concurrent triage cycle (in_flight)",
+                        message_id=mid, account_id=account_id,
+                        skip_reason="in_flight",
                     )
-                #  — O365 push site watch-fire delivery retry.
-                if _res.unretried_watch_failures > 0:
+                    continue
+                try:
+                    # 404 means the message was deleted between the delta
+                    # walk + the per-message fetch — common when an
+                    # operator clears their Inbox while the webhook is
+                    # in flight. Mirror Gmail's vanished-message handling:
+                    # log + skip, don't fail the whole delta.
+                    try:
+                        message = await provider.fetch_message(mid)
+                    except GraphError as ge:
+                        if ge.status == 404:
+                            log.info(
+                                "Office365 push: message vanished before "
+                                "fetch (404)",
+                                **_acct_log_extras(acct),
+                                message_id=mid,
+                            )
+                            continue
+                        raise
+                    _res = await triage_single_message(
+                        _push_ctx, message, mid,
+                    )
+                    if _res.status == "e":
+                        # Route the error through the per-message except so
+                        # the retry-queue enqueue fires unchanged.
+                        raise RuntimeError(
+                            _res.entry.get("error", "triage error")
+                        )
+                    #  — O365 push site watch-fire delivery retry.
+                    if _res.unretried_watch_failures > 0:
+                        try:
+                            from email_triage.web.watcher_retry import (
+                                enqueue_watch_delivery_retry as _wdr,
+                            )
+                            await db_call(
+                                _wdr,
+                                app.state.db,
+                                account_id=int(account_id),
+                                provider_type=acct.get(
+                                    "provider_type", "office365",
+                                ),
+                                failed_count=_res.unretried_watch_failures,
+                                total_count=len(
+                                    _res.entry.get("watches_fired") or []
+                                ),
+                                o365_msg_id=str(mid),
+                            )
+                        except Exception as exc:
+                            # #8: a failed enqueue means the
+                            # undelivered watch is NOT queued for re-fire — surface
+                            # it (fail VISIBLE, PD#8) rather than silently swallow.
+                            log.warning(
+                                "watch-delivery retry enqueue FAILED (o365 push) "
+                                "— the undelivered watch is NOT queued for re-fire",
+                                o365_msg_id=str(mid),
+                                error=fmt_exc(exc),
+                            )
+                    results.append(_res.entry)
+                except Exception as e:
+                    errors.append({"message_id": mid, "error": fmt_exc(e)})
+                    log.error(
+                        "Office365 push consumer: per-message error",
+                        **_acct_log_extras(acct),
+                        message_id=mid, error=fmt_exc(e),
+                    )
+                    #  — stamp ``failure_kind='llm_unreachable'`` on an
+                    # LLM-unreachable failure so the retry drainer's
+                    # LLM-breaker gate engages. triage_single_message
+                    # re-raises LLMBackendUnreachableError unchanged.
+                    from email_triage.llm_health import (
+                        LLMBackendUnreachableError,
+                    )
+                    _is_llm_down = isinstance(e, LLMBackendUnreachableError)
+                    # Durable per-message retry queue. O365 push site:
+                    # pass the Graph resource id as the addressing tuple.
+                    # Auth-revoked → enqueue + dead.
+                    _enqueued_o = False
                     try:
                         from email_triage.web.watcher_retry import (
-                            enqueue_watch_delivery_retry as _wdr,
+                            enqueue_watcher_retry as _wr_enqueue_o,
                         )
-                        await db_call(
-                            _wdr,
+                        #  — enqueue_watcher_retry writes a retry row on
+                        # the shared connection; dispatch off the O365 push
+                        # consumer's loop thread via db_call.
+                        _rid_o = await db_call(
+                            _wr_enqueue_o,
                             app.state.db,
                             account_id=int(account_id),
                             provider_type=acct.get(
                                 "provider_type", "office365",
                             ),
-                            failed_count=_res.unretried_watch_failures,
-                            total_count=len(
-                                _res.entry.get("watches_fired") or []
-                            ),
                             o365_msg_id=str(mid),
+                            error=e,
+                            failure_kind=(
+                                "llm_unreachable" if _is_llm_down else None
+                            ),
                         )
+                        _enqueued_o = _rid_o is not None
                     except Exception:
-                        pass
-                results.append(_res.entry)
-            except Exception as e:
-                errors.append({"message_id": mid, "error": fmt_exc(e)})
-                log.error(
-                    "Office365 push consumer: per-message error",
-                    **_acct_log_extras(acct),
-                    message_id=mid, error=fmt_exc(e),
-                )
-                #  — stamp ``failure_kind='llm_unreachable'`` on an
-                # LLM-unreachable failure so the retry drainer's
-                # LLM-breaker gate engages. triage_single_message
-                # re-raises LLMBackendUnreachableError unchanged.
-                from email_triage.llm_health import (
-                    LLMBackendUnreachableError,
-                )
-                _is_llm_down = isinstance(e, LLMBackendUnreachableError)
-                # Durable per-message retry queue. O365 push site:
-                # pass the Graph resource id as the addressing tuple.
-                # Auth-revoked → enqueue + dead.
-                _enqueued_o = False
-                try:
-                    from email_triage.web.watcher_retry import (
-                        enqueue_watcher_retry as _wr_enqueue_o,
-                    )
-                    #  — enqueue_watcher_retry writes a retry row on
-                    # the shared connection; dispatch off the O365 push
-                    # consumer's loop thread via db_call.
-                    _rid_o = await db_call(
-                        _wr_enqueue_o,
-                        app.state.db,
-                        account_id=int(account_id),
-                        provider_type=acct.get(
-                            "provider_type", "office365",
-                        ),
-                        o365_msg_id=str(mid),
-                        error=e,
-                        failure_kind=(
-                            "llm_unreachable" if _is_llm_down else None
-                        ),
-                    )
-                    _enqueued_o = _rid_o is not None
-                except Exception:
-                    _enqueued_o = False
-                if not _enqueued_o:
-                    #  — hold the delta_link back so the next
-                    # webhook re-walks this delta.
-                    retry_enqueue_failed = True
-                    log.warning(
-                        "Office365 push consumer: retry enqueue failed — "
-                        "delta_link cursor will not advance this delta",
-                        **_acct_log_extras(acct), message_id=mid,
-                    )
-            finally:
-                # Release the in-flight slot. Idempotent.
-                _release_inflight(app.state, account_id, mid)
+                        _enqueued_o = False
+                    if not _enqueued_o:
+                        #  — hold the delta_link back so the next
+                        # webhook re-walks this delta.
+                        retry_enqueue_failed = True
+                        log.warning(
+                            "Office365 push consumer: retry enqueue failed — "
+                            "delta_link cursor will not advance this delta",
+                            **_acct_log_extras(acct), message_id=mid,
+                        )
 
         elapsed = time.time() - t0
-        run_id = f"o365_push_{account_id}_{int(time.time())}"
+        from email_triage._ids import new_run_id
+        run_id = new_run_id("o365_push", account_id)
+        #  tail — route through the `complete_triage_run` SSOT so
+        # this O365-push terminal RECORDS the run row AND EMITS the
+        # `et_triage_runs_total{trigger,outcome}` counter AND fires the
+        # outbound webhook in one call. Pre-fix, `record_triage_run` +
+        # `fire_triage_completed` were called separately and the counter
+        # never fired for o365-push — Prometheus IS-activity-review
+        # (§164.308(a)(1)(ii)(D)) silently under-reported. Same-shape
+        # as the Gmail push path so external integrations don't have
+        # to special-case provider.
+        dispatcher = getattr(app.state, "event_dispatcher", None)
+        from email_triage.web.events import complete_triage_run
         try:
-            await db_call(
-                record_triage_run,
-                db,
-                account_id=account_id,
-                account_name=acct.get("name", ""),
+            await complete_triage_run(
+                dispatcher, db, config, acct,
+                run_id=run_id,
                 query="office365_push",
+                trigger="push",
                 total_messages=len(message_ids),
                 results=results,
                 errors=errors,
                 elapsed_secs=elapsed,
             )
-        except Exception:
-            pass
-
-        # Outbound webhook (HIPAA + quiet-hours gated). Same shape
-        # as the Gmail push path so external integrations don't have
-        # to special-case provider.
-        dispatcher = getattr(app.state, "event_dispatcher", None)
-        if dispatcher is not None:
-            from email_triage.web.events import fire_triage_completed
-            try:
-                await fire_triage_completed(
-                    dispatcher, db, config, acct,
-                    {
-                        "run_id": run_id,
-                        "query": "office365_push",
-                        "total_messages": len(message_ids),
-                        "results": results,
-                        "errors": errors,
-                        "elapsed_secs": elapsed,
-                    },
-                    trigger="push",
-                )
-            except Exception as _e:
-                log.warning(
-                    "o365 push: triage.completed dispatch failed",
-                    error=str(_e),
-                )
+        except Exception as _e:
+            log.warning(
+                "o365 push: complete_triage_run outer "
+                "(webhook/emit) failed",
+                error=str(_e),
+            )
 
         # Advance cursor only after the whole delta processed —
         # mid-delta crash means the next webhook re-walks the same
@@ -1114,6 +1312,27 @@ async def _process_office365_push_item(app: FastAPI, item: dict) -> None:
             cursor_advanced=not retry_enqueue_failed,
             elapsed=f"{elapsed:.1f}s",
         )
+    except Exception as _push_exc:
+        # Auth-revoked failure on the O365 push path → surface the re-auth
+        # chip (previously set nothing here). Needle-filtered; re-raise to
+        # preserve the caller's handling. Census 2026-06-09 #1.
+        try:
+            await db_call(record_provider_outcome, db, acct, _push_exc)
+        except Exception:
+            pass
+        # Census run23 #1 — mirror the O365 lifecycle SSOT SET half so the
+        # `office365_subscriptions.status` flag flips to 'errored' on a
+        # push-consumer failure. Pre-fix the auth_stale chip flipped while
+        # the row stayed 'active' on /health until the next renewer sweep.
+        try:
+            from email_triage.web.db import record_o365_subscription_outcome
+            await db_call(
+                record_o365_subscription_outcome, db,
+                account_id=account_id, error_text=fmt_exc(_push_exc),
+            )
+        except Exception:
+            pass
+        raise
     finally:
         try:
             await provider.close()
@@ -1156,7 +1375,7 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
     # helper (40+ consumers) that STAYS in web/app.py; importing at
     # module top would cycle (app.py re-exports the names defined
     # here). Mirrors the watcher/#277c late-import precedent.
-    from email_triage.web.app import _acct_log_extras
+    from email_triage.web.app import _acct_log_extras, record_provider_outcome
     from datetime import timedelta
     from email_triage.web.db import (
         list_gmail_watches_expiring, upsert_gmail_watch, get_email_account,
@@ -1173,7 +1392,7 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
     secrets = app.state.secrets
 
     now = datetime.now(timezone.utc)
-    horizon = (now + timedelta(hours=window_hours)).isoformat()
+    horizon = to_utc_iso(now + timedelta(hours=window_hours))
     expiring = await db_call(list_gmail_watches_expiring, db, horizon)
 
     if not expiring:
@@ -1191,6 +1410,19 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
         acct_id = watch["account_id"]
         acct = await db_call(get_email_account, db, acct_id)
         if acct is None:
+            continue
+        # Fail-closed is_active gate (Loop-5 census). A deactivated
+        # account's Gmail watch must NOT be re-registered — re-arming the
+        # push registration is exactly what would resurrect live PHI
+        # ingestion for a paused account. The watch row is left intact (it
+        # expires naturally on its own ~7-day clock; we just stop
+        # *extending* it), so re-activation + a watcher start re-registers
+        # it. Default True so a missing column never silently pauses.
+        if not acct.get("is_active", True):
+            log.debug(
+                "Watch renewer: skipping (account inactive)",
+                account_id=acct_id,
+            )
             continue
         try:
             provider = _create_provider_from_account(acct, secrets)
@@ -1218,9 +1450,18 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
                     await provider.close()
                 except Exception:
                     pass
-            exp_ms = int(data.get("expiration", 0))
-            exp_iso = datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc).isoformat() \
-                if exp_ms else (now + timedelta(days=7)).isoformat()
+            # register_watch succeeded → the OAuth credential is alive; clear
+            # any prior auth_stale chip BEFORE the email-resolution branch so
+            # the empty-email `continue` below also clears it. The renewer
+            # previously never cleared. Census 2026-06-09 #1.
+            await db_call(record_provider_outcome, db, acct, None)
+            from email_triage.web.routers.ui._shared import _safe_int
+            # /run18 : ``data`` is the Gmail register_watch API RESPONSE — a
+            # malformed ``expiration`` must not 500 (external-API robustness). Coerce
+            # via the _safe_int SSOT, not a bare int().
+            exp_ms = _safe_int(data.get("expiration"), 0)
+            exp_iso = to_utc_iso(datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc)) \
+                if exp_ms else to_utc_iso(now + timedelta(days=7))
             # Prefer fresh profile email; fall back through stored
             # value, then config "account" key. If everything is empty
             # we'd persist "" again — log loudly so the operator can
@@ -1245,6 +1486,14 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
                 history_id=str(data.get("historyId") or watch["history_id"]),
                 expires_at=exp_iso,
             )
+            # N-256b R27: wire the gmail_watches lifecycle SSOT (N-256).
+            # A successful renew clears status → 'active' + resets
+            # error counters; /health reflects the live watch state.
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=acct_id, error_text=None,
+            )
             log.info(
                 "Gmail watch renewed",
                 **_acct_log_extras(acct), new_expires_at=exp_iso,
@@ -1255,3 +1504,21 @@ async def _run_watch_renewal_sweep(app: FastAPI, *, window_hours: int = 48) -> N
                 "Gmail watch renewal failed",
                 **_acct_log_extras(acct), error=fmt_exc(e),
             )
+            # Auth-revoked renewal failure → surface the re-auth chip (the
+            # renewer previously set nothing, so a dead token on a push-only
+            # account stayed invisible). Needle-filtered. Census 2026-06-09 #1.
+            try:
+                await db_call(record_provider_outcome, db, acct, e)
+            except Exception:
+                pass
+            # N-256b R27: wire the gmail_watches lifecycle SSOT (N-256).
+            # A failed renew bumps error_count + sets status='errored';
+            # /health now surfaces this without waiting for a next tick.
+            try:
+                from email_triage.web.db import record_gmail_watch_outcome
+                await db_call(
+                    record_gmail_watch_outcome, db,
+                    account_id=acct_id, error_text=fmt_exc(e),
+                )
+            except Exception:
+                pass

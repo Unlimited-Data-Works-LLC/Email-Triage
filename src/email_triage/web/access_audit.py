@@ -19,6 +19,9 @@ import asyncio
 import logging
 import os
 import re
+
+from email_triage._envbool import env_bool
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
 import uuid
 from typing import Any
 
@@ -34,9 +37,16 @@ from email_triage.triage_logging import request_id_var
 # tweaked the function later).
 from email_triage.web.db import record_access_event as _record_access_event
 from email_triage.web.db_threadpool import db_call as _db_call
+# run18 #2 — the production access_log emit routes through the audit-write SSOT
+# (best-effort: run it, never raise, log a uniform ``audit_write_failed``
+# WARNING visible to /health's drift counter). Module-top import mirrors the
+# .2 rationale for ``_record_access_event`` (avoid the per-request lazy
+# lookup tax); ``web._audit`` only depends on ``triage_logging`` (no cycle).
+from email_triage.web._audit import safe_audit_write_async
 
 
-_log = logging.getLogger("email_triage.web.access_audit")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.access_audit")  # N-196b R21_4
 
 
 # Path prefixes that touch mail content. Order matters only for
@@ -46,7 +56,11 @@ _PHI_ROUTE_PREFIXES: tuple[str, ...] = (
     "/classify",
     "/triage/run",
     "/runs/",
-    "/api/openclaw/accounts/",
+    #  — the external integration API moved /api/openclaw -> /api/v1. The
+    # AUDITED request is the /api/v1 one (the legacy /api/openclaw path now only
+    # serves a 308 redirect that touches no PHI), so the §164.312(b) PHI-route
+    # classification keys on the new path.
+    "/api/v1/accounts/",
     "/api/messages",
     "/discover",
 )
@@ -56,12 +70,32 @@ _PHI_ROUTE_PREFIXES: tuple[str, ...] = (
 _ACCOUNT_PATH_RE = re.compile(
     r"^/accounts/(?P<account_id>\d+)/(?P<rest>"
     r"messages|digest/(?:generate|run|edit|toggle|reschedule|schedule|schedules)"
+    # N-172 + N-173 — the plural ``digests/<digest_id>/...`` mail-content
+    # dry-runs were NOT covered by the singular ``digest/...`` alternatives
+    # above (note PLURAL ``digests`` + the ``/<digest_id>/`` segment), so
+    # ``_is_phi_path`` returned False and NO §164.312(b) access_log row fired
+    # for ANY actor (even the owner). The three PHI-bearing members:
+    #   • candidates (N-172) — "Show matches" dry-run lists matched
+    #     sender + subject = PHI (accounts.py:digest_candidates).
+    #   • preview (N-173) — renders the digest body via the SAME
+    #     ``_render_digest_payload`` send-render path (gather→filter→render);
+    #     the iframe srcdoc embeds matched sender/subject/body = PHI
+    #     (accounts.py:digest_preview).
+    #   • test-send (N-173) — runs the full ``_fire_one_digest`` path
+    #     (gather→filter→render→SMTP); reads + discloses matched mail
+    #     content (accounts.py:digest_test_send).
+    # Scoped to those THREE only — the sibling digests/* subroutes
+    # (new / new/edit / {id}/edit / save / delete / validate-query) are
+    # config CRUD or query-syntax checks (validate-query returns only a
+    # MATCH COUNT, no sender/subject/body), not mail-content reads, so they
+    # stay out to avoid audit-table noise + over-matching the net.
+    r"|digests/\d+/(?:candidates|preview|test-send)"
     r"|folders|discover|triage|test|bulk"
     r")(?P<tail>/[^?]*)?$"
 )
 
 # Sub-pattern for pulling a message id out of a path like
-# /api/openclaw/accounts/3/messages/<message_id>/...
+# /api/v1/accounts/3/messages/<message_id>/...
 _MESSAGE_PATH_RE = re.compile(
     r"/messages/(?P<message_id>[^/?]+)"
 )
@@ -70,17 +104,12 @@ _MESSAGE_PATH_RE = re.compile(
 def _extract_account_id(path: str) -> int | None:
     m = _ACCOUNT_PATH_RE.match(path)
     if m:
-        try:
-            return int(m.group("account_id"))
-        except (ValueError, TypeError):
-            return None
-    # OpenClaw API: /api/openclaw/accounts/<id>/...
-    m2 = re.match(r"^/api/openclaw/accounts/(\d+)/", path)
+        return parse_int_or_none(m.group("account_id"))  # N-219b R23: SSOT
+    # External integration API:
+    # /api/v1/accounts/<id>/...
+    m2 = re.match(r"^/api/v1/accounts/(\d+)/", path)
     if m2:
-        try:
-            return int(m2.group(1))
-        except (ValueError, TypeError):
-            return None
+        return parse_int_or_none(m2.group(1))  # N-219b R23: SSOT
     return None
 
 
@@ -138,7 +167,9 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             if rid:
                 rid = "".join(c for c in rid if c.isalnum() or c in "-_")[:64]
         if not rid:
-            rid = uuid.uuid4().hex[:12]
+            # N-244b R25: SSOT — `_ids.new_short_id("")` = bare hex tail.
+            from email_triage._ids import new_short_id
+            rid = new_short_id("")
 
         request.state.request_id = rid
         token = request_id_var.set(rid)
@@ -221,7 +252,7 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
             # surfaces on the request response (operator debug aid
             # for audit-write regressions). Production keeps
             # fire-and-forget.
-            if os.environ.get("EMAIL_TRIAGE_AUDIT_STRICT"):
+            if env_bool("EMAIL_TRIAGE_AUDIT_STRICT"):
                 # _audit_write already re-raises in strict mode
                 # (env-var check at end of the body). Awaiting
                 # synchronously here surfaces the exception on the
@@ -247,6 +278,28 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
                     request_id=request_id,
                 )
             )
+            # the backlog  F1 (DA + db-sme convergent) — attach a
+            # done-callback that stashes ``task.exception()`` /
+            # ``task.cancelled()`` unconditionally on the fire-and-
+            # forget task. Closes the pre-await-cancel hole where the
+            # ``except BaseException`` inside ``safe_audit_write_async``
+            # never runs because the loop cancelled the coroutine
+            # BEFORE it hit ``await awrite()``. Idempotent with the
+            # inner stash — same class name lands on _LAST_AUDIT_EXC
+            # either way, so the drain-race pin fires loud on every
+            # task-end mode.
+            from email_triage.web._audit import (
+                attach_audit_done_callback,
+            )
+            # the backlog  (DA  F3 root-cause fix): pass the
+            # optional test-side threading.Event so the drain helper
+            # wakes on task completion instead of polling every 20ms.
+            # Prod app never sets ``_audit_pending_signal``; the
+            # callback is a no-op there. Test fixtures set it up at
+            # TestClient app boot.
+            _sig = getattr(app_state, "_audit_pending_signal", None)
+            attach_audit_done_callback(task, "access_audit_middleware", signal=_sig)
+
             # Track on app.state so tests + a future graceful-shutdown
             # path can ``await`` outstanding writes. Weak ref via list
             # so completed tasks GC normally.
@@ -262,6 +315,10 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
             # task creation). Same surface-don't-silence policy as
             # before. The audit-write itself is now async, so its
             # failures land in ``_audit_write`` instead.
+            # 2026-07-10 drain-race fix — stash for test observability
+            # (see _audit._LAST_AUDIT_EXC docstring).
+            from email_triage.web._audit import _stash_last_audit_exc
+            _stash_last_audit_exc(exc, "access_audit:dispatch")
             state = request.app.state
             current = getattr(state, "audit_failures", 0)
             state.audit_failures = int(current) + 1
@@ -278,7 +335,7 @@ class AccessAuditMiddleware(BaseHTTPMiddleware):
                     }
                 },
             )
-            if os.environ.get("EMAIL_TRIAGE_AUDIT_STRICT"):
+            if env_bool("EMAIL_TRIAGE_AUDIT_STRICT"):
                 raise
 
         return response
@@ -305,9 +362,65 @@ async def _audit_write(
     (response has already returned by the time this runs). It is NOT
     optional — the task will run to completion or it will be counted
     as an audit failure, never silently dropped.
+
+    run18 #2 — the production emit converges onto the
+    ``safe_audit_write_async`` SSOT (PD#5: collapse the divergent
+    funnel; the audit-emit-swallow pin sees a routed emit, not a
+    hand-rolled swallowing try/except). Strict mode keeps a BARE emit
+    that re-raises the ORIGINAL exception: strict's purpose is to
+    surface the failure verbatim on the request response (operator
+    debug aid), which the never-raise SSOT cannot do. Both paths
+    preserve the /health ``audit_failures`` counter bump.
     """
-    try:
-        await _db_call(
+    if env_bool("EMAIL_TRIAGE_AUDIT_STRICT"):
+        # Strict debug mode: NOT routed through the SSOT — we WANT the
+        # original exception to surface (byte-equivalent to the prior
+        # strict re-raise). Bump the counter, log with context, re-raise.
+        try:
+            await _db_call(
+                _record_access_event,
+                db,
+                actor_user_id=actor_user_id,
+                method=method,
+                route=path,
+                account_id=_extract_account_id(path),
+                message_id=_extract_message_id(path),
+                status_code=status_code,
+                outcome=_outcome_from_status(status_code),
+                request_id=request_id,
+            )
+        except Exception as exc:
+            # 2026-07-10 drain-race defensive stash — even though this
+            # handler re-raises (and the upstream `safe_audit_write_async`
+            # swallow stashes on the way out), we stash HERE too so a
+            # future refactor that shortens the propagation chain does
+            # not re-open the invisible-swallow class. See
+            # `_audit._LAST_AUDIT_EXC` + `feedback_fix_flaky_tests_dont_dismiss`.
+            from email_triage.web._audit import _stash_last_audit_exc
+            _stash_last_audit_exc(exc, "access_audit:_audit_write")
+            current = getattr(app_state, "audit_failures", 0)
+            app_state.audit_failures = int(current) + 1
+            _log.error(
+                "access_audit write failed",
+                exc_info=exc,
+                extra={
+                    "_extra": {
+                        "path": path,
+                        "method": method,
+                        "request_id": request_id or "",
+                    }
+                },
+            )
+            raise
+        return
+
+    # Production: route the best-effort emit through the SSOT (run it,
+    # never raise, log a uniform ``audit_write_failed`` WARNING for
+    # /health's drift counter). ``record_access_event`` returns the new
+    # row id, so a ``None`` return is the SSOT's swallowed-failure signal
+    # — preserve the access-audit /health counter bump on it.
+    result = await safe_audit_write_async(
+        lambda: _db_call(
             _record_access_event,
             db,
             actor_user_id=actor_user_id,
@@ -318,24 +431,9 @@ async def _audit_write(
             status_code=status_code,
             outcome=_outcome_from_status(status_code),
             request_id=request_id,
-        )
-    except Exception as exc:
-        # Same failure surface as the prior synchronous write: bump the
-        # counter so /health flips degraded, and log with context.
-        # Strict-mode re-raise becomes "task crash" (loop exception
-        # handler picks it up + tests see it via raise_server_exceptions).
+        ),
+        description=f"access_log {method} route={path} status={status_code}",
+    )
+    if result is None:
         current = getattr(app_state, "audit_failures", 0)
         app_state.audit_failures = int(current) + 1
-        _log.error(
-            "access_audit write failed",
-            exc_info=exc,
-            extra={
-                "_extra": {
-                    "path": path,
-                    "method": method,
-                    "request_id": request_id or "",
-                }
-            },
-        )
-        if os.environ.get("EMAIL_TRIAGE_AUDIT_STRICT"):
-            raise

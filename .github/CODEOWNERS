@@ -1,0 +1,20 @@
+# CODEOWNERS — email-triage trust-root gate coupling (N-326-C5)
+#
+# Purpose: any PR that touches the trust-root pubkey mirror OR the
+# golden-hash file requires operator (Alex Doe) review before
+# merge. GitHub enforces this at the PR-review layer; the SME-gate CI
+# check enforces the signed-proof trailer half; together they close the
+# `80cfbbdc` trust-breach class end-to-end (see
+# `internal documentation` + `internal documentation`
+# §4.7 N-333 + §4.9 N-326-C5).
+#
+# Coupling rationale (N-326-C5 SME-panel DA fold #8): a malicious PR
+# that swaps `.github/op-approve/allowed_signers` (the CI-side trust
+# root mirror) MUST also swap `tests/goldens/allowed_signers.sha256`
+# (the byte-integrity golden). CODEOWNERS on BOTH forms the joint gate
+# — the trust-root pin at `tests/test_n326_c5_allowed_signers_ssot.py`
+# checks byte-equality against the golden; without CODEOWNERS on both,
+# a direct-push to `feat/v0.2.0` would sidestep the operator review.
+
+.github/op-approve/**   @C-Doe
+tests/goldens/**        @C-Doe

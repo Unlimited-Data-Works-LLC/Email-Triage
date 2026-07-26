@@ -19,8 +19,10 @@ from fastapi.responses import JSONResponse
 
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage.web._audit import safe_audit_write_async
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.gmail_push_auth import (
+    GmailPushTransientFetchError,
     GmailPushVerificationError,
     _CertCache,
     verify_pubsub_jwt,
@@ -76,11 +78,30 @@ async def gmail_push(request: Request):
         _inc_counter(request, "gmail_push.auth_failed")
         log.warning("Gmail push: JWT verification failed", reason=e.reason)
         return JSONResponse({"status": "error", "reason": "unauthorized"}, status_code=401)
+    except GmailPushTransientFetchError as e:
+        # N-288 R30: brief DNS/network failure during JWKS fetch.
+        # Return 503 so Pub/Sub retries (its default behavior on 5xx)
+        # + suppresses the stack trace that a bare exception would
+        # produce. Log a WARN not an ERROR — this is expected during
+        # a transient outage.
+        _inc_counter(request, "gmail_push.jwks_transient")
+        log.warning("Gmail push: JWKS cert fetch transient failure",
+                    reason=e.reason)
+        return JSONResponse(
+            {"status": "retry", "reason": "jwks_fetch_transient"},
+            status_code=503,
+        )
 
+    # N-233 R22 — route through the SSOT so the 400-on-malformed shape
+    # matches the auth entry points. FastAPI turns HTTPException(400)
+    # into `{"detail":"invalid_json"}` — Google Pub/Sub only checks the
+    # status_code, not the body.
+    from email_triage.web.routers._json import parse_json_body
+    from fastapi import HTTPException as _HTTPException
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"status": "error", "reason": "bad_json"}, status_code=400)
+        body = await parse_json_body(request)
+    except _HTTPException as e:
+        return JSONResponse({"status": "error", "reason": "bad_json"}, status_code=e.status_code)
 
     message = body.get("message", {}) if isinstance(body, dict) else {}
     raw_data = message.get("data", "")
@@ -88,7 +109,12 @@ async def gmail_push(request: Request):
         return JSONResponse({"status": "ignored", "reason": "no_data"})
 
     try:
-        decoded = base64.b64decode(raw_data).decode("utf-8")
+        #  tail — external URL-safe base64 from Gmail push (RFC 4648
+        # §5, padding-stripped). Route through the SSOT so a length-not-
+        # multiple-of-4 input decodes correctly instead of raising and
+        # dropping the push.
+        from email_triage._base64url import b64decode_permissive
+        decoded = b64decode_permissive(raw_data).decode("utf-8")
         payload = json.loads(decoded)
     except Exception as e:
         log.warning("Gmail push: failed to decode data", error=fmt_exc(e))
@@ -162,6 +188,13 @@ def _inc_counter(request: Request, key: str) -> None:
     Also mirrors to Redis via the install-level persistent counter
     backend when configured (namespace ``webhooks``). Best-effort;
     Redis hiccups are silent. Process-local stays authoritative.
+
+    N-385 (2026-07-10 wf_69674c7e-c67, HIGH): the Prometheus text ``/metrics``
+    surface is the canonical operator-facing counter registry (see the
+    ``email_triage.metrics`` module docstring). This funnel is the ONE
+    convergence seam every webhook counter caller already routes through,
+    so mirroring here through :func:`~email_triage.metrics.emit_webhook_event`
+    lifts every callsite onto the SSOT without a per-site edit.
     """
     try:
         from email_triage.engine.persistent_counters import (
@@ -173,6 +206,12 @@ def _inc_counter(request: Request, key: str) -> None:
     except Exception:  # noqa: BLE001
         pass
     _inc_counter_local(request, key)
+    # N-385 — Prometheus SSOT mirror. Fail-open (the funnel already swallows).
+    try:
+        from email_triage.metrics import emit_webhook_event
+        emit_webhook_event(key)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _inc_counter_local(request: Request, key: str) -> None:
@@ -223,11 +262,14 @@ async def _office365_webhook(request: Request):
         return PlainTextResponse(validation_token)
 
     # ----- Change notification ------------------------------------------
+    # N-233 R22 — same SSOT routing as gmail_push (see comment above).
+    from email_triage.web.routers._json import parse_json_body
+    from fastapi import HTTPException as _HTTPException
     try:
-        body = await request.json()
-    except Exception:
+        body = await parse_json_body(request)
+    except _HTTPException as e:
         return JSONResponse(
-            {"status": "error", "reason": "bad_json"}, status_code=400,
+            {"status": "error", "reason": "bad_json"}, status_code=e.status_code,
         )
 
     notifications = body.get("value", []) if isinstance(body, dict) else []
@@ -300,40 +342,65 @@ async def _office365_webhook(request: Request):
         # tenant token, AND old code paths logged them) could POST
         # to /webhooks/office365 and queue triage work for that
         # account. Fail closed: missing secret == 401 + audit.
-        expected_state = _expected_client_state(request, watch)
+        expected_state, cs_undecryptable = _expected_client_state(request, watch)
         if not expected_state:
             account_id_for_log = watch.get("account_id")
-            log.info(
-                "office365_clientstate missing for account "
-                f"{account_id_for_log} — webhook delivery rejected; "
-                "operator must re-register the subscription so a "
-                "freshly-generated clientState lands on both sides.",
-                account_id=account_id_for_log,
-                subscription_id=sub_id,
-            )
+            # A5 / F-1 — distinguish "operator never registered a secret"
+            # (unset) from "a stored secret won't decrypt" (master-key
+            # mismatch). Both fail closed (401), but the durable audit row
+            # must record the TRUE cause (§164.312(b) audit accuracy).
+            cause = "undecryptable" if cs_undecryptable else "unset"
+            if cs_undecryptable:
+                log.error(
+                    "office365_clientstate unreadable for account "
+                    f"{account_id_for_log} — stored secret won't decrypt "
+                    "(corrupt row / master-key mismatch); webhook rejected. "
+                    "Check the secrets master key.",
+                    account_id=account_id_for_log,
+                    subscription_id=sub_id,
+                )
+            else:
+                log.info(
+                    "office365_clientstate missing for account "
+                    f"{account_id_for_log} — webhook delivery rejected; "
+                    "operator must re-register the subscription so a "
+                    "freshly-generated clientState lands on both sides.",
+                    account_id=account_id_for_log,
+                    subscription_id=sub_id,
+                )
             try:
                 from email_triage.web.db import record_auth_event
                 if db is not None:
                     # ASYNC-DB: auth-event write off the loop.
-                    await db_call(
-                        record_auth_event,
-                        db,
-                        event_type="o365_webhook_auth",
-                        email="",
-                        outcome="failure",
-                        detail=(
-                            f"clientstate_unset account_id="
-                            f"{account_id_for_log} subscription_id="
-                            f"{sub_id}"
+                    await safe_audit_write_async(
+                        lambda: db_call(
+                            record_auth_event,
+                            db,
+                            event_type="o365_webhook_auth",
+                            email="",
+                            outcome="failure",
+                            detail=(
+                                f"clientstate_{cause} account_id="
+                                f"{account_id_for_log} subscription_id="
+                                f"{sub_id}"
+                            ),
+                        ),
+                        description=(
+                            f"o365_webhook_auth clientstate_{cause} "
+                            f"account_id={account_id_for_log}"
                         ),
                     )
             except Exception:
                 pass
-            _inc_counter(request, "office365_push.client_state_unset")
+            _inc_counter(
+                request,
+                "office365_push.client_state_"
+                + ("undecryptable" if cs_undecryptable else "unset"),
+            )
             return JSONResponse(
                 {
                     "status": "error",
-                    "reason": "clientstate_unset",
+                    "reason": f"clientstate_{cause}",
                 },
                 status_code=401,
             )
@@ -351,17 +418,23 @@ async def _office365_webhook(request: Request):
                 from email_triage.web.db import record_auth_event
                 if db is not None:
                     # ASYNC-DB: auth-event write off the loop.
-                    await db_call(
-                        record_auth_event,
-                        db,
-                        event_type="o365_webhook_auth",
-                        email="",
-                        outcome="failure",
-                        detail=(
-                            f"clientstate_mismatch account_id="
-                            f"{watch.get('account_id')} subscription_id="
-                            f"{sub_id} had_client_state="
-                            f"{bool(client_state)}"
+                    await safe_audit_write_async(
+                        lambda: db_call(
+                            record_auth_event,
+                            db,
+                            event_type="o365_webhook_auth",
+                            email="",
+                            outcome="failure",
+                            detail=(
+                                f"clientstate_mismatch account_id="
+                                f"{watch.get('account_id')} subscription_id="
+                                f"{sub_id} had_client_state="
+                                f"{bool(client_state)}"
+                            ),
+                        ),
+                        description=(
+                            f"o365_webhook_auth clientstate_mismatch "
+                            f"account_id={watch.get('account_id')}"
                         ),
                     )
             except Exception:
@@ -442,8 +515,8 @@ async def _office365_webhook(request: Request):
     })
 
 
-def _expected_client_state(request: Request, watch: dict) -> str:
-    """Return the expected ``clientState`` for this subscription row.
+def _expected_client_state(request: Request, watch: dict) -> tuple[str, bool]:
+    """Return ``(expected_clientState, undecryptable)`` for this row.
 
     Strategy: secrets store keyed by
     ``office365_clientstate:<account_id>``. Falls back to the install-
@@ -456,22 +529,38 @@ def _expected_client_state(request: Request, watch: dict) -> str:
     Graph side stay deliverable until the operator clicks Stop +
     Start in /admin/integrations to re-register with a freshly-
     generated secret.
+
+    ``undecryptable`` is True when a stored clientState secret EXISTS
+    but won't decrypt (corrupt row / master-key mismatch) — distinct
+    from genuinely-unset (``("", False)``). The receiver fails closed
+    either way, but threads the true cause into the §164.312(b) audit
+    row so a key mismatch isn't recorded as "operator forgot to
+    register" (A5 / SME finding F-1).
     """
     account_id = watch.get("account_id") if watch else None
     secrets = getattr(request.app.state, "secrets", None)
     if secrets is None or account_id is None:
-        return ""
+        return "", False
+    from email_triage.web.settings_keys import office365_clientstate
+    from email_triage.secrets import SecretsDecryptError, read_secret
     try:
-        from email_triage.web.settings_keys import office365_clientstate
-        per_acct = secrets.get(office365_clientstate(account_id))
+        per_acct = read_secret(secrets, office365_clientstate(account_id))
         if per_acct:
-            return str(per_acct)
-        install = secrets.get("office365_clientstate")
+            return str(per_acct), False
+        install = read_secret(secrets, "office365_clientstate")
         if install:
-            return str(install)
-    except Exception:
-        pass
-    return ""
+            return str(install), False
+    except SecretsDecryptError:
+        # A5 — returning "" still fails closed (caller rejects the push
+        # with 401, per ); but report the TRUE cause so a master-key
+        # mismatch isn't mistaken for an unset clientState.
+        log.error(
+            "office365 clientState unreadable — corrupt secret row or "
+            "master-key mismatch; webhook will be rejected as if unset",
+            account_id=account_id,
+        )
+        return "", True
+    return "", False
 
 
 @router.post("/office365")

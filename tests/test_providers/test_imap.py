@@ -85,6 +85,15 @@ def _mock_client():
     # Default to AUTH so existing tests can ignore the new path; tests
     # that exercise NONAUTH / LOGOUT recovery override this.
     client.get_state = MagicMock(return_value="AUTH")
+    #  (test-harness warnings, bucket 2): the close() path calls
+    # ``client.protocol.transport.close()`` — a real asyncio transport's
+    # close() is SYNCHRONOUS, so imap.py correctly does NOT await it. On a
+    # bare AsyncMock the nested transport.close resolves async and leaks an
+    # un-awaited coroutine (RuntimeWarning). This is a test-mock mis-wiring,
+    # NOT a product bug — pin the transport subtree sync to mirror the real
+    # asyncio API.
+    client.protocol = MagicMock()
+    client.protocol.transport = MagicMock()
     return client
 
 
@@ -134,6 +143,53 @@ class TestImapProvider:
         client.search.return_value = ("NO", [b""])
         uids = await provider.search("UNSEEN")
         assert uids == []
+
+    @pytest.mark.asyncio
+    async def test_uid_exists_present_with_status_trailer(self):
+        """REAL aioimaplib-2.0 wire shape: a present UID returns its seq token
+        PLUS a trailing 'Search completed' status line. uid_exists keys on the
+        NUMERIC token, not the trailer."""
+        provider = _make_provider()
+        client = _mock_client()
+        provider._client = client
+        client.search.return_value = (
+            "OK", [b"7", b"Search completed (0.001 + 0.000 secs)."],
+        )
+        assert await provider.uid_exists("84083") is True
+
+    @pytest.mark.asyncio
+    async def test_uid_exists_absent_with_status_trailer(self):
+        """A genuinely-expunged UID: ZERO matches but aioimaplib STILL appends
+        the non-numeric 'Search completed' trailer. uid_exists MUST return False
+        (not True on the trailer) — else the expunge mis-reads as present and
+        the message_expunged split is inert (db-sme MUST-FIX 2026-06-19)."""
+        provider = _make_provider()
+        client = _mock_client()
+        provider._client = client
+        client.search.return_value = (
+            "OK", [b"", b"Search completed (0.000 + 0.000 secs)."],
+        )
+        assert await provider.uid_exists("84083") is False
+
+    @pytest.mark.asyncio
+    async def test_uid_exists_search_not_ok_is_unverifiable(self):
+        """A non-OK SEARCH → None (unverifiable) so the caller fails toward
+        message_gone (keeps the fail-safe), never a false 'absent'."""
+        provider = _make_provider()
+        client = _mock_client()
+        provider._client = client
+        client.search.return_value = ("NO", [b""])
+        assert await provider.uid_exists("84083") is None
+
+    @pytest.mark.asyncio
+    async def test_uid_exists_exception_is_unverifiable(self):
+        """A SEARCH blow-up → None (unverifiable), never a crash or a false
+        verdict — the sweeper degrades gracefully to message_gone."""
+        provider = _make_provider()
+        client = _mock_client()
+        provider._client = client
+        client.search.side_effect = RuntimeError("boom")
+        assert await provider.uid_exists("84083") is None
 
     @pytest.mark.asyncio
     async def test_fetch_message(self):
@@ -517,9 +573,9 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\HasNoChildren) "." "INBOX"',
-            b'(\Drafts \HasNoChildren) "." "Drafts"',
-            b'(\Sent \HasNoChildren) "." "Sent"',
+            b'(\\HasNoChildren) "." "INBOX"',
+            b'(\\Drafts \\HasNoChildren) "." "Drafts"',
+            b'(\\Sent \\HasNoChildren) "." "Sent"',
         ]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
         provider._client = client
@@ -540,8 +596,8 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\HasNoChildren) "." "INBOX"',
-            b'(\Drafts \HasNoChildren) "." "INBOX.Drafts"',
+            b'(\\HasNoChildren) "." "INBOX"',
+            b'(\\Drafts \\HasNoChildren) "." "INBOX.Drafts"',
         ]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
         provider._client = client
@@ -559,9 +615,9 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\HasNoChildren) "." "INBOX"',
-            b'(\HasNoChildren) "." "Drafts"',
-            b'(\HasNoChildren) "." "Sent"',
+            b'(\\HasNoChildren) "." "INBOX"',
+            b'(\\HasNoChildren) "." "Drafts"',
+            b'(\\HasNoChildren) "." "Sent"',
         ]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
         provider._client = client
@@ -578,7 +634,7 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\HasNoChildren) "." "INBOX"',
+            b'(\\HasNoChildren) "." "INBOX"',
         ]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
         provider._client = client
@@ -596,8 +652,8 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\HasNoChildren) "." "Drafts (Old)"',
-            b'(\Drafts \HasNoChildren) "." "Drafts"',
+            b'(\\HasNoChildren) "." "Drafts (Old)"',
+            b'(\\Drafts \\HasNoChildren) "." "Drafts"',
         ]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
         provider._client = client
@@ -618,7 +674,7 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\Drafts \HasNoChildren) "." "Drafts"',
+            b'(\\Drafts \\HasNoChildren) "." "Drafts"',
         ]))
         client.create = AsyncMock(return_value=("NO", [b"Mailbox already exists"]))
         client.append = AsyncMock(return_value=("OK", [b"APPEND completed"]))
@@ -644,7 +700,7 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\Drafts \HasNoChildren) "." "INBOX.Drafts"',
+            b'(\\Drafts \\HasNoChildren) "." "INBOX.Drafts"',
         ]))
         client.create = AsyncMock(return_value=("OK", []))
         # First APPEND to INBOX.Drafts returns NO; second to Drafts
@@ -673,7 +729,7 @@ class TestCreateDraftFolderDiscovery:
         provider = _make_provider()
         client = _mock_client()
         client.list = AsyncMock(return_value=("OK", [
-            b'(\Drafts \HasNoChildren) "." "INBOX.Drafts"',
+            b'(\\Drafts \\HasNoChildren) "." "INBOX.Drafts"',
         ]))
         client.create = AsyncMock(return_value=("OK", []))
         client.append = AsyncMock(side_effect=[

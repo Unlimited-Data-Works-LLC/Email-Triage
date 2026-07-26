@@ -10,6 +10,7 @@ v17 fan-out must keep that contract.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timezone
@@ -101,7 +102,7 @@ def _rollback_to_v16(conn: sqlite3.Connection) -> None:
 @pytest.fixture
 def v16_db():
     """A DB at schema v16 (one version below the migration under test)."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     _rollback_to_v16(conn)
     assert schema_version(conn) == 16
     yield conn

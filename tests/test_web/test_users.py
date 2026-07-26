@@ -157,7 +157,7 @@ class TestDisabledApiKey:
         store_api_key(db, hash_api_key(raw_key), "test", regular_user["id"])
         set_user_disabled(db, regular_user["id"], True, actor_user_id=admin_user["id"])
         resp = client.get(
-            "/api/openclaw/accounts",
+            "/api/v1/accounts",
             headers={"Authorization": f"Bearer {raw_key}"},
         )
         assert resp.status_code == 401

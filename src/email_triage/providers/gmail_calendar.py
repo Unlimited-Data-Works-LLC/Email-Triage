@@ -22,8 +22,11 @@ from typing import Any
 
 import httpx
 
-from email_triage._isotime import parse_iso
+from email_triage._egress import Intent, egress_async_client
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+from email_triage._isotime import parse_iso_aware, to_utc_iso_z
 from email_triage.engine.models import CalendarEvent
+from email_triage.mail_headers import canonical_email
 from email_triage.providers.calendar_base import (
     CalendarProvider,
     _CalendarHttpMixin,
@@ -35,7 +38,7 @@ from email_triage.providers.gmail_api import (
     GmailAuthError,
 )
 
-logger = logging.getLogger("email_triage.providers.gmail_calendar")
+logger = get_logger("email_triage.providers.gmail_calendar")  # N-196b R21_4
 
 CAL_BASE = "https://www.googleapis.com/calendar/v3"
 
@@ -119,7 +122,9 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
                 "grant_type": "refresh_token",
             }
 
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with egress_async_client(
+                intent=Intent.OAUTH_TOKEN, timeout=self._timeout
+            ) as client:
                 resp = await client.post(OAUTH_TOKEN_URL, data=data)
 
             if resp.status_code >= 400:
@@ -146,7 +151,9 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
     # -- _CalendarHttpMixin hooks --------------------------------------
 
     async def _build_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=CAL_BASE, timeout=self._timeout)
+        return egress_async_client(
+            intent=Intent.PROVIDER_API, base_url=CAL_BASE, timeout=self._timeout
+        )
 
     async def _auth_headers(self) -> dict[str, str]:
         # Google's access token rotates; apply it per request rather
@@ -170,18 +177,20 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
         if not raw:
             return None, False
         if "dateTime" in raw:
-            dt = parse_iso(raw.get("dateTime"))
+            # N-357b (2026-07-06 baseline shrink): migrated to parse_iso_aware SSOT.
+            dt = parse_iso_aware(raw.get("dateTime"))
             if dt is None:
                 return None, False
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc), False
         if "date" in raw:
-            try:
-                d = date.fromisoformat(raw["date"])
-                return datetime.combine(d, dt_time.min, tzinfo=timezone.utc), True
-            except Exception:
+            # N-263b R31 fromisoformat sweep — route through
+            # `_isotime.parse_iso_date` SSOT (returns None on
+            # unparseable, behavior-preserving vs prior try/except).
+            from email_triage._isotime import parse_iso_date
+            d = parse_iso_date(raw["date"])
+            if d is None:
                 return None, True
+            return datetime.combine(d, dt_time.min, tzinfo=timezone.utc), True
         return None, False
 
     def _normalise(
@@ -319,8 +328,8 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
         cid = calendar_id or self._calendar_id
         path = f"/calendars/{cid}/events"
         params: dict[str, Any] = {
-            "timeMin": time_min.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "timeMax": time_max.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timeMin": to_utc_iso_z(time_min),
+            "timeMax": to_utc_iso_z(time_max),
             "singleEvents": "true",
             "orderBy": "startTime",
             "maxResults": str(min(limit, 250)),
@@ -359,8 +368,8 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
         cid = calendar_id or self._calendar_id
         path = f"/calendars/{cid}/events"
         params: dict[str, Any] = {
-            "timeMin": time_min.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "timeMax": time_max.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timeMin": to_utc_iso_z(time_min),
+            "timeMax": to_utc_iso_z(time_max),
             "singleEvents": "true",
             "orderBy": "startTime",
             "eventTypes": "outOfOffice",
@@ -423,12 +432,17 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
                 body["end"] = {"date": (event.end or event.start).date().isoformat()}
             else:
                 body["start"] = {
-                    "dateTime": event.start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "dateTime": to_utc_iso_z(event.start),
                 }
                 if event.end:
                     body["end"] = {
-                        "dateTime": event.end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "dateTime": to_utc_iso_z(event.end),
                     }
+        # "transparent" = show as FREE (doesn't block the day) — used for
+        # reminders / deadline markers. Default "opaque" sends nothing (Google's
+        # own default is opaque), so existing callers are unaffected.
+        if event.transparency == "transparent":
+            body["transparency"] = "transparent"
         if event.attendees:
             body["attendees"] = [
                 {"email": a.get("email", "")} for a in event.attendees if a.get("email")
@@ -502,12 +516,24 @@ class GoogleCalendarProvider(_CalendarHttpMixin, CalendarProvider):
             raise ValueError(f"Unsupported response: {response!r}")
         # Read the event so we can find our attendee row.
         event = await self.get_event(event_id, calendar_id=cid)
-        my_email = (self._account or "").lower()
+        # the backlog  (Census v3 finding #2) — RSVP attendee-match
+        # MUST route both sides through ``canonical_email`` per N-253
+        # R25 (peer office365.py:172/356 already convention). Under
+        # display-name-wrap divergence (``"Name <a@b>"`` vs ``"a@b"``)
+        # or IDNA divergence (U-label ``alice@münchen.de`` vs A-label
+        # ``alice@xn--mnchen-3ya.de``), raw ``.lower()`` preserves the
+        # mismatch → equality fails at :523 → ``found=False`` at :534
+        # → a DUPLICATE attendee row PATCHed onto the event with the
+        # requested status while the operator's real row stays
+        # ``needsAction``. Original ``a.get("email", "")`` display
+        # form is preserved in the payload sent back to Google — only
+        # the local comparison is canonicalized.
+        my_email = canonical_email(self._account)
         attendees: list[dict[str, Any]] = []
         found = False
         for a in event.attendees:
-            email = (a.get("email") or "").lower()
-            if email == my_email:
+            email = canonical_email(a.get("email"))
+            if my_email and email == my_email:
                 attendees.append({
                     "email": a.get("email", ""),
                     "responseStatus": new_status,

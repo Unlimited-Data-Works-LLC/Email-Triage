@@ -6,6 +6,7 @@ escalate, notify, and label (audit-only).
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -304,7 +305,7 @@ def idem_db(tmp_path):
     table) for the durable-idempotency tests. Seeds user 1 so
     create_email_account satisfies the email_accounts.user_id FK."""
     from email_triage.web.db import init_db
-    conn = init_db(tmp_path / "idem.db")
+    conn = track(init_db(tmp_path / "idem.db"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('pi@example.com', 'PI', 'admin', ?)",

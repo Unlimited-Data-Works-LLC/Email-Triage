@@ -62,7 +62,8 @@ from __future__ import annotations
 import ast
 import io
 import tokenize
-from pathlib import Path
+
+from _pin_harness import iter_src_files, parse_module, relpath  # N-350 R31
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +96,16 @@ _CALLER_SERIALIZED_BASELINE = {
     # decorator calls; decorating it would re-enter the wrapper.
     ("db/audit.py", "_write_audit_gap_event"),
     # watch helpers — dispatched via db_call(...) from routers/openclaw.py
-    # (upsert_watch) + watch_runner.py (_record_watch_fired); db_call holds
-    # the  RLock for the dispatched call's whole duration, so these are
-    # serialized at the call site, not the definition.
+    # (upsert_watch) + watch_runner.py (_record_watch_fired,
+    # maybe_auto_retire_watch); db_call holds the  RLock for the dispatched
+    # call's whole duration, so these are serialized at the call site, not the
+    # definition. maybe_auto_retire_watch verified db_call-dispatched at
+    # its sole src call site (watch_runner.py:889) 2026-06-13; it also calls the
+    # baselined delete_watch under that same held lock — so baselining (not
+    # @db_write) keeps it consistent with its siblings and avoids double-dispatch.
     ("web/email_watches.py", "upsert_watch"),
     ("web/email_watches.py", "delete_watch"),
+    ("web/email_watches.py", "maybe_auto_retire_watch"),
     ("web/watch_runner.py", "_record_watch_fired"),
 }
 # NOTE: the ~11 db_auth_helpers.py conn-first writers are NOT here — they
@@ -111,10 +117,6 @@ _DML_PREFIXES = (
 )
 _CONN_PARAM_NAMES = {"conn", "session", "db"}
 _LOCK_FNS = {"get_write_lock", "acquire_db_lock", "acquire_db_lock_async"}
-
-
-def _src_root() -> Path:
-    return Path(__file__).resolve().parent.parent / "src" / "email_triage"
 
 
 def _first_arg_is_dml(call: ast.Call) -> bool:
@@ -224,18 +226,21 @@ def _scan() -> tuple[set[tuple[str, str]], list[tuple[str, str, int]]]:
     A match is EXPLAINED by: @db_write, enclosing lock block, opt-out, or
     membership in the documented caller-serialized baseline.
     """
-    root = _src_root()
     matched_baseline: set[tuple[str, str]] = set()
     violations: list[tuple[str, str, int]] = []
-    for p in root.rglob("*.py"):
-        if "__pycache__" in p.parts:
-            continue
-        rel = str(p.relative_to(root)).replace("\\", "/")
+    for p in iter_src_files():
+        rel = relpath(p)
         if rel not in _WRITE_HELPER_MODULES:
             continue
-        src = p.read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        optout = _optout_lines(src)
+        source_text = p.read_text(encoding="utf-8")
+        tree = parse_module(p)
+        if tree is None:
+            import pytest
+            pytest.fail(
+                f"{p} did not parse — a non-parsing src module is a defect "
+                "this guard must surface, not skip"
+            )
+        optout = _optout_lines(source_text)
         lock_ranges = _lock_block_ranges(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -301,4 +306,125 @@ def test_caller_serialized_baseline_is_not_stale():
         "@db_write-decorated, or refactored). Remove them from the "
         "baseline:\n"
         + "\n".join(f"  {rel}::{name}" for rel, name in sorted(stale))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Comprehensiveness meta-pin (R5c — census the censuser). The per-writer _scan
+# above is BLIND to any conn-first-write-helper module OUTSIDE the hardcoded
+# _WRITE_HELPER_MODULES — divergence census run11 §10 proved the vacuous-pass
+# (purge_account_local_state in db/accounts.py, run_migrations in web/migrations.py,
+# … silently un-scanned). This DERIVES every conn-first-write-helper module and
+# asserts each is scanned here OR documented serialized-elsewhere, so a NEW one
+# can't silently escape the scope.
+# ---------------------------------------------------------------------------
+
+# The ONE permitted hardcode (dynamic-over-hardcoding): a DOCUMENTED exceptions
+# list of conn-first-write-helper modules whose writers are serialized by a
+# mechanism OTHER than this pin's per-writer scan — classified + verified
+# 2026-06-21. Per-writer un-serialized writes in these are ALSO caught repo-wide
+# by the async-reachable sibling test_async_db_safety.py (+ the router
+# .state.db shape by test_no_direct_app_state_db_method.py); this list records
+# WHY each is out of the scan, and the test below fails if a NEW module appears
+# in neither set. (A future cycle may MIGRATE an entry into _WRITE_HELPER_MODULES
+# for per-writer coverage here, baselining its db_call-dispatched writers.)
+_COVERED_ELSEWHERE = {
+    # db/ helper modules — writers @db_write and/or db_call-dispatched ( RLock
+    # held for the dispatched call at every call site).
+    "db/accounts.py": "writers @db_write (15) / db_call-dispatched; the uncalled "
+                      "delete_email_account primitive is pinned uncalled (N-108).",
+    "db/users.py": "writers @db_write (12) / db_call-dispatched.",
+    "db/style.py": "writers @db_write (21).",
+    "db/regulatory_clock.py": "writers @db_write (16).",
+    "actions/topic_configs.py": "writers @db_write (9).",
+    "web/auth.py": "writers @db_write (14) + lock-wrapped.",
+    "web/mfa.py": "writers @db_write (5).",
+    "web/background_sweepers.py": "writers @db_write (10) / lease-locked.",
+    "jobs/topic_backscan.py": "back-scan writer @db_write / db_call-dispatched.",
+    "embedding_bits/__init__.py": "embedding-cache writer; db_call-dispatched.",
+    "web/settings_keys.py": "settings-table SSOT; writers db_call-dispatched at "
+                            "every call site.",
+    # The db-write-LOCK SSOT itself — its lease writes ARE the serialization.
+    "single_flight.py": "the db-write-lock SSOT (21 lock fns); its lease-conn "
+                        "writes are the serialization mechanism, not a subject of it.",
+    # BOOT-only — single-threaded startup, no concurrent writers.
+    "web/migrations.py": "run_migrations + migration bodies run at BOOT only "
+                        "(cli.py:1765 / web/db.py:885), single-threaded startup.",
+    # Routers — covered by the async-safety + direct-.state.db sibling pins.
+    "web/routers/api.py": "router; async-reachable writes covered by "
+                          "test_async_db_safety.py + test_no_direct_app_state_db_method.py.",
+    "web/routers/ui/_shared.py": "router; covered by the async-safety siblings.",
+    "web/routers/ui/users.py": "router; covered by the async-safety siblings.",
+}
+
+
+def _modules_with_write_helper() -> set[str]:
+    """Every src module DEFINING a conn-first DML+commit helper — derived via the
+    SAME detector the scan uses (`_first_param` ∈ conn-names AND `_matches`), so it
+    cannot drift from the scan's notion of a write helper."""
+    mods: set[str] = set()
+    for p in iter_src_files():
+        try:
+            tree = parse_module(p); assert tree is not None  # N-350 R31
+        except SyntaxError:  # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            cn = _first_param(node)
+            if cn in _CONN_PARAM_NAMES and _matches(node, cn):
+                mods.add(relpath(p))
+                break
+    return mods
+
+
+def test_write_helper_module_set_is_comprehensive():
+    """R5c — no conn-first-write-helper module silently escapes the scope. DERIVE
+    every such module; assert each is in _WRITE_HELPER_MODULES (per-writer scanned
+    here) OR _COVERED_ELSEWHERE (documented serialized-elsewhere). A NEW one in
+    neither FAILS — closing the run11 §10 vacuous-pass (the 7-module hardcoded
+    scope was blind to new write-helper modules)."""
+    derived = _modules_with_write_helper()
+    known = set(_WRITE_HELPER_MODULES) | set(_COVERED_ELSEWHERE)
+    escaped = sorted(derived - known)
+    assert not escaped, (
+        "conn-first-write-helper module(s) in NEITHER _WRITE_HELPER_MODULES "
+        "(scanned here) NOR _COVERED_ELSEWHERE (documented serialized-elsewhere):\n  "
+        + "\n  ".join(escaped)
+        + "\nEither add to _WRITE_HELPER_MODULES (and ensure each conn-first writer "
+        "is @db_write / lock-wrapped / baselined), OR document the serialization "
+        "mechanism in _COVERED_ELSEWHERE. Never leave it silently un-scanned."
+    )
+
+
+def test_comprehensiveness_meta_pin_has_teeth():
+    """Guard the meta-pin: a brand-new write-helper module outside both sets must
+    be flagged (the escape-set must have teeth)."""
+    known = set(_WRITE_HELPER_MODULES) | set(_COVERED_ELSEWHERE)
+    assert ({"some/brand_new_writer.py"} - known), (
+        "meta-pin would not flag a brand-new write-helper module"
+    )
+
+
+def test_covered_elsewhere_entries_exist():
+    """PD#7 rot-guard (census run15 §10 — the comprehensiveness meta-pin's
+    ``_COVERED_ELSEWHERE`` lacked the rot-guard its sibling
+    ``_CALLER_SERIALIZED_BASELINE`` has via
+    ``test_caller_serialized_baseline_is_not_stale``). Every documented
+    ``_COVERED_ELSEWHERE`` entry must name a src module that STILL EXISTS — a
+    renamed/deleted/moved module leaves a DEAD exemption that would silently
+    exempt a FUTURE conn-first-write-helper module which happens to land on the
+    stale path. (File-existence, not write-helper-shape: the 3 router entries are
+    listed because their async-reachable writes are covered by the sibling pins,
+    not because they define a conn-first helper, so a shape check would
+    false-flag them.)"""
+    from _pin_harness import SRC_ROOT
+
+    missing = sorted(m for m in _COVERED_ELSEWHERE if not (SRC_ROOT / m).is_file())
+    assert not missing, (
+        "Stale _COVERED_ELSEWHERE entries — these src modules no longer exist "
+        "(renamed / deleted / moved), so the documented serialized-elsewhere "
+        "exemption is dead weight (PD#7 — keep the exemption list honest):\n  "
+        + "\n  ".join(missing)
+        + "\nRemove them, or update the path to the module's new location."
     )

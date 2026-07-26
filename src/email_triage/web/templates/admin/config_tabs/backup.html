@@ -4,17 +4,198 @@
    COPY RULES:  no end-user copy rules; this is admin disaster
                 recovery. See feedback_audience_per_page.md.
    ─────────────────────────────────────────────────────────── #}
+{% import "_macros.html" as m %}
 
 <h3>Backup &amp; Restore</h3>
 <p>
-    Download an encrypted bundle of this install's state. Operator
-    drives cadence: run an export whenever you want a fresh copy
-    (calendar reminder works fine; no automation involved).
+    Two ways to back this install up: <strong>automated</strong>
+    scheduled snapshots written to a local directory (configured
+    below), or an <strong>on-demand encrypted bundle</strong> you
+    download by hand (further down). Most installs use both — the
+    automated cadence for routine recovery, a hand-exported bundle
+    before a risky change.
 </p>
 
 {% if error %}
 <p style="color:var(--pico-del-color);"><small>{{ error }}</small></p>
 {% endif %}
+{% if backup_save_msg %}
+<p style="color:var(--pico-ins-color);"><small>✓ {{ backup_save_msg }}</small></p>
+{% endif %}
+{% if backup_save_error %}
+<p style="color:var(--pico-del-color);"><small>{{ backup_save_error }}</small></p>
+{% endif %}
+
+<h4>Automated backup</h4>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    A supervised in-app sweeper writes a verified, encrypted snapshot
+    on the cadence you pick. You can also trigger a run any time from
+    the CLI: <code>email-triage backup now</code> (inside the
+    container). Snapshots land in the output directory below; a
+    host-side job relocates them to off-box / SMB storage — that part
+    lives outside this app.
+    </small>
+</p>
+
+<form method="post" action="/admin/backup/config-save">
+    {{ csrf_input(request) }}
+
+    <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;">
+        <input type="checkbox" name="enabled" value="1"
+               {% if backup_enabled %}checked{% endif %}>
+        <span><strong>Enable automated backup</strong>{{ m.help("Turns on the in-app scheduled snapshot sweeper. Leave OFF until you have a restore path: a master-key export (master-key mode) or a public key set (public-key mode) — otherwise you'd write backups you can't restore.") }}
+            <small style="color:var(--pico-muted-color);">
+                &nbsp;— leave OFF until you've exported a restore key
+                (master-key mode) or set a public key (public-key mode).
+            </small>
+        </span>
+    </label>
+
+    <div class="grid">
+        <label>
+            Cadence{{ m.help("How often the in-app sweeper writes a snapshot. 'Manual' disables the in-app timer — runs happen only from the CLI (email-triage backup now) or a host cron you wire yourself.") }}
+            <select name="cadence">
+                <option value="manual"
+                    {% if backup_cadence == 'manual' %}selected{% endif %}>
+                    Manual — CLI / host-cron only (no in-app timer)
+                </option>
+                <option value="daily"
+                    {% if backup_cadence == 'daily' %}selected{% endif %}>
+                    Daily
+                </option>
+                <option value="weekly"
+                    {% if backup_cadence == 'weekly' %}selected{% endif %}>
+                    Weekly
+                </option>
+            </select>
+        </label>
+        <label>
+            Format{{ m.help("Full bundle (.etbk) = DB + config + certs in one encrypted, integrity-verified file (recommended; required for public-key mode). DB snapshot = the raw SQLCipher database only — smaller, but config/certs aren't captured.") }}
+            <select name="format">
+                <option value="etbk"
+                    {% if backup_format == 'etbk' %}selected{% endif %}>
+                    Full bundle (.etbk) — DB + config + certs
+                </option>
+                <option value="db"
+                    {% if backup_format == 'db' %}selected{% endif %}>
+                    Database snapshot only (raw SQLCipher)
+                </option>
+            </select>
+        </label>
+    </div>
+
+    <div class="grid">
+        <label>
+            Retention{{ m.help("How many snapshots (or how long) to keep before old ones are pruned. Plain number = keep that many files; 14d = keep 14 days; 2w = keep 2 weeks. Pruning only runs after a verified-good new snapshot lands.") }}
+            <input type="text" name="retention"
+                   value="{{ backup_retention }}"
+                   placeholder="14"
+                   pattern="[0-9]+[dwDW]?">
+            <small style="color:var(--pico-muted-color);">
+                Plain number = keep that many. <code>14d</code> = keep
+                14 days. <code>2w</code> = keep 2 weeks.
+            </small>
+        </label>
+        <label>
+            Output directory{{ m.help("Where snapshots are written inside the container. Blank = the install default (shown as the placeholder). The app only WRITES here; a host-side job moves them off-box. A non-writable path makes a run FAIL (recorded in the run status + health report — not silent).") }}
+            <input type="text" name="dir"
+                   value="{{ backup_dir }}"
+                   placeholder="{{ backup_dir_effective }}">
+            <small style="color:var(--pico-muted-color);">
+                Blank → <code>{{ backup_dir_effective }}</code>
+                (a container-local volume the host job relocates).
+            </small>
+        </label>
+    </div>
+
+    <fieldset style="margin-top:0.75rem;">
+        <legend><strong>Encryption</strong>{{ m.help("How each backup is sealed. Master key: sealed with this install's master key — restore needs the master-key export. Public key (write-only): sealed to an off-box X25519 public key — the container can't read its own backups; restore needs the off-box private key.") }}</legend>
+        <label style="display:flex;align-items:flex-start;gap:0.5rem;margin:0.35rem 0;">
+            <input type="radio" name="encryption" value="master-key"
+                {% if backup_encryption != 'public-key' %}checked{% endif %}>
+            <span><strong>Master key</strong> (default)
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— sealed with a key derived from this install's
+                    master key. To restore, you need the
+                    <em>master key only</em> export (further down). Do
+                    that export <strong>before</strong> enabling.
+                </small>
+            </span>
+        </label>
+        <label style="display:flex;align-items:flex-start;gap:0.5rem;margin:0.35rem 0;">
+            <input type="radio" name="encryption" value="public-key"
+                {% if backup_encryption == 'public-key' %}checked{% endif %}>
+            <span><strong>Public key (write-only)</strong>
+                <small style="color:var(--pico-muted-color);">
+                    &nbsp;— each snapshot's passphrase is sealed to an
+                    X25519 <em>public</em> key. The server holds only
+                    the public half, so even a compromised container
+                    cannot READ its own backups. Restore needs the
+                    matching <em>private</em> key, kept off-box.
+                    <strong>Requires the full bundle (.etbk) format</strong>
+                    — the raw database snapshot has no seal layer.
+                </small>
+            </span>
+        </label>
+
+        <label style="margin-top:0.5rem;">
+            X25519 public key (PEM) — for public-key mode{{ m.help("Paste the PUBLIC half of an X25519 keypair (a -----BEGIN PUBLIC KEY----- PEM block). Generate it OFF this box; never paste the private key. Ignored in master-key mode. See the how-to below.") }}
+            <textarea name="public_key" rows="5"
+                      style="font-family:monospace;font-size:0.8em;"
+                      placeholder="-----BEGIN PUBLIC KEY-----&#10;...&#10;-----END PUBLIC KEY----- &#10;(or an on-server path to a .pem file)">{{ backup_public_key }}</textarea>
+            <small style="color:var(--pico-muted-color);">
+                <strong>Generate the keypair OFF this box</strong> on a
+                trusted workstation — <code>python -m email_triage backup
+                gen-keypair</code> — and paste only the
+                <strong>public</strong> key here. The private key must
+                never touch this server (that's the whole point of
+                public-key mode). Ignored in master-key mode.
+            </small>
+        </label>
+        {% set x25519_help %}
+        <p><strong>What it is.</strong> An X25519 public key is the shareable
+        &ldquo;lock&rdquo; half of a modern elliptic-curve keypair (Curve25519).
+        Anyone can use it to <em>encrypt</em> to you; only the matching
+        <strong>private</strong> key &mdash; which you keep off this server &mdash;
+        can <em>decrypt</em>. It&rsquo;s a short PEM block beginning
+        <code>-----BEGIN PUBLIC KEY-----</code>. Storing the public half here is
+        safe: it grants no ability to read backups.</p>
+        <p><strong>Generate it OFF this box</strong> (your own workstation), then
+        paste only the public block into the field above:</p>
+        <pre><code># Windows / macOS / Linux &mdash; the built-in tool (no openssl needed):
+python -m email_triage backup gen-keypair
+#   -&gt; prints a PUBLIC KEY block  (paste it above)
+#   -&gt; prints a PRIVATE KEY block (store in your password manager, NEVER the server)
+
+# macOS / Linux alternative, if you prefer openssl:
+openssl genpkey -algorithm X25519 -out backup-private.pem
+openssl pkey -in backup-private.pem -pubout -out backup-public.pem</code></pre>
+        <p><strong>Pitfalls:</strong> paste the PUBLIC key, never the private one
+        (a <code>-----BEGIN PRIVATE KEY-----</code> block is the wrong half).
+        Don&rsquo;t use <code>age-keygen</code> &mdash; its <code>age1&hellip;</code>
+        format isn&rsquo;t PEM and won&rsquo;t load here. <strong>Lose the private
+        key and public-key-sealed backups are permanently unrecoverable</strong>
+        &mdash; custody is entirely on you.</p>
+        {% endset %}
+        {{ m.help_details("What is an X25519 key, and how do I generate one?", x25519_help) }}
+    </fieldset>
+
+    <button type="submit" style="margin-top:0.75rem;">
+        Save automated-backup settings
+    </button>
+</form>
+
+<hr style="margin:2rem 0;">
+
+<h4>On-demand encrypted bundle</h4>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    Download an encrypted bundle of this install's state by hand —
+    e.g. right before a risky upgrade. Independent of the automated
+    cadence above.
+    </small>
+</p>
 
 <article style="border-left:3px solid var(--pico-color-amber-500);
                 padding:0.75rem 1rem;margin:1rem 0;">

@@ -21,9 +21,10 @@ import httpx
 import jwt
 from jwt import PyJWKClient
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
 
-logger = logging.getLogger("email_triage.web.gmail_push_auth")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.web.gmail_push_auth")  # N-196b R21_4
 
 # Google publishes the OAuth2 signing certs here. The x509 variant is
 # the one whose `kid` matches the `kid` in Pub/Sub push JWTs.
@@ -41,6 +42,48 @@ class GmailPushVerificationError(Exception):
         super().__init__(reason)
 
 
+class GmailPushTransientFetchError(Exception):
+    """N-288 R30 — raised when the JWKS cert fetch fails for a
+    TRANSIENT reason (DNS blip, connect timeout, upstream 5xx).
+
+    Distinct from :class:`GmailPushVerificationError` so the webhook
+    receiver can respond 503 (retry-able) instead of 500 (stack
+    trace) — Google Pub/Sub retries hard on 5xx, so a brief infra
+    blip used to flood the log with thousands of stack traces
+    (2026-06-25 Tailscale MagicDNS outage — ~6,775 traces in a few
+    hours). A 503 still tells Pub/Sub to retry but is the
+    RFC-preferred response for a transient upstream dependency
+    failure + suppresses the stack trace.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+# -d (2026-07-11) — CONFIG-DRIVEN Gmail JWKS-fetch client timeout,
+# per feedback_dynamic_over_hardcoding. Pre-fix ``timeout=10.0`` was
+# a hardcoded float literal inside _CertCache.__init__. Now module-
+# level with a boot-wired setter; a NEW _CertCache picks up the tuned
+# value at construction. (Existing instances keep their captured
+# timeout — call sites re-instantiate on app startup via
+# app.state._gmail_cert_cache = _CertCache(), so a boot-time tune
+# reaches the singleton.)
+_GMAIL_CERT_TIMEOUT_SECS: float = 10.0
+
+
+def configure_gmail_cert_timeout(timeout_secs: float) -> None:
+    """-d — set the Gmail JWKS-fetch client timeout budget.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    the resolved ``config.push.gmail_cert_timeout_secs`` value.
+    Rejects non-positive values.
+    """
+    global _GMAIL_CERT_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _GMAIL_CERT_TIMEOUT_SECS = float(timeout_secs)
+
+
 class _CertCache:
     """In-memory cache of Google's public signing certs, keyed by ``kid``."""
 
@@ -53,8 +96,11 @@ class _CertCache:
         # refresh fires on cold-start + every ``ttl_seconds`` (1 h
         # default) + on any unknown ``kid``. Holding the connection
         # pool open trims the cold-path TLS handshake to once per
-        # process.
-        self._http = LazyHttpClient(timeout=10.0)
+        # process. -d: timeout is now the module-level SSOT so a
+        # config tune reaches the singleton on next startup.
+        self._http = LazyHttpClient(
+            intent=Intent.PROVIDER_API, timeout=_GMAIL_CERT_TIMEOUT_SECS,
+        )
 
     def _expired(self) -> bool:
         return (time.time() - self._fetched_at) >= self._ttl
@@ -73,8 +119,36 @@ class _CertCache:
 
     async def _refresh(self) -> None:
         client = await self._http.get()
-        resp = await client.get(GOOGLE_JWKS_URL)
+        # N-288 R30: transient network failure (DNS blip, connect
+        # timeout) during JWKS fetch used to escape uncaught → the
+        # webhook receiver returned a 500 stack-trace, Google Pub/Sub
+        # retried hard, producing thousands of error rows on a brief
+        # infra blip (2026-06-25 Tailscale MagicDNS outage). Convert
+        # to `GmailPushTransientFetchError` so the receiver can return
+        # a 503 (transient/retry) instead of a 500.
+        try:
+            resp = await client.get(GOOGLE_JWKS_URL)
+        except httpx.RequestError as e:
+            # N-298 R30 CI-red fix-forward: route through `fmt_exc` SSOT
+            # (with_class=True keeps the ClassName: prefix while
+            # PHI-scrubbing the message body) — the exc-render twin pin
+            # caught the bare `f"{type(e).__name__}: {e}"` idiom.
+            from email_triage._errfmt import fmt_exc
+            raise GmailPushTransientFetchError(
+                f"transient fetch failure for Google JWKS: "
+                f"{fmt_exc(e, with_class=True)}"
+            ) from e
         if resp.status_code != 200:
+            # 5xx from Google itself is ALSO a transient case (retry-able);
+            # 429 (rate-limit) is transient too — retrying after backoff is
+            # correct per HTTP semantics. 4xx (except 429) is a real config
+            # failure — raise the verification error.
+            # N-297 R30 (DB-SME FU-3 on N-288): 429 added to the transient
+            # set. Rare in practice for JWKS but easy to close.
+            if 500 <= resp.status_code < 600 or resp.status_code == 429:
+                raise GmailPushTransientFetchError(
+                    f"Google JWKS transient upstream status: {resp.status_code}"
+                )
             raise GmailPushVerificationError(
                 f"failed to fetch Google JWKS: {resp.status_code}"
             )

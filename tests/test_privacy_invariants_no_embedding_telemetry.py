@@ -44,7 +44,7 @@ from pathlib import Path
 import pytest
 
 # --- which files this invariant covers ---
-PKG_ROOT = Path(__file__).resolve().parent.parent / "src" / "email_triage"
+from _pin_harness import SRC_ROOT as PKG_ROOT  # census run15 #3 — harness SRC root, not a hand-rolled off-by-one
 
 EMBEDDING_BITS_SOURCES = [
     PKG_ROOT / "embedding_bits" / "__init__.py",

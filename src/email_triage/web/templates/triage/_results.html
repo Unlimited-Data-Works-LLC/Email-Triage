@@ -159,7 +159,7 @@
                     {% elif a.result == 'skipped' %}
                     <span style="color:var(--pico-color-amber-500);">skipped</span>
                     {% elif a.result == 'failed' %}
-                    <span style="color:var(--pico-del-color);">failed{% if a.error %}: {{ a.error[:50] }}{% endif %}</span>
+                    <span style="color:var(--pico-del-color);">failed{% if a.error %}: {{ a.error[:50] }}{% if a.error|length > 50 %}…{% endif %}{% endif %}</span>
                     {% else %}
                     {{ a.result }}
                     {% endif %}

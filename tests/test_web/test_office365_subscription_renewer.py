@@ -20,8 +20,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from email_triage.web.app import _maybe_mark_auth_stale
 from email_triage.web.db import (
     get_o365_subscription,
+    get_setting,
     list_auth_events,
     upsert_o365_subscription,
 )
@@ -152,7 +154,10 @@ class TestRunO365RenewalSweep:
         fake_provider.renew_subscription.assert_awaited_once_with(
             "subscription-fixture-1",
         )
-        assert counters == {"considered": 1, "renewed": 1, "failed": 0}
+        assert counters == {
+            "considered": 1, "renewed": 1, "failed": 0,
+            "skipped_inactive": 0,
+        }
         row = get_o365_subscription(db, 1)
         assert row["expiration_at"] == new_exp
         assert row["status"] == "active"
@@ -163,6 +168,75 @@ class TestRunO365RenewalSweep:
         )
         assert len(events) == 1
         assert events[0]["outcome"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_renewal_auth_failure_sets_auth_stale(
+        self, renewer_app, db, fake_provider,
+    ):
+        """Integration of the census-#1 wiring: a renew that fails with an
+        auth-revoked error drives the REAL sweep -> _renew_one ->
+        record_provider_outcome SET edge, flipping the re-auth chip. (Before
+        the fix the renewer set nothing, so a dead O365 token on a push-only
+        account showed healthy.)"""
+        _make_account(db)
+        soon = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        upsert_o365_subscription(
+            db, account_id=1, subscription_id="subscription-fixture-1",
+            expiration_at=soon,
+        )
+        # Provider-side credential death (matches the InvalidAuthenticationToken
+        # needle in the _auth_revoked SSOT).
+        fake_provider.renew_subscription.side_effect = Exception(
+            "Graph API 401: InvalidAuthenticationToken — token expired",
+        )
+        assert get_setting(db, "auth_stale:1") is None  # not stale before
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ):
+            counters = await _run_o365_renewal_sweep(renewer_app, window_hours=24)
+
+        assert counters["failed"] == 1
+        # The wired SET edge fired through the real sweep path.
+        assert get_setting(db, "auth_stale:1") is not None
+
+    @pytest.mark.asyncio
+    async def test_renewal_success_clears_auth_stale(
+        self, renewer_app, db, fake_provider,
+    ):
+        """Integration of the census-#1 wiring: a SUCCESSFUL renew drives the
+        real sweep CLEAR edge, unsticking an account a prior path had flagged.
+        (Before the fix the renewer never cleared, so an account flagged by the
+        poll path stayed stuck on the chip even after recovering.)"""
+        _make_account(db)
+        # An earlier failure flagged the account stale.
+        _maybe_mark_auth_stale(
+            db, {"id": 1, "name": "Test O365"}, Exception("invalid_grant"),
+        )
+        assert get_setting(db, "auth_stale:1") is not None  # stale before
+
+        soon = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        upsert_o365_subscription(
+            db, account_id=1, subscription_id="subscription-fixture-1",
+            expiration_at=soon,
+        )
+        new_exp = (datetime.now(timezone.utc) + timedelta(days=2)).strftime(
+            "%Y-%m-%dT%H:%M:%S.0000000Z",
+        )
+        fake_provider.renew_subscription.return_value = {
+            "id": "subscription-fixture-1", "expirationDateTime": new_exp,
+        }
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ):
+            counters = await _run_o365_renewal_sweep(renewer_app, window_hours=24)
+
+        assert counters["renewed"] == 1
+        # The wired CLEAR edge fired through the real sweep path.
+        assert get_setting(db, "auth_stale:1") is None
 
     @pytest.mark.asyncio
     async def test_skips_subscriptions_outside_window(
@@ -188,7 +262,10 @@ class TestRunO365RenewalSweep:
             )
 
         fake_provider.renew_subscription.assert_not_awaited()
-        assert counters == {"considered": 0, "renewed": 0, "failed": 0}
+        assert counters == {
+            "considered": 0, "renewed": 0, "failed": 0,
+            "skipped_inactive": 0,
+        }
         row = get_o365_subscription(db, 1)
         assert row["expiration_at"] == far  # unchanged
 
@@ -349,13 +426,53 @@ class TestRunO365RenewalSweep:
         assert counters["failed"] == 0
 
     @pytest.mark.asyncio
+    async def test_skips_inactive_account_subscription(
+        self, renewer_app, db, fake_provider,
+    ):
+        """Loop-5 census: a DEACTIVATED account's Graph subscription is
+        NOT renewed — extending it re-arms live PHI ingestion for a
+        paused account. Counted under ``skipped_inactive`` for
+        observability; the subscription row is left to die on its own
+        ~3-day Graph clock."""
+        _make_account(db)
+        soon = (
+            datetime.now(timezone.utc) + timedelta(hours=12)
+        ).isoformat()
+        upsert_o365_subscription(
+            db, account_id=1,
+            subscription_id="subscription-fixture-1",
+            expiration_at=soon,
+        )
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = 1")
+        db.commit()
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ):
+            counters = await _run_o365_renewal_sweep(
+                renewer_app, window_hours=24,
+            )
+
+        fake_provider.renew_subscription.assert_not_awaited()
+        assert counters == {
+            "considered": 1, "renewed": 0, "failed": 0,
+            "skipped_inactive": 1,
+        }
+        # Subscription row untouched.
+        assert get_o365_subscription(db, 1)["expiration_at"] == soon
+
+    @pytest.mark.asyncio
     async def test_no_subscriptions_no_op(self, renewer_app, db):
         """Empty table → returns zero counters without instantiating
         a provider."""
         counters = await _run_o365_renewal_sweep(
             renewer_app, window_hours=24,
         )
-        assert counters == {"considered": 0, "renewed": 0, "failed": 0}
+        assert counters == {
+            "considered": 0, "renewed": 0, "failed": 0,
+            "skipped_inactive": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_window_hours_controls_eligibility(
@@ -400,6 +517,9 @@ class TestRunO365RenewalSweep:
             )
             fake_provider.renew_subscription.assert_awaited_once()
 
-        assert tight == {"considered": 0, "renewed": 0, "failed": 0}
+        assert tight == {
+            "considered": 0, "renewed": 0, "failed": 0,
+            "skipped_inactive": 0,
+        }
         assert wide["considered"] == 1
         assert wide["renewed"] == 1

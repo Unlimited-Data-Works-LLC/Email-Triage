@@ -183,6 +183,12 @@
                                                    {% if account_locked %}disabled{% endif %}
                                                    {% if acct.hipaa and not account_locked %}
                                                    onchange="if (!this.checked && !confirm('This account was previously HIPAA-protected. Turning it off means new mail for this account will be logged with full details. Previously-written rows are unaffected. Continue?')) { this.checked = true; }"
+                                                   {% elif not acct.hipaa and not account_locked %}
+                                                   {# N-262 R26 — HIPAA 0->1 cascade warning banner. The auto_scan
+                                                      toggle is force-OFF'd on flip per operator's fail-closed
+                                                      §164.502(a) posture decision; surface this at the source so
+                                                      the operator knows what changes on Save. #}
+                                                   onchange="if (this.checked && !confirm('Turning HIPAA ON will also force-disable Auto-scan for this account (§164.502(a) fail-closed default). You can re-enable Auto-scan manually knowing HIPAA is on. A HIPAA boundary event will be recorded in the audit log. Continue?')) { this.checked = false; }"
                                                    {% endif %}
                                                    style="margin:0;">
                                             HIPAA
@@ -769,6 +775,22 @@
                     <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
                         Push couldn't start: Office 365 didn't return the expected
                         confirmation. Try Start Push again in a moment.
+                    </p>
+                    {% elif _o365_err == 'clientstate_persist_failed' %}
+                    <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
+                        Push couldn't start: the install couldn't save the secret used
+                        to verify Office 365's notifications. Try Start Push again; if it
+                        keeps failing, check the secret store.
+                    </p>
+                    {% elif _o365_err %}
+                    {# Catch-all: any producer error code we
+                       don't have a specific message for STILL surfaces something — a
+                       redirect carrying an unhandled o365_err code must never land the
+                       operator on a blank tab (the clientstate_persist_failed silent
+                       swallow this replaces). No raw code echoed (end-user audience). #}
+                    <p style="color:var(--pico-del-color);margin:0 0 0.4rem 0;font-size:0.9em;">
+                        Push couldn't start due to an unexpected error. Try Start Push
+                        again; if it keeps failing, check the application logs.
                     </p>
                     {% endif %}
                     <div id="o365-push-cell-{{ acct.id }}"

@@ -1,0 +1,758 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate). The person
+                tuning a Topic they own. NOT developers.
+   TECH-SKILL:  low. Computer-literate professional (exec, doctor,
+                lawyer, researcher). Comfortable with email +
+                dashboards; no terminal, no protocol RFCs.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC, ISO 8601, OData, "language model",
+       "LLM", "substring match", "regex"). Plain English.
+     - "AI" not "language model" / "LLM".
+     - Disabled controls speak via their disabled state — never
+       "Ask your administrator".
+     - Tooltips lead with a concrete example, real-shape but never
+       real PII.
+   ─────────────────────────────────────────────────────────────
+   DETAIL editor. A full-page URL reached from a Topic
+   card or the New Topic button (§3c) — never an inline panel. It
+   re-renders the My Settings tab strip (active="topic-digest") so
+   the operator keeps cluster context, exactly as routes.html
+   re-renders _edit_tabs.html on its detail page.
+
+   Consumes:
+     topic               the TopicConfig being edited. .id falsy = New.
+                         .name, .subjects (list[str]), .details,
+                         .selected_account_ids (list), .enabled,
+                         .protected_mode, .mode ('full'|'differential'
+                         |'both'), .retention_days, and a nested
+                         .digest (schedule/format, mirrors a DigestConfig).
+     manageable_accounts iterable of the requester's manageable
+                         mailboxes — raw list_email_accounts rows, so
+                         each carries .id, .name, .email_address, and
+                         .hipaa (NOT .display_name / .is_hipaa — those
+                         enriched keys only exist in the watches ctx).
+                         The multiselect is fed THIS set (gate on the
+                         access boundary, NOT is_account_hipaa — §3d).
+     enums               cadences / window_kinds / render_as / group_bys
+                         (the digest-options form reuses the digest
+                         editor's enum bundle).
+     errors              optional list[str] of validation messages.
+#}
+{% set is_new = (not topic.id) %}
+{% set save_action = "/profile/topic-digest/save" %}
+{% block title %}{% if is_new %}New Topic{% else %}{{ topic.name or "Topic" }}{% endif %} — Topic Digest — Email Triage{% endblock %}
+{% block content %}
+
+{# Re-render the My Settings cluster tab strip so the operator keeps
+   context on the full-page detail (§3d) — same pattern routes.html
+   uses with _edit_tabs.html. #}
+{% set active = "topic-digest" %}
+{% include "_settings_tabs.html" %}
+
+{# Back-to-list breadcrumb (§3d) — the routes editor has no back-link
+   because its list is on the same tab; a full-page Topic editor does. #}
+<p style="margin:0 0 1rem 0;">
+    <a href="/profile?tab=topic-digest" role="button"
+       class="outline secondary"
+       style="padding:0.25rem 0.6rem;font-size:0.85em;">
+        &larr; Topic Digest
+    </a>
+</p>
+
+<h2>{% if is_new %}New Topic{% else %}Editing: {{ topic.name or "Topic" }}{% endif %}</h2>
+
+{% if errors %}
+<article style="border-left:3px solid var(--pico-del-color);
+                padding:0.4rem 0.8rem;margin:0 0 0.75rem 0;">
+    <strong>Please fix the following</strong>
+    <ul style="margin:0.3rem 0 0 1.2rem;">
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+{# Protected-mode notice on the detail too (§1a / §3d) — shown at both
+   altitudes so an operator editing the multiselect sees the posture
+   flip the moment a HIPAA mailbox is added. Gated on the ``protected``
+   ctx key the router computes (§5 most-restrictive-wins over the
+   selected manageable accounts) — NOT a ``topic`` attribute, which the
+   TopicConfig doesn't carry. AUDIENCE-appropriate; the escape hatch
+   (remove that mailbox) is implied. #}
+{% if protected %}
+<article id="topic-protected-notice"
+         style="border-left:3px solid var(--pico-muted-border-color);
+                padding:0.5rem 1rem;margin:0 0 1rem 0;
+                background:var(--pico-card-background-color);">
+    <strong style="display:block;margin-bottom:0.25rem;">🔒 Protected mode</strong>
+    <small style="color:var(--pico-muted-color);">
+        This Topic includes a HIPAA-protected mailbox, so it runs in
+        protected mode — registry-only study lookup, and matches are
+        stored protected.
+    </small>
+</article>
+{% endif %}
+
+<form id="topic-editor-form" method="POST" action="{{ save_action }}">
+    {{ csrf_input(request) }}
+    <input type="hidden" name="topic_id" value="{{ topic.id or '' }}">
+
+    {# ── Name + repeatable Subject chips (§3d) ─────────────────── #}
+    <fieldset>
+        <legend><strong>What to watch</strong></legend>
+
+        <label>
+            Name{{ m.help("A short label for this Topic, shown on the Topic Digest list and in the digest's subject line. Example: 'SELENA lupus study' or 'Q3 budget thread'. Only you see this name.") }}
+            <input type="text" name="name" value="{{ topic.name or '' }}"
+                   placeholder="e.g. SELENA lupus study"
+                   maxlength="200" required>
+        </label>
+
+        {# Subject is repeatable — a study has a name + acronym +
+           sponsor; matching ORs across them. JS adds/removes chip
+           rows; the server reads every ``subjects`` value. At least
+           one row is always present so the operator isn't staring at
+           an empty fieldset. #}
+        <fieldset style="margin:0.75rem 0 0 0;">
+            <legend><small>Subjects{{ m.help("One or more names for what you're watching — a match on ANY of them counts. A study often has several: its full name, its short acronym, and its sponsor. Example: 'Safety of Estrogens in Lupus', 'SELENA', 'NYU Langone'. Add a row for each.") }}</small></legend>
+            <div id="topic-subjects-list">
+                {% set _subjects = topic.subjects or [''] %}
+                {% for subj in _subjects %}
+                <div class="topic-subject-row"
+                     style="display:flex;gap:0.4rem;align-items:center;margin-bottom:0.4rem;">
+                    <input type="text" name="subjects" value="{{ subj }}"
+                           placeholder="e.g. SELENA"
+                           maxlength="200"
+                           style="margin:0;flex:1;min-width:0;">
+                    <div class="topic-subject-control"></div>
+                </div>
+                {% endfor %}
+            </div>
+            {# Cloned by the +/- JS below; wrapped in <template> so the
+               serialiser ignores its input until it's inserted. #}
+            <template id="topic-subject-row-template">
+                <div class="topic-subject-row"
+                     style="display:flex;gap:0.4rem;align-items:center;margin-bottom:0.4rem;">
+                    <input type="text" name="subjects" value=""
+                           placeholder="e.g. SELENA"
+                           maxlength="200"
+                           style="margin:0;flex:1;min-width:0;">
+                    <div class="topic-subject-control"></div>
+                </div>
+            </template>
+        </fieldset>
+    </fieldset>
+
+    {# ── Accounts multiselect (§3d) ───────────────────────────────
+       Fed the requester's MANAGEABLE accounts — gate on the access
+       boundary, NOT is_account_hipaa (2026-06-06 use-vs-disclosure
+       ruling). data-multiselect drives the shared chip widget. #}
+    <fieldset>
+        <legend><strong>Mailboxes to watch</strong>{{ m.help("Pick which of your mailboxes this Topic scans. A match in any of them is collected into the Topic's digest. Adding a HIPAA-protected mailbox switches the whole Topic to protected mode (see the notice above).") }}</legend>
+        {% set _selected_accts = topic.selected_account_ids or [] %}
+        {% if manageable_accounts %}
+        <select multiple
+                name="selected_account_ids"
+                data-multiselect
+                data-placeholder="Mailboxes to scan…"
+                size="{{ [manageable_accounts|length, 6] | min }}"
+                style="width:100%;">
+            {# Row keys come straight from list_email_accounts: the
+               label is ``name`` (the mailbox nickname) with the
+               resolved ``email_address`` in parens, falling back to the
+               email / owner email so we never render a bare account id
+               (feedback_no_account_id_alone). The HIPAA flag column is
+               ``hipaa`` (NOT ``is_hipaa`` — that enriched key only
+               exists in the watches context). #}
+            {% for acct in manageable_accounts %}
+            <option value="{{ acct.id }}"
+                    {% if acct.id in _selected_accts %}selected{% endif %}>
+                {{ acct.name or acct.email_address or acct.owner_email }}{% if acct.name and acct.email_address %} ({{ acct.email_address }}){% endif %}{% if acct.hipaa %} 🔒{% endif %}
+            </option>
+            {% endfor %}
+        </select>
+        <small style="color:var(--pico-muted-color);display:block;margin-top:0.25rem;">
+            🔒 marks a HIPAA-protected mailbox. Including one runs the
+            Topic in protected mode.
+        </small>
+        {% else %}
+        <p style="color:var(--pico-muted-color);">
+            You don't manage any mailboxes yet. Add a mailbox on the
+            Accounts page, then come back to pick it here.
+        </p>
+        {% endif %}
+    </fieldset>
+
+    {# ── Details + Internet Search (§3d) ──────────────────────────
+       Free-text Details guides the matcher. The Internet Search
+       button posts to search-details and swaps a confirm card into
+       #topic-search-result — never silently overwriting the textarea.
+       Backend-absent → the button renders disabled with self-
+       explaining text (no "ask your administrator"). #}
+    <fieldset>
+        <legend><strong>Details</strong>{{ m.help("Describe what you're watching in your own words — the study's focus, the conditions, the people or sites involved (in public terms). The AI reads this to decide what counts as a match, so be specific. Keep it to public information; don't paste private patient details.") }}</legend>
+        <textarea name="details" rows="8" maxlength="8000"
+                  placeholder="Example: A phase 3 trial of hormone therapy safety in lupus patients. Watch for sponsor updates, safety reports, and site correspondence."
+                  style="width:100%;font-family:var(--pico-font-family);">{{ topic.details or '' }}</textarea>
+        <small style="color:var(--pico-muted-color);display:block;">
+            Up to 8000 characters. Keep this to public information only.
+        </small>
+
+        {# Look up public study info to help fill Details. Posts a
+           DEDICATED ``query`` field (the old button hx-include'd the whole
+           fieldset, which sent ``details`` not ``query`` — so the lookup
+           always got an empty query and always "found nothing"). In
+           protected mode the search is limited to the public study
+           registry (ClinicalTrials.gov); otherwise it does a free-text web
+           search when one is configured, falling back to the registry. The
+           handler renders a confirm-before-change card — nothing is written
+           to Details automatically. #}
+        {# Reopen prefill: a saved Topic stores its looked-up registry number
+           as a Subject, so on reopen the lookup field shows it again (the
+           operator expects the Study ID to persist in this field, not just
+           in Subjects). First NCT-shaped subject wins. #}
+        {% set _q = namespace(nct='') %}
+        {% for s in (topic.subjects or []) %}{% if not _q.nct and s and (s | string | upper | trim).startswith('NCT') %}{% set _q.nct = (s | string | trim) %}{% endif %}{% endfor %}
+        <div style="margin-top:0.6rem;">
+            <div style="display:flex;gap:0.5rem;align-items:end;flex-wrap:wrap;">
+                <label style="flex:1;min-width:14rem;margin:0;">
+                    {# Label + help + placeholder reflect the mode: a protected
+                       (HIPAA) Topic is registry-only — "Study lookup"; an
+                       open Topic does a free-text web search — "Internet
+                       search". The protected-aware description below carries
+                       the detail. Keyed on the same ``protected`` flag the
+                       notice + Mailboxes copy use. #}
+                    <small>{% if protected %}Study lookup{{ m.help("Looks up a study by its public registry number (for example NCT00000419) and offers to fill in the Details for you. You'll see what it found and choose whether to replace or add to your text — nothing changes automatically. Keep your query to public terms.") }}{% else %}Internet search{{ m.help("Searches the public web (or enter a public study number) — an AI drafts Details for you from the results. You'll see what it found and choose whether to replace or add to your text — nothing changes automatically. Keep your query to public terms.") }}{% endif %}</small>
+                    <input type="text" name="query" id="topic-search-query"
+                           value="{{ _q.nct }}"
+                           placeholder="{% if protected %}Public registry number, e.g. NCT00000419{% else %}A few words to search, or a study number{% endif %}"
+                           maxlength="200" style="margin:0;">
+                </label>
+                {# Include the LIVE mailbox multiselect, not just the query,
+                   so the server's HIPAA gate sees a mailbox added in the
+                   editor BEFORE Save — an unsaved HIPAA mailbox must still
+                   force registry-only (SME 2026-06-08 fail-open fix). #}
+                {# hx-disabled-elt + hx-indicator: the free-text path can run
+                   a local LLM summary (several seconds), so disable the
+                   button + show "Searching…" while the fragment loads. #}
+                <button type="button"
+                        hx-post="/profile/topic-digest/{{ topic.id or 'new' }}/search-details"
+                        hx-include="#topic-search-query, #topic-editor-form select[name='selected_account_ids']"
+                        hx-target="#topic-search-result"
+                        hx-swap="innerHTML"
+                        hx-disabled-elt="this"
+                        hx-indicator="#topic-search-spinner"
+                        class="outline secondary"
+                        style="padding:0.45rem 0.9rem;font-size:0.9em;margin:0;white-space:nowrap;">
+                    Look up
+                </button>
+                <span id="topic-search-spinner" class="htmx-indicator"
+                      aria-live="polite"
+                      style="font-size:0.85em;color:var(--pico-muted-color);
+                             white-space:nowrap;">Searching…</span>
+            </div>
+            <small style="color:var(--pico-muted-color);display:block;margin-top:0.3rem;">
+                {% if protected %}
+                🔒 This Topic includes a HIPAA-protected mailbox, so lookups
+                stay limited to public study-registry numbers (e.g.
+                NCT00000419) — no free-text web search. You confirm before
+                anything changes.
+                {% else %}
+                Enter a public study number (e.g. NCT00000419), or a few
+                words to search the web — to help fill Details. You confirm
+                before anything changes. Adding a HIPAA-protected mailbox
+                limits this to public study-number lookups only.
+                {% endif %}
+            </small>
+        </div>
+        {# Confirm card / lookup result lands here (Replace / Append /
+           Cancel offered by the fragment; the textarea stays editable). #}
+        <div id="topic-search-result" style="margin-top:0.5rem;" aria-live="polite"></div>
+    </fieldset>
+
+    {# ── Keep a match for (retention — Topic-level) ─────────────────
+       A dropdown of common windows + Forever + a freeform Custom number.
+       The bare number input with "days" stacked beneath it read as weird
+       (operator screenshot); this is a clean inline control. "0" =
+       Forever (retention sweep treats 0 as never-purge). Retention is
+       shared across ALL of this Topic's digests, so it lives here on the
+       Topic, not per-digest. #}
+    <fieldset>
+        <legend><strong>Keep a match for</strong>{{ m.help("How long a caught message stays in this Topic before it ages out of the digests. 'Forever' never drops a match. Older matches leave the digest, never your mailbox. Shared across all of this Topic's digests — for example, 90 days keeps a rolling quarter.") }}</legend>
+        {% set _rd = topic.retention_days if topic.retention_days is not none else 90 %}
+        {% set _rd_presets = [30, 60, 90, 0] %}
+        {% set _rd_is_preset = _rd in _rd_presets %}
+        <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+            <select name="retention_days" id="topic-retention-select"
+                    style="width:auto;margin:0;"
+                    onchange="(function(s){var w=document.getElementById('topic-retention-custom');if(w){w.style.display=(s.value==='custom')?'inline-flex':'none';}})(this)">
+                <option value="30" {% if _rd_is_preset and _rd == 30 %}selected{% endif %}>30 days</option>
+                <option value="60" {% if _rd_is_preset and _rd == 60 %}selected{% endif %}>60 days</option>
+                <option value="90" {% if _rd_is_preset and _rd == 90 %}selected{% endif %}>90 days</option>
+                <option value="0" {% if _rd_is_preset and _rd == 0 %}selected{% endif %}>Forever</option>
+                <option value="custom" {% if not _rd_is_preset %}selected{% endif %}>Custom…</option>
+            </select>
+            <span id="topic-retention-custom"
+                  style="display:{% if _rd_is_preset %}none{% else %}inline-flex{% endif %};align-items:center;gap:0.35rem;">
+                <input type="number" name="retention_days_custom"
+                       min="1" max="3650"
+                       value="{% if not _rd_is_preset %}{{ _rd }}{% endif %}"
+                       placeholder="days" style="width:7rem;margin:0;">
+                <small style="color:var(--pico-muted-color);">days</small>
+            </span>
+        </div>
+    </fieldset>
+
+    {# ── Match strictness (per-Topic confidence floor) ──────────── #}
+    <fieldset>
+        <legend><strong>How sure a match must be</strong>{{ m.help("How sure the system must be that a message really belongs to this Topic before it appears in a digest. Higher = fewer, stronger matches (less noise); lower = more matches, including weaker ones. Leave it BLANK to use the system default. Example: 0.7 shows only strong matches; 0.3 shows almost anything related to the Topic. Nothing is ever deleted — raising or lowering this only changes what the digest shows, and you can change it back any time.") }}</legend>
+        <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+            <input type="number" name="confidence_floor"
+                   min="0" max="1" step="0.05"
+                   value="{{ topic.confidence_floor if topic.confidence_floor is not none else '' }}"
+                   placeholder="system default" style="width:9rem;margin:0;">
+            <small style="color:var(--pico-muted-color);">0 = show everything · 1 = only the strongest · blank = default</small>
+        </div>
+    </fieldset>
+
+    {# ── Enabled ──────────────────────────────────────────────── #}
+    <label style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0 1rem 0;">
+        <input type="checkbox" name="enabled" value="1"
+               {% if topic.enabled or is_new %}checked{% endif %}
+               style="margin:0;">
+        <span>Enabled</span>
+        {{ m.help("Off pauses this Topic without deleting it — no new matches collect and no digest sends while it's off. New Topics start enabled.") }}
+    </label>
+
+    {# Save + Cancel — matched size: both auto-width, same height. The
+       bare Pico <button> defaults to width:100% (block), which made
+       Save span the row while the Cancel link stayed content-width
+       (operator screenshot). Pin both to width:auto + inline-flex so
+       they read as a matched button pair. #}
+    <div style="display:flex;gap:0.6rem;margin:0.5rem 0 1.5rem 0;
+                align-items:stretch;">
+        <button type="submit" style="width:auto;margin:0;">
+            {% if is_new %}Create Topic{% else %}Save Topic{% endif %}
+        </button>
+        <a href="/profile?tab=topic-digest" role="button"
+           class="secondary outline"
+           style="width:auto;margin:0;text-decoration:none;
+                  display:inline-flex;align-items:center;">
+            Cancel
+        </a>
+    </div>
+</form>
+
+{# ── Preview matches (§3d) ─────────────────────────────────────
+   A separate form so the preview back-scan never co-submits with the
+   Save form above. Posts to .../preview and swaps the result fragment
+   (profile/_topic_digest_preview.html) into #topic-preview. "Edit
+   Details & re-preview" is implicit: edit above, press again — the
+   loop is one screen. Only meaningful once the Topic is saved (it has
+   an id); on a brand-new unsaved Topic, prompt to save first. #}
+<section style="margin-top:1.5rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;
+                flex-wrap:wrap;gap:0.5rem;">
+        <h3 style="margin:0;">Preview matches{{ m.help("A fast SEARCH of your Subject terms across all your folders — your mail server returns just the messages whose Subject matches, so it's quick even on a large mailbox and never misses one because of where it's filed. Press 'Test Details' on the results to run the AI matcher over them (using your full Details) and see what the Topic really catches. Nothing is sent.") }}</h3>
+    </div>
+    <p style="color:var(--pico-muted-color);margin:0.35rem 0 0.6rem 0;">
+        Preview does a fast <strong>search of your Subject terms</strong> across
+        all your folders and lists the messages whose Subject matches. Then press
+        <strong>Test Details</strong> on the results to see which of those the
+        full Topic (with your Details, via the AI) actually catches — that's the
+        pass to tune the Details against.
+    </p>
+
+    {% if topic.id %}
+    <form hx-post="/profile/topic-digest/{{ topic.id }}/preview"
+          hx-target="#topic-preview"
+          hx-swap="innerHTML"
+          hx-indicator="#topic-preview-loading"
+          style="display:flex;gap:0.6rem;align-items:end;flex-wrap:wrap;margin-bottom:0.75rem;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;">
+            <small>How far back{{ m.help("How much recent mail to scan for this preview. A wider window gives you a bigger sample to tune against. The actual digest uses its own schedule — this only affects the preview.") }}</small>
+            <select name="lookback_days" style="margin:0;padding:0.3rem 0.5rem;font-size:0.9em;">
+                <option value="7">Last 7 days</option>
+                <option value="15">Last 15 days</option>
+                <option value="30" selected>Last 30 days</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+            </select>
+        </label>
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.35rem;">
+            <input type="checkbox" name="group_by_account" value="1" checked
+                   style="margin:0;">
+            <small>Group by mailbox{{ m.help("On: results are grouped under each mailbox, so you can see which mailbox is noisy. Off: one flat list.") }}</small>
+        </label>
+        <button type="submit" class="outline"
+                hx-disabled-elt="this"
+                style="padding:0.3rem 0.8rem;font-size:0.9em;margin:0;">
+            Preview matches
+        </button>
+    </form>
+    {# In-flight feedback (operator 2026-06-12 "the wait indicator needs to
+       surface better details so I know it's actually working"). hx-indicator
+       reveals this block ONLY while the request is in flight; hx-disabled-elt
+       greys the button. A descriptive line + spinner beats a bare busy-dot so a
+       working search never looks dead. The search is server-side now, so it's
+       usually quick — the "few seconds" line covers a large mailbox. #}
+    <div id="topic-preview-loading" class="htmx-indicator" role="status"
+         style="display:flex;align-items:center;gap:0.5rem;margin:0.5rem 0;
+                color:var(--pico-muted-color);">
+        <span aria-busy="true"></span>
+        <small>Searching your mailbox for messages matching this Topic's
+        <strong>Subject terms</strong>, across every folder&hellip; on a large
+        mailbox this can take a few seconds.</small>
+    </div>
+    {% else %}
+    <p style="color:var(--pico-muted-color);">
+        <small>Create the Topic first — then you can preview what it
+        catches and tune it.</small>
+    </p>
+    {% endif %}
+
+    {# Preview fragment swap target. #}
+    <div id="topic-preview" aria-live="polite"></div>
+
+    {# ── Muted senders (operator 2026-06-12 reinforcement) ──────────────
+       Senders you 👎'd for this Topic. Their mail is auto-dropped from the
+       Preview + digest. This is the ONLY undo — a muted sender's mail never
+       reappears to thumbs-up, so un-mute it here to match it again. Only the
+       existing-Topic editor populates ``muted_senders``. #}
+    {% if muted_senders is defined and muted_senders %}
+    <section style="margin-top:1.1rem;">
+        <h4 style="margin:0 0 0.3rem 0;font-size:0.95rem;">
+            Muted senders{{ m.help("Senders you dropped (👎) for this Topic — their mail is automatically left out of the Preview and digest. Un-mute one to start matching its mail again.") }}
+        </h4>
+        <ul style="list-style:none;padding:0;margin:0;">
+            {% for s in muted_senders %}
+            <li id="muted-sender-{{ loop.index }}"
+                style="display:flex;align-items:center;gap:0.5rem;
+                       padding:0.2rem 0;font-size:0.9rem;flex-wrap:wrap;">
+                <span style="color:var(--pico-muted-color);">&#x1F44E; {{ s.addr }}</span>
+                <button type="button"
+                        hx-post="/profile/topic-digest/{{ topic.id }}/feedback/unmute"
+                        hx-vals='{"sender_b64": "{{ s.b64 }}"}'
+                        hx-target="#muted-sender-{{ loop.index }}"
+                        hx-swap="outerHTML"
+                        class="outline secondary"
+                        style="padding:0.05rem 0.5rem;font-size:0.8rem;margin:0;">
+                    un-mute
+                </button>
+            </li>
+            {% endfor %}
+        </ul>
+    </section>
+    {% endif %}
+</section>
+
+{# ── Re-Triage now (§8 R3 — on-demand back-scan that STORES) ───────
+   Preview only shows what WOULD match (ephemeral). Re-Triage runs the
+   matcher over the selected mailboxes' history for the chosen window and
+   RECORDS each match into the Topic (topic_hits), so it's collected into
+   the digest. [30 / 60 / 90 / All]. Background job, concurrency 1. Only
+   meaningful once the Topic exists. #}
+{% if topic.id %}
+<section style="margin-top:1.5rem;">
+    <h3 style="margin:0 0 0.35rem 0;">Re-Triage now{{ m.help("Runs the matcher over your selected mailboxes' recent mail and RECORDS every match into this Topic, so it shows up in the digest. Use it after creating or tuning a Topic to catch mail that arrived before the Topic existed. Runs in the background, one mailbox at a time; come back and Preview to see what it found.") }}</h3>
+    <p style="color:var(--pico-muted-color);margin:0 0 0.6rem 0;">
+        Unlike Preview, Re-Triage stores the matches so they're collected
+        into the Topic. Pick how far back to scan.
+    </p>
+    <form hx-post="/profile/topic-digest/{{ topic.id }}/retriage"
+          hx-target="#topic-retriage-result" hx-swap="innerHTML"
+          style="display:flex;gap:0.6rem;align-items:end;flex-wrap:wrap;">
+        {{ csrf_input(request) }}
+        <label style="margin:0;">
+            <small>How far back</small>
+            <select name="window_days"
+                    style="margin:0;padding:0.3rem 0.5rem;font-size:0.9em;">
+                <option value="30" selected>Last 30 days</option>
+                <option value="60">Last 60 days</option>
+                <option value="90">Last 90 days</option>
+                <option value="0">All mail</option>
+            </select>
+        </label>
+        <button type="submit"
+                style="padding:0.4rem 0.9rem;font-size:0.9em;margin:0;">
+            Re-Triage now
+        </button>
+    </form>
+    <div id="topic-retriage-result" style="margin-top:0.5rem;"
+         aria-live="polite"></div>
+</section>
+{% endif %}
+
+{# ── Delivery digests (§3d v2 — multiple named digests) ────────────
+   A Topic can carry SEVERAL digests, each its own schedule + what-to-
+   include + render — e.g. a daily incremental on weekdays plus a weekly
+   full on Monday. Rendered from ``topic.digests`` (NOT ``topic.digest``,
+   which never existed — reading it silently blanked this whole section
+   pre-v2). Every field is indexed ``digest-<i>-<field>`` and carries
+   ``form="topic-editor-form"`` so the blocks post WITH the Save form
+   above without nesting (HTML forbids nested forms). The macro renders
+   both the existing blocks and the JS-clone <template>, so they can
+   never drift apart. #}
+
+{% macro digest_block(i, d, enums) %}
+{% set _name = d.name if d else '' %}
+{% set _id = d.id if d else '' %}
+{% set _enabled = (d.enabled if d is not none else True) %}
+{% set _mode = (d.mode if d else 'full') %}
+{% set _cadence = (d.schedule.cadence if d else 'daily') %}
+{% set _time = (d.schedule.time_local if d else '08:10') %}
+{% set _days = (d.schedule.days_of_week if d else []) or [] %}
+{% set _render = (d.format.render_as if d else 'table') %}
+{% set _group = (d.format.group_by if d else 'none') %}
+{% set _maxrows = (d.format.max_rows if d else 50) %}
+{% set _preview = (d.format.include_body_preview if d else False) %}
+<fieldset class="topic-digest-block"
+          data-digest-index="{{ i }}"
+          style="border:1px solid var(--pico-muted-border-color);
+                 border-radius:8px;padding:0.75rem 1rem;margin-bottom:0.75rem;">
+    <div style="display:flex;gap:0.6rem;align-items:center;margin-bottom:0.5rem;">
+        <input type="text" name="digest-{{ i }}-name" form="topic-editor-form"
+               value="{{ _name }}"
+               placeholder="Digest name (e.g. Daily incremental)"
+               maxlength="120" style="flex:1;min-width:0;margin:0;">
+        <label style="display:inline-flex;align-items:center;gap:0.3rem;margin:0;white-space:nowrap;">
+            <input type="checkbox" name="digest-{{ i }}-enabled" value="1"
+                   form="topic-editor-form" {% if _enabled %}checked{% endif %}
+                   style="margin:0;">
+            <small>On</small>
+        </label>
+        <button type="button" class="outline secondary topic-remove-digest"
+                style="padding:0.15rem 0.6rem;font-size:0.85em;margin:0;
+                       color:var(--pico-del-color);border-color:var(--pico-del-color);">
+            Remove
+        </button>
+    </div>
+    <input type="hidden" name="digest-{{ i }}-id" form="topic-editor-form"
+           value="{{ _id }}">
+
+    <div class="grid">
+        <label>
+            Send time
+            <input type="time" name="digest-{{ i }}-time" form="topic-editor-form"
+                   value="{{ _time or '08:10' }}">
+        </label>
+        <label>
+            Cadence
+            <select name="digest-{{ i }}-cadence" form="topic-editor-form">
+                {% for c in (enums.cadences if enums else ['daily','weekly','monthly']) %}
+                <option value="{{ c }}" {% if _cadence == c %}selected{% endif %}>{{ c | capitalize }}</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+
+    <fieldset style="margin:0.4rem 0;">
+        <legend><small>Days of week (weekly only)</small></legend>
+        {% for idx, lbl in [(0,'Mon'),(1,'Tue'),(2,'Wed'),(3,'Thu'),(4,'Fri'),(5,'Sat'),(6,'Sun')] %}
+        <label style="display:inline-flex;align-items:center;gap:0.25rem;margin:0 0.4rem 0 0;">
+            <input type="checkbox" name="digest-{{ i }}-days" value="{{ idx }}"
+                   form="topic-editor-form"
+                   {% if idx in _days %}checked{% endif %} style="margin:0;">
+            <span>{{ lbl }}</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+
+    <fieldset style="margin:0.4rem 0;">
+        <legend><small>What to include</small></legend>
+        {% for slug, label in [('full','Everything that matches'),('differential',"Only what's new"),('both','Both')] %}
+        <label style="display:inline-flex;align-items:center;gap:0.3rem;margin:0 0.8rem 0 0;">
+            <input type="radio" name="digest-{{ i }}-mode" value="{{ slug }}"
+                   form="topic-editor-form" {% if _mode == slug %}checked{% endif %}>
+            <span>{{ label }}</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+
+    <div class="grid">
+        <label>
+            Render as
+            <select name="digest-{{ i }}-render_as" form="topic-editor-form">
+                {% for r in (enums.render_as if enums else ['table','grouped_list','plain_list']) %}
+                <option value="{{ r }}" {% if _render == r %}selected{% endif %}>{{ r | replace('_',' ') | capitalize }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Group by
+            <select name="digest-{{ i }}-group_by" form="topic-editor-form">
+                {% for g in (enums.group_bys if enums else ['none','category','folder','day','sender']) %}
+                <option value="{{ g }}" {% if _group == g %}selected{% endif %}>{{ g | capitalize }}</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div class="grid">
+        <label>
+            Max rows
+            <input type="number" name="digest-{{ i }}-max_rows" form="topic-editor-form"
+                   min="1" max="1000" value="{{ _maxrows or 50 }}">
+        </label>
+        <label style="display:flex;align-items:center;gap:0.4rem;align-self:end;margin-bottom:0.6rem;">
+            <input type="checkbox" name="digest-{{ i }}-include_body_preview" value="1"
+                   form="topic-editor-form" {% if _preview %}checked{% endif %}
+                   style="margin:0;">
+            <span>Include a short preview line</span>
+        </label>
+    </div>
+</fieldset>
+{% endmacro %}
+
+<section style="margin-top:1.5rem;">
+    <div style="display:flex;justify-content:space-between;align-items:center;
+                flex-wrap:wrap;gap:0.5rem;">
+        <h3 style="margin:0;">Digests{{ m.help("Each digest is a separate scheduled email for this Topic. Give each its own schedule, what-to-include, and layout — for example a daily 'only what's new' on weekdays at 10pm, plus a weekly full summary every Monday at 7am. Add as many as you need; retention above is shared across them all.") }}</h3>
+        <button type="button" id="topic-add-digest" class="outline secondary"
+                style="padding:0.3rem 0.8rem;font-size:0.9em;margin:0;">
+            + Add a digest
+        </button>
+    </div>
+    <p style="color:var(--pico-muted-color);margin:0.35rem 0 0.75rem 0;">
+        These save with the Topic — use
+        <strong>{% if is_new %}Create Topic{% else %}Save Topic{% endif %}</strong>
+        above.
+    </p>
+
+    <div id="topic-digests-list">
+        {% for d in (topic.digests or []) %}
+        {{ digest_block(loop.index0, d, enums) }}
+        {% endfor %}
+    </div>
+
+    {# Empty-state nudge when a Topic has no digests yet — it still
+       collects matches; it just won't email until a digest is added. #}
+    <p id="topic-no-digests-note"
+       style="color:var(--pico-muted-color);display:{% if topic.digests %}none{% else %}block{% endif %};">
+        <small>No digests yet — this Topic still collects matches (use
+        Preview / Re-Triage below), it just won't email a summary until
+        you add one.</small>
+    </p>
+
+    {# JS-clone source. ``__I__`` is rewritten to a fresh index on add.
+       Rendered via the SAME macro as the live blocks so they can't drift. #}
+    <template id="topic-digest-block-template">
+        {{ digest_block('__I__', none, enums) }}
+    </template>
+</section>
+
+{% if topic.id %}
+{# Delete — its own form (HTML forbids nested forms), soft-tombstone
+   on the server (§9 V3 = soft-then-horizon-purge). #}
+<form method="POST" action="/profile/topic-digest/{{ topic.id }}/delete"
+      style="margin-top:1.5rem;"
+      onsubmit="return confirm('Delete the Topic {{ topic.name }}? Its collected matches are removed; your mailboxes are untouched.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="outline"
+            style="color:var(--pico-del-color);
+                   border-color:var(--pico-del-color);
+                   padding:0.25rem 0.6rem;font-size:0.85em;margin:0;">
+        Delete this Topic
+    </button>
+</form>
+{% endif %}
+
+<script>
+(function () {
+    /* Repeatable Subject rows — +/- manager mirroring the digest
+       editor's column-row pattern. First row always shows "+"
+       (append); last row shows "-" (remove itself) when there's more
+       than one. Single-row case shows "+" only so it never drops to
+       zero. The save form= attribute carries every ``subjects`` input
+       into the POST regardless of how many rows exist. */
+    var listEl = document.getElementById("topic-subjects-list");
+    var tmplEl = document.getElementById("topic-subject-row-template");
+    if (!listEl || !tmplEl) return;
+
+    function refreshControls() {
+        var rows = listEl.querySelectorAll(".topic-subject-row");
+        rows.forEach(function (row, idx) {
+            var ctrl = row.querySelector(".topic-subject-control");
+            if (!ctrl) return;
+            ctrl.innerHTML = "";
+            var isFirst = idx === 0;
+            var isLast = idx === rows.length - 1;
+            if (isFirst) {
+                var plus = document.createElement("button");
+                plus.type = "button";
+                plus.className = "outline secondary";
+                plus.style.cssText = "padding:0.2rem 0.6rem;font-size:1em;line-height:1;margin:0;";
+                plus.title = "Add another subject";
+                plus.setAttribute("aria-label", "Add another subject");
+                plus.textContent = "+";
+                plus.addEventListener("click", function () {
+                    var clone = tmplEl.content.firstElementChild.cloneNode(true);
+                    listEl.appendChild(clone);
+                    refreshControls();
+                });
+                ctrl.appendChild(plus);
+            }
+            if (isLast && rows.length > 1) {
+                var minus = document.createElement("button");
+                minus.type = "button";
+                minus.className = "outline secondary";
+                minus.style.cssText = "padding:0.2rem 0.6rem;font-size:1em;line-height:1;margin:0;color:var(--pico-del-color);border-color:var(--pico-del-color);";
+                minus.title = "Remove this subject";
+                minus.setAttribute("aria-label", "Remove this subject");
+                minus.textContent = "−";
+                minus.addEventListener("click", function () {
+                    row.remove();
+                    refreshControls();
+                });
+                ctrl.appendChild(minus);
+            }
+        });
+    }
+    // Exposed so the NCT-lookup fragment can re-wire +/- controls after it
+    // adds the Study ID as a new subject chip.
+    window.__topicSubjectsRefresh = refreshControls;
+    refreshControls();
+})();
+
+/* Repeatable digest blocks — add/remove named digests. The server reads
+   every block by index (digest-<n>-<field>); fresh indices are never
+   reused (the parser scans a set, so gaps are fine). Each block carries
+   form="topic-editor-form" so it posts with the Save form. */
+(function () {
+    var list = document.getElementById("topic-digests-list");
+    var tmpl = document.getElementById("topic-digest-block-template");
+    var addBtn = document.getElementById("topic-add-digest");
+    var note = document.getElementById("topic-no-digests-note");
+    if (!list || !tmpl || !addBtn) return;
+    var counter = list.querySelectorAll(".topic-digest-block").length;
+
+    function syncNote() {
+        if (!note) return;
+        var has = list.querySelectorAll(".topic-digest-block").length > 0;
+        note.style.display = has ? "none" : "block";
+    }
+    addBtn.addEventListener("click", function () {
+        var idx = counter++;
+        var html = tmpl.innerHTML.replace(/__I__/g, String(idx));
+        var wrap = document.createElement("div");
+        wrap.innerHTML = html.trim();
+        var block = wrap.firstElementChild;
+        if (block) {
+            list.appendChild(block);
+            syncNote();
+            var nameInput = block.querySelector('input[type="text"]');
+            if (nameInput) nameInput.focus();
+        }
+    });
+    list.addEventListener("click", function (e) {
+        var btn = e.target.closest(".topic-remove-digest");
+        if (!btn) return;
+        var block = btn.closest(".topic-digest-block");
+        if (block) { block.remove(); syncNote(); }
+    });
+})();
+</script>
+{% endblock %}

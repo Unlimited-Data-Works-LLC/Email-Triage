@@ -13,9 +13,10 @@ Shape
   change. Lazy initialise on first lookup; no connection at startup.
 * **Key**: SHA-256 of
   ``(account_id, sender_norm, subject_norm, body_hash, classifier_model,
-  prompt_version)``. Hashing the key is defence-in-depth: even though
-  the cache is OFF for HIPAA accounts, the sender + subject shape is
-  PHI-flavoured and we don't want it sitting in a Redis ``KEYS *``
+  prompt_version)``. Hashing the key is defence-in-depth: HIPAA
+  accounts ARE cached (with ``reason`` stripped at store time per the
+  HIPAA gate below), and the sender + subject shape is PHI-flavoured
+  regardless, so we don't want it sitting in a Redis ``KEYS *``
   dump in cleartext.
 * **Value**: JSON ``{category, reason, confidence, classified_at,
   model}``. Stored cleartext (server-side Redis isn't authenticated +
@@ -24,9 +25,18 @@ Shape
   fragments — see "Privacy invariants" below.
 * **TTL**: configurable, default 30 days. Operator-tunable per install
   via ``/admin/integrations``.
-* **HIPAA gate**: callers must skip ``lookup``/``store`` when the
-  message is HIPAA-flagged. The cache module trusts the caller's gate;
-  it doesn't re-check.
+* **HIPAA gate**: HIPAA-flagged messages ARE cached, with the
+  classifier free-text ``reason`` stripped at store time
+  (:func:`cache_store_for_message` handles the redaction when its
+  ``is_hipaa`` kwarg is set — revised 2026-05-13; see
+  :func:`cache_keys_for_message` docstring for the design rationale).
+  The lookup path is unconditional. Pre-2026-05-13 the contract was
+  "callers must skip lookup/store when HIPAA-flagged"; that contract
+  is dropped. Callers pass ``is_hipaa=bool(message.hipaa)`` at store
+  time and the cache module handles the redaction — see the live
+  caller at ``classify/base.py:790``. Feature-report eval fold
+  (2026-07-17) refreshed this line to end the site vs code drift; the
+  actual runtime path has been store-with-redaction since 2026-05-13.
 
 Server choice
 -------------
@@ -63,15 +73,22 @@ call always wins as the fallback.
 
 from __future__ import annotations
 
+from email_triage._int_utils import bounded_int, parse_int_or_none  # N-219c R23
+from email_triage._isotime import now_utc_iso
+
 import asyncio
 import hashlib
 import json
 import logging
 import re
 import threading
-import time
-from dataclasses import dataclass
 from typing import Any
+
+# run17 / — the Redis subsystem SSOT: the ``redis.Redis.from_url`` factory
+# + the ONE shared fallback circuit-breaker. ``_redis`` imports nothing from
+# ``email_triage`` (stdlib + lazy ``redis`` only), so it is a leaf — no cycle
+# with the ``persistent_counters`` edge below.
+from email_triage.cache._redis import RedisFallbackBreaker, build_redis_client
 
 #  — hoisted from inside ``_Counters._mirror`` (was re-imported on
 # every cache-counter bump). ``persistent_counters`` imports only
@@ -81,7 +98,8 @@ from email_triage.engine.persistent_counters import (
     get_install_counter_backend,
 )
 
-logger = logging.getLogger("email_triage.cache.classification")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.cache.classification")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +230,8 @@ def clamp_ttl_secs(value: int | None, default: int = DEFAULT_TTL_SECS) -> int:
     snaps up to the floor, anything above snaps down to the ceiling.
     ``None`` / non-int input falls back to ``default`` before clamping.
     """
-    try:
-        v = int(value) if value is not None else default
-    except (TypeError, ValueError):
-        v = default
+    # N-219c/44 R23: bounded_int SSOT — returns default on None + non-numeric.
+    v = bounded_int(value, default=default) if value is not None else default
     if v < MIN_TTL_SECS:
         return MIN_TTL_SECS
     if v > MAX_TTL_SECS:
@@ -371,7 +387,6 @@ _WS = re.compile(r"\s+")
 # substring + we keep applying it as long as it matches a leading run
 # of those tokens. ``fw:`` is the Outlook variant; ``aw:`` German
 # variant skipped (operator install is English-only).
-_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fwd|fw)\s*:\s*", re.IGNORECASE)
 
 
 def _norm(s: str) -> str:
@@ -395,14 +410,10 @@ def normalise_subject(subject: str) -> str:
     = more inner hits but more risk of conflating distinct messages.
     Today's call leaves those distinct.
     """
-    s = subject or ""
-    # Strip repeated leading Re:/Fwd: tokens (``Re: Fwd: Re: foo`` → ``foo``).
-    while True:
-        new = _SUBJECT_PREFIX_RE.sub("", s, count=1)
-        if new == s:
-            break
-        s = new
-    return _norm(s)
+    # Strip repeated leading Re:/Fwd: tokens (``Re: Fwd: Re: foo`` → ``foo``)
+    # via the mail_headers SSOT (census run13 ), then normalise.
+    from email_triage.mail_headers import strip_reply_prefix
+    return _norm(strip_reply_prefix(subject))
 
 
 def compute_body_hash(body_text: str) -> str:
@@ -467,9 +478,20 @@ def make_outer_cache_key(
     SHA-256 of the tuple (defence-in-depth — sender is PHI-shape; a
     Redis ``KEYS *`` dump shouldn't surface it cleartext).
     """
+    # census run17  — key the outer HASH on the BARE sender address
+    # (display-name-independent) via the extract_bare_address SSOT, not the
+    # whitespace-normalised raw header. ``_norm`` kept the display name, so
+    # "Name <a@b>" and "Name via Service <a@b>" forked into two HASHes for
+    # one sender — a silent cache-hit-rate loss on the hot path. The inner
+    # field still discriminates the message (subject + body_hash), so merging
+    # display-name variants of one address is strictly more correct. An
+    # address-less sender degrades to the lowercased raw value (the SSOT
+    # returns it unchanged when there is no ``<addr>``), matching the prior
+    # bucketing for that degenerate case.
+    from email_triage.mail_headers import extract_bare_address
     payload = "|".join([
         str(account_id),
-        _norm(sender),
+        extract_bare_address(sender),
         classifier_model.strip(),
         prompt_version.strip(),
         _categories_digest(categories),
@@ -527,19 +549,6 @@ def make_cache_key(
 # Cache class
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _BreakerState:
-    """Lightweight circuit-breaker for Redis-unreachable errors.
-
-    Mirrors the shape of ``email_triage.llm_health.set_unhealthy`` but
-    stays local to the cache module — keeping the dependency surface
-    minimal. When ``open_until`` is in the future, ``lookup`` returns
-    ``None`` immediately without attempting a Redis round-trip.
-    """
-    open_until: float = 0.0  # monotonic deadline; 0 = closed
-    last_reason: str = ""
-
-
 class ClassificationCache:
     """Optional Redis-backed cache for classification results.
 
@@ -580,7 +589,7 @@ class ClassificationCache:
         self._url = (url or "").strip()
         self._default_ttl = int(default_ttl_secs)
         self._breaker_ttl = int(breaker_ttl_secs)
-        self._breaker = _BreakerState()
+        self._breaker = RedisFallbackBreaker(ttl_secs=self._breaker_ttl)
         self._client: Any = None  # lazily built
         self._client_lock = threading.Lock()
         # 2026-05-13 two-level cache tuning knobs (operator-configurable
@@ -626,8 +635,14 @@ class ClassificationCache:
         with self._client_lock:
             if self._client is not None:
                 return self._client
+            # run17  — build through the Redis-subsystem factory SSOT
+            # (``cache/_redis.build_redis_client``), which owns the canonical
+            # ``from_url`` params (decode_responses + short LAN socket/connect
+            # timeouts). ``ImportError`` (optional ``cache`` extra missing) is
+            # kept DISTINCT from a connection-build error so each keeps its own
+            # operator log + breaker reason.
             try:
-                import redis  # type: ignore[import-not-found]
+                client = build_redis_client(self._url)
             except ImportError as exc:
                 logger.warning(
                     "Classification cache: redis package not installed "
@@ -636,17 +651,6 @@ class ClassificationCache:
                 )
                 self._open_breaker(f"import error: {exc}")
                 return None
-            try:
-                # ``decode_responses=True`` gives us str in/out, which
-                # plays nicely with json.dumps/loads. ``socket_timeout``
-                # short — LAN-only, and we don't want to block the
-                # classifier on a slow / stuck Redis.
-                client = redis.Redis.from_url(
-                    self._url,
-                    decode_responses=True,
-                    socket_timeout=2.0,
-                    socket_connect_timeout=2.0,
-                )
             except Exception as exc:  # noqa: BLE001 — Redis raises misc types
                 logger.warning(
                     "Classification cache: client init failed; cache "
@@ -660,11 +664,10 @@ class ClassificationCache:
     # -- Breaker ------------------------------------------------------------
 
     def _breaker_open(self) -> bool:
-        return self._breaker.open_until > time.monotonic()
+        return self._breaker.is_open()
 
     def _open_breaker(self, reason: str) -> None:
-        self._breaker.open_until = time.monotonic() + self._breaker_ttl
-        self._breaker.last_reason = reason[:200]
+        self._breaker.trip(reason)
         # Drop the broken client so the next attempt rebuilds it.
         self._client = None
 
@@ -689,9 +692,9 @@ class ClassificationCache:
             raw = client.get(key)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: GET failed (%s); falling through "
-                "to LLM. cache_hit=False breaker_open=True",
-                type(exc).__name__,
+                "Classification cache: GET failed; falling through to LLM. "
+                "cache_hit=False breaker_open=True",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"GET: {exc}")
             _counters.incr_error()
@@ -707,9 +710,11 @@ class ClassificationCache:
             # Corrupted entry — drop it on the floor, count as miss
             # (NOT error — Redis itself is healthy).
             logger.warning(
-                "Classification cache: corrupt JSON in %s.. (%s); "
-                "treating as miss",
-                key[:24], type(exc).__name__,
+                "Classification cache: corrupt JSON; treating as miss",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "error_msg": str(key[:24]) + "..",
+                },
             )
             _counters.incr_miss()
             return None
@@ -750,8 +755,8 @@ class ClassificationCache:
             client.set(key, payload, ex=ttl)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: SET failed (%s); breaker open",
-                type(exc).__name__,
+                "Classification cache: SET failed; breaker open",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"SET: {exc}")
             _counters.incr_error()
@@ -777,8 +782,8 @@ class ClassificationCache:
             raw = client.hget(outer_key, inner_field)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: HGET failed (%s); breaker open",
-                type(exc).__name__,
+                "Classification cache: HGET failed; breaker open",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"HGET: {exc}")
             _counters.incr_error()
@@ -792,8 +797,11 @@ class ClassificationCache:
             return parsed
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: corrupt inner JSON %s.. (%s)",
-                outer_key[:24], type(exc).__name__,
+                "Classification cache: corrupt inner JSON",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "error_msg": str(outer_key[:24]) + "..",
+                },
             )
             return None
 
@@ -817,17 +825,16 @@ class ClassificationCache:
             raw = client.hgetall(outer_key + ":dist")
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: dist HGETALL failed (%s); breaker open",
-                type(exc).__name__,
+                "Classification cache: dist HGETALL failed; breaker open",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"dist HGETALL: {exc}")
             _counters.incr_error()
             return {}
         out: dict[str, int] = {}
         for cat, cnt in (raw or {}).items():
-            try:
-                n = int(cnt)
-            except (TypeError, ValueError):
+            n = parse_int_or_none(cnt)  # N-219c/10 R23: SSOT
+            if n is None:
                 continue
             if n > 0:
                 out[str(cat)] = n
@@ -887,8 +894,8 @@ class ClassificationCache:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: store EVAL failed (%s); breaker open",
-                type(exc).__name__,
+                "Classification cache: store EVAL failed; breaker open",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"store_inner EVAL: {exc}")
             _counters.incr_error()
@@ -939,15 +946,15 @@ class ClassificationCache:
                 total += int(deleted or 0)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Classification cache: flush_all failed (%s); breaker open",
-                type(exc).__name__,
+                "Classification cache: flush_all failed; breaker open",
+                extra={"error_type": type(exc).__name__},
             )
             self._open_breaker(f"FLUSH: {exc}")
             _counters.incr_error()
             return total
         logger.info(
-            "Classification cache: flushed %d keys via admin action",
-            total,
+            "Classification cache: flushed keys via admin action",
+            extra={"total": total},
         )
         return total
 
@@ -1336,7 +1343,10 @@ def cache_store_for_message(
     try:
         cache.store_inner(outer_key, inner_field, value, cap=cap)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Classification cache store error: %s", exc)
+        logger.debug(
+            "Classification cache store error",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+        )
 
 
 def _build_inner_payload(
@@ -1357,11 +1367,10 @@ def _build_inner_payload(
     cat = getattr(classification, "category", "")
     if cat not in categories:
         return None
-    from datetime import datetime, timezone
     value: dict[str, Any] = {
         "category": cat,
         "confidence": float(getattr(classification, "confidence", 0.5)),
-        "classified_at": datetime.now(timezone.utc).isoformat(),
+        "classified_at": now_utc_iso(),
         "model": classifier_model,
     }
     if not is_hipaa:
@@ -1398,7 +1407,10 @@ async def acache_store_for_message(
     try:
         await cache.astore_inner(outer_key, inner_field, value, cap=cap)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Classification cache async store error: %s", exc)
+        logger.debug(
+            "Classification cache async store error",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+        )
 
 
 def build_cache_from_config(redis_cache_cfg: Any) -> ClassificationCache | None:

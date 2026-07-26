@@ -1,5 +1,6 @@
-"""Tests for /api/openclaw/accounts/{id}/calendar/* endpoints."""
+"""Tests for /api/v1/accounts/{id}/calendar/* endpoints."""
 
+from _db_tracking import track
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -71,7 +72,7 @@ class TestHipaaBlock:
     def test_list_403_on_hipaa(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True, calendar_enabled=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/events"
+            f"/api/v1/accounts/{aid}/calendar/events"
             "?time_min=2026-04-20T00:00:00Z&time_max=2026-04-21T00:00:00Z",
             headers=bearer,
         )
@@ -81,7 +82,7 @@ class TestHipaaBlock:
     def test_create_403_on_hipaa(self, client, db, admin_user, bearer):
         aid = _make_account(db, admin_user["id"], hipaa=True, calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/events",
+            f"/api/v1/accounts/{aid}/calendar/events",
             json={"summary": "x", "start": "2026-04-20T09:00:00Z",
                   "end": "2026-04-20T09:30:00Z"},
             headers=bearer,
@@ -95,7 +96,7 @@ class TestCalendarNotEnabled:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=False)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/events"
+            f"/api/v1/accounts/{aid}/calendar/events"
             "?time_min=2026-04-20T00:00:00Z&time_max=2026-04-21T00:00:00Z",
             headers=bearer,
         )
@@ -107,7 +108,7 @@ class TestEndpoints:
     def test_list_events(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/events"
+            f"/api/v1/accounts/{aid}/calendar/events"
             "?time_min=2026-04-20T00:00:00Z&time_max=2026-04-21T00:00:00Z",
             headers=bearer,
         )
@@ -119,7 +120,7 @@ class TestEndpoints:
     def test_get_event(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.get(
-            f"/api/openclaw/accounts/{aid}/calendar/events/ev1",
+            f"/api/v1/accounts/{aid}/calendar/events/ev1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -128,7 +129,7 @@ class TestEndpoints:
     def test_create_event(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/events",
+            f"/api/v1/accounts/{aid}/calendar/events",
             json={"summary": "Sync",
                   "start": "2026-04-21T14:00:00Z",
                   "end": "2026-04-21T14:30:00Z"},
@@ -140,7 +141,7 @@ class TestEndpoints:
     def test_update_event(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.patch(
-            f"/api/openclaw/accounts/{aid}/calendar/events/ev1",
+            f"/api/v1/accounts/{aid}/calendar/events/ev1",
             json={"summary": "Updated"},
             headers=bearer,
         )
@@ -149,7 +150,7 @@ class TestEndpoints:
     def test_delete_event(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.delete(
-            f"/api/openclaw/accounts/{aid}/calendar/events/ev1",
+            f"/api/v1/accounts/{aid}/calendar/events/ev1",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -157,7 +158,7 @@ class TestEndpoints:
     def test_respond(self, client, db, admin_user, bearer, patch_factory):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/events/ev1/respond",
+            f"/api/v1/accounts/{aid}/calendar/events/ev1/respond",
             json={"response": "accepted"},
             headers=bearer,
         )
@@ -169,7 +170,7 @@ class TestEndpoints:
     ):
         aid = _make_account(db, admin_user["id"], calendar_enabled=True)
         resp = client.post(
-            f"/api/openclaw/accounts/{aid}/calendar/events/ev1/respond",
+            f"/api/v1/accounts/{aid}/calendar/events/ev1/respond",
             json={"response": "maybe"},
             headers=bearer,
         )
@@ -232,7 +233,7 @@ class TestLocalRenderFields:
             return_value=fake_calendar_summer,
         ):
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/calendar/events"
+                f"/api/v1/accounts/{aid}/calendar/events"
                 "?time_min=2026-05-08T00:00:00Z"
                 "&time_max=2026-05-09T00:00:00Z",
                 headers=bearer,
@@ -266,7 +267,7 @@ class TestLocalRenderFields:
             return_value=fake_calendar_summer,
         ):
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/calendar/events/ev1",
+                f"/api/v1/accounts/{aid}/calendar/events/ev1",
                 headers=bearer,
             )
         assert resp.status_code == 200
@@ -294,7 +295,7 @@ class TestLocalRenderFields:
             return_value=cal,
         ):
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/calendar/events"
+                f"/api/v1/accounts/{aid}/calendar/events"
                 "?time_min=2026-07-04T00:00:00Z"
                 "&time_max=2026-07-05T00:00:00Z",
                 headers=bearer,
@@ -327,7 +328,7 @@ class TestLocalRenderFields:
             return_value=cal,
         ):
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/calendar/events"
+                f"/api/v1/accounts/{aid}/calendar/events"
                 "?time_min=2026-01-15T00:00:00Z"
                 "&time_max=2026-01-16T00:00:00Z",
                 headers=bearer,
@@ -339,7 +340,7 @@ class TestLocalRenderFields:
 
     def test_noon_and_midnight_format(self):
         """Format helper: noon = 12:00 PM, midnight = 12:00 AM."""
-        from email_triage.web.routers.openclaw import _format_local_time
+        from email_triage.web.routers.agent_api import _format_local_time
         from datetime import datetime as _dt
         assert _format_local_time(_dt(2026, 5, 8, 12, 0)) == "12:00 PM"
         assert _format_local_time(_dt(2026, 5, 8, 0, 0)) == "12:00 AM"
@@ -358,7 +359,7 @@ class TestLocalRenderFields:
             return_value=fake_calendar_summer,
         ):
             resp = client.get(
-                f"/api/openclaw/accounts/{aid}/calendar/events"
+                f"/api/v1/accounts/{aid}/calendar/events"
                 "?time_min=2026-05-08T00:00:00Z"
                 "&time_max=2026-05-09T00:00:00Z",
                 headers=bearer,
@@ -385,7 +386,7 @@ class TestTzMigrationBackfill:
     def test_v6_backfills_default_tz(self):
         """Migration v6 stamps America/New_York on rows with no tz."""
         from email_triage.web.db import init_db
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         uid = _migration_seed_user(conn)
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
@@ -415,7 +416,7 @@ class TestTzMigrationBackfill:
         """Re-running v6 against rows that already declare tz
         leaves them untouched."""
         from email_triage.web.db import init_db
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         uid = _migration_seed_user(conn)
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(

@@ -30,16 +30,18 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from pathlib import Path
 from typing import Any, Callable
 
 #  — DbSecrets shares the one process-wide sqlite3.Connection; every
 # touch of it is serialised on the same write lock @db_write / db_call
 # use. db_writelock imports only stdlib, so this is cycle-free.
+from email_triage.db._helpers import row_get  # N-234 R23 row-factory-agnostic SSOT
 from email_triage.web.db_writelock import get_write_lock
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 
-logger = logging.getLogger("email_triage.secrets")
+logger = get_logger("email_triage.secrets")  # N-196b R21_4
 
 _SERVICE_NAME = "email-triage"
 
@@ -95,6 +97,215 @@ class SecretsDecryptError(Exception):
             f"Could not decrypt secret '{key}' — corrupt ciphertext "
             f"or master-key mismatch"
         )
+
+
+# ---------------------------------------------------------------------------
+# Optional-secret read SSOT  (A5, divergence census 2026-06-09)
+# ---------------------------------------------------------------------------
+
+def read_secret(secrets: "SecretsProvider | None", key: str) -> str | None:
+    """Single sanctioned way to read a *possibly-absent* secret.
+
+    Returns the secret value, or ``None`` when the secrets provider is
+    absent (``secrets is None``) or the key is not present.
+
+    It deliberately does **NOT** catch :class:`SecretsDecryptError`. A
+    decrypt failure means the row exists but is unreadable — a corrupt
+    ciphertext or (far more likely, since it hits *every* secret at once)
+    an install-wide master-key mismatch. That is a categorically
+    different condition from "the secret was never configured", and the
+     typed error exists precisely to keep them apart.
+
+    The divergence this SSOT closes (A5): a dozen call sites each wrapped
+    their read in a broad ``except Exception: <falsy>`` that folded the
+    *unreadable* case back into the *absent* case — so a master-key
+    mismatch silently degraded a security control (e.g. shipped an
+    UNSIGNED webhook, or reported a saved account as "needs re-auth")
+    with nobody the wiser. Callers MUST let ``SecretsDecryptError``
+    propagate, or catch it *explicitly* (``except SecretsDecryptError``)
+    and surface a distinct, fail-closed degraded state — never collapse
+    it into the absent path with a bare/broad ``except``.
+
+    The ``tests/test_web/test_secret_read_collapse_pin_a5.py`` AST pin
+    enforces that no module under ``src/email_triage`` reintroduces the
+    broad-except-around-a-secret-read collapse.
+    """
+    if secrets is None:
+        return None
+    return secrets.get(key)
+
+
+def read_secret_required(secrets: "SecretsProvider", key: str) -> str:
+    """Single sanctioned way to read a REQUIRED secret (raise if absent).
+
+    The raise-on-missing twin of :func:`read_secret`, for callers where a
+    missing secret is a HARD failure — master-key reads, the DR-bundle export
+    (``backup.py``), key rotation/migration (``cli.py``). Returns the secret
+    value or raises :class:`SecretNotFound` (via the provider's ``require``).
+    Like :func:`read_secret` it does NOT swallow :class:`SecretsDecryptError`
+    (the  typed-error contract — an unreadable row is categorically
+    distinct from an absent one).
+
+    The divergence this SSOT closes (run17 #4 / N-137): the master-key read —
+    the highest-privilege secret read, unlocking every ciphertext AND the
+    ``log_entries`` HMAC audit-chain key — was done via a raw
+    ``provider.require(master_key_name)`` at ``backup.py``/``cli.py`` (the only
+    unpinned read surface). Routing every required read through ONE funnel lets
+    ``tests/test_secret_read_funnel_pin.py`` ban a raw ``.require()``/``.get()``
+    on a secrets/bootstrap receiver outside this module.
+    """
+    return secrets.require(key)
+
+
+def get_or_mint_secret(
+    secrets: "SecretsProvider",
+    key: str,
+    mint_fn: Callable[[], str],
+    *,
+    on_decrypt_error: str = "fail_closed",
+    bypass_check: "Callable[[], bool] | None" = None,
+    bypass_clear: "Callable[[], None] | None" = None,
+    bypass_audit_emit: "Callable[[], None] | None" = None,
+) -> str:
+    """N-349 R31 (2026-07-04, census DISCOVERED MED; hybrid mode
+    added 2026-07-05 per operator decision) — SSOT for the
+    read-else-mint pattern.
+
+    The watch-HMAC-key hydration path (``agent_api.py`` +
+    ``profile.py``) previously used a hand-rolled shape:
+
+        try:
+            existing = secrets.get(key)
+        except Exception:  # BROAD — catches SecretsDecryptError too
+            existing = None
+        if existing is None:
+            existing = mint()
+            secrets.set(key, existing)
+
+    Same clobber class as the 2026-06-08 OAuth save-clobber (which was
+    on the WRITE arm) — mirrored on the READ arm: a
+    :class:`SecretsDecryptError` (row present but unreadable) got folded
+    into the "absent" branch + a fresh key minted + the unreadable row
+    OVERWRITTEN, silently discarding whatever the operator had stored
+    under a now-superseded master key.
+
+    Fail-CLOSED policy (this SSOT):
+
+    * ``existing is None`` (secret genuinely absent, e.g. fresh install):
+      call ``mint_fn()``, ``.set()``, return the freshly-minted value.
+    * :class:`SecretsDecryptError` (row present but unreadable — master-
+      key mismatch, corrupt ciphertext): default ``on_decrypt_error=
+      "fail_closed"`` propagates the error so the caller can surface a
+      distinct degraded state. NEVER folds into the mint path.
+    * ``existing is not None``: return the existing value verbatim.
+
+    Callers MUST route watch-HMAC hydration + similar "mint-once, hydrate
+    every request" reads through this SSOT. The 3 census-flagged clobber
+    sites (agent_api:2510, profile:3543 + :3646) are the migration
+    surface tracked under N-349-migrate.
+
+    **Hybrid mode (2026-07-05 operator decision):** callers may pass
+    ``bypass_check`` + ``bypass_clear`` callables (typically closures over
+    a DB-persisted operator-set flag). When ``bypass_check()`` returns
+    True on an unreadable row, the SSOT LOGS the clobber, MINTS + WRITES
+    the fresh secret, then calls ``bypass_clear()`` — clear runs LAST so
+    a mint or set failure preserves the operator's one-shot flag for the
+    next attempt (PD  set/clear symmetry — SME panel 2026-07-05).
+    This gives operators an explicit recovery lever without silent
+    clobbers. The flag lifecycle is CLI-only per operator directive (no
+    env-flag), so a runaway process cannot re-arm the bypass without the
+    CLI's audit trail. When ``bypass_check`` is None or returns False,
+    the fail-closed policy above holds.
+
+    Race caveat (known follow-up): two concurrent unreadable reads on
+    the same key with ``armed=True`` can both observe the flag before
+    either mints, resulting in a double-mint where the second write
+    clobbers the first. Intra-worker is race-free (sync body); the
+    admin-triggered write flow makes multi-worker concurrency for the
+    same watch-HMAC key rare in practice. Atomic check-and-consume via
+    a `RETURNING`-clause `DELETE` at the settings layer landed under
+    N-363 (N-349b item 2) — bypass_check now atomically consumes.
+
+    **N-349b Item 1 (2026-07-07):** callers may pass
+    ``bypass_audit_emit`` — a caller-supplied closure over
+    ``record_hmac_clobber_bypass_consumed(conn, secret_key=key, ...)``
+    that fires an HMAC-chained emitter-owned audit row AFTER the
+    fresh mint + ``.set()`` succeed. This closes the §164.312(b) gap
+    the 2026-07-05 SME panel surfaced (ARM row visible in the CLI
+    audit log, CONSUME event previously only a stdlib warning). The
+    call is guarded so an audit-emit failure does NOT block the
+    recovery mint — the ``@audit_emitter`` gap-event contract already
+    covers audit-visibility on write failure.
+
+    **Pin-design seam (2026-07-11 census verdict, wf_69674c7e-c67):**
+    the two live watch-HMAC hydration call sites dispatch this SSOT
+    interprocedurally as a first-class function arg through the
+    threadpool-hop seam:
+
+        db_call(get_or_mint_secret, secrets, key, mint_fn, ...)
+
+    (see ``web/routers/agent_api.py:2229`` and
+    ``web/routers/ui/profile.py:3572`` + the aliased-import twin at
+    ``profile.py:3708`` that uses ``_get_or_mint_secret``). A naive
+    ``func.id == 'get_or_mint_secret'`` walker sees ZERO direct
+    calls. Any future *coverage* pin that tries to enforce
+    "watch-HMAC hydration MUST route through this SSOT" needs to
+    walk first-arg dispatch through ``db_call`` / ``asyncio.to_thread``
+    / ``run_in_executor`` (the same interprocedural-hop discipline
+    ``test_async_db_safety.py`` already implements), AND resolve
+    ``ImportFrom`` asname bindings so aliased dispatches are visible.
+    The existing funnel + collapse pins are NOT weakened by this —
+    they still block the raw ``.get`` / ``.require`` / broad-swallow
+    shapes underneath — but a coverage pin (as distinct from an
+    anti-pattern pin) would need this seam-aware walker.
+    """
+    try:
+        existing = secrets.get(key)
+    except SecretsDecryptError:
+        if bypass_check is not None and bypass_check():
+            # One-shot operator-armed recovery — log, mint, set, THEN
+            # clear (PD  set/clear symmetry — a mint or set failure
+            # leaves the flag armed so the next attempt can recover;
+            # SME panel 2026-07-05 F1 fix).
+            # N-242 pin fix (CI-red on 815a3cfe): route via the module-
+            # scope TriageLogger `logger` rather than a fresh stdlib
+            # `_lg.getLogger(...)` — the latter is the N-242 aliased-
+            # import bypass shape.
+            logger.warning(
+                "N-349 hybrid: unreadable secret + operator-armed bypass flag consumed; minting fresh replacement",
+                extra={"secret_key": key},
+            )
+            minted = mint_fn()
+            secrets.set(key, minted)
+            if bypass_audit_emit is not None:
+                # N-349b Item 1 (2026-07-07): emitter-owned CONSUME
+                # audit row inside the HMAC-chained envelope. Guarded
+                # — a failed audit-emit MUST NOT block the recovery
+                # mint (mint + set already succeeded above; the
+                # break-glass semantics preserve). @audit_emitter's
+                # `audit_gap_events` row fires on the failure path
+                # so the CONSUME event stays visible either way.
+                try:
+                    bypass_audit_emit()
+                except Exception:
+                    logger.warning(
+                        "N-349b Item 1: bypass-consumed audit emit failed — gap-event should follow",
+                        extra={"secret_key": key},
+                    )
+            if bypass_clear is not None:
+                bypass_clear()
+            return minted
+        if on_decrypt_error == "fail_closed":
+            raise
+        raise ValueError(
+            f"get_or_mint_secret: unexpected "
+            f"on_decrypt_error={on_decrypt_error!r} (only 'fail_closed' supported)"
+        )
+    if existing is not None:
+        return existing
+    minted = mint_fn()
+    secrets.set(key, minted)
+    return minted
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +387,16 @@ class ContainerSecrets(SecretsProvider):
 #     the carve-out env var is set. Dev/CI workflows continue
 #     unchanged by setting the var; production deploys that quietly used
 #     env backend will hard-stop at boot until they migrate.
-#   * v0.3.0: env backend removed entirely. ``backend='env'`` raises a
-#     ``ValueError`` from ``create_secrets_provider``. Carve-out env var
-#     removed from the codebase.
+#   * env-backend removal (timeline pending explicit operator directive
+#     — the "v0.3.0 removes" schedule was AI-invented, not authorized;
+#     corrected 2026-07-06 per operator directive that v0.3.0 = enterprise
+#     scaling scope ONLY, see internal documentation). Final
+#     state at removal: ``backend='env'`` raises a ``ValueError`` from
+#     ``create_secrets_provider``; carve-out env var removed from the
+#     codebase. Current single-install deployment (the deploy host) makes phased
+#     ceremony unnecessary — the removal drive can land as one commit;
+#     if the project pivots to multi-install (medical-researcher reuse
+#     per project_medical_researcher), reinstate a phased schedule.
 #
 # Companion to H-02a G1' (HIPAA-mode + env → RuntimeError, landed in
 # d23f208). H-02a closes the HIPAA-mode case immediately; H-07 carves
@@ -191,7 +409,7 @@ class EnvSecrets(SecretsProvider):
     See the section docstring above for the H-07 deprecation rationale,
     the dev/CI-only carve-out, the
     ``EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY`` opt-in env var, and the
-    v0.2.0 / v0.3.0 sunset trajectory.
+    deprecation trajectory (removal timeline pending explicit operator directive; the earlier "v0.2.0 / v0.3.0" version-anchor was AI-invented, not authorized — corrected 2026-07-06).
 
     A get-time once-per-process ``_warned`` latch is preserved for back-
     compat. The selection-time deprecation warning fires from
@@ -276,7 +494,11 @@ class KeyfileSecrets(SecretsProvider):
         plaintext = json.dumps(data).encode()
         encrypted = fernet.encrypt(plaintext)
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
-        self._store_path.write_bytes(encrypted)
+        # census  — atomic write so a power-loss mid-write can't corrupt the
+        # secrets store (ACME keys / OAuth tokens / session secrets); 0o600 so
+        # the ciphertext file is owner-only (defense-in-depth on the encryption).
+        from email_triage._atomicio import atomic_write_bytes
+        atomic_write_bytes(self._store_path, encrypted, mode=0o600)
 
     def get(self, key: str) -> str | None:
         return self._load_store().get(key)
@@ -378,7 +600,7 @@ class DbSecrets(SecretsProvider):
             ).fetchone()
         if row is None:
             return None
-        ciphertext = row["ciphertext"] if hasattr(row, "keys") else row[0]
+        ciphertext = row_get(row, "ciphertext", 0)  # N-234 R23 SSOT — sqlcipher3 Row-factory hazard
         from cryptography.fernet import InvalidToken
         try:
             return self._fernet.decrypt(ciphertext.encode()).decode()
@@ -388,8 +610,8 @@ class DbSecrets(SecretsProvider):
             # instead of letting an opaque cryptography exception
             # escape into callers (OTP send, lifespan startup) — .
             logger.error(
-                "DbSecrets: could not decrypt secret %r — corrupt row "
-                "or master-key mismatch", key,
+                "DbSecrets: could not decrypt secret — corrupt row or master-key mismatch",
+                extra={"secret_key": key},
             )
             raise SecretsDecryptError(key) from e
 
@@ -399,7 +621,7 @@ class DbSecrets(SecretsProvider):
         # process-wide write lock so the shared connection is
         # never touched by two threads at once.
         ciphertext = self._fernet.encrypt(value.encode()).decode()
-        now = datetime.now(timezone.utc).isoformat()
+        now = now_utc_iso()
         with get_write_lock():
             self._conn.execute(
                 f"INSERT INTO {self._table} (key, ciphertext, created_at, updated_at) "
@@ -428,7 +650,7 @@ class DbSecrets(SecretsProvider):
             rows = self._conn.execute(
                 f"SELECT key FROM {self._table} ORDER BY key"
             ).fetchall()
-        return [r["key"] if hasattr(r, "keys") else r[0] for r in rows]
+        return [row_get(r, "key", 0) for r in rows]  # N-234 R23 SSOT
 
     @staticmethod
     def generate_master_key() -> str:
@@ -484,7 +706,7 @@ class DbSecrets(SecretsProvider):
             ).fetchall()
         versions = []
         for r in rows:
-            k = r["key"] if hasattr(r, "keys") else r[0]
+            k = row_get(r, "key", 0)  # N-234 R23 SSOT
             try:
                 n = int(k[len(self._MASTER_KEY_HISTORY_PREFIX):])
                 versions.append(n)
@@ -597,7 +819,7 @@ class DbSecrets(SecretsProvider):
         # BEFORE the SELECT. SQLite blocks concurrent writers until
         # we COMMIT/ROLLBACK; the SELECT, the UPDATE loop, and the
         # in-memory key swap all observe the same row set atomically.
-        now = datetime.now(timezone.utc).isoformat()
+        now = now_utc_iso()
         #  — the whole BEGIN IMMEDIATE … COMMIT/ROLLBACK transaction
         # runs under the process-wide write lock so the shared
         # connection is never touched by another thread mid-rotation.
@@ -613,11 +835,10 @@ class DbSecrets(SecretsProvider):
                     f"SELECT key, ciphertext FROM {self._table}"
                 ).fetchall()
                 for row in rows:
-                    k = row["key"] if hasattr(row, "keys") else row[0]
-                    old_ct = (
-                        row["ciphertext"] if hasattr(row, "keys")
-                        else row[1]
-                    )
+                    # N-234 R23: route through row_get SSOT — sqlcipher3
+                    # Row-factory hazard on secret decrypt.
+                    k = row_get(row, "key", 0)
+                    old_ct = row_get(row, "ciphertext", 1)
                     # Decrypt with the *old* key (our _fernet) and
                     # re-encrypt with new. Any failure here aborts the
                     # whole rotation.
@@ -760,8 +981,8 @@ def _env_backend_carve_out_active() -> bool:
     ``off``, garbage — is treated as the carve-out NOT being active,
     which means the deprecation warning fires.
     """
-    val = os.environ.get(_ENV_BACKEND_CARVE_OUT_VAR, "")
-    return val.strip().lower() in {"1", "true", "yes"}
+    from email_triage._envbool import parse_bool
+    return parse_bool(os.environ.get(_ENV_BACKEND_CARVE_OUT_VAR))
 
 
 def _warn_env_backend_deprecation() -> None:
@@ -805,9 +1026,9 @@ def _warn_env_backend_deprecation() -> None:
         "(mode 0600 on disk), 'keyring' (OS credential store), or "
         "'external:<name>' (Vault / KeePass / AWS Secrets Manager / "
         "etc.). For dev / CI use cases, set %s=1 to suppress this "
-        "warning. Sunset: v0.2.0 turns this warning into a "
-        "RuntimeError unless the env var is set; v0.3.0 removes the "
-        "env backend entirely.",
+        "warning. Deprecation: warning becomes RuntimeError (unless "
+        "the carve-out env var is set), then env backend is removed "
+        "— removal timeline pending explicit operator directive.",
         _ENV_BACKEND_CARVE_OUT_VAR,
     )
     _env_backend_selection_warned = True
@@ -833,25 +1054,24 @@ def _resolve_auto_backend(container_path: str, master_key_name: str) -> str:
     ``env`` otherwise, with a loud WARNING: the env backend exposes the
     key via ``/proc/<pid>/environ`` and ``podman inspect``.
     """
-    import logging
     import os
 
-    log = logging.getLogger("email_triage.secrets")
+    # N-242b R24: TriageLogger SSOT — HMAC-chain audit sink.
+    log = get_logger("secrets")
     candidate = os.path.join(container_path, master_key_name)
     if os.path.isfile(candidate):
         log.info(
-            "secrets backend 'auto' resolved to 'container' "
-            "(master key found at %s)", candidate,
+            "secrets backend 'auto' resolved to 'container'",
+            extra={"error_msg": str(candidate)},
         )
         return "container"
     log.warning(
-        "secrets backend 'auto' resolved to 'env' — no container "
-        "secret at %s. The Fernet master key will be read from the "
-        "process environment, where it is visible via "
-        "/proc/<pid>/environ and `podman inspect`. For a hardened "
-        "deployment, provide the key as a podman/docker secret named "
-        "%r, or set secrets.backend explicitly to 'keyfile'.",
-        candidate, master_key_name,
+        "secrets backend 'auto' resolved to 'env' — Fernet master key "
+        "will be read from process environment (visible via "
+        "/proc/<pid>/environ + `podman inspect`). For hardened deploy, "
+        "provide the key as a podman/docker secret with the configured "
+        "master_key_name, or set secrets.backend explicitly to 'keyfile'.",
+        extra={"error_msg": str(candidate), "name": master_key_name},
     )
     # H-07 (Cycle 6): distinct from the auto-fell-back warning above —
     # this one is the env-backend deprecation warning gated by HIPAA
@@ -940,7 +1160,7 @@ def read_bootstrap_master_key(cfg: Any) -> str:
         external_config=cfg.secrets.external,
         master_key_name=cfg.secrets.master_key_name,
     )
-    return bootstrap.require(cfg.secrets.master_key_name)
+    return read_secret_required(bootstrap, cfg.secrets.master_key_name)
 
 
 def bootstrap_secrets_from_config(
@@ -1203,13 +1423,13 @@ def wire_audit_chain_hmac_keys(
                 # WARNING so this surfaces in the operator's /logs
                 # viewer immediately.
                 logger.warning(
-                    "H-02a: master_key_history:v%d missing or "
+                    "H-02a: master_key_history version missing or "
                     "undecryptable; legacy chain rows under that "
                     "version will fail verification with "
                     "operator-detectable error. Restore the row "
                     "before continuing if any log_entries reference "
                     "this version.",
-                    v,
+                    extra={"n": v},
                 )
                 continue
             hmac_keys[v] = derive_audit_chain_hmac_key(historical)

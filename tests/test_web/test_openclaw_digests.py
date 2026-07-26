@@ -1,4 +1,4 @@
-"""Tests for the /api/openclaw/accounts/{id}/digests CRUD surface."""
+"""Tests for the /api/v1/accounts/{id}/digests CRUD surface."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ class TestList:
     ):
         acct_id = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{acct_id}/digests",
+            f"/api/v1/accounts/{acct_id}/digests",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -66,7 +66,7 @@ class TestList:
     def test_unauth_is_401(self, client, db, admin_user):
         acct_id = _make_account(db, admin_user["id"])
         resp = client.get(
-            f"/api/openclaw/accounts/{acct_id}/digests",
+            f"/api/v1/accounts/{acct_id}/digests",
         )
         assert resp.status_code == 401
 
@@ -88,7 +88,7 @@ class TestCreate:
             "filter": {"categories": ["newsletter"]},
         }
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/digests",
+            f"/api/v1/accounts/{acct_id}/digests",
             json=body, headers=bearer,
         )
         assert resp.status_code == 200
@@ -106,7 +106,7 @@ class TestCreate:
             "schedule": {"cadence": "daily", "time_local": "08:10"},
         }
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/digests",
+            f"/api/v1/accounts/{acct_id}/digests",
             json=body, headers=bearer,
         )
         assert resp.status_code == 400
@@ -135,7 +135,7 @@ class TestPatch:
             ),
         )
         resp = client.patch(
-            f"/api/openclaw/accounts/{acct_id}/digests/{seeded.id}",
+            f"/api/v1/accounts/{acct_id}/digests/{seeded.id}",
             json={"enabled": False}, headers=bearer,
         )
         assert resp.status_code == 200
@@ -153,7 +153,7 @@ class TestPatch:
         list_digest_configs(db, acct_id)  # triggers preset creation
         # Try to demote preset to a custom-named thing.
         resp = client.patch(
-            f"/api/openclaw/accounts/{acct_id}/digests/{PRESET_ID}",
+            f"/api/v1/accounts/{acct_id}/digests/{PRESET_ID}",
             json={
                 "name": "should not stick",
                 "kind": "custom",
@@ -187,7 +187,7 @@ class TestDelete:
             DigestConfig(kind="custom", name="bye"),
         )
         resp = client.delete(
-            f"/api/openclaw/accounts/{acct_id}/digests/{seeded.id}",
+            f"/api/v1/accounts/{acct_id}/digests/{seeded.id}",
             headers=bearer,
         )
         assert resp.status_code == 200
@@ -200,7 +200,7 @@ class TestDelete:
         acct_id = _make_account(db, admin_user["id"])
         list_digest_configs(db, acct_id)
         resp = client.delete(
-            f"/api/openclaw/accounts/{acct_id}/digests/{PRESET_ID}",
+            f"/api/v1/accounts/{acct_id}/digests/{PRESET_ID}",
             headers=bearer,
         )
         assert resp.status_code == 400
@@ -224,7 +224,7 @@ class TestValidateQuery:
             DigestConfig(kind="custom", name="x"),
         )
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/digests/{seeded.id}/"
+            f"/api/v1/accounts/{acct_id}/digests/{seeded.id}/"
             "validate-query",
             json={"advanced": ""}, headers=bearer,
         )
@@ -253,7 +253,7 @@ class TestTestSend:
             DigestConfig(kind="custom", name="x"),
         )
         resp = client.post(
-            f"/api/openclaw/accounts/{acct_id}/digests/{seeded.id}/"
+            f"/api/v1/accounts/{acct_id}/digests/{seeded.id}/"
             "test-send",
             headers=bearer,
         )

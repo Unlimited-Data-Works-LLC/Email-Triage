@@ -48,7 +48,8 @@ from email_triage.web.webauthn_auth import (
 
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
-    return init_db(str(tmp_path / "test.db"))
+    from _db_tracking import track
+    return track(init_db(str(tmp_path / "test.db")))
 
 
 @pytest.fixture
@@ -61,6 +62,44 @@ def user_id(db) -> int:
     )
     db.commit()
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Revoke bumps session_epoch
+# ---------------------------------------------------------------------------
+
+class TestRevokeBumpsSessionEpoch:
+    """Revoking a passkey must cut the owner's live sessions (bump
+    ``session_epoch``), not merely block the next login — a revoked
+    (possibly compromised) credential whose session survives is the gap."""
+
+    @staticmethod
+    def _epoch(db, user_id):
+        return db.execute(
+            "SELECT session_epoch FROM users WHERE id = ?", (user_id,),
+        ).fetchone()[0]
+
+    def test_revoke_bumps_owner_epoch(self, db, user_id):
+        kid = add_hardware_key(
+            db, user_id=user_id, credential_id=b"\x09" * 16,
+            public_key=b"p", sign_count=0, transports=[], aaguid=None,
+            nickname="yk",
+        )
+        before = self._epoch(db, user_id)
+        assert revoke_hardware_key(db, kid) is True
+        assert self._epoch(db, user_id) == before + 1
+
+    def test_idempotent_revoke_does_not_rebump(self, db, user_id):
+        kid = add_hardware_key(
+            db, user_id=user_id, credential_id=b"\x0a" * 16,
+            public_key=b"p", sign_count=0, transports=[], aaguid=None,
+            nickname="yk2",
+        )
+        assert revoke_hardware_key(db, kid) is True
+        mid = self._epoch(db, user_id)
+        # already revoked → rowcount 0 → MUST NOT bump again
+        assert revoke_hardware_key(db, kid) is False
+        assert self._epoch(db, user_id) == mid
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +504,7 @@ class TestFinishAuthenticationIntegration:
         return SimpleNamespace(new_sign_count=new_count)
 
     def test_sign_count_update_round_trip(self, db, user_id, monkeypatch):
-        """Verify path: existing hardware key, mock library verify,
+        """Verify path: existing passkey, mock library verify,
         finish_authentication updates sign_count and returns key id."""
         cred_id = b"\xcc" * 32
         kid = add_hardware_key(

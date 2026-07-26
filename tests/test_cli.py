@@ -113,6 +113,30 @@ class TestInit:
         data_dir = tmp_path / "triage" / "data"
         assert data_dir.is_dir()
 
+    def test_scaffolds_backup_section_loadable(self, tmp_path):
+        """ — the init scaffold carries a documented ``backup:`` block
+        (question 3: configurable via the CLI/init OR the UI). It must be
+        DISABLED by default and parse cleanly back through load_config so a
+        fresh install can fill it in without a YAML syntax surprise."""
+        import yaml
+
+        from email_triage.config import load_config
+
+        parser = build_parser()
+        args = parser.parse_args(["init", str(tmp_path / "triage")])
+        assert cmd_init(args) == 0
+
+        config_file = tmp_path / "triage" / "email-triage.yaml"
+        content = config_file.read_text()
+        assert "backup:" in content
+        raw = yaml.safe_load(content)
+        assert raw["backup"]["enabled"] is False  # OFF until a restore path exists
+
+        cfg = load_config(config_file)
+        assert cfg.backup.enabled is False
+        assert cfg.backup.cadence == "manual"
+        assert cfg.backup.encryption == "master-key"
+
     def test_refuses_if_exists(self, tmp_path):
         config_file = tmp_path / "email-triage.yaml"
         config_file.write_text("existing")
@@ -150,6 +174,43 @@ class TestInit:
             "deprecated path H-07 closes. New installs would otherwise "
             "land on the deprecation warning on first boot."
         )
+
+
+class TestBackupGenKeypairWindows:
+    """ — the `backup gen-keypair` admin tool must work on Windows.
+
+    The bug: its guidance printed a `→` (U+2192), which Windows' cp1252 console
+    cannot encode → UnicodeEncodeError killed the command AFTER its first ASCII
+    line but BEFORE it emitted the keys (exit 1, no usable output). The operator
+    hit this trying to generate a public-key-backup keypair on Windows. Two
+    independent fixes, each pinned below: (1) main() reconfigures stdout to UTF-8
+    (SSOT for the whole CLI); (2) the safety-critical keygen guidance is ASCII.
+    """
+
+    def test_gen_keypair_output_is_ascii_safe(self, capsys):
+        """The keygen output must be pure ASCII so it can't crash on ANY console
+        encoding — a future non-ASCII char reintroduced here fails this pin."""
+        rc = main(["backup", "gen-keypair"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        out.encode("ascii")  # raises UnicodeEncodeError if non-ASCII slipped back
+        assert "BEGIN PUBLIC KEY" in out
+        assert "BEGIN PRIVATE KEY" in out
+
+    def test_cli_main_forces_utf8_stdout(self, monkeypatch):
+        """SSOT class-fix: the CLI reconfigures stdout to UTF-8 at entry so ANY
+        non-ASCII CLI output survives a Windows cp1252 console — not just the
+        ASCII-ized gen-keypair. Pin via a real cp1252-backed stream."""
+        import io
+        import sys
+
+        buf = io.BytesIO()
+        stream = io.TextIOWrapper(buf, encoding="cp1252")
+        monkeypatch.setattr(sys, "stdout", stream)
+        rc = main(["backup", "gen-keypair"])
+        assert rc == 0
+        # main() reconfigured the cp1252 stream to UTF-8 before any output.
+        assert sys.stdout.encoding.lower().replace("-", "") == "utf8"
 
 
 class TestConfigValidate:
@@ -332,12 +393,14 @@ class TestProviderCloseFailureSurface_H275:
         # Exit code preserved.
         assert actual == return_value == 1
 
-    def test_both_call_sites_have_log_warning_not_bare_pass(self):
-        """Regression-pin: the byte-pattern at the two cli.py sites
-        must contain `log.warning("provider.close failed"...)` and NOT
-        the legacy `pass` swallow. This catches a future revert that
-        bypasses the unit tests above (e.g., someone refactors the
-        pattern and accidentally restores the bare pass).
+    def test_close_failure_log_is_centralized_not_swallowed(self):
+        """Regression-pin: the close-failure `log.warning(
+        "provider.close failed"...)` must EXIST and never be a bare `pass`
+        swallow. Post-N-131 the  log is CENTRALIZED in the
+        `_aclose_provider_quietly` helper (was inlined at the two mine sites);
+        all three CLI provider-close surfaces route close through it, in-loop.
+        The cross-loop `asyncio.run(provider.close())` shape that N-131 fixed is
+        pinned separately by test_cli_provider_close_in_loop_pin.py.
         """
         import re
         from pathlib import Path
@@ -347,18 +410,23 @@ class TestProviderCloseFailureSurface_H275:
         ).resolve().parent.parent.joinpath(
             "src", "email_triage", "cli.py",
         ).read_text(encoding="utf-8")
-        # Two sites must each have the post-#275 log.warning pattern.
-        # Count the live pattern + the legacy-bare-pass pattern.
+        # The post-#275 close-failure log must exist (>=1; centralized in the
+        # _aclose_provider_quietly helper). A future revert to a bare swallow
+        # drops this to 0 -> RED. N-131: match the log call itself — the except
+        # now binds `as e` + carries comment lines + uses error=fmt_exc(e) (NOT
+        # the dead exc_info=True that TriageLogger.warning silently drops, PD#10).
         post_fix = re.findall(
-            r'except Exception:\s*\n\s*log\.warning\("provider\.close failed"',
+            r'log\.warning\("provider\.close failed"',
             cli_src,
         )
+        # The legacy cross-loop close + bare-pass swallow must be gone.
         legacy_swallow = re.findall(
             r'asyncio\.run\(provider\.close\(\)\)\s*\n\s*except Exception:\s*\n\s*pass\b',
             cli_src,
         )
-        assert len(post_fix) == 2, (
-            f"expected 2 post-#275 sites, found {len(post_fix)}"
+        assert len(post_fix) >= 1, (
+            "expected >=1 post-#275 close-failure log site (centralized in "
+            f"_aclose_provider_quietly), found {len(post_fix)}"
         )
         assert len(legacy_swallow) == 0, (
             f"expected 0 legacy-bare-pass sites, found {len(legacy_swallow)}"

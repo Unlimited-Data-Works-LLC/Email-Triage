@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from _db_tracking import track
+
 from email_triage.actions.hipaa_sent_counter import HipaaSentCounterLoop
 from email_triage.engine.models import EmailMessage
 
@@ -48,7 +50,7 @@ def _make_db() -> sqlite3.Connection:
     the loop. Build a minimal CREATE TABLE that satisfies the
     foreign-key constraints in the v29/v33 tables.
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("""

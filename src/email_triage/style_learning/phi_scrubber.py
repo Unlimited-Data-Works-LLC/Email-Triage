@@ -93,7 +93,9 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger("email_triage.style_learning.phi_scrubber")
+from email_triage._int_utils import parse_int_or_none  # N-219c/42 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.style_learning.phi_scrubber")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +459,7 @@ def _layer3_scan_string(
         # NER libraries occasionally raise on malformed input. Log
         # + treat as no-entity-found (defense in depth — the regex
         # layer is still in place).
-        logger.warning(
+        logger.error(  # N-332: was .warning — silently swallowed exc_info on TriageLogger
             "phi_scrubber: NER analyzer raised, treating as no-match",
             exc_info=True,
         )
@@ -574,10 +576,7 @@ def scrub_descriptor(
 
     for field_name, (lo, hi) in SCHEMA_NUMERIC_RANGES.items():
         raw = descriptor.get(field_name)
-        try:
-            n = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            n = None
+        n = parse_int_or_none(raw)  # N-219c/42 R23: SSOT (None → None; non-numeric → None)
         if n is None or n < lo or n > hi:
             layer1_drops.append(field_name)
             cleaned[field_name] = lo

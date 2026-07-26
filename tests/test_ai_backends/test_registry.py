@@ -8,6 +8,7 @@ instead of the explicit "not implemented" message.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import pytest
 
@@ -33,10 +34,10 @@ def test_every_enum_value_has_registered_adapter():
 
 
 def test_registry_has_no_anthropic_entry():
-    """Per ``feedback_no_anthropic``, Anthropic must never appear in
+    """Per ``feedback_no_anthropic``, AI provider must never appear in
     the backend list. This test pins the exclusion at the registry
     layer; the SQL CHECK constraint pins it at the schema layer."""
-    assert "anthropic" not in BACKEND_TYPES
+    assert "AI provider" not in BACKEND_TYPES
 
 
 def test_check_constraint_in_sync():
@@ -45,7 +46,7 @@ def test_check_constraint_in_sync():
     the two layers would mean a row can exist that the registry can't
     load (or vice versa)."""
     from email_triage.web.db import init_db
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     try:
         # Read the table's CREATE SQL and extract the CHECK list.
         sql = conn.execute(
@@ -102,7 +103,7 @@ def test_register_backend_rejects_unknown_type():
             return ""
 
     with pytest.raises(KeyError, match="unknown backend type"):
-        register_backend("anthropic", Stub)
+        register_backend("AI provider", Stub)
 
 
 def test_register_backend_rejects_non_adapter():

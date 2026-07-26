@@ -1,0 +1,54 @@
+{
+  "_doc": "Shared test-vectors for the llm-host multi-host knob-precedence contract (design_leira_multihost_full §Knob-precedence). CONSUMED BY BOTH TWINS: tests/test_leira_multihost_symmetry.py (Python) + tests/leira_multihost_symmetry.Tests.ps1 (PowerShell). Prime Directive #1 (project_style_guide) — every SSOT ships a count-agnostic structural pin in the same change; this JSON is that SSOT. Adding a new vector here MUST make both twins add a new test case; if either twin skips a vector the symmetry harness fails. Vector IDs are stable + sortable so cross-twin failure output aligns line-by-line. Landed 2026-07-17 in Drive-A of the llm-host multi-host completion arc, closing the DA follow-on NTH from Drive-16 (state_2026-07-17_0900_edt).",
+  "_schema": {
+    "id": "sortable string (V01-, V02-, ...) — used in test IDs; sortable so parametrized output aligns cross-twin",
+    "name": "human label — echoed into failure output",
+    "env": "map of env-var -> value; missing keys unset. Empty object == no env set. Only OLLAMA_HOST/LEIRA_URL/OLLAMA_URL supported today (the multi-host knobs).",
+    "expect_active_host_name": "string; the value active_host_name() / (Get-LeiraActiveHost) MUST return. Absent when expect_raises is set.",
+    "expect_active_host_url": "OPTIONAL string; when set, both twins assert the resolved URL matches (Python: mod.LEIRA_URL; PS: (_ResolveActiveHost).Url). Skip when the vector is a name-only test.",
+    "expect_raises": "OPTIONAL string; the class-name a twin MUST raise. Only 'LeiraConfigError' supported today.",
+    "expect_message_contains": "OPTIONAL list of substrings; every element must be a substring of the raised exception message (case-sensitive)."
+  },
+  "vectors": [
+    {
+      "id": "V01-default-no-env",
+      "name": "no env set -> resolves to config default_host ('llm-host')",
+      "env": {},
+      "expect_active_host_name": "llm-host"
+    },
+    {
+      "id": "V02-explicit-known-host",
+      "name": "OLLAMA_HOST=llm-host -> explicit routing to hosts.llm-host",
+      "env": {"OLLAMA_HOST": "llm-host"},
+      "expect_active_host_name": "llm-host"
+    },
+    {
+      "id": "V03-explicit-unknown-host-raises",
+      "name": "OLLAMA_HOST=<unknown> -> LeiraConfigError typo trap (drawer rule 3)",
+      "env": {"OLLAMA_HOST": "the ML host"},
+      "expect_raises": "LeiraConfigError",
+      "expect_message_contains": ["the ML host", "known:", "llm-host"]
+    },
+    {
+      "id": "V04-llm-host-url-raw-bypass",
+      "name": "LEIRA_URL env -> raw URL bypasses hosts map (drawer rule 1)",
+      "env": {"LEIRA_URL": "http://ad-hoc-vector-04:11434/api/chat"},
+      "expect_active_host_name": "<env-url>",
+      "expect_active_host_url": "http://ad-hoc-vector-04:11434/api/chat"
+    },
+    {
+      "id": "V05-ollama-url-raw-bypass",
+      "name": "OLLAMA_URL env -> raw URL bypasses hosts map (drawer rule 2, LEIRA_URL alias)",
+      "env": {"OLLAMA_URL": "http://ad-hoc-vector-05:11434/api/chat"},
+      "expect_active_host_name": "<env-url>",
+      "expect_active_host_url": "http://ad-hoc-vector-05:11434/api/chat"
+    },
+    {
+      "id": "V06-raw-url-wins-over-typo",
+      "name": "OLLAMA_HOST=<unknown> + LEIRA_URL=<url> -> raw URL wins (rule 1 > rule 3, DA drive MF)",
+      "env": {"OLLAMA_HOST": "the ML host", "LEIRA_URL": "http://ad-hoc-vector-06:11434/api/chat"},
+      "expect_active_host_name": "<env-url>",
+      "expect_active_host_url": "http://ad-hoc-vector-06:11434/api/chat"
+    }
+  ]
+}

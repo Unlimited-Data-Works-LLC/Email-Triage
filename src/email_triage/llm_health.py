@@ -21,9 +21,9 @@ read concurrently; writes are infrequent (one per classifier failure
 dict mutation pattern ("set whole tuple under key") is enough — we
 do not need a lock here.
 
-Sibling drawer: ``feedback_no_anthropic.md`` (Anthropic API is not
+Sibling drawer: ``feedback_no_anthropic.md`` (AI provider API is not
 a supported LLM backend on this install — same reasoning that this
-module is provider-neutral; treat any future Anthropic backend the
+module is provider-neutral; treat any future AI provider backend the
 same way Ollama is treated).
 """
 
@@ -31,13 +31,15 @@ from __future__ import annotations
 
 import contextlib
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Optional
 
 
-_log = logging.getLogger("email_triage.llm_health")
+_log = get_logger("email_triage.llm_health")  # N-196b R21_4
 
 
 @dataclass
@@ -195,15 +197,28 @@ def is_unreachable_error(exc: BaseException) -> bool:
     """Return True if ``exc`` looks like an LLM-backend-unreachable
     failure that should trigger the circuit breaker.
 
-    We match by both type (``httpx.ConnectError`` and family) AND by
-    message substring ("All connection attempts failed") to catch
-    the case where a different transport raises the same connect
-    failure under a different exception class.
+    We match by type (``httpx.ConnectError`` and family, plus a
+    ``503/502/504`` ``HTTPStatusError``) AND by message substring, to
+    catch the case where a different transport — or a downstream re-wrap
+    into another exception class — carries the same signal.
 
-    Kept narrow on purpose: a 429 / 500 / parse error is NOT an
-    "unreachable" error — those mean the backend is up but
-    misbehaving. We do not flip the breaker for those; the existing
-    per-message error path handles them.
+    What counts as "unreachable" (trips the breaker + is tagged
+    ``llm_unreachable`` so the retry drainer PARKS the message instead of
+    hammering it per-message):
+      * connect-class failures (can't reach the backend at all), AND
+      * a **503 Service Unavailable / 502 Bad Gateway / 504 Gateway
+        Timeout** from the LLM endpoint. These are WHOLE-BACKEND
+        "temporarily can't serve" signals — Ollama returns 503 when it is
+        out of memory / loading a model / its request queue is full
+        (server-overloaded), affecting EVERY request, not a specific one.
+        Treating them as per-message errors (the old behaviour) enqueued a
+        per-message retry for each in-flight message; by the time it ran
+        the message had been handled + moved by the normal watcher pass,
+        so the stale retry tombstoned it ``message_gone``.
+
+    Kept narrow otherwise: a 429 / **500** / parse error is NOT
+    "unreachable" — those mean the backend is up but the specific request
+    misbehaved, and the per-message error path correctly handles them.
     """
     try:
         import httpx
@@ -224,10 +239,31 @@ def is_unreachable_error(exc: BaseException) -> bool:
             httpx.RemoteProtocolError,
         )):
             return True
+        # 503/502/504 = whole-backend "service unavailable / gateway"
+        # signal (Ollama 503 = overloaded / OOM / queue-full). Treat as
+        # unreachable so the breaker backs off the backend instead of
+        # retrying per-message. A 500 / 4xx stays per-message (see above).
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = getattr(
+                getattr(exc, "response", None), "status_code", None,
+            )
+            if code in (502, 503, 504):
+                return True
     msg = str(exc).lower()
     if "all connection attempts failed" in msg:
         return True
     if "connection refused" in msg:
+        return True
+    # Safety net: a 503/502/504 whose httpx type was re-wrapped upstream
+    # (e.g. re-raised as a RuntimeError carrying the httpx error string
+    # "Server error '503 Service Unavailable' for url ...", or Ollama's
+    # own "server overloaded" body). 500 is deliberately excluded.
+    if (
+        "503 service unavailable" in msg
+        or "502 bad gateway" in msg
+        or "504 gateway timeout" in msg
+        or "server overloaded" in msg
+    ):
         return True
     return False
 
@@ -280,8 +316,9 @@ def translate_unreachable(
     backend is marked unhealthy for ``ttl_seconds`` and a typed
     :class:`LLMBackendUnreachableError` carrying host/port is raised.
     Any other exception (429 / 500 / parse error) propagates
-    unchanged — those mean the backend is up but misbehaving and the
-    per-message error path handles them.
+    unchanged — those mean the backend is up but the specific request
+    misbehaved, and the per-message error path handles them. (A
+    503/502/504 IS now treated as unreachable — see is_unreachable_error.)
 
     ``backend_name`` is the circuit-breaker key — it MUST match the
     name the :func:`is_healthy` gate resolves for this backend (the
@@ -300,7 +337,16 @@ def translate_unreachable(
             raise LLMBackendUnreachableError(
                 backend_name, host, port, original=exc,
             ) from exc
+        # N-185 R20_17: any non-unreachable exception (429 / 500 / parse
+        # error) means the backend WAS reachable — clear a stale breaker
+        # entry so recovery doesn't wait for the TTL-only ~300s drainer.
+        clear_unhealthy(backend_name)
         raise
+    else:
+        # N-185 R20_17: successful yield = the HTTP call round-tripped;
+        # clear a stale breaker entry immediately (TTL-only recovery
+        # extended the drainer stale window on transient outages).
+        clear_unhealthy(backend_name)
 
 
 # ---------------------------------------------------------------------------

@@ -50,9 +50,10 @@ Key design points:
 from __future__ import annotations
 
 import asyncio
-import imaplib
 import re
 from typing import Tuple
+
+from email_triage.providers.imap_fetch_transport import imap_connect
 
 
 # Strip ``\Recent`` from FLAGS — it's a session-only flag (RFC 3501
@@ -64,6 +65,38 @@ _FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
 # group, optionally quoted. Hierarchy delimiter (group 1) ignored
 # here; we just need the mailbox name to drive SELECT.
 _LIST_NAME_RE = re.compile(r'"[^"]?"\s+"?([^"]+?)"?\s*$')
+
+# RFC 6154 SPECIAL-USE flags for folders a WHOLE-MAILBOX topic scan must
+# skip: deleted (\Trash), spam (\Junk), unsent (\Drafts), and Gmail's
+# \All virtual folder (it mirrors every other folder → double-counts).
+# \Sent / \Archive / \Flagged / normal folders are KEPT (real
+# correspondence about a topic). Lower-cased for token comparison.
+_SPECIAL_USE_EXCLUDE_FLAGS = (r"\trash", r"\junk", r"\drafts", r"\all")
+# Leaf-name fallback for servers that do NOT advertise SPECIAL-USE flags
+# (substring match against the last path component, case-insensitive).
+_SPECIAL_USE_NAME_TOKENS = (
+    "trash", "deleted", "junk", "spam", "bulk", "draft", "all mail",
+)
+
+
+def _folder_excluded_from_topic_scan(list_line: str, name: str) -> bool:
+    """True if a LIST entry is a special-use folder a whole-mailbox topic
+    scan must skip (deleted / spam / drafts / Gmail-All-Mail dedup).
+
+    Primary signal: RFC 6154 SPECIAL-USE flags in the LIST ``(\\flags)``
+    prefix (precise — the server declares the folder's role). Fallback: a
+    leaf-name heuristic for servers that don't advertise SPECIAL-USE. Used
+    by the topic back-scan (``exclude_special_use=True``); the default
+    cross-folder search keeps the prior behaviour (no exclusion).
+    """
+    # Flags live in the parenthesised prefix: (\HasNoChildren \Trash) ...
+    lp, rp = list_line.find("("), list_line.find(")")
+    flag_tokens = list_line[lp + 1 : rp].lower().split() if 0 <= lp < rp else []
+    for fl in _SPECIAL_USE_EXCLUDE_FLAGS:
+        if fl in flag_tokens:
+            return True
+    leaf = re.split(r"[./]", name.strip().lower())[-1].strip()
+    return any(tok in leaf for tok in _SPECIAL_USE_NAME_TOKENS)
 
 
 def _quote_mailbox(name: str) -> str:
@@ -116,10 +149,7 @@ def _blocking_fetch(
         shape). The caller wraps this in the provider's own
         error semantics.
     """
-    if use_ssl:
-        client = imaplib.IMAP4_SSL(host, port)
-    else:
-        client = imaplib.IMAP4(host, port)
+    client = imap_connect(host, port, use_ssl=use_ssl)
 
     try:
         typ, _ = client.login(username, password)
@@ -278,10 +308,7 @@ def _blocking_fetch_batch(
     if not uids:
         return []
 
-    if use_ssl:
-        client = imaplib.IMAP4_SSL(host, port)
-    else:
-        client = imaplib.IMAP4(host, port)
+    client = imap_connect(host, port, use_ssl=use_ssl)
 
     try:
         typ, _ = client.login(username, password)
@@ -391,6 +418,7 @@ def _blocking_search_all_folders(
     password: str,
     criteria: str,
     limit: int,
+    exclude_special_use: bool = False,
 ) -> list[tuple[str, str]]:
     """Cross-folder UID search via stdlib imaplib.
 
@@ -408,10 +436,7 @@ def _blocking_search_all_folders(
     bugs (upstream issue ) don't apply. One TLS connection per
     cross-folder call; folder-loop happens in-process.
     """
-    if use_ssl:
-        client = imaplib.IMAP4_SSL(host, port)
-    else:
-        client = imaplib.IMAP4(host, port)
+    client = imap_connect(host, port, use_ssl=use_ssl)
 
     pairs: list[tuple[str, str]] = []
     try:
@@ -433,8 +458,16 @@ def _blocking_search_all_folders(
             if "\\Noselect" in line:
                 continue
             m = _LIST_NAME_RE.search(line)
-            if m:
-                folder_names.append(m.group(1))
+            if not m:
+                continue
+            name = m.group(1)
+            # Topic back-scan: skip deleted/spam/drafts/Gmail-All-Mail so a
+            # whole-mailbox scan never resurrects user-deleted or quarantined
+            # PHI into a digest, and never double-counts via the \All virtual
+            # folder. Opt-in — the default cross-folder search is unchanged.
+            if exclude_special_use and _folder_excluded_from_topic_scan(line, name):
+                continue
+            folder_names.append(name)
 
         # Quote each name for IMAP wire (see :func:`_quote_mailbox`).
         for fname in folder_names:
@@ -496,6 +529,7 @@ async def search_all_folders_blocking(
     password: str,
     criteria: str,
     limit: int,
+    exclude_special_use: bool = False,
 ) -> list[tuple[str, str]]:
     """Async wrapper around :func:`_blocking_search_all_folders`.
 
@@ -505,6 +539,11 @@ async def search_all_folders_blocking(
     (each fetch opens its own connection per
     :func:`fetch_message_blocking`), so the search→fetch pipeline
     parallelises naturally.
+
+    ``exclude_special_use`` (default False keeps the prior behaviour)
+    skips RFC 6154 deleted/spam/drafts/All-Mail folders — used by the
+    topic back-scan so a whole-mailbox scan never rakes user-deleted or
+    quarantined PHI into a digest.
     """
     return await asyncio.to_thread(
         _blocking_search_all_folders,
@@ -515,4 +554,5 @@ async def search_all_folders_blocking(
         password=password,
         criteria=criteria,
         limit=limit,
+        exclude_special_use=exclude_special_use,
     )

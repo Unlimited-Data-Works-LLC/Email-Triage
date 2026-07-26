@@ -439,6 +439,45 @@ class TestO365PushChipRender:
         # Subscription id surfaced (truncated).
         assert "sub-active" in body
 
+    def test_o365_err_clientstate_persist_failed_surfaces(
+        self, client, db, admin_user, admin_cookies,
+    ):
+        """#7 (census 2026-06-10) — the `clientstate_persist_failed` redirect
+        code (push.py emits it when the verification secret can't be saved) was
+        SET with NO read-branch in _edit.html, so the operator landed on a blank
+        tab. Assert it now renders a non-blank user-facing message."""
+        acct_id = _seed_o365_account(db, user_id=admin_user["id"])
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        client.raise_server_exceptions = True
+        resp = client.get(
+            f"/accounts/{acct_id}/edit?tab=integrations"
+            f"&o365_err=clientstate_persist_failed",
+        )
+        assert resp.status_code == 200
+        # (phrase contiguous on one template line — the message wraps after "used")
+        assert "couldn't save the secret used" in resp.text
+
+    def test_o365_err_unknown_code_surfaces_via_catchall(
+        self, client, db, admin_user, admin_cookies,
+    ):
+        """The catch-all `{% elif _o365_err %}` arm IS the count-agnostic
+        structural pin: ANY producer error code we don't have a specific
+        message for must still surface SOMETHING — never a silent blank tab.
+        A future push.py error code added without a template arm is caught
+        here, not swallowed."""
+        acct_id = _seed_o365_account(db, user_id=admin_user["id"])
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        client.raise_server_exceptions = True
+        resp = client.get(
+            f"/accounts/{acct_id}/edit?tab=integrations"
+            f"&o365_err=some_future_unhandled_code",
+        )
+        assert resp.status_code == 200
+        assert "Push couldn't start due to an unexpected error" in resp.text
+        # And a normal load (no o365_err) shows NO error chrome.
+        clean = client.get(f"/accounts/{acct_id}/edit?tab=integrations")
+        assert "Push couldn't start" not in clean.text
+
     def test_gmail_account_does_not_show_o365_section(
         self, client, db, admin_user, admin_cookies,
     ):
