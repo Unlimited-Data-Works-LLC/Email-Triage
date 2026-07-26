@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder — install dependencies and build the package
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
@@ -235,7 +235,7 @@ RUN pip install --no-cache-dir --no-deps --prefix=/install \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — minimal image with only what's needed
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # The canonical authorship + description for this image lives on
 # the OCI labels declared in .github/workflows/release.yml's
