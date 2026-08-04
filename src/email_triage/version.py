@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 from email_triage import __version__ as APP_VERSION
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
 
 
 # ---------------------------------------------------------------------------
@@ -278,18 +279,15 @@ def read_db_schema_version(db_path: str | Path) -> int:
     # sets WAL). The encrypted branch uses _make_encrypted_conn directly
     # (PRAGMA key first); under encryption the read is a harmless SELECT
     # on a read-write handle.
-    from email_triage.db._engine import (
-        dedicated_conn_is_encrypted,
-        open_dedicated_encrypted_conn_readish,
-    )
+    # the backlog  (Census v3 #8) — route through the SSOT
+    # ``open_dedicated_conn_readish`` (boot-encryption-aware RO opener).
+    # The pre-fix encrypted/plaintext hand-roll drifted vs init_db on
+    # ``timeout=30.0`` + ``cached_statements=0``; the SSOT carries the
+    # full argument set uniformly across the 7 census-flagged sites.
+    from email_triage.db._engine import open_dedicated_conn_readish
 
     try:
-        if dedicated_conn_is_encrypted():
-            conn = open_dedicated_encrypted_conn_readish(str(p))
-        else:
-            conn = sqlite3.connect(
-                f"file:{p}?mode=ro", uri=True, check_same_thread=False,
-            )
+        conn = open_dedicated_conn_readish(str(p))
     except sqlite3.Error:
         return 0
     except Exception:
@@ -298,19 +296,34 @@ def read_db_schema_version(db_path: str | Path) -> int:
         # any open failure" contract rather than crashing a banner render.
         return 0
     try:
-        try:
-            row = conn.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()
-        except sqlite3.OperationalError:
-            # Table not created yet — pre-framework install, or
-            # truly fresh DB.
-            return 0
-        if row is None or row[0] is None:
-            return 0
-        return int(row[0])
+        return read_schema_version(conn)
     finally:
         conn.close()
+
+
+def read_schema_version(conn: sqlite3.Connection) -> int:
+    """Pure, side-effect-free schema-version read off an OPEN connection:
+    ``MAX(version)`` from ``schema_migrations``, or 0 if the table is absent /
+    empty.
+
+    The SSOT for reading the applied schema version off a live connection
+    WITHOUT the migration-framework's ``_ensure_bookkeeping`` side effect
+    (``web.migrations.schema_version`` CREATEs the bookkeeping table on read —
+    correct for the framework, WRONG for a read-only banner/health render that
+    must never mutate). ``read_db_schema_version`` (path-based, above) and the
+    daily-health banner both route through it (census run15  — the raw
+    ``MAX(version)`` SELECT lived in two places). Does NOT close ``conn`` (the
+    caller owns its lifecycle)."""
+    try:
+        row = conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Table not created yet — pre-framework install, or truly fresh DB.
+        return 0
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
 
 
 _PREVIOUS_CAPS_ENV = "EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS"
@@ -342,11 +355,8 @@ def read_previous_schema_caps() -> Optional[int]:
     raw = os.environ.get(_PREVIOUS_CAPS_ENV, "").strip()
     if not raw or raw == "0":
         return None
-    try:
-        v = int(raw)
-    except ValueError:
-        return None
-    if v < 1:
+    v = parse_int_or_none(raw)  # N-219b R23: SSOT
+    if v is None or v < 1:
         return None
     return v
 

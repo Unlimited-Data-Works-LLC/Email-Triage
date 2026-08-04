@@ -35,6 +35,14 @@ class TestConfigPage:
         assert 'name="classifier_backend"' in resp.text
         assert 'name="classifier_model"' in resp.text
 
+    def test_config_shows_num_ctx_field(self, client, admin_cookies):
+        """ — the pinnable Ollama context-window field renders on the
+        general config tab (rule 17: assert the rendered view). StrictUndefined
+        would 500 here if config.classifier.num_ctx didn't exist."""
+        resp = client.get("/config", cookies=admin_cookies)
+        assert resp.status_code == 200
+        assert 'name="classifier_num_ctx"' in resp.text
+
     def test_config_shows_smtp_fields(self, client, admin_cookies):
         resp = client.get("/config", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -292,6 +300,28 @@ class TestConfigSave:
         assert resp.status_code == 200
         assert app.state.config.classifier.backend == "openai"
         assert app.state.config.classifier.model == "gpt-4o"
+
+    def test_save_classifier_num_ctx(self, client, app, admin_cookies):
+        """ — a numeric num_ctx posts through to config; blank clears it to
+        None (inherit). YAML FULL-REBUILD persistence is covered by
+        test_config_roundtrip.test_classifier_num_ctx_roundtrip."""
+        base = {"log_level": "INFO", "classifier_backend": "ollama",
+                "classifier_model": "qwen3.6:35b",
+                "classifier_ollama_url": "http://localhost:11434",
+                "smtp_port": "587", "logging_format": "text"}
+        resp = client.post(
+            "/config/save", data={**base, "classifier_num_ctx": "98304"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        assert app.state.config.classifier.num_ctx == 98304
+        # Blank clears it back to inherit (None).
+        resp2 = client.post(
+            "/config/save", data={**base, "classifier_num_ctx": ""},
+            cookies=admin_cookies,
+        )
+        assert resp2.status_code == 200
+        assert app.state.config.classifier.num_ctx is None
 
     def test_save_smtp_settings(self, client, app, admin_cookies):
         resp = client.post(

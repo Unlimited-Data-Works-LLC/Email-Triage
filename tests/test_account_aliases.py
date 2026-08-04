@@ -15,6 +15,7 @@ Covers the JSON-array-first cut:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -43,7 +44,7 @@ class TestMigrationV10:
     def test_fresh_db_has_aliases_column_with_empty_default(self):
         """A fresh init_db should create email_accounts with an
         ``aliases_json`` column whose default is the empty JSON array."""
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         try:
             cols = conn.execute(
                 "PRAGMA table_info(email_accounts)"
@@ -242,7 +243,7 @@ class TestNormalizeAliases:
 @pytest.fixture
 def db_with_account():
     """Init the DB and seed one user + one IMAP account."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "

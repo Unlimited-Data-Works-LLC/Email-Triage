@@ -30,7 +30,7 @@ allowlist so a misconfigured YAML can't slip a non-local backend
 through. The allowed set is a tuple constant -- adding to it is a
 privacy decision, not a config tweak.
 
-Anthropic is intentionally omitted from the allowlist on top of
+AI provider is intentionally omitted from the allowlist on top of
 the local-only restriction (project standing rule).
 """
 
@@ -38,16 +38,68 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from typing import Any, Sequence
 
 import httpx
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
 from email_triage.classify.base import _is_local_host
 from email_triage.triage_logging import get_logger
 
 log = get_logger("engine.embedding_backend")
+
+
+# ---------------------------------------------------------------------------
+#  — E5-family instruction-prefix + model-stamp helpers
+# ---------------------------------------------------------------------------
+# The intfloat E5 family (e.g. ``intfloat/multilingual-e5-base``) REQUIRES
+# an instruction prefix — ``query: `` on search queries, ``passage: `` on
+# indexed documents — applied SYMMETRICALLY at index + retrieve time.
+# Skipping it, or applying it on only one side, silently drops recall
+# ~5-10%. The other shipped models (all-MiniLM, nomic-embed, bge, gte) do
+# NOT use a prefix, so the helpers no-op for them. The prefix scheme is
+# encoded into the stored model STAMP (``<model>+e5prefix``) so toggling
+# the model (or the scheme) invalidates old rows via the existing
+# ``WHERE embedding_model = ?`` filter — write, retrieve, and reindex MUST
+# all use ``embedding_stamp`` so the values match.
+
+def is_e5_model(model: str) -> bool:
+    """True if ``model`` is an intfloat E5-family embedding model that
+    needs ``query:`` / ``passage:`` prefixes. ``e5`` must be a delimited
+    TOKEN (split on ``/ _ - .``), NOT any substring — so a future model
+    name containing a stray ``e5`` (e.g. ``...-v5e5-...``) can't
+    false-trigger the prefix + stamp once the model picker lets operators
+    type arbitrary names. Matches the curated fleet
+    (``intfloat/multilingual-e5-base``, ``e5-small``, ``e5-large-v2``);
+    the other shipped models (all-MiniLM, nomic-embed, bge, gte) have no
+    ``e5`` token.
+    """
+    import re
+    return any(
+        tok == "e5"
+        for tok in re.split(r"[/_.\-]", (model or "").lower())
+    )
+
+
+def e5_prefix(model: str, role: str) -> str:
+    """E5 instruction prefix for ``role`` (``"query"`` | ``"passage"``) —
+    e.g. ``"query: "`` — or ``""`` for non-E5 models. Prepend to the text
+    BEFORE embedding. MUST be symmetric: ``passage: `` at index + reindex,
+    ``query: `` at retrieve.
+    """
+    return f"{role}: " if is_e5_model(model) else ""
+
+
+def embedding_stamp(model: str) -> str:
+    """The value written to (and filtered on) ``sent_mail_index.
+    embedding_model``. Encodes the E5 prefix scheme so a model/scheme
+    change invalidates old rows. For non-E5 models the stamp == the bare
+    model name, so existing rows + behaviour are unchanged.
+    """
+    m = model or ""  # always a str — a None model must not become a
+    # SQL-NULL stamp that the retrieve filter binds + silently 0-matches.
+    return f"{m}+e5prefix" if is_e5_model(m) else m
 
 
 class _BackendMetrics:
@@ -76,7 +128,7 @@ class _BackendMetrics:
         self._latency_sum: float = 0.0
         self.last_error: str = ""
         self.last_error_at: str = ""
-        self.started_at: str = datetime.now(timezone.utc).isoformat()
+        self.started_at: str = now_utc_iso()
         # Per-instance namespace for the Redis mirror. Empty string
         # disables persistence (test paths + tooling that don't want
         # to touch Redis pass "" or leave the default).
@@ -109,11 +161,18 @@ class _BackendMetrics:
         # can be recomputed on read (sum_us / calls). Integer-only
         # because HINCRBY rejects floats.
         self._mirror("latency_us_sum", int(latency_secs * 1_000_000))
+        # N-215 R23 (2026-07-02, census R23_9): clear stale last_error /
+        # last_error_at on success — the pre-N-215 set-broad/clear-narrow
+        # shape (record_failure sets both, record_success never cleared) left
+        # /health reporting a stale error indefinitely for a backend that had
+        # recovered. Pair edges through the SAME funnel.
+        self.last_error = None
+        self.last_error_at = None
 
     def record_failure(self, exc: BaseException) -> None:
         self.errors += 1
         self.last_error = type(exc).__name__
-        self.last_error_at = datetime.now(timezone.utc).isoformat()
+        self.last_error_at = now_utc_iso()
         self._mirror("errors")
 
     @property
@@ -167,10 +226,16 @@ class OllamaEmbeddingBackend:
         base_url: str = "http://localhost:11434",
         timeout: float = 30.0,
         local_url_suffixes: Sequence[str] = (),
+        keep_alive: str | int = "10m",
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout = float(timeout)
+        # N-431 (2026-07-19) — Ollama ``keep_alive`` payload option, threaded
+        # through /api/embeddings via the shared SSOT ``_ollama_reuse``.
+        # Was previously absent; Ollama's default "5m" would evict a
+        # Forever-pinned embedding model every 5 min silently.
+        self._keep_alive: str | int = keep_alive
         # Persistence namespace: "embedding:ollama" — distinct from
         # SentenceTransformers so the operator can tell which member
         # of a fallback chain absorbed traffic over the long horizon.
@@ -180,7 +245,7 @@ class OllamaEmbeddingBackend:
         # Long-lived httpx client. The RAG indexer fires N
         # embed_text calls per index_recent batch + every draft-reply
         # retrieval — each previously paid a fresh TLS handshake.
-        self._http = LazyHttpClient(timeout=self._timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=self._timeout)
         # The sent-mail-index module's privacy guarantee depends on
         # the embedding backend speaking ONLY to a local Ollama
         # instance. Surface a hard error at construction when the
@@ -204,19 +269,53 @@ class OllamaEmbeddingBackend:
             )
 
     async def embed_text(self, text: str) -> list[float]:
-        """Embed ``text`` via Ollama and return the float vector."""
+        """Embed ``text`` via Ollama and return the float vector.
+
+        N-220 R22 (2026-07-02): the POST /api/embeddings is wrapped in the
+        shared circuit-breaker helper :func:`llm_health.translate_unreachable`
+        AND the :mod:`metrics` ``et_llm_embed_seconds`` timer. Prior to
+        N-220 a dead Ollama on the M-4 sent-mail-index or draft-reply
+        retrieval path raised a raw ``httpx.ConnectError`` — the fallback
+        backend caught it silently, so the ``ollama`` circuit breaker never
+        tripped and /metrics carried zero embedding latency for the
+        Ollama path.
+        """
         start = time.monotonic()
+        # N-384 (2026-07-10 wf_69674c7e-c67, HIGH): emit the outcome-counter
+        # twin — the timer records latency but was blind to the failure edge.
+        # ``parse_failed`` covers the shape-mismatch fall-through (non-list
+        # embedding, unfloatable element) — the returned ``[]`` is the caller-
+        # facing "we couldn't build a vector" signal, so it earns a
+        # counter-visible failure alongside its (already-recorded) success
+        # signal on the internal circuit-breaker metrics.
+        from email_triage import metrics as _metrics
+        outcome = "transport_error"
         try:
             payload = {"model": self._model, "prompt": text}
-            client = await self._http.get()
-            resp = await client.post(
-                f"{self._base_url}/api/embeddings", json=payload,
-            )
-            resp.raise_for_status()
+            from email_triage.llm_health import translate_unreachable
+            from email_triage._ollama_reuse import merge_reuse_options
+            with _metrics.timer("et_llm_embed_seconds", backend="ollama"), \
+                    translate_unreachable(
+                        "ollama", self._base_url, default_port=11434,
+                    ):
+                client = await self._http.get()
+                # N-431 (2026-07-19) — SSOT injects ``keep_alive``. The
+                # embedding backend was previously absent this field; a
+                # long-running RAG index build would burn the model reload
+                # cost every 5 min silently.
+                await merge_reuse_options(
+                    payload, self._base_url, self._model, client,
+                    default_keep_alive=self._keep_alive,
+                )
+                resp = await client.post(
+                    f"{self._base_url}/api/embeddings", json=payload,
+                )
+                resp.raise_for_status()
             body = resp.json() or {}
             vec = body.get("embedding") or []
             if not isinstance(vec, list):
                 self._metrics.record_success(time.monotonic() - start)
+                outcome = "parse_failed"
                 return []
             # Coerce defensively -- Ollama returns plain floats but a
             # forked / proxied endpoint might leak ints or strings.
@@ -226,12 +325,16 @@ class OllamaEmbeddingBackend:
                     out.append(float(v))
                 except (TypeError, ValueError):
                     self._metrics.record_success(time.monotonic() - start)
+                    outcome = "parse_failed"
                     return []
             self._metrics.record_success(time.monotonic() - start)
+            outcome = "success"
             return out
         except Exception as e:
             self._metrics.record_failure(e)
             raise
+        finally:
+            _metrics.emit_llm_outcome("embed", "ollama", outcome)
 
     def metrics(self) -> dict[str, Any]:
         """Per-backend operational counters for /admin/stats + /health."""
@@ -291,6 +394,32 @@ class SentenceTransformersBackend:
         )
         self._embedding_dimension: int | None = None
 
+    def _resolve_staged_model_path(self) -> str | None:
+        """The local path to the embedding-bits-staged model dir, or ``None``.
+
+        The offline installer stages a model at
+        ``$HF_HOME/<hf_cache_dir_for_model(model_name)>/`` (a flat ST dir).
+        Loading THAT path directly is the only air-gap-safe load (modern ST
+        ignores the flat dir in its hub-cache resolution and would hit the
+        network). ``hf_cache_dir_for_model`` is the shared SSOT used by the
+        installer to choose the same dir. Returns ``None`` (→ bare-name
+        hub-download fallback) when ``HF_HOME`` is unset or nothing is staged.
+        """
+        import os
+        from pathlib import Path
+        hf_home = os.environ.get("HF_HOME")
+        if not hf_home:
+            return None
+        try:
+            from email_triage.embedding_bits import hf_cache_dir_for_model
+        except Exception:  # noqa: BLE001 — installer package not importable
+            return None
+        staged = Path(hf_home) / hf_cache_dir_for_model(self._model_name)
+        # A real staged model dir carries at least config.json (the model card).
+        if (staged / "config.json").is_file():
+            return str(staged)
+        return None
+
     def _load_model(self) -> Any:
         """Load the SentenceTransformer model on first use.
 
@@ -321,12 +450,20 @@ class SentenceTransformersBackend:
                     f"``pip install email-triage[embedding]``. "
                     f"Underlying error: {e}"
                 ) from e
+            # OFFLINE-SAFE LOAD. The embedding-
+            # bits installer stages the model in a FLAT sentence-transformers
+            # dir ``$HF_HOME/<hf_cache_dir_for_model(name)>/``. Modern ST does
+            # NOT find a flat dir via its hub-cache resolution, so on a true
+            # air-gap a bare-name load would reach for the network and FAIL
+            # (proven: flat-only + offline → ST tries huggingface.co). If the
+            # staged dir is present, load it by EXPLICIT PATH (ST loads a local
+            # dir directly, no network); else fall back to the bare name so an
+            # online/dev install still hub-downloads as before.
+            model_arg = self._resolve_staged_model_path() or self._model_name
             # Force CPU — the whole point of this backend is to skip GPU
             # contention with the chat model. ``device="cpu"`` overrides
             # any auto-detection that might pick the GPU if torch sees one.
-            self._model = SentenceTransformer(
-                self._model_name, device="cpu",
-            )
+            self._model = SentenceTransformer(model_arg, device="cpu")
             try:
                 dim = self._model.get_sentence_embedding_dimension()
                 self._embedding_dimension = (
@@ -478,6 +615,7 @@ def _build_single_backend(
     model: str,
     ollama_url: str,
     local_url_suffixes: Sequence[str],
+    keep_alive: str | int = "10m",
 ) -> Any:
     """Construct one backend by name; reusable for primary + fallback."""
     if backend == "ollama":
@@ -485,6 +623,7 @@ def _build_single_backend(
             model=model,
             base_url=ollama_url,
             local_url_suffixes=local_url_suffixes,
+            keep_alive=keep_alive,
         )
     if backend == "sentence_transformers":
         return SentenceTransformersBackend(model=model)
@@ -510,7 +649,7 @@ def build_embedding_backend(config: Any) -> Any | None:
     Both members must individually pass the local-only allowlist.
 
     Raises :class:`ValueError` when the config asks for a non-allowed
-    backend (e.g. ``backend: openai`` / ``backend: anthropic``). The
+    backend (e.g. ``backend: openai`` / ``backend: AI provider``). The
     error names the rule and the rejected value so the operator's
     log surface tells them exactly what to change.
     """
@@ -545,10 +684,19 @@ def build_embedding_backend(config: Any) -> Any | None:
     local_suffixes = tuple(
         getattr(getattr(config, "tls", None), "local_url_suffixes", []) or ()
     )
+    # N-431 (2026-07-19) — read the SAME ``ollama_keep_alive`` knob the
+    # classifier reads (``config.classifier.ollama_keep_alive``). The
+    # embedding-config section carries no per-embed keep_alive override
+    # today — one setting drives both paths so a Forever pin covers the
+    # whole install.
+    _keep_alive = str(getattr(
+        getattr(config, "classifier", None), "ollama_keep_alive", "10m",
+    ) or "10m")
 
     primary = _build_single_backend(
         backend, model=model, ollama_url=ollama_url,
         local_url_suffixes=local_suffixes,
+        keep_alive=_keep_alive,
     )
 
     # Optional fallback chain — only built when the YAML carries a
@@ -573,6 +721,7 @@ def build_embedding_backend(config: Any) -> Any | None:
         backup = _build_single_backend(
             fb_backend, model=fb_model, ollama_url=fb_url,
             local_url_suffixes=local_suffixes,
+            keep_alive=_keep_alive,
         )
     except ValueError as exc:
         log.warning(

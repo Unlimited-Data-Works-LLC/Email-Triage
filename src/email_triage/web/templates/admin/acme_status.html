@@ -268,9 +268,7 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
         </div>
         <label>
             TSIG shared secret (base64) — paste once, stored encrypted; leave blank to keep existing{{ m.help("Base64-encoded shared secret matching the key block on the nameserver. Stored encrypted in the secrets store on save; never written to YAML. Leave blank to preserve the stored value -- saving with this field empty does NOT zero the secret.") }}
-            <input type="password" name="rfc_tsig_secret_value"
-                   placeholder="leave blank if already set"
-                   autocomplete="off">
+            {{ m.secret_input("rfc_tsig_secret_value", false, "leave blank if already set") }}
             <small style="color:var(--pico-muted-color);">
                 Written to the secrets store under
                 <code>{{ rfc.tsig_secret_ref }}</code>; never persisted to YAML.
@@ -289,6 +287,9 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
         <div class="grid">
             <label>
                 Public resolvers (comma-separated IPs){{ m.help("Public recursive resolvers to query before signaling LE. The renewer waits until ALL of them see the TXT -- guards against the propagation window between authoritative and public DNS. Three is enough; more = slower gate without meaningfully better signal.") }}
+                {# Plain <input>, NOT m.combo_input: comma-separated
+                   multi-value field. A datalist autocompletes the whole
+                   value, so single-IP suggestions would clobber the list. #}
                 <input type="text" name="rfc_public_resolvers"
                        value="{{ rfc.public_resolvers | join(', ') }}"
                        placeholder="8.8.8.8, 1.1.1.1, 9.9.9.9">
@@ -311,7 +312,7 @@ sudo podman restart email-triage       # podman installs (no systemd)</pre>
         <div class="grid">
             <label>
                 rp_id (must match cert SAN; permanent — changing
-                invalidates registered keys){{ m.help("Hardware-key 'relying party' ID -- the domain credentials are bound to. Must match a SAN on the active cert. Permanent: changing it invalidates every registered hardware key. Use the bare hostname (no scheme, no port).") }}
+                invalidates registered keys){{ m.help("Passkey 'relying party' ID -- the domain credentials are bound to. Must match a SAN on the active cert. Permanent: changing it invalidates every registered passkey. Use the bare hostname (no scheme, no port).") }}
                 <input type="text" name="webauthn_rp_id"
                        value="{{ webauthn.rp_id }}"
                        placeholder="triage.example.com">

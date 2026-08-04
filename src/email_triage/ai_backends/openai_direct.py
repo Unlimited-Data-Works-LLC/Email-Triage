@@ -62,12 +62,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from urllib.parse import urlsplit
+from email_triage._secret_scrub import strip_url_query_secrets as _strip_sensitive_query_params
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.classify.base import JsonChatClassifier
 
-logger = logging.getLogger("email_triage.ai_backends.openai_direct")
+logger = get_logger("email_triage.ai_backends.openai_direct")  # N-196b R21_4
 
 # Default OpenAI public endpoint. Operators self-hosting LiteLLM /
 # vLLM / LM Studio / text-generation-webui override via the
@@ -144,40 +145,7 @@ class OpenAIAuthError(OpenAIError):
     """Raised when OpenAI rejects the api_key (401 / 403)."""
 
 
-def _strip_sensitive_query_params(url: str) -> str:
-    """Remove ``api-key`` / ``key`` / ``token`` / ``access_token`` /
-    ``code`` query params from URL.
-
-    Belt-and-suspenders: today the adapter never puts the key in the
-    URL (it goes in the ``Authorization: Bearer`` header), but
-    third-party OpenAI samples sometimes show ``?api-key=...`` patterns;
-    a future refactor that copy-pastes from one of those samples would
-    introduce a leak. Strip at error-render time so a leaked URL can't
-    surface plaintext in logs.
-    """
-    if not url or "?" not in url:
-        return url
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return url
-    sensitive = {"api-key", "key", "token", "access_token", "code"}
-    pairs = []
-    for raw in parts.query.split("&"):
-        if not raw:
-            continue
-        k, _, _v = raw.partition("=")
-        if k.lower() in sensitive:
-            pairs.append(f"{k}=REDACTED")
-        else:
-            pairs.append(raw)
-    new_query = "&".join(pairs)
-    return f"{parts.scheme}://{parts.netloc}{parts.path}" + (
-        f"?{new_query}" if new_query else ""
-    )
-
-
-from email_triage.ai_backends.base import BackendAdapter
+from email_triage.ai_backends.base import BackendAdapter, meter_chat_complete
 
 
 class OpenAIAdapter(BackendAdapter):
@@ -250,7 +218,7 @@ class OpenAIAdapter(BackendAdapter):
         # instance, reused across every chat_complete() call instead of
         # a fresh AsyncClient (TLS handshake) per call. Mirrors the
         # classify/* cloud classifiers and OllamaClassifier.
-        self._http = LazyHttpClient(timeout=timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
 
         # HIPAA gate posture mirrors classify.openai_compat — local
         # endpoints (localhost / RFC1918 / .local / operator-defined
@@ -269,6 +237,7 @@ class OpenAIAdapter(BackendAdapter):
     # Canonical W1-A method
     # ------------------------------------------------------------------
 
+    @meter_chat_complete  # N-194b R21_9: et_llm_chat_seconds metric
     async def chat_complete(
         self,
         messages: list[dict[str, Any]],
@@ -406,6 +375,13 @@ class OpenAIAdapter(BackendAdapter):
                 payload,
                 url,
             )
+        #  silent-truncation guard (shared SSOT) — a max_tokens cut yields
+        # invalid JSON for a classify / a mid-word cut for complete.
+        from email_triage.llm_truncation import warn_if_llm_truncated
+        warn_if_llm_truncated(
+            payload, family="openai", model=str(payload.get("model") or ""),
+            context="chat_complete", logger=logger,
+        )
         content = (
             choices[0].get("message", {}).get("content")
             or ""

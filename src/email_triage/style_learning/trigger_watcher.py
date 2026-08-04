@@ -91,6 +91,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from email_triage.triage_logging import is_account_hipaa
+from email_triage._isotime import parse_iso_aware  # N-357b R31 (was N-269c R28 parse_iso)
 from email_triage.web.db import (
     HIPAA_PER_CONTACT_TRIGGER_MIN_MESSAGES,
     HIPAA_SEND_COUNTER_AGGREGATE_HASH,
@@ -106,7 +107,8 @@ from email_triage.web.db import (
     reset_hipaa_send_counter,
 )
 
-log = logging.getLogger("email_triage.style_learning.trigger_watcher")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.style_learning.trigger_watcher")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -184,16 +186,13 @@ def _now() -> datetime:
 
 def _parse_iso(ts: str | None) -> datetime | None:
     """Tolerant ISO8601 parse. Returns None on any error so a corrupt
-    timestamp on a single row doesn't blow up the whole sweep."""
+    timestamp on a single row doesn't blow up the whole sweep.
+
+    N-357b (2026-07-06 baseline shrink): the private wrapper's body IS
+    the parse_iso_aware SSOT — collapsed to a direct call."""
     if not ts:
         return None
-    try:
-        out = datetime.fromisoformat(ts)
-    except (TypeError, ValueError):
-        return None
-    if out.tzinfo is None:
-        out = out.replace(tzinfo=timezone.utc)
-    return out
+    return parse_iso_aware(ts)
 
 
 def _eligible_hipaa_accounts(

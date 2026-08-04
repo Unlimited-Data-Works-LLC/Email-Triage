@@ -64,6 +64,7 @@ Two layers of coverage:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import ast
 import sqlite3
@@ -87,9 +88,9 @@ from email_triage.web.watcher_retry import enqueue_watcher_retry
 # Per pattern_count_agnostic_structural_drift_catch.md.
 # ---------------------------------------------------------------------------
 
-_WEB_DIR = (
-    Path(__file__).resolve().parent.parent / "src" / "email_triage" / "web"
-)
+from _pin_harness import SRC_ROOT, iter_src_files, parse_module  # N-350 R31
+
+_WEB_DIR = SRC_ROOT / "web"  # harness-rooted (R5b)
 
 
 def _ingestion_modules() -> list[Path]:
@@ -118,8 +119,8 @@ def _ingestion_modules() -> list[Path]:
     auto-covered with nothing to update.
     """
     mods: list[Path] = []
-    for path in sorted(_WEB_DIR.glob("**/*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in iter_src_files("web"):  # R5b harness walk
+        tree = parse_module(path); assert tree is not None, f"parse failed: {path}"  # N-350 R31
         if any(
             isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             and n.name == "enqueue_watcher_retry"
@@ -145,9 +146,9 @@ def _enqueue_watcher_retry_calls() -> list[tuple[Path, ast.Call]]:
     """
     calls: list[tuple[Path, ast.Call]] = []
     for module in _ingestion_modules():
-        tree = ast.parse(
-            module.read_text(encoding="utf-8"), filename=str(module)
-        )
+        tree = parse_module(module)
+        if tree is None:
+            continue  # skip unparseable modules (N-178 sweep)
 
         aliases: set[str] = set()
         for node in ast.walk(tree):
@@ -254,7 +255,7 @@ class TestIngestionEnqueueSitesStampFailureKind:
 
 @pytest.fixture
 def conn() -> sqlite3.Connection:
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     yield c
     c.close()
 

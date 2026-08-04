@@ -30,10 +30,14 @@ def _seed_gmail_account(db, user_id: int, *, name="acct") -> int:
 def _form_post(client, url, items, cookies=None):
     """POST a form with possibly duplicate keys (e.g. arrays).
 
-    httpx TestClient's ``data=`` kwarg silently drops list-of-tuple
-    input for arrays; use raw ``content=`` with the
-    application/x-www-form-urlencoded content type so the form
-    fields actually reach the server.
+    Uses raw ``content=`` with the application/x-www-form-urlencoded
+    content type. **Rationale:** httpx TestClient's dict-body kwarg
+    silently drops list-of-tuple input for arrays (which is exactly
+    the shape multi-value form fields need), so the array entries
+    never reach the server. Encoding via ``urlencode(items)`` on the
+    tuple list preserves the repetition, and shipping the encoded
+    string as ``content=`` bypasses TestClient's dict-body path
+    entirely.
     """
     body = urlencode(items)
     return client.post(
@@ -210,7 +214,7 @@ def test_save_empty_discovered_ids_refuses(
     aid = _seed_gmail_account(db, admin_user["id"])
     r = client.post(
         f"/accounts/{aid}/calendars/save",
-        data=[("discovered_ids", "")],
+        data={"discovered_ids": ""},
         cookies=admin_cookies,
     )
     assert r.status_code == 200
@@ -221,7 +225,7 @@ def test_save_anonymous_unauthorized(client, db, admin_user):
     aid = _seed_gmail_account(db, admin_user["id"])
     r = client.post(
         f"/accounts/{aid}/calendars/save",
-        data=[("discovered_ids", "primary")],
+        data={"discovered_ids": "primary"},
     )
     assert r.status_code == 401
 

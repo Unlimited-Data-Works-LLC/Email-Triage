@@ -36,11 +36,13 @@ alone (rollback safety net stays in place).
 from __future__ import annotations
 
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-logger = logging.getLogger("email_triage.backup_snapshot_cleanup")
+logger = get_logger("email_triage.backup_snapshot_cleanup")  # N-196b R21_4
 
 # Files matching this glob are treated as pre-upgrade snapshots. The
 # suffix encodes the commit_sha the deploy ran from; we don't parse

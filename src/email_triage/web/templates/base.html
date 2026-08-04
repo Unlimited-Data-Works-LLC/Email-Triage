@@ -20,6 +20,11 @@
     <link rel="stylesheet" href="/static/pico.min.css">
     <link rel="stylesheet" href="/static/style.css">
     <script src="/static/htmx.min.js"></script>
+    {# #130 — base64url SSOT (`window.ETBase64`). Loaded unconditionally
+       so unauth pages (login + login_dev_keypair) get it too, since
+       WebAuthn login on the anonymous login page needs URL-safe base64
+       decode/encode. Mirror-of Python `email_triage._base64url`. #}
+    <script src="/static/base64url.js"></script>
     {# CSRF shim — auto-attach X-CSRF-Token header on every
        state-changing fetch(). Loaded for authenticated callers only;
        skipped on the login page so unauthenticated /api/csrf-token
@@ -123,9 +128,11 @@
             <li><a href="/triage">Triage</a></li>
             <li><a href="/routes">Routes</a></li>
             <li><a href="/accounts">My Settings</a></li>
+            <li><a href="/clocks">Deadlines</a></li>
             <li><a href="/help/tasks">Help</a></li>
+            {% if user %}<li><a href="/help/me">Guide me</a></li>{% endif %}
 
-            {% if user.role == "admin" %}
+            {% if _admin_of(user) %}
             <li class="has-menu">
                 <button type="button" class="menu-trigger" onclick="this.blur()">Admin <span class="caret">▾</span></button>
                 <ul class="submenu">
@@ -148,13 +155,15 @@
             <li><a href="/triage">Triage</a></li>
             <li><a href="/routes">Routes</a></li>
             <li><a href="/accounts">My Settings</a></li>
+            <li><a href="/clocks">Deadlines</a></li>
             <li><a href="/help/tasks">Help</a></li>
-            {% if user.role == "admin" %}<li><a href="/users">Users</a></li>{% endif %}
-            {% if user.role == "admin" %}<li><a href="/config">Config</a></li>{% endif %}
-            {% if user.role == "admin" %}<li><a href="/admin/stats">Stats</a></li>{% endif %}
-            {% if user.role == "admin" %}<li><a href="/compliance">Compliance</a></li>{% endif %}
-            {% if user.role == "admin" %}<li><a href="/config?tab=backup">Backup</a></li>{% endif %}
-            {% if user.role == "admin" %}<li><a href="/logs">Logs</a></li>{% endif %}
+            {% if user %}<li><a href="/help/me">Guide me</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/users">Users</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/config">Config</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/admin/stats">Stats</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/compliance">Compliance</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/config?tab=backup">Backup</a></li>{% endif %}
+            {% if _admin_of(user) %}<li><a href="/logs">Logs</a></li>{% endif %}
         </ul>
 
         <ul class="nav-user">
@@ -431,6 +440,67 @@
             .catch(function () { /* silent: install prompt is opt-in */ });
         });
       }
+    </script>
+
+    <script>
+      /*
+       * 2026-07-13 — Viewer-local US datetime enhancer (operator ask).
+       *
+       * Any element with `data-us-datetime` gets its text rewritten to
+       * '7/13/2026 9:12:33 AM EDT' in the VIEWER'S local timezone,
+       * derived from `<time datetime="ISO-8601-UTC">`. Server renders
+       * a defensible server-local fallback (works with JS off / in email
+       * clients / in print); this enhancer overrides to viewer-local
+       * only when JS is available.
+       *
+       * Contract with server: an element carrying `data-us-datetime`
+       * MUST have a `datetime="..."` attribute holding an ISO-8601
+       * value the browser can parse (`new Date(iso)`). Malformed input
+       * leaves the server text untouched (defensive; no throw).
+       */
+      (function () {
+        function pad2(n) { return n < 10 ? '0' + n : String(n); }
+        function formatUsDatetime(date) {
+          if (!(date instanceof Date) || isNaN(date.getTime())) return null;
+          var month = date.getMonth() + 1;
+          var day = date.getDate();
+          var year = date.getFullYear();
+          var hour24 = date.getHours();
+          var hour12 = hour24 % 12 || 12;
+          var ampm = hour24 < 12 ? 'AM' : 'PM';
+          var tzMatch = date.toString().match(/\(([^)]+)\)$/);
+          var tzAbbrev = '';
+          if (tzMatch) {
+            // "Eastern Daylight Time" → "EDT"; single-word zones passed through.
+            tzAbbrev = tzMatch[1].split(/\s+/).map(function (w) {
+              return w.charAt(0);
+            }).join('');
+            // Fallback: if the zone is already an abbreviation (some browsers),
+            // the split-and-initial dance harmlessly yields the same string.
+          }
+          return month + '/' + day + '/' + year + ' ' +
+            hour12 + ':' + pad2(date.getMinutes()) + ':' +
+            pad2(date.getSeconds()) + ' ' + ampm +
+            (tzAbbrev ? ' ' + tzAbbrev : '');
+        }
+        function apply(root) {
+          var nodes = (root || document).querySelectorAll('[data-us-datetime]');
+          for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var iso = el.getAttribute('datetime') || el.textContent.trim();
+            var d = new Date(iso);
+            var s = formatUsDatetime(d);
+            if (s !== null) el.textContent = s;
+          }
+        }
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', function () { apply(); });
+        } else {
+          apply();
+        }
+        // Expose for htmx-fragment / dynamic-insertion callers.
+        window.applyUsDatetimes = apply;
+      })();
     </script>
 </body>
 </html>

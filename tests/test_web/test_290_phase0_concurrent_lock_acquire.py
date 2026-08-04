@@ -38,6 +38,7 @@ introduces the concurrent PRAGMA / cursor-cache hazard, this test
 fails fast.
 """
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 import logging
@@ -62,7 +63,7 @@ def temp_db(tmp_path):
     """File-backed DB with the Phase 0 fixes (cached_statements=0,
     cached _triage_db_path attribute, timeout=30)."""
     db_path = tmp_path / "triage.db"
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     init_lock_conn(str(db_path))
     yield conn, str(db_path)
     try:
@@ -229,7 +230,7 @@ def test_cached_statements_zero_on_init_db_connection():
     tmpdir = tempfile.mkdtemp()
     try:
         db_path = os.path.join(tmpdir, "triage.db")
-        conn = init_db(db_path)
+        conn = track(init_db(db_path))
         try:
             # No direct API to read cached_statements back; instead
             # we verify the conn was constructed with the kwarg by

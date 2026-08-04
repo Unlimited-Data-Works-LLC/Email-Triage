@@ -65,6 +65,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 import subprocess
@@ -72,10 +73,7 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
@@ -98,13 +96,64 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")  # we DO need to fetch initia
 # pip should never call home for version checks during our install.
 os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
 
-log = logging.getLogger("email_triage.embedding_bits")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.embedding_bits")  # N-196b R21_4
+
+
+# -e (2026-07-11) — CONFIG-DRIVEN sentence_transformers probe budget.
+# Pre-fix hardcoded ``timeout=60`` at the subprocess.run probe site.
+# Compute-bound wait for a Python interpreter import probe (not network).
+# Module-level SSOT with a boot-wired setter reading
+# ``config.classifier.st_probe_timeout_secs``.
+_ST_PROBE_TIMEOUT_SECS: float = 60.0
+
+
+def configure_st_probe_timeout(timeout_secs: float) -> None:
+    """-e — set the sentence_transformers subprocess probe budget.
+
+    Called at boot from ``load_config._wire_module_singletons``.
+    Rejects non-positive values.
+    """
+    global _ST_PROBE_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _ST_PROBE_TIMEOUT_SECS = float(timeout_secs)
 
 CHUNK = 64 * 1024
 DEFAULT_RUNTIME_DEPS = "/app/data/runtime-deps"
 DEFAULT_MANIFEST_PATH = "/app/scripts/embedding-bits-manifest.json"
 DOWNLOAD_TIMEOUT_SECS = 300
 PIP_TIMEOUT_SECS = 600
+
+
+def hf_cache_dir_for_model(model_name: str) -> str:
+    """The flat sentence-transformers cache-dir name for ``model_name`` — the
+    repo-id with ``/`` → ``_``, prefixing the implicit ``sentence-transformers/``
+    org for a bare name. THE SSOT for the on-disk staged-model dir
+    (``$HF_HOME/<dir>/``): the OFFLINE installer stages a model here and
+    ``engine.embedding_backend`` loads it from here by EXPLICIT PATH — modern
+    sentence-transformers won't find a flat dir via its hub-cache resolution, so
+    a true air-gap MUST load by path (verified on the deploy host 2026-06-11:
+    flat-dir-only + offline → ST tries the network and fails; explicit-path
+    load → OK). Mirrors ST's own legacy ``name.replace('/', '_')`` convention,
+    so a manifest's ``hf_cache_dir`` and this derivation are pinned-equal.
+
+    ``all-MiniLM-L6-v2`` → ``sentence-transformers_all-MiniLM-L6-v2``;
+    ``intfloat/multilingual-e5-base`` → ``intfloat_multilingual-e5-base``.
+    """
+    name = (model_name or "").strip()
+    if "/" not in name:
+        name = f"sentence-transformers/{name}"
+    return name.replace("/", "_")
+
+
+def _model_hf_cache_dir(model: dict) -> str:
+    """The staged hf-cache subdir for a manifest ``models`` entry: the explicit
+    ``hf_cache_dir`` field when present (the SSOT), else derived from ``name``
+    via :func:`hf_cache_dir_for_model` (back-compat for a pre-field manifest)."""
+    explicit = model.get("hf_cache_dir")
+    if explicit:
+        return str(explicit)
+    return hf_cache_dir_for_model(str(model.get("name") or ""))
 
 # Retry schedule for hash-mismatch + network errors during a single
 # file's download. After 3 attempts the file (and the whole install)
@@ -300,11 +349,15 @@ def runtime_imports_cleanly(
             [sys.executable, "-c", probe],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=_ST_PROBE_TIMEOUT_SECS,
             check=False,
         )
     except Exception as exc:  # noqa: BLE001
-        return False, f"probe subprocess failed: {type(exc).__name__}: {exc}"
+        from email_triage._errfmt import scrub_class_error_for_persist
+        return False, (
+            f"probe subprocess failed: "
+            f"{scrub_class_error_for_persist(exc)}"
+        )
     if result.returncode == 0 and "OK" in (result.stdout or ""):
         return True, None
     err_tail = (result.stderr or "").strip().splitlines()
@@ -369,20 +422,19 @@ def _synthetic_not_installed() -> dict[str, Any]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    from email_triage._isotime import now_utc_iso
+    return now_utc_iso()
 
 
 def _scrub_error(text: str | None) -> str | None:
-    """Trim + clip error messages before writing to the row.
-
-    Hard cap: 500 chars (matches the foundation docstring promise).
-    Strips trailing whitespace + collapses CR/LF runs so a multi-
-    line pip stderr renders cleanly in the admin banner.
-    """
-    if not text:
-        return None
-    flat = " ".join(str(text).split())
-    return flat[:500]
+    """Token-scrub + PHI-scrub + collapse + clip an error message before writing
+    the row. Census run13 #2: converged onto the shared persisted-error funnel
+    ``_errfmt.scrub_error_for_persist`` (this was the ONE site that already
+    composed both legs — redact_exc PHI + scrub_secrets_from_text token — so it
+    became the SSOT). Behaviour-identical; now every persisted ``*error*`` field
+    shares one funnel instead of this mirror."""
+    from email_triage._errfmt import scrub_error_for_persist
+    return scrub_error_for_persist(text)
 
 
 @_db_write
@@ -519,9 +571,60 @@ def _manifest_sha256(manifest_path: Path) -> str:
     return _hash_file(manifest_path)
 
 
-def _load_manifest(manifest_path: Path) -> dict[str, Any]:
+def normalize_arch(machine: str | None = None) -> str:
+    """Map ``platform.machine()`` to the manifest's arch key.
+
+    x86_64 family (x86_64 / amd64 / AMD64 / x64) -> ``'x86_64'``;
+    arm64 family (aarch64 / arm64 / ARM64) -> ``'aarch64'``. Raises on any
+    other arch so the install fails LOUD rather than silently skipping the
+    binary wheels (a silent skip would leave torch/tokenizers/etc. uninstalled
+    and ``sentence_transformers`` un-importable with a confusing later error).
+    THE SSOT for arch selection — used by ``_load_manifest`` and the manifest
+    regenerator/completeness pin.
+    """
+    m = (machine or platform.machine() or "").lower()
+    if m in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    if m in ("aarch64", "arm64"):
+        return "aarch64"
+    raise RuntimeError(
+        f"embedding_bits: unsupported CPU arch {m!r}; the manifest ships "
+        f"binary wheels for x86_64 + aarch64 only."
+    )
+
+
+def _load_manifest(
+    manifest_path: Path, *, arch: str | None = None
+) -> dict[str, Any]:
+    """Load the manifest, resolving arch-specific binary wheels into ``wheels``.
+
+    Manifest v2 (flat ``wheels`` only) loads unchanged. Manifest v3 (
+    multi-arch) keeps the arch-NEUTRAL ``py3-none-any`` wheels in ``wheels``
+    and the arch-SPECIFIC binary wheels (torch, tokenizers, safetensors,
+    regex, scikit-learn, scipy, pillow, hf-xet) under
+    ``wheels_by_arch.{x86_64,aarch64}``. This is the ONE resolution point:
+    it merges the running arch's binary set into ``wheels`` so every
+    downstream consumer (``_count_manifest_files`` / ``_install_common`` /
+    ``_all_files_present_and_valid`` / ``reverify`` /
+    ``_check_manifest_hashes_populated``) stays arch-unaware and validates /
+    installs only THIS arch's wheels (so the other arch's entries — which may
+    legitimately still carry placeholder hashes pre-release — never block the
+    install we're actually running).
+    """
     with manifest_path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        manifest = json.load(fh)
+    by_arch = manifest.get("wheels_by_arch")
+    if by_arch:
+        key = normalize_arch(arch)
+        arch_wheels = by_arch.get(key)
+        if arch_wheels is None:
+            raise RuntimeError(
+                f"embedding_bits: manifest {manifest_path.name} declares "
+                f"wheels_by_arch but has no entry for arch {key!r}; "
+                f"available: {sorted(by_arch)}."
+            )
+        manifest["wheels"] = list(manifest.get("wheels", [])) + list(arch_wheels)
+    return manifest
 
 
 def _check_manifest_hashes_populated(manifest: dict[str, Any]) -> None:
@@ -562,8 +665,18 @@ def _http_download(url: str, dest: Path) -> int:
 
     Atomic — writes to a sibling tempfile + renames. No partial
     files left behind on crash.
+
+    Routes through the egress funnel (``egress_client`` /
+    ``Intent.PUBLIC_FETCH``, run17 #5 — was a raw
+    ``urllib.request.urlopen``). Streamed (``client.stream`` +
+    ``iter_bytes(CHUNK)``) so a large binary is never buffered whole in
+    memory; ``raise_for_status`` makes a non-2xx raise BEFORE any body is
+    written (the old urllib.urlopen raised HTTPError the same way).
     """
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    import httpx
+
+    from email_triage._egress import Intent, egress_client
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     size = 0
     with tempfile.NamedTemporaryFile(
@@ -571,15 +684,21 @@ def _http_download(url: str, dest: Path) -> int:
     ) as tmp:
         tmp_path = Path(tmp.name)
         try:
-            with urllib.request.urlopen(  # noqa: S310
-                req, timeout=DOWNLOAD_TIMEOUT_SECS,
-            ) as resp:
-                while True:
-                    buf = resp.read(CHUNK)
-                    if not buf:
-                        break
-                    tmp.write(buf)
-                    size += len(buf)
+            # follow_redirects=True preserves urllib.urlopen's default
+            # redirect-following — model/wheel mirrors (HF, CDNs) routinely
+            # 302 to a storage host. The funnel's SSRF hook re-runs on each
+            # redirect hop, so this stays guarded.
+            with egress_client(intent=Intent.PUBLIC_FETCH) as client:
+                with client.stream(
+                    "GET", url,
+                    headers={"User-Agent": UA},
+                    timeout=DOWNLOAD_TIMEOUT_SECS,
+                    follow_redirects=True,
+                ) as resp:
+                    resp.raise_for_status()
+                    for buf in resp.iter_bytes(CHUNK):
+                        tmp.write(buf)
+                        size += len(buf)
         except Exception:
             tmp.close()
             tmp_path.unlink(missing_ok=True)
@@ -603,6 +722,8 @@ def _fetch_with_retry(
     wrong; one retry usually clears it. After all retries: raises the
     final exception (HashMismatch or the network error).
     """
+    import httpx
+
     last_exc: Exception | None = None
     for attempt, delay in enumerate(RETRY_BACKOFF_SECS):
         try:
@@ -611,14 +732,20 @@ def _fetch_with_retry(
             if actual != expected_sha256:
                 raise HashMismatch(filename, expected_sha256, actual)
             return size
-        except (urllib.error.URLError, HashMismatch, OSError) as e:
+        # httpx.HTTPError = the run17 #5 funnel equivalent of the old
+        # urllib.error.URLError (covers transport RequestError + a non-2xx
+        # HTTPStatusError from _http_download's raise_for_status).
+        except (httpx.HTTPError, HashMismatch, OSError) as e:
             last_exc = e
             # Don't sleep after the final attempt — we're about to raise.
             if attempt < len(RETRY_BACKOFF_SECS) - 1:
                 log.warning(
-                    "embedding_bits: fetch attempt %d failed (%s); "
-                    "sleeping %ds before retry",
-                    attempt + 1, type(e).__name__, delay,
+                    "embedding_bits: fetch attempt failed, sleeping before retry",
+                    extra={
+                        "attempt": attempt + 1,
+                        "error_type": type(e).__name__,
+                        "seconds": delay,
+                    },
                 )
                 time.sleep(delay)
             # Clean up partial file before retry so the next try starts
@@ -704,8 +831,8 @@ def _all_files_present_and_valid(
             return False
         if _hash_file(p) != w["sha256"]:
             return False
-    hf_dir = target_dir / "hf-cache" / "sentence-transformers_all-MiniLM-L6-v2"
     for model in manifest.get("models", []):
+        hf_dir = target_dir / "hf-cache" / _model_hf_cache_dir(model)
         for f in model.get("files", []):
             # Preserve subdir structure in the model dir
             p = hf_dir / f["name"]
@@ -769,9 +896,10 @@ async def install_sideload(
 ) -> InstallResult:
     """Copy + hash-verify + pip-install from an operator-staged dir.
 
-    ``source_dir`` must contain ``wheels/`` and ``hf-cache/
-    sentence-transformers_all-MiniLM-L6-v2/`` populated by
-    scripts/download-embedding-bits.sh on a connected machine.
+    ``source_dir`` must contain ``wheels/`` and a per-model
+    ``hf-cache/<hf_cache_dir>/`` subtree (one per manifest ``models``
+    entry, e.g. ``sentence-transformers_all-MiniLM-L6-v2/``) populated
+    by scripts/download-embedding-bits.sh on a connected machine.
 
     Hash verification is IDENTICAL to the auto path — sideload does
     NOT trust the operator-staged files. A bit-corrupted tarball or
@@ -826,9 +954,10 @@ def _install_common(
 
     target_dir.mkdir(parents=True, exist_ok=True)
     wheels_dir = target_dir / "wheels"
-    hf_dir = target_dir / "hf-cache" / "sentence-transformers_all-MiniLM-L6-v2"
     wheels_dir.mkdir(parents=True, exist_ok=True)
-    hf_dir.mkdir(parents=True, exist_ok=True)
+    # Per-model hf-cache dirs are created in the staging loop (each model
+    # lands under its own ``hf_cache_dir``); create the shared parent here.
+    (target_dir / "hf-cache").mkdir(parents=True, exist_ok=True)
 
     try:
         manifest = _load_manifest(manifest_path)
@@ -841,7 +970,7 @@ def _install_common(
             bump_attempt=True,
             set_last_attempt_now=True,
             last_error_class=type(e).__name__,
-            last_error_msg=str(e),
+            last_error_msg=_scrub_error(str(e)),
         )
         return InstallResult(
             status="failed",
@@ -1028,13 +1157,15 @@ def _install_common(
 
         # 2. Model files
         for model in manifest.get("models", []):
+            model_hf_dir = target_dir / "hf-cache" / _model_hf_cache_dir(model)
+            model_hf_dir.mkdir(parents=True, exist_ok=True)
             for f in model.get("files", []):
                 if is_cancel_requested():
                     raise InstallCancelled()
-                dest = hf_dir / f["name"]
+                dest = model_hf_dir / f["name"]
                 _stage_one(
                     source_dir=source_dir,
-                    source_subdir="hf-cache/sentence-transformers_all-MiniLM-L6-v2",
+                    source_subdir=f"hf-cache/{_model_hf_cache_dir(model)}",
                     url=f.get("url", ""),
                     dest=dest,
                     expected_sha256=f["sha256"],
@@ -1070,8 +1201,9 @@ def _install_common(
             if actual != w["sha256"]:
                 raise HashMismatch(w["filename"], w["sha256"], actual)
         for model in manifest.get("models", []):
+            model_hf_dir = target_dir / "hf-cache" / _model_hf_cache_dir(model)
             for f in model.get("files", []):
-                p = hf_dir / f["name"]
+                p = model_hf_dir / f["name"]
                 actual = _hash_file(p)
                 if actual != f["sha256"]:
                     raise HashMismatch(f["name"], f["sha256"], actual)
@@ -1089,10 +1221,10 @@ def _install_common(
         )
 
         # Point HF_HOME at the model cache so the embedding backend
-        # finds the all-MiniLM-L6-v2 files we just staged. The
-        # Containerfile sets this env var at image build, but we also
-        # set it here so an installer-CLI invocation outside the
-        # container (test runs) finds the model.
+        # finds the model files we just staged (each model under its own
+        # ``hf_cache_dir``). The Containerfile sets this env var at image
+        # build, but we also set it here so an installer-CLI invocation
+        # outside the container (test runs) finds the models.
         os.environ.setdefault("HF_HOME", str(target_dir / "hf-cache"))
 
         # 5. Verify pip actually populated the runtime path. Pip's
@@ -1318,7 +1450,6 @@ def reverify(
         )
 
     wheels_dir = target_dir / "wheels"
-    hf_dir = target_dir / "hf-cache" / "sentence-transformers_all-MiniLM-L6-v2"
 
     files_checked = 0
     try:
@@ -1333,6 +1464,7 @@ def reverify(
                 raise HashMismatch(w["filename"], w["sha256"], actual)
             files_checked += 1
         for model in manifest.get("models", []):
+            hf_dir = target_dir / "hf-cache" / _model_hf_cache_dir(model)
             for f in model.get("files", []):
                 p = hf_dir / f["name"]
                 if not p.exists():
@@ -1359,7 +1491,7 @@ def reverify(
             conn,
             status="failed",
             last_error_class=type(e).__name__,
-            last_error_msg=str(e),
+            last_error_msg=_scrub_error(str(e)),
         )
         return InstallResult(
             status="failed",
@@ -1379,6 +1511,7 @@ __all__ = [
     "install_sideload",
     "get_install_status",
     "is_runtime_ready",
+    "normalize_arch",
     "runtime_python_path",
     "runtime_imports_cleanly",
     "add_runtime_to_sys_path",

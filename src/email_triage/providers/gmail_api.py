@@ -21,17 +21,22 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+
+from email_triage._isotime import assume_utc_if_naive  # N-357b R31
 from email.message import EmailMessage as MIMEEmailMessage
 from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator
 
 import httpx
 
+from email_triage._egress import Intent, egress_async_client
+from email_triage._int_utils import parse_int_or_none  # N-219c/33 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.engine.models import EmailMessage
 from email_triage.providers.base import EmailProvider, PushCapable
 from email_triage.providers._oauth_http import oauth_request, refresh_lock_for
 
-logger = logging.getLogger("email_triage.providers.gmail_api")
+logger = get_logger("email_triage.providers.gmail_api")  # N-196b R21_4
 
 GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105
@@ -51,29 +56,14 @@ CALENDAR_SCOPES = [
 
 
 def _html_to_text_fallback(html_str: str) -> str:
-    """Crude HTML → text for the multipart/alternative plain fallback.
+    """HTML → text for the multipart/alternative plain fallback.
 
-    Not trying to render HTML beautifully in text — just produce a
-    readable fallback so strict-plain-text IMAP clients + accessibility
-    readers have something coherent. Strips tags, decodes entities,
-    collapses whitespace. No external dependencies.
+     — delegates to the ``engine.html_text`` SSOT (was a parallel renderer).
+    The SSOT additionally drops ``<script>``/``<style>`` CONTENT, so a crafted
+    body can't leak JS/CSS into the plain part, and keeps block structure.
     """
-    import html as _html
-    import re as _re
-    # Replace block-level tags with newlines before stripping so the
-    # output has some structure.
-    with_breaks = _re.sub(
-        r"</?(?:p|div|br|li|tr|h[1-6]|ul|ol|hr)[^>]*>", "\n", html_str,
-        flags=_re.IGNORECASE,
-    )
-    # Strip remaining tags.
-    no_tags = _re.sub(r"<[^>]+>", "", with_breaks)
-    # Decode HTML entities.
-    decoded = _html.unescape(no_tags)
-    # Collapse whitespace: trim each line, drop empties, join with \n.
-    lines = [ln.strip() for ln in decoded.splitlines()]
-    lines = [ln for ln in lines if ln]
-    return "\n".join(lines) + "\n"
+    from email_triage.engine.html_text import html_to_text
+    return html_to_text(html_str)
 
 
 class GmailApiError(Exception):
@@ -220,7 +210,9 @@ class GmailApiProvider(EmailProvider, PushCapable):
                 "grant_type": "refresh_token",
             }
 
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with egress_async_client(
+                intent=Intent.OAUTH_TOKEN, timeout=self._timeout
+            ) as client:
                 resp = await client.post(OAUTH_TOKEN_URL, data=data)
 
             if resp.status_code >= 400:
@@ -259,7 +251,8 @@ class GmailApiProvider(EmailProvider, PushCapable):
             # Re-check after acquiring — another coroutine may have
             # constructed it while we waited.
             if self._http is None:
-                self._http = httpx.AsyncClient(
+                self._http = egress_async_client(
+                    intent=Intent.PROVIDER_API,
                     base_url=GMAIL_BASE,
                     timeout=self._timeout,
                 )
@@ -333,12 +326,19 @@ class GmailApiProvider(EmailProvider, PushCapable):
         *,
         batch_size: int = 500,
         resume_cursor: str | None = None,
+        filter: Any = None,  # MailFilter | None
     ):
         """Yield ``(batch, cursor)`` tuples via Gmail's ``pageToken``.
 
         Gmail's ``users.messages.list`` returns up to ``maxResults``
         per call (capped at 500 by Google) and a ``nextPageToken``
         when more results exist. Loop until that token is absent.
+
+        ``filter`` (a structured :class:`MailFilter`) is translated and
+        merged with the raw ``query`` exactly as :meth:`search` does — so a
+        windowed bulk caller (the topic back-scan's whole-mailbox enumeration)
+        gets the date constraint on EVERY page, not just the first 500 (the
+        single-page :meth:`search` is silently capped at Google's 500).
 
         Resume support: the cursor IS the pageToken. On a fresh run
         the caller passes ``resume_cursor=None``; on resume after a
@@ -350,8 +350,9 @@ class GmailApiProvider(EmailProvider, PushCapable):
         8) catches duplicates from already-processed UIDs.
         """
         page_size = min(int(batch_size), 500)
+        translated_filter = self._translate_filter(filter) if filter is not None else ""
         translated_query = self._translate_imap_query(query) if query else ""
-        merged = translated_query.strip()
+        merged = " ".join(s for s in (translated_filter, translated_query) if s).strip()
         page_token: str | None = resume_cursor or None
         while True:
             params: dict[str, Any] = {"maxResults": str(page_size)}
@@ -404,26 +405,30 @@ class GmailApiProvider(EmailProvider, PushCapable):
         headers_only: bool = False,
         folder: str | None = None,
     ) -> EmailMessage:
-        # Gmail API supports format=metadata for headers-only, but the
-        # bulk-list path that drives ``headers_only`` is currently
-        # IMAP-specific (the kwarg dodges an aioimaplib parens bug).
-        # Switching Gmail to format=metadata would also work but
-        # offers no win here, and metadata mode drops the snippet
-        # field that ``_summarise_message`` happily renders. Leave
-        # Gmail on ``format=full`` until there's a measured payoff.
-        # ``folder`` is also no-op here — Gmail labels are global,
-        # not folder-scoped, and the messages.get endpoint resolves
-        # by message_id alone.
-        _ = headers_only
+        # §164.502(b) minimum-necessary (run17 #8): a ``headers_only``
+        # request must NOT pull the PHI body. Gmail's ``format=metadata``
+        # returns id + labels + headers ONLY — no ``payload`` body parts,
+        # no attachment bytes — which is exactly the narrowing the provider
+        # contract (:meth:`base.EmailProvider.fetch_message`) asks for. The
+        # ``_extract_body`` / ``_extract_html_body`` / ``_extract_attachments``
+        # helpers already degrade to "" / [] when the body parts are absent
+        # (every accessor is a ``.get(...)`` with a default), so the returned
+        # EmailMessage keeps its metadata fields (sender / subject /
+        # recipients / date / labels) populated and leaves body_text /
+        # body_html / attachments empty — the contract's headers_only shape.
+        # The default ``format=full`` path is byte-for-byte unchanged.
+        #
+        # ``folder`` is a no-op here — Gmail labels are global, not
+        # folder-scoped, and messages.get resolves by message_id alone.
         _ = folder
         data = await self._request(
             "GET",
             f"/users/me/messages/{message_id}",
-            params={"format": "full"},
+            params={"format": "metadata" if headers_only else "full"},
         )
         if not isinstance(data, dict):
             raise GmailApiError(500, f"Unexpected response for {message_id}")
-        return self._normalise(data, message_id)
+        return self._normalise(data, message_id, headers_only=headers_only)
 
     async def list_history(
         self,
@@ -464,7 +469,7 @@ class GmailApiProvider(EmailProvider, PushCapable):
                     if "too old" in body_str or "not found" in body_str:
                         raise GmailHistoryExpiredError(
                             404, e.body, "/users/me/history",
-                        )
+                        ) from e
                 raise
 
             if not isinstance(data, dict):
@@ -483,7 +488,8 @@ class GmailApiProvider(EmailProvider, PushCapable):
 
         return {"history": merged, "historyId": latest_history_id}
 
-    def _normalise(self, data: dict[str, Any], message_id: str) -> EmailMessage:
+    def _normalise(self, data: dict[str, Any], message_id: str,
+                   *, headers_only: bool = False) -> EmailMessage:
         """Extract Gmail-dialect fields and hand off to the shared
         :func:`providers._normalize.build_email_message` helper.
 
@@ -513,17 +519,15 @@ class GmailApiProvider(EmailProvider, PushCapable):
         date = datetime.now(timezone.utc)
         internal_date = data.get("internalDate")
         if internal_date:
-            try:
-                date = datetime.fromtimestamp(
-                    int(internal_date) / 1000, tz=timezone.utc,
-                )
-            except (ValueError, TypeError):
-                pass
+            # N-219c/33 R23: parse_int_or_none SSOT; only int() could raise
+            # (fromtimestamp is non-raising for int input).
+            _ms = parse_int_or_none(internal_date)
+            if _ms is not None:
+                date = datetime.fromtimestamp(_ms / 1000, tz=timezone.utc)
         elif headers.get("date"):
             try:
-                date = parsedate_to_datetime(headers["date"])
-                if date.tzinfo is None:
-                    date = date.replace(tzinfo=timezone.utc)
+                # N-357b (2026-07-06 baseline shrink): assume_utc_if_naive SSOT.
+                date = assume_utc_if_naive(parsedate_to_datetime(headers["date"]))
             except (ValueError, TypeError):
                 logger.warning("Failed to parse Date header", extra={"message_id": message_id})
 
@@ -544,7 +548,10 @@ class GmailApiProvider(EmailProvider, PushCapable):
             labels=list(data.get("labelIds", []) or []),
             headers=headers,
             raw_metadata={
-                "snippet": data.get("snippet", ""),
+                # §164.502(b) (run17 #8 DA must-fix): Gmail's `snippet` is a
+                # ~200-char body-derived PHI excerpt — drop it on the
+                # headers_only minimisation path, don't rely on the API omitting it.
+                "snippet": "" if headers_only else data.get("snippet", ""),
                 "historyId": data.get("historyId"),
             },
             attachments=attachments,
@@ -831,11 +838,9 @@ class GmailApiProvider(EmailProvider, PushCapable):
         if from_addr:
             # Build an RFC-5322 From value. Keep the quoting contained
             # here so callers don't need to import format_from_header.
-            if from_name:
-                safe = from_name.replace("\\", "\\\\").replace('"', '\\"')
-                msg["From"] = f'"{safe}" <{from_addr}>'
-            else:
-                msg["From"] = from_addr
+            # Census 2026-06-09 #5: route through the From-header SSOT (CR/LF-strip).
+            from email_triage.mail_headers import format_from_header
+            msg["From"] = format_from_header(from_addr, from_name)
         elif self._account:
             msg["From"] = self._account
         if reply_to:
@@ -858,7 +863,10 @@ class GmailApiProvider(EmailProvider, PushCapable):
         else:
             msg.set_content(body, subtype=subtype)
 
-        return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii").rstrip("=")
+        #  tail — route through the `_base64url` SSOT so the pad-strip
+        # shape cannot silently drift.
+        from email_triage._base64url import b64encode_urlsafe
+        return b64encode_urlsafe(msg.as_bytes(), strip_padding=True).decode("ascii")
 
     async def create_draft(
         self,
@@ -1081,7 +1089,9 @@ async def exchange_code_for_tokens(
         "grant_type": "authorization_code",
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with egress_async_client(
+        intent=Intent.OAUTH_TOKEN, timeout=timeout
+    ) as client:
         resp = await client.post(OAUTH_TOKEN_URL, data=data)
     try:
         payload = resp.json()
@@ -1121,12 +1131,17 @@ def extract_code_from_pasted(text: str) -> tuple[str, str]:
 
 
 def _b64url_decode(data: str) -> str | None:
-    """Decode a Gmail base64url body part to UTF-8 text, tolerating padding."""
+    """Decode a Gmail base64url body part to UTF-8 text, tolerating padding.
+
+     tail — thin wrapper delegating to the `_base64url` SSOT so the
+    hand-rolled pad-restore shape (previously `data + "=" *
+    ((4 - len(data) % 4) % 4)` inline) is centralised.
+    """
     if not data:
         return None
-    padded = data + "=" * ((4 - len(data) % 4) % 4)
+    from email_triage._base64url import b64decode_permissive
     try:
-        raw = base64.urlsafe_b64decode(padded)
+        raw = b64decode_permissive(data, urlsafe=True)
     except Exception:
         return None
     return raw.decode("utf-8", errors="replace")

@@ -64,6 +64,14 @@ class TestRedisCacheSectionRender:
         assert "On-LAN only" in body
         # The HIPAA defence-in-depth note is present.
         assert "HIPAA-flagged" in body
+        # The Flush button must RENDER — not merely exist in template
+        # source. The config-tabs refactor (1cbfe6e) once dropped this
+        # form, orphaning the still-live /cache/flush route from the UI;
+        # only a render assertion (the route-behaviour tests below POST
+        # directly and don't prove reachability) catches that class of
+        # regression. .
+        assert 'action="/admin/integrations/cache/flush"' in body
+        assert "Flush cached classifications" in body
 
 
 class TestRedisCacheSave:

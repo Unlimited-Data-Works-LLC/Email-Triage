@@ -43,7 +43,8 @@ from email_triage.web.db import (
 @pytest.fixture
 def db():
     """Fresh in-memory DB with v26 schema applied."""
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 @pytest.fixture
@@ -361,7 +362,8 @@ class TestSurfaceHelpers:
         assert ctx["severity"] == "loud"
 
         # Reset + try expired-only
-        db2 = init_db(":memory:")
+        from _db_tracking import track
+        db2 = track(init_db(":memory:"))
         _insert_backend(
             db2, name="ExpiredAzure",
             baa_expires_at=_iso_today_plus(-10),

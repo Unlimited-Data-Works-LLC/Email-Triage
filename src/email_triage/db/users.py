@@ -15,6 +15,10 @@ further; imports are local-style (each function imports what it needs).
 
 from __future__ import annotations
 
+from email_triage._isotime import now_utc_iso, to_utc_iso
+
+from email_triage.db._helpers import dump_json_col, load_json_col
+
 import sqlite3
 from typing import Any
 
@@ -44,8 +48,7 @@ def add_dev_key(
     duplicate).
     """
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cur = conn.execute(
         "INSERT INTO dev_keys "
         "(name, public_key, fingerprint, email_allowlist_json, "
@@ -53,7 +56,7 @@ def add_dev_key(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             name, public_key, fingerprint,
-            json.dumps(email_allowlist),
+            dump_json_col(email_allowlist),
             created_by_user_id, now, expires_at,
         ),
     )
@@ -80,7 +83,7 @@ def list_dev_keys(conn: sqlite3.Connection) -> list[dict]:
     for r in rows:
         d = dict(r)
         try:
-            d["email_allowlist"] = json.loads(d.pop("email_allowlist_json") or "[]")
+            d["email_allowlist"] = load_json_col(d.pop("email_allowlist_json", None), default=[])
         except Exception:
             d["email_allowlist"] = []
         out.append(d)
@@ -100,7 +103,7 @@ def find_dev_key_by_fingerprint(
         return None
     d = dict(row)
     try:
-        d["email_allowlist"] = json.loads(d.pop("email_allowlist_json") or "[]")
+        d["email_allowlist"] = load_json_col(d.pop("email_allowlist_json", None), default=[])
     except Exception:
         d["email_allowlist"] = []
     return d
@@ -116,13 +119,38 @@ def revoke_dev_key(
     timestamp). Returns True on first revoke, False if already
     revoked or missing.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cur = conn.execute(
         "UPDATE dev_keys SET revoked_at = ?, revoked_by_user_id = ? "
         "WHERE id = ? AND revoked_at IS NULL",
         (now, revoked_by_user_id, key_id),
     )
+    if cur.rowcount > 0:
+        #  — a dev-key authenticates as ANY email in its allowlist, and
+        # session tokens don't record which credential authed them, so we
+        # can't be surgical: fail-secure by bumping ``session_epoch`` for
+        # every allowlisted user (a no-op for emails with no user row). This
+        # rides the SAME implicit transaction as the revoke above (one
+        # ``conn.commit()`` below) → atomic + fail-closed: if the bump can't
+        # be written the revoke rolls back too, because a revoked credential
+        # whose live sessions survive is the worse state. Revoking a
+        # (possibly compromised) dev-key MUST cut the session, not merely
+        # block the next login.
+        row = conn.execute(
+            "SELECT email_allowlist_json FROM dev_keys WHERE id = ?", (key_id,),
+        ).fetchone()
+        emails = load_json_col(
+            row["email_allowlist_json"] if row is not None else None,
+            default=[], label="dev_key.email_allowlist_json",
+        )
+        for email in emails:
+            if not isinstance(email, str):
+                continue
+            conn.execute(
+                "UPDATE users SET session_epoch = session_epoch + 1 "
+                "WHERE email = ?",
+                (email,),
+            )
     conn.commit()
     return cur.rowcount > 0
 
@@ -136,8 +164,7 @@ def mark_dev_key_used(
     ip: str,
 ) -> None:
     """Stamp last_used_at + last_used_email + last_used_ip on the row."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute(
         "UPDATE dev_keys SET last_used_at = ?, last_used_email = ?, "
         "last_used_ip = ? WHERE id = ?",
@@ -178,8 +205,7 @@ def add_hardware_key(
     Returns the new id.
     """
     import json
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cur = conn.execute(
         "INSERT INTO hardware_keys "
         "(user_id, credential_id, public_key, sign_count, transports, "
@@ -187,7 +213,7 @@ def add_hardware_key(
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             user_id, credential_id, public_key, int(sign_count),
-            json.dumps(list(transports) if transports else []),
+            dump_json_col(list(transports) if transports else []),  # N-199 R21_7 SSOT
             aaguid, nickname, now,
         ),
     )
@@ -201,7 +227,7 @@ def list_hardware_keys(
     *,
     include_revoked: bool = False,
 ) -> list[dict]:
-    """List hardware keys, newest first.
+    """List passkeys, newest first.
 
     ``user_id=None`` returns ALL users' keys (admin-only view) with
     ``owner_email`` + ``owner_name`` joined for the filter dropdown
@@ -231,7 +257,7 @@ def list_hardware_keys(
     for r in rows:
         d = dict(r)
         try:
-            d["transports"] = json.loads(d.get("transports") or "[]")
+            d["transports"] = load_json_col(d.get("transports"), default=[])
         except Exception:
             d["transports"] = []
         out.append(d)
@@ -259,8 +285,7 @@ def update_hardware_key_sign_count(
     regression is the cloned-authenticator signal and must be
     rejected by the caller before this function is called.
     """
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute(
         "UPDATE hardware_keys SET sign_count = ?, last_used_at = ? "
         "WHERE id = ?",
@@ -271,14 +296,26 @@ def update_hardware_key_sign_count(
 
 @_db_write
 def revoke_hardware_key(conn: sqlite3.Connection, key_id: int) -> bool:
-    """Soft-revoke a hardware key. Returns True on first revoke."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
+    """Soft-revoke a passkey. Returns True on first revoke.
+
+    On a real revoke this also bumps the key OWNER's ``session_epoch`` in the SAME implicit transaction (one ``conn.commit()`` below),
+    so a live session that authenticated via the now-revoked passkey dies
+    immediately — revoking a (possibly compromised) credential must cut the
+    session, not merely block the next login. Fail-closed: if the bump
+    can't be written the revoke rolls back too.
+    """
+    now = now_utc_iso()
     cur = conn.execute(
         "UPDATE hardware_keys SET revoked_at = ? "
         "WHERE id = ? AND revoked_at IS NULL",
         (now, key_id),
     )
+    if cur.rowcount > 0:
+        conn.execute(
+            "UPDATE users SET session_epoch = session_epoch + 1 "
+            "WHERE id = (SELECT user_id FROM hardware_keys WHERE id = ?)",
+            (key_id,),
+        )
     conn.commit()
     return cur.rowcount > 0
 
@@ -286,7 +323,7 @@ def revoke_hardware_key(conn: sqlite3.Connection, key_id: int) -> bool:
 def user_has_active_hardware_key(
     conn: sqlite3.Connection, user_id: int,
 ) -> bool:
-    """True if the user has at least one non-revoked hardware key.
+    """True if the user has at least one non-revoked passkey.
 
     Drives the hardware-key-wins rule for dev-keypair login (when
     True, dev-keypair logins for this user's email are denied) and
@@ -356,9 +393,9 @@ def store_webauthn_challenge(
     (user_id, kind) or (email, kind) at finish time.
     """
     from datetime import datetime, timedelta, timezone
-    expires_at = (
+    expires_at = to_utc_iso(
         datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-    ).isoformat()
+    )
     cur = conn.execute(
         "INSERT INTO webauthn_challenges "
         "(user_id, email, kind, challenge, expires_at) "
@@ -381,8 +418,7 @@ def consume_webauthn_challenge(
 
     None if no match (or expired). Single-use.
     """
-    from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = now_utc_iso()
     if user_id is not None:
         row = conn.execute(
             "SELECT id, challenge FROM webauthn_challenges "
@@ -413,8 +449,7 @@ def prune_expired_webauthn_challenges(conn: sqlite3.Connection) -> int:
     Caller drives via a periodic task. Returns the number of rows
     deleted.
     """
-    from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = now_utc_iso()
     cur = conn.execute(
         "DELETE FROM webauthn_challenges WHERE expires_at <= ?",
         (now_iso,),
@@ -448,8 +483,7 @@ def insert_acme_renewal_log(
     ``db_call`` (it runs both on the event loop via
     ``check_and_renew_async`` and on a worker thread via ``issue_now``).
     """
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = now_utc_iso()
     cur = conn.execute(
         "INSERT INTO acme_renewal_log "
         "(ts, domain, outcome, not_before, not_after, error) "

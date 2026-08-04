@@ -1,0 +1,133 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user. Passkey (FIDO2 / WebAuthn) self-service.
+   Included by profile/security.html (the consolidated Security tab).
+   Expects in context: keys, visible_owners, owner_filter, is_admin,
+   request (for csrf_input). Variable names are scoped by the
+   including page via {% with %} so they don't collide with the API
+   Keys section's same-named `keys`.
+   ─────────────────────────────────────────────────────────── #}
+<section id="hardware-keys" style="margin-top:2rem;">
+<h3>Passkeys</h3>
+<p>
+    Register a passkey — a FIDO2 / WebAuthn credential (a hardware
+    security key like a YubiKey, SoloKey, or Titan, or an Apple/Windows
+    device passkey) — to skip the OTP step on login. Touch the key or
+    authenticator when prompted; the credential is bound to this site by
+    your browser and can't be used elsewhere.
+</p>
+<p>
+    OTP login keeps working alongside passkeys — pick &ldquo;Send
+    OTP instead&rdquo; on the login page if your passkey is unavailable.
+</p>
+
+{% if visible_owners %}
+{# Owner filter shown to admins only — they can see other users'
+   keys (e.g. for forensic review) but default to their own. #}
+<form method="get" action="/profile/security" style="margin:0 0 1rem 0;">
+    <label style="display:inline-flex;gap:0.5rem;align-items:center;">
+        Filter by owner:
+        <select name="owner_filter" onchange="this.form.submit()" style="margin:0;width:auto;">
+            <option value="all" {% if owner_filter == "all" %}selected{% endif %}>All users</option>
+            {% for o in visible_owners %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                {{ o.label }}
+            </option>
+            {% endfor %}
+        </select>
+    </label>
+    <noscript><button type="submit" class="outline secondary">Apply</button></noscript>
+</form>
+{% endif %}
+
+<section>
+    <h4>Register a new passkey</h4>
+    <form id="hw-register-form" onsubmit="return false;">
+        <label>
+            Nickname
+            <input type="text" id="hw-nickname" placeholder="YubiKey blue" required>
+        </label>
+        <button id="hw-register-btn" type="button">
+            Touch your passkey to register
+        </button>
+        <p id="hw-register-status" style="margin-top:0.5rem;"></p>
+    </form>
+</section>
+
+<section style="margin-top:1.5rem;">
+    <h4>Registered passkeys</h4>
+    {% set hw_active = keys | selectattr("revoked_at", "none") | list %}
+    {% if hw_active %}
+    <table>
+        <thead>
+            <tr>
+                <th>Nickname</th>
+                <th>Created</th>
+                <th>Last used</th>
+                <th>Sign count</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for k in hw_active %}
+            <tr>
+                <td>{{ k.nickname }}</td>
+                <td><small>{% if k.created_at %}<time datetime="{{ k.created_at }}" data-us-datetime>{{ k.created_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
+                <td><small>{% if k.last_used_at %}<time datetime="{{ k.last_used_at }}" data-us-datetime>{{ k.last_used_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
+                <td><small>{{ k.sign_count }}</small></td>
+                <td>
+                    <form method="post" action="/profile/hardware-keys/{{ k.id }}/revoke" style="margin:0;">
+                        {{ csrf_input(request) }}
+                        <button class="outline secondary"
+                                style="padding:0.1rem 0.5rem;font-size:0.85rem;color:var(--pico-del-color);">
+                            Revoke
+                        </button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>You haven't registered any passkeys yet.</em></p>
+    {% endif %}
+
+    {% set hw_revoked = keys | rejectattr("revoked_at", "none") | list %}
+    {% if hw_revoked %}
+    <details>
+        <summary>Revoked passkeys ({{ hw_revoked | length }})</summary>
+        <table>
+            {% for k in hw_revoked %}
+            <tr style="opacity:0.55;">
+                <td>{{ k.nickname }}</td>
+                <td><small>revoked {% if k.revoked_at %}<time datetime="{{ k.revoked_at }}" data-us-datetime>{{ k.revoked_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </details>
+    {% endif %}
+</section>
+</section>
+
+<script src="/static/webauthn.js"></script>
+<script>
+document.getElementById("hw-register-btn").addEventListener("click", async () => {
+    const status = document.getElementById("hw-register-status");
+    const nickname = document.getElementById("hw-nickname").value.trim();
+    if (!nickname) {
+        status.textContent = "Nickname required.";
+        status.style.color = "var(--pico-del-color)";
+        return;
+    }
+    status.textContent = "Touch your passkey…";
+    status.style.color = "var(--pico-muted-color)";
+    try {
+        await ETWebAuthn.registerHardwareKey(nickname);
+        status.textContent = "✓ Registered. Reloading…";
+        status.style.color = "var(--pico-ins-color)";
+        setTimeout(() => location.reload(), 600);
+    } catch (e) {
+        status.textContent = "✗ " + (e.message || "Registration failed");
+        status.style.color = "var(--pico-del-color)";
+    }
+});
+</script>

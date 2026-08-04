@@ -9,7 +9,7 @@ that downstream consumers honour:
                                 this calendar
 * ``listings`` (multi)        — include in event-listing reads
                                 (digests, suggest_meeting_times)
-* ``api`` (multi)             — expose to the OpenClaw / API surface
+* ``api`` (multi)             — expose to the webhook / API surface
                                 that lets external assistants query
                                 the user's schedule
 * ``self_schedule`` (single)  — destination for the self-sent-event
@@ -46,6 +46,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
+
 
 # Role keys the schema permits. Order also drives column order in
 # the editor table.
@@ -56,7 +58,7 @@ ROLES: tuple[str, ...] = ("meetings", "listings", "api", "self_schedule")
 SINGLE_ROLES: frozenset[str] = frozenset({"self_schedule"})
 
 # Roles unavailable on HIPAA-flagged accounts. ``api`` exposes
-# events to the OpenClaw / external assistant surface — that
+# events to the webhook / external assistant surface — that
 # surface lacks the HIPAA controls (audit gate, redaction,
 # §164.312(b) bookkeeping) the rest of the pipeline applies, so
 # PHI events must never reach it. Other roles stay available
@@ -309,10 +311,7 @@ def get_surrogate_account_id(acct: dict[str, Any]) -> int | None:
     raw = (acct.get("config") or {}).get("calendar_surrogate_account_id")
     if raw is None or raw == "":
         return None
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
+    return parse_int_or_none(raw)  # N-219b R23: SSOT
 
 
 def resolve_surrogate_account(
@@ -378,7 +377,7 @@ def is_calendar_effectively_enabled(
     ``calendar_not_enabled``, and the operator-side meeting-
     request intercept never produced a calendar-aware draft.
 
-    Mirrors the gate that ``openclaw.py:_open_calendar`` has
+    Mirrors the gate that ``webhook.py:_open_calendar`` has
     used since the surrogate feature shipped — that path
     correctly resolved the flag via the surrogate, the
     dispatch paths did not. This helper consolidates both

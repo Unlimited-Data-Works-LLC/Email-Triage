@@ -78,22 +78,22 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import iter_src_files, relpath, parse_source
+
 
 # ---------------------------------------------------------------------------
 # Module discovery — every `.py` under `src/email_triage`
 # ---------------------------------------------------------------------------
-
-def _src_root() -> Path:
-    return Path(__file__).resolve().parent.parent / "src" / "email_triage"
-
+# Discovery + relpath route through the shared harness (R5b): the
+# package-root walk, the ``__pycache__`` skip, and the canonical
+# ``web/db.py`` relpath all live in ``tests/_pin_harness.py`` so this pin
+# cannot drift in its scoping. The harness ``relpath`` base is identical
+# to this pin's former ``relative_to(_src_root())`` base, so no allow-list
+# re-key is needed (this pin keys nothing on relpath — baseline is zero;
+# relpath appears only in test ids and the violation message).
 
 def _all_modules() -> list[Path]:
-    root = _src_root()
-    assert root.is_dir(), f"src tree not found at {root}"
-    return sorted(
-        p for p in root.rglob("*.py")
-        if "__pycache__" not in p.parts and p.is_file()
-    )
+    return list(iter_src_files())
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +344,7 @@ class _DirectTouchFinder(ast.NodeVisitor):
 @pytest.mark.parametrize(
     "module_path",
     _all_modules(),
-    ids=lambda p: str(p.relative_to(_src_root())).replace("\\", "/"),
+    ids=relpath,
 )
 def test_no_direct_app_state_db_method_call(module_path: Path):
     """No direct ``<X>.state.db.<METHOD>(...)`` call may appear outside
@@ -380,15 +380,19 @@ def test_no_direct_app_state_db_method_call(module_path: Path):
     """
     try:
         src = module_path.read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (SyntaxError, UnicodeDecodeError):
-        pytest.skip(f"{module_path} did not parse")
+        tree = parse_source(src)
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        # Fail-CLOSED: this is the guard's OWN scanner machinery, not an
+        # optional runtime dep. A src module that won't parse/decode is itself
+        # a defect — skipping would let it silently escape the invariant.
+        pytest.fail(f"{module_path} did not parse ({exc!r}) — a non-parsing "
+                    "src module is a defect this guard must surface, not skip")
 
     finder = _DirectTouchFinder(src)
     finder.visit(tree)
 
     if finder.findings:
-        rel = str(module_path.relative_to(_src_root())).replace("\\", "/")
+        rel = relpath(module_path)
         lines = "\n".join(
             f"  {rel}:{lineno}:{col}  <…>.state.db.{sig}"
             for lineno, col, sig in finder.findings
@@ -417,7 +421,7 @@ def test_no_direct_app_state_db_method_call(module_path: Path):
 def _detect_on(src: str) -> list[tuple[int, int, str]]:
     """Run the finder on a synthetic source string. Returns the
     finding list (empty when clean)."""
-    tree = ast.parse(src)
+    tree = parse_source(src)
     f = _DirectTouchFinder(src)
     f.visit(tree)
     return f.findings
@@ -649,13 +653,13 @@ class TestNoFalsePositivesInTree:
         for mod in _all_modules():
             try:
                 src = mod.read_text(encoding="utf-8")
-                tree = ast.parse(src)
+                tree = parse_source(src)
             except (SyntaxError, UnicodeDecodeError):
                 continue
             f = _DirectTouchFinder(src)
             f.visit(tree)
             if f.findings:
-                rel = str(mod.relative_to(_src_root())).replace("\\", "/")
+                rel = relpath(mod)
                 per_module[rel] = len(f.findings)
                 total += len(f.findings)
         assert total == 0, (

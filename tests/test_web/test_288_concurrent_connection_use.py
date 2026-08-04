@@ -88,6 +88,7 @@ import threading
 
 import pytest
 
+from _db_tracking import track
 from email_triage.web.db_threadpool import db_call
 
 
@@ -100,7 +101,7 @@ def _fresh_conn() -> sqlite3.Connection:
     handoff in the first place (and what makes the race observable
     rather than caught earlier by the same-thread assertion).
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")

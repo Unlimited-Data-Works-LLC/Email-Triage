@@ -7,20 +7,12 @@
  * b64url encoding for older browsers handled inline).
  */
 window.ETWebAuthn = (function () {
-    function b64urlToBytes(s) {
-        s = s.replace(/-/g, "+").replace(/_/g, "/");
-        while (s.length % 4) s += "=";
-        const raw = atob(s);
-        const out = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-        return out;
-    }
-    function bytesToB64url(bytes) {
-        let s = "";
-        const a = new Uint8Array(bytes);
-        for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
-        return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    }
+    //  — base64url encode/decode routes through `window.ETBase64`
+    // SSOT (`/static/base64url.js`, loaded in `base.html` before this
+    // script). Local copies were removed after all three hand-rolled
+    // sites (this file + login.html + login_dev_keypair.html) converged.
+    const b64urlToBytes = window.ETBase64.b64urlToBytes;
+    const bytesToB64url = window.ETBase64.bytesToB64url;
 
     function decodeOptions(opts, idFields) {
         // Decode b64url fields server emits as JSON.

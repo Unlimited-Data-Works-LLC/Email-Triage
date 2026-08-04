@@ -73,9 +73,10 @@ from email_triage.engine.models import (
 )
 from email_triage.providers.base import EmailProvider
 from email_triage._errfmt import fmt_exc
-from email_triage.triage_logging import is_hipaa_mode
+from email_triage.actions.provider_labels import resolve_label_hipaa
 
-logger = logging.getLogger("email_triage.actions.add_label")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.add_label")  # N-196b R21_4
 
 
 class AddLabelAction(Action):
@@ -124,13 +125,12 @@ class AddLabelAction(Action):
         internal_slugs = _normalise_string_list(raw_internal, lower=True)
         provider_names = _normalise_string_list(raw_provider, lower=False)
 
-        # Resolve HIPAA on the SAME basis ``build_action_log_extras``
-        # uses — message.hipaa is stamped at fetch time from the
-        # per-account flag and is the canonical signal. is_hipaa_mode()
-        # backstops against an install where the message-level flag
-        # wasn't set but the install is HIPAA-mode globally (digest
-        # render / future surfaces).
-        hipaa = bool(getattr(message, "hipaa", False)) or is_hipaa_mode()
+        # Resolve HIPAA through the one provider-label gate resolver —
+        # message.hipaa is stamped at fetch from the per-account flag and
+        # is the canonical signal; the system flag backstops it. Routing
+        # through resolve_label_hipaa keeps this action, LabelAction, and
+        # the triage rule path from drifting in the gate's own input.
+        hipaa = resolve_label_hipaa(message=message)
 
         def _extras(**more: Any) -> dict[str, Any]:
             return build_action_log_extras(
@@ -197,7 +197,7 @@ class AddLabelAction(Action):
                     )
                 except Exception as e:
                     errors.append(f"internal: {fmt_exc(e)}")
-                    logger.warning(
+                    logger.error(  # N-332: was .warning — silently swallowed exc_info on TriageLogger
                         "add-label: internal label apply failed",
                         exc_info=e,
                         extra=_extras(),
@@ -217,43 +217,59 @@ class AddLabelAction(Action):
         # label strings off the upstream mailbox. Internal labels
         # stayed above (DB-only, perimeter-safe).
         if provider_names:
-            if hipaa:
-                provider_skipped = list(provider_names)
+            # §164.502(e) egress gate lives in the SSOT now — it skips
+            # the provider write in HIPAA mode (keeping PHI-adjacent
+            # label strings off the upstream mailbox) and runs the
+            # apply-loop otherwise. This action was the reference
+            # implementation of the gate; the SSOT is the count-agnostic
+            # home so the two automated paths that were MISSING it
+            # (LabelAction, triage rule labels) can't drift again.
+            from email_triage.actions.provider_labels import push_provider_labels
+
+            applied_pl, skipped_pl, errors_pl = await push_provider_labels(
+                provider, message.message_id, provider_names, hipaa=hipaa,
+            )
+            provider_applied.extend(applied_pl)
+            provider_skipped.extend(skipped_pl)
+            errors.extend(f"provider:{lbl}: {detail}" for lbl, detail, _ in errors_pl)
+            if hipaa and skipped_pl:
                 logger.info(
                     "add-label: provider labels skipped (HIPAA mode)",
-                    extra=_extras(skipped=provider_skipped),
+                    extra=_extras(skipped=skipped_pl),
                 )
-            else:
-                for label in provider_names:
-                    try:
-                        await provider.apply_label(message.message_id, label)
-                        provider_applied.append(label)
-                    except NotImplementedError:
-                        # Whole-provider lack of support → skip the
-                        # remaining label list too, log once.
-                        provider_skipped.extend(
-                            n for n in provider_names if n not in provider_applied
-                        )
-                        logger.info(
-                            "add-label: provider does not support labels, "
-                            "skipping remainder",
-                            extra=_extras(skipped=provider_skipped),
-                        )
-                        break
-                    except Exception as e:
-                        errors.append(f"provider:{label}: {fmt_exc(e)}")
-                        logger.warning(
-                            "add-label: provider label apply failed for %r",
-                            label,
-                            exc_info=e,
-                            extra=_extras(label=label),
-                        )
+            elif skipped_pl:
+                logger.info(
+                    "add-label: provider does not support labels, "
+                    "skipping remainder",
+                    extra=_extras(skipped=skipped_pl),
+                )
+            for lbl, detail, exc in errors_pl:
+                logger.error(  # N-332 + N-338c: extra carries label, drop the positional %r
+                    "add-label: provider label apply failed",
+                    exc_info=exc,
+                    extra=_extras(label=lbl, error=detail),
+                )
 
         # Decide the outcome. COMPLETED if anything was applied,
         # SKIPPED if nothing applied but no errors (e.g. HIPAA + no
         # internals), FAILED if every attempt errored.
         any_applied = bool(internal_applied) or bool(provider_applied)
         if any_applied:
+            # N-204 R22 (2026-07-02): idempotency stamp on COMPLETED path
+            # so /flows surfaces AddLabelAction runs (parity with
+            # LabelAction — census run22 R22_7). A bulk re-drive on a
+            # crash-recovery rerun previously hit the provider API again
+            # per label because the stamp was absent. external_id encodes
+            # BOTH internal + provider label sets so re-drive comparison
+            # can detect no-op vs partial re-apply.
+            from email_triage.actions.base import record_idempotent_done
+            _stamp = "|".join(
+                [f"internal:{s}" for s in internal_applied]
+                + [f"provider:{s}" for s in provider_applied]
+            ) or "none"
+            await record_idempotent_done(
+                flow, message, self.name, external_id=_stamp,
+            )
             return ActionOutput(
                 result=ActionResult.COMPLETED,
                 data={

@@ -1,3 +1,4 @@
+{% import "_macros.html" as m %}
 {# IMAP per-folder watch picker — rendered inside the Watch + Push tab
    when ``acct.provider_type == 'imap'``. Lives outside the IMAP
    connection fieldset (host/port/user/pass) because folder selection
@@ -43,7 +44,11 @@
     {% else %}
     {# Fallback: comma-separated text entry when folder discovery is
        unavailable. The save handler parses this via ``mailboxes_csv``
-       in _extract_provider_config. #}
+       in _extract_provider_config. Plain <input> deliberately, NOT
+       m.combo_input: this is a COMMA-SEPARATED multi-value field, and a
+       datalist autocompletes the WHOLE input value — picking a single
+       folder ("Spam") would clobber the existing list ("INBOX, Sent").
+       Single-value suggestions are wrong for a multi-value field. #}
     <label>
         <input type="text" name="mailboxes_csv"
                value="{{ selected_mailboxes | join(', ') if selected_mailboxes else 'INBOX' }}"

@@ -131,12 +131,36 @@ class TestAccountsUI:
         assert 'name="client_secret"' not in resp.text
 
     def test_delete_account(self, client, admin_cookies, db, admin_user):
+        """Remove = soft-deactivate, NEVER hard-delete (N-108). A DELETE FROM
+        email_accounts cascade-deletes the account's hipaa_access_events
+        (account_id ON DELETE CASCADE) — wiping the §164.312(b) trail. So the
+        row + audit history are RETAINED; only is_active flips to 0."""
         from email_triage.web.db import create_email_account
+        from email_triage.db.audit import record_hipaa_access_event
         aid = create_email_account(db, admin_user["id"], "Delete Me", "imap", {"host": "x.com"})
+        record_hipaa_access_event(db, admin_user["id"], aid, "n86_seed")
+        db.commit()
 
         resp = client.delete(f"/accounts/{aid}", cookies=admin_cookies)
         assert resp.status_code == 200
-        assert resp.text == ""
+        # The row re-renders showing the account DISABLED (not removed/blank);
+        # re-enable is via the Edit panel's existing is_active toggle.
+        assert "Disabled" in resp.text
+
+        # Account row RETAINED + deactivated (NEVER hard-deleted).
+        row = db.execute(
+            "SELECT is_active FROM email_accounts WHERE id = ?", (aid,)
+        ).fetchone()
+        assert row is not None, "account row must be RETAINED (never hard-deleted)"
+        assert row["is_active"] == 0, "account must be deactivated, not deleted"
+
+        # THE guarantee: the §164.312(b) PHI-access trail SURVIVES (a hard delete
+        # would have cascade-wiped these rows).
+        seed = db.execute(
+            "SELECT COUNT(*) c FROM hipaa_access_events "
+            "WHERE account_id = ? AND operation = 'n86_seed'", (aid,)
+        ).fetchone()["c"]
+        assert seed == 1, "the seeded PHI-access audit row must SURVIVE the soft-deactivate"
 
     def test_regular_user_cannot_edit_others_account(self, client, user_cookies, db, admin_user):
         from email_triage.web.db import create_email_account

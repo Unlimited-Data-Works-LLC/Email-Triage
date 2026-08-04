@@ -18,6 +18,7 @@ No real domains / addresses in fixtures — abstract typed placeholders
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timezone
 
@@ -112,7 +113,7 @@ async def test_run_triage_rewrites_query_for_imap(monkeypatch, tmp_path):
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     provider = _RecordingProvider(ids=[])  # empty result — focus on query
@@ -148,7 +149,7 @@ async def test_run_triage_rewrites_query_for_gmail(monkeypatch, tmp_path):
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     provider = _RecordingProvider(ids=[])
@@ -185,7 +186,7 @@ async def test_run_triage_rewrites_query_for_office365(monkeypatch, tmp_path):
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     provider = _RecordingProvider(ids=[])
@@ -225,7 +226,7 @@ async def test_run_triage_no_rewrite_when_self_from_unset(
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     provider = _RecordingProvider(ids=[])
@@ -269,7 +270,7 @@ async def test_run_triage_skips_when_sender_matches_smtp_from(
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     # Sender == self-from, but headers DO NOT include X-Email-Triage.
@@ -316,7 +317,7 @@ async def test_run_triage_x_header_skip_records_reason_self_origin(
     from email_triage.web.triage_runner import run_triage
     import email_triage.web.routers.ui as ui_mod
 
-    conn = init_db(str(tmp_path / "t.db"))
+    conn = track(init_db(str(tmp_path / "t.db")))
     _seed_categories(conn)
 
     msg = _msg(

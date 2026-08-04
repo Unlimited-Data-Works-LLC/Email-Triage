@@ -9,6 +9,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timedelta, timezone
 
@@ -113,7 +114,7 @@ def _seed_dead(db, *, account_id, dead_reason, updated_hours_ago=2, count=1):
 
 @pytest.fixture
 def db():
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     _install_ra_schema(conn)
     yield conn
     conn.close()

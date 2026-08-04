@@ -285,6 +285,92 @@ class TestRenewWatchEndpoint:
         assert resp.status_code == 400
         assert resp.json()["error"] == "not_gmail"
 
+    def test_force_renew_success_clears_auth_stale_even_if_email_missing(
+        self, client, admin_cookies, db, admin_user, app,
+    ):
+        """#5 / DA MUST-FIX #1 (census 2026-06-10) — BEHAVIOURAL.
+
+        A force-renew whose ``register_watch`` SUCCEEDS proves the credential
+        is alive, so the ``auth_stale`` "re-authenticate" chip MUST clear —
+        even when email resolution then fails and the endpoint returns 400.
+        The CLEAR edge must be as broad as the success; the first cut placed
+        it AFTER the ``missing_email_address`` early-return, leaving a
+        recovered account stuck on the chip (the clear-narrow asymmetry, PD#18,
+        this fix exists to kill). The structural Invariant-4 pin proves the
+        funnel is REFERENCED; THIS test proves it fires on the right EDGE."""
+        from unittest.mock import patch
+        from email_triage.web.db import get_setting, set_setting
+        from email_triage.providers.gmail_api import GmailApiProvider
+
+        app.state.config.push.gmail_topic_name = "projects/p/topics/t"
+        acct_id = _add_gmail_account(db, email="", user_id=admin_user["id"])
+        # No config email + no watch row → email resolution fails (400 path).
+        set_setting(db, f"auth_stale:{acct_id}", {"reason": "test-revoked"})
+        assert get_setting(db, f"auth_stale:{acct_id}") is not None
+
+        class _FakeProvider(GmailApiProvider):  # type: ignore[misc]
+            def __init__(self, *a, **kw):
+                pass
+
+            async def register_watch(self, topic):
+                return {"expiration": 0, "historyId": "1"}  # success
+
+            async def get_profile(self):
+                return {}  # no emailAddress → drives the missing-email branch
+
+            async def close(self):
+                return None
+
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=_FakeProvider(),
+        ):
+            resp = client.post(f"/admin/integrations/{acct_id}/renew-watch")
+        # Endpoint returns 400 (email couldn't be resolved) ...
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "missing_email_address"
+        # ... but the credential was PROVEN alive, so the chip is CLEARED.
+        assert get_setting(db, f"auth_stale:{acct_id}") is None
+
+    def test_force_renew_auth_revoked_failure_sets_auth_stale(
+        self, client, admin_cookies, db, admin_user, app,
+    ):
+        """#5 — the SET edge: a force-renew whose register_watch fails on a
+        revoked token sets the chip (the funnel needle-filters, so only an
+        auth-revoked signal sets — a transient error would not)."""
+        from unittest.mock import patch
+        from email_triage.web.db import get_setting
+        from email_triage.providers.gmail_api import GmailApiProvider
+
+        app.state.config.push.gmail_topic_name = "projects/p/topics/t"
+        acct_id = _add_gmail_account(db, email="x@gmail.com", user_id=admin_user["id"])
+        assert get_setting(db, f"auth_stale:{acct_id}") is None
+
+        class _FakeProvider(GmailApiProvider):  # type: ignore[misc]
+            def __init__(self, *a, **kw):
+                pass
+
+            async def get_profile(self):
+                return {"emailAddress": "x@gmail.com"}
+
+            async def register_watch(self, topic):
+                raise Exception("invalid_grant: Token has been expired or revoked")
+
+            async def close(self):
+                return None
+
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=_FakeProvider(),
+        ):
+            resp = client.post(f"/admin/integrations/{acct_id}/renew-watch")
+        assert resp.status_code == 500
+        assert resp.json()["error"] == "renew_failed"
+        # Auth-revoked → chip SET.
+        assert get_setting(db, f"auth_stale:{acct_id}") is not None
+
     def test_anonymous_returns_401(self, client):
         resp = client.post("/admin/integrations/1/renew-watch")
         # Admin gate: redirect-resp converts to 401 here per the JSON
@@ -312,18 +398,23 @@ class TestHistoryExpiryRecovery:
     """When ``provider.list_history`` raises GmailHistoryExpiredError
     (cursor older than Gmail's ~7-day retention window), the consumer
     falls back to a bounded backfill over the last 7 days, capped at
-    200 messages. This locks in the recovery path so a future regression
-    in _process_push_item doesn't silently drop a week of messages.
+    BACKFILL_CAP (200) messages. This locks in the recovery path so a
+    future regression in _process_push_item doesn't silently drop a
+    week of messages.
+
+     — the fetch asks for BACKFILL_CAP+1 (201) as a saturation
+    PROBE: search(limit=N) returns <=N, so > CAP proves the gap
+    overflowed; the consumer still enumerates at most CAP.
     """
 
     @pytest.mark.asyncio
     async def test_recovery_calls_search_with_7d_200(
         self, app, db, admin_user,
     ):
-        """The bounded-backfill query is `newer_than:7d` with limit=200.
-        Stricter caps would shrink the recovery window without warning;
-        looser caps would invite runaway LLM-quota burn on a high-
-        volume mailbox."""
+        """The bounded-backfill query is `newer_than:7d` with
+        limit=BACKFILL_CAP+1 (201, the saturation probe). Stricter caps
+        would shrink the recovery window without warning; looser caps
+        would invite runaway LLM-quota burn on a high-volume mailbox."""
         from email_triage.web.app import _process_push_item
         from email_triage.providers.gmail_api import (
             GmailApiProvider, GmailHistoryExpiredError,
@@ -383,4 +474,7 @@ class TestHistoryExpiryRecovery:
             await _process_push_item(app, item)
 
         assert captured.get("query") == "newer_than:7d"
-        assert captured.get("limit") == 200
+        #  — CAP+1 probe: the fetch asks for one more than the cap so a
+        # gap of exactly CAP isn't mis-read as saturated.
+        from email_triage.web._backfill_chip import BACKFILL_CAP
+        assert captured.get("limit") == BACKFILL_CAP + 1

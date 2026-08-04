@@ -31,8 +31,13 @@ from email_triage.providers.calendar_base import (
     CalendarProvider,
     CalendarScopeError,
 )
+from email_triage.triage_logging import get_logger
 
-log = logging.getLogger("email_triage.actions.invite")
+# census run17 #1 — TriageLogger (``get_logger``), NOT raw ``logging.getLogger``,
+# so the _PHI_KEYS scrubber strips PHI on the console/file leg too (the HMAC
+# ``log_entries`` sink is independently allowlisted by ``redact_persisted_extra``).
+# The ``reason=`` field below is a calendar-respond error string (PHI-adjacent).
+log = get_logger("actions.invite")
 
 
 def _find_invite_attachment(message: EmailMessage) -> Any:
@@ -100,11 +105,11 @@ async def _draft_imip_fallback(
     organizer = invite_parsed.get("organizer", "") or message.sender
     # 2026-05-13 — In-Reply-To must be the RFC 5322 Message-Id
     # header value (``<hash@domain>``), NOT the provider-specific
-    # message_id (which is the IMAP UID for IMAP messages).
-    from email_triage.mail_headers import get_rfc_message_id
-    _rfc_id = (
-        get_rfc_message_id(message.headers) or message.message_id
-    )
+    # message_id (which is the IMAP UID for IMAP messages). A6
+    # (census 2026-06-09): the message-level SSOT is exactly this
+    # header-then-provider-id shape (all header casings).
+    from email_triage.mail_headers import get_message_rfc_id
+    _rfc_id = get_message_rfc_id(message)
     draft_id = await provider.create_draft(
         to=[organizer],
         subject=f"Re: {message.subject}" if message.subject else "Re: Meeting invite",
@@ -139,13 +144,9 @@ class _InviteResponseBase(Action):
         if prior is not None:
             log.info(
                 "Invite reply already applied for this message; skipping",
-                extra={
-                    "flow_id": flow.flow_id,
-                    "response": self.response,
-                    "previous_external_id": prior.data.get(
-                        "previous_external_id",
-                    ),
-                },
+                flow_id=flow.flow_id,
+                response=self.response,
+                previous_external_id=prior.data.get("previous_external_id"),
             )
             return prior
 
@@ -158,7 +159,7 @@ class _InviteResponseBase(Action):
         parsed = att.parsed
 
         # The action receives the email provider; the calendar provider
-        # (if any) lives on flow.state_bag where the runner / OpenClaw
+        # (if any) lives on flow.state_bag where the runner / webhook receiver
         # stash it before invoking actions. None → fallback to draft.
         state_bag = getattr(flow, "state_bag", None)
         cal: CalendarProvider | None = None
@@ -189,7 +190,8 @@ class _InviteResponseBase(Action):
             # Scope error or lookup miss → fall through to draft path.
             log.info(
                 "Calendar respond failed; falling back to iMIP draft",
-                extra={"reason": detail, "uid": parsed.get("uid", "")},
+                reason=detail,
+                uid=parsed.get("uid", ""),
             )
 
         try:

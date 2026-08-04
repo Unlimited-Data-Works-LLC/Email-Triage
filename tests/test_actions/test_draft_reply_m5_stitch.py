@@ -48,7 +48,8 @@ def _make_db() -> sqlite3.Connection:
     flag), and ``sent_mail_index`` (M-4 retrieval target).
     """
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -561,7 +562,7 @@ class TestEmptyRetrieval:
 
 class TestEmbeddingBackendAllowlist:
     def test_non_ollama_backend_raises_value_error(self):
-        """Operator points ``embedding.backend`` at openai / anthropic
+        """Operator points ``embedding.backend`` at openai / AI provider
         / etc -> the factory raises ValueError naming the rejected
         value AND the allowlist."""
         cfg = SimpleNamespace(
@@ -579,18 +580,18 @@ class TestEmbeddingBackendAllowlist:
         assert "local-only" in msg
 
     def test_anthropic_backend_rejected_on_top_of_allowlist(self):
-        """Belt-and-braces: project-wide no-Anthropic rule rides on top
+        """Belt-and-braces: project-wide no-AI provider rule rides on top
         of the allowlist."""
         cfg = SimpleNamespace(
             embedding=SimpleNamespace(
-                backend="anthropic",
+                backend="AI provider",
                 model_name="voyage-2",
                 ollama_url="http://localhost:11434",
             ),
         )
         with pytest.raises(ValueError) as excinfo:
             build_embedding_backend(cfg)
-        assert "anthropic" in str(excinfo.value)
+        assert "AI provider" in str(excinfo.value)
 
     def test_empty_backend_returns_none(self):
         """Operator left ``embedding:`` out of YAML -> factory returns

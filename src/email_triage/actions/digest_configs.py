@@ -26,7 +26,7 @@ This module owns:
   the unified ``digest_configs:<id>`` list on first read.
 * ``list_digest_configs`` / ``get_digest_config`` /
   ``upsert_digest_config`` / ``delete_digest_config`` — the CRUD
-  surface used by the web router and the OpenClaw API.
+  surface used by the web router and the outbound-webhook API.
 
 Render + scheduler logic live in ``actions.recipient_digest`` (for
 the preset) and ``actions.digest_render`` (for custom; new).
@@ -315,8 +315,12 @@ def to_dict(cfg: DigestConfig) -> dict[str, Any]:
 
 
 def _new_id() -> str:
-    """Mint an opaque id for a new digest config."""
-    return f"digest_{uuid.uuid4().hex[:12]}"
+    """Mint an opaque id for a new digest config.
+
+    N-244b R25: SSOT — `_ids.new_short_id`. Byte-identical wire shape.
+    """
+    from email_triage._ids import new_short_id
+    return new_short_id("digest")
 
 
 # ---------------------------------------------------------------------------

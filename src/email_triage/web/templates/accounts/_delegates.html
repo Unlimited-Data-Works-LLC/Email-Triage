@@ -32,7 +32,7 @@
         <tr>
             <td>{{ user_label(d.name, d.email) }}</td>
             <td><small>{{ d.granted_by_email or '—' }}</small></td>
-            <td><small style="font-family:var(--pico-font-family-monospace);">{{ d.granted_at[:19] }}</small></td>
+            <td><small style="font-family:var(--pico-font-family-monospace);">{% if d.granted_at %}<time datetime="{{ d.granted_at }}" data-us-datetime>{{ d.granted_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
             <td>
                 <button class="outline secondary"
                         style="padding:0.15rem 0.5rem;font-size:0.8rem;color:var(--pico-del-color);"

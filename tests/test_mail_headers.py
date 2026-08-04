@@ -1,6 +1,7 @@
 """Outbound X-Email-Triage stamping + inbound loop-prevention skip."""
 
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 from datetime import datetime, timezone
@@ -250,7 +251,7 @@ def test_otp_email_stamps_x_email_triage_otp(monkeypatch):
     captured: dict[str, Any] = {}
 
     class _FakeSMTP:
-        def __init__(self, host, port):
+        def __init__(self, host, port, timeout=None):
             pass
 
         def __enter__(self):
@@ -268,8 +269,9 @@ def test_otp_email_stamps_x_email_triage_otp(monkeypatch):
         def send_message(self, msg):
             captured["msg"] = msg
 
-    import email_triage.web.auth as auth_mod
-    monkeypatch.setattr(auth_mod.smtplib, "SMTP", _FakeSMTP)
+    # The SMTP transport now lives in the smtp_send SSOT (divergence
+    # census C2) — patch it there, not the (now smtplib-free) auth module.
+    monkeypatch.setattr("email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP)
 
     send_otp_email(
         smtp_host="h", smtp_port=25,
@@ -309,6 +311,37 @@ def test_health_email_stamps_x_email_triage_health_email():
     msg = assemble_daily_health_email(state, cfg)
     stamp = msg.get(X_EMAIL_TRIAGE_HEADER)
     assert stamp and stamp.startswith("health-email")
+    # N-272 R28 hardening — RFC-preferred GMT Date + Message-Id present
+    # at build time (was missing; matches build_alternative_message SSOT).
+    date_hdr = msg.get("Date")
+    assert date_hdr, f"no Date header; got keys={list(msg.keys())}"
+    assert str(date_hdr).endswith(("GMT", "+0000")), (
+        f"expected UTC Date (GMT or +0000), got {date_hdr!r}"
+    )
+    msgid = msg.get("Message-Id")
+    assert msgid and msgid.startswith("<") and msgid.endswith(">"), (
+        f"expected RFC-2822 Message-Id, got {msgid!r}"
+    )
+
+
+def test_update_failed_email_hardened_headers():
+    """N-272 R28 hardening — GMT Date + Message-Id at build time."""
+    from email_triage.web.daily_health import _assemble_update_failed_email
+
+    msg = _assemble_update_failed_email(
+        attempted_tag="v0.2.1",
+        current_tag="v0.2.0",
+        failure_reason="post-apply /health returned 503",
+        restored_from_snapshot=None,
+        now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        repo_url="https://example.invalid/repo",
+    )
+    stamp = msg.get(X_EMAIL_TRIAGE_HEADER)
+    assert stamp and stamp.startswith("update-failed-email")
+    date_hdr = msg.get("Date")
+    assert date_hdr and str(date_hdr).endswith(("GMT", "+0000"))
+    msgid = msg.get("Message-Id")
+    assert msgid and msgid.startswith("<") and msgid.endswith(">")
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +407,7 @@ async def test_run_triage_records_skipped_entry(monkeypatch, tmp_path):
 
     db_path = tmp_path / "t.db"
     from email_triage.web.db import init_db
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
 
     # Need a category and a provider. Stub everything the runner pulls.
     now = datetime.now(timezone.utc).isoformat()

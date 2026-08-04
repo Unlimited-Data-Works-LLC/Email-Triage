@@ -49,24 +49,20 @@ from pathlib import Path
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Discovery
-# ---------------------------------------------------------------------------
-
-def _src_root() -> Path:
-    """Locate `src/email_triage` relative to this test file."""
-    return Path(__file__).resolve().parent.parent / "src" / "email_triage"
+# R5b: the source-tree walk / relpath scaffolding lives in the ONE shared
+# harness so it cannot drift per-pin. `SRC_ROOT` here is identical to the
+# old `_src_root()` (repo-root/src/email_triage); `iter_src_files()` is the
+# old `_all_modules()` (sorted `*.py`, `__pycache__` skipped); `relpath()`
+# is the old `str(p.relative_to(_src_root())).replace("\\", "/")` — same
+# `web/db.py` base, so the parametrize IDs and violation messages are
+# byte-identical. This pin keys NO allow-list on the relpath (it has no
+# allow-list), so the base is purely cosmetic here — no re-keying needed.
+from _pin_harness import SRC_ROOT, iter_src_files, relpath as _relpath, parse_source
 
 
 def _all_modules() -> list[Path]:
-    """Every `.py` under `src/email_triage`."""
-    root = _src_root()
-    assert root.is_dir(), f"src tree not found at {root}"
-    return sorted(
-        p for p in root.rglob("*.py")
-        if "__pycache__" not in p.parts and p.is_file()
-    )
+    """Every `.py` under `src/email_triage` — via the shared harness walk."""
+    return list(iter_src_files())
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +120,7 @@ def _function_scope_import_asyncio_lines(
 @pytest.mark.parametrize(
     "module_path",
     _all_modules(),
-    ids=lambda p: str(p.relative_to(_src_root())).replace("\\", "/"),
+    ids=_relpath,
 )
 def test_no_legb_shadow_import_asyncio(module_path: Path):
     """A module that imports `asyncio` at module scope MUST NOT
@@ -152,9 +148,13 @@ def test_no_legb_shadow_import_asyncio(module_path: Path):
     """
     try:
         src = module_path.read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (SyntaxError, UnicodeDecodeError):
-        pytest.skip(f"{module_path} did not parse")
+        tree = parse_source(src)
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        # Fail-CLOSED: this is the guard's OWN scanner machinery, not an
+        # optional runtime dep. A src module that won't parse/decode is itself
+        # a defect — skipping would let it silently escape the invariant.
+        pytest.fail(f"{module_path} did not parse ({exc!r}) — a non-parsing "
+                    "src module is a defect this guard must surface, not skip")
 
     if not _has_module_level_import_asyncio(tree):
         # No module-level binding → function-local imports aren't
@@ -164,7 +164,7 @@ def test_no_legb_shadow_import_asyncio(module_path: Path):
 
     offenders = _function_scope_import_asyncio_lines(tree)
     if offenders:
-        rel = str(module_path.relative_to(_src_root())).replace("\\", "/")
+        rel = _relpath(module_path)
         lines = "\n".join(
             f"  {rel}:{lineno}  in def {fn_name}(): import asyncio"
             for fn_name, lineno in offenders
@@ -188,7 +188,7 @@ def test_no_legb_shadow_import_asyncio(module_path: Path):
 
 def _detect_on(src: str) -> tuple[bool, list[tuple[str, int]]]:
     """Run the pin's two helpers on a synthetic source string."""
-    tree = ast.parse(src)
+    tree = parse_source(src)
     return (
         _has_module_level_import_asyncio(tree),
         _function_scope_import_asyncio_lines(tree),
@@ -333,9 +333,9 @@ class TestNoFalsePositivesInTree:
 
     def test_cli_py_is_clean_after_fix(self):
         # The exact file the -followup-B fix targeted.
-        cli_py = _src_root() / "cli.py"
+        cli_py = SRC_ROOT / "cli.py"
         src = cli_py.read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        tree = parse_source(src)
         has_module = _has_module_level_import_asyncio(tree)
         offenders = _function_scope_import_asyncio_lines(tree)
         assert has_module is True, (

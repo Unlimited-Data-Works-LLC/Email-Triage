@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from _db_tracking import track
 from email_triage.actions.sent_mail_capture import SentMailCaptureLoop
 from email_triage.actions.sent_mail_index import (
     _CAPTURED_PAIR_BOOST,
@@ -49,7 +50,7 @@ def _make_db() -> sqlite3.Connection:
     threadpool worker via ``db_call``, so cross-thread use must be
     permitted.
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -59,14 +60,14 @@ def _make_db() -> sqlite3.Connection:
             created_under_system_hipaa INTEGER NOT NULL DEFAULT 0
         )
     """)
-    from email_triage.web.migrations import MIGRATIONS
-    # Apply v12 (creates table) then v14 (adds is_captured_pair column).
-    for v in (12, 14, 15):
-        for m in MIGRATIONS:
-            if m.version == v:
-                m.body(conn)
-                break
-    conn.commit()
+    #  — apply EVERY migration that touches sent_mail_index, in version
+    # order, DYNAMICALLY — so the fixture schema matches what production
+    # index_message() writes WITHOUT a hand-maintained version tuple. The old
+    # ``(12, 14, 15, 32)`` had to be hand-synced on each new ALTER ('s v32
+    # embedding_dimension was the last such break); a future ALTER is now picked
+    # up automatically ("Keep this list in sync" is no longer a manual chore).
+    from _migration_fixtures import apply_table_migrations
+    apply_table_migrations(conn, "sent_mail_index")
     return conn
 
 
@@ -152,7 +153,7 @@ def _make_index(conn: sqlite3.Connection, account_id: int) -> SentMailIndex:
 class TestMigrationV14:
     def test_v14_applies_cleanly(self):
         """v14 runs against a DB that already has v12's sent_mail_index."""
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn = track(sqlite3.connect(":memory:", check_same_thread=False))
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)")
         from email_triage.web.migrations import MIGRATIONS
@@ -166,7 +167,7 @@ class TestMigrationV14:
         assert "is_captured_pair" in cols
 
     def test_v14_idempotent(self):
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        conn = track(sqlite3.connect(":memory:", check_same_thread=False))
         conn.row_factory = sqlite3.Row
         conn.execute("CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)")
         from email_triage.web.migrations import MIGRATIONS
@@ -564,7 +565,7 @@ class TestBackgroundLoop:
         # Build a minimal app.state stub.
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
         app.state.db.row_factory = sqlite3.Row
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
@@ -623,7 +624,7 @@ class TestBackgroundLoop:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
         app.state.embedding_model = EMBED_MODEL_FIXTURE
@@ -648,7 +649,7 @@ class TestBackgroundLoop:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
         app.state.secrets = object()
         app.state.embedding_backend = None  # not wired
 
@@ -717,7 +718,7 @@ class TestAuditRow:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
         app.state.db.row_factory = sqlite3.Row
         app.state.secrets = object()
         app.state.embedding_backend = _FakeBackend()
@@ -764,7 +765,7 @@ class TestCronAnchor:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
 
         noon = datetime(2026, 5, 8, 12, 0, 0, tzinfo=timezone.utc)
         # No setting row -> default 6h interval.
@@ -778,7 +779,7 @@ class TestCronAnchor:
 
         app = type("FakeApp", (), {})()
         app.state = type("S", (), {})()
-        app.state.db = sqlite3.connect(":memory:", check_same_thread=False)
+        app.state.db = track(sqlite3.connect(":memory:", check_same_thread=False))
 
         # Choose a moment 0.001s before a boundary -- next tick is
         # almost immediate.

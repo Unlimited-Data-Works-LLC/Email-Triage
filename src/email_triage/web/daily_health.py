@@ -39,19 +39,23 @@ without running the full lifespan stack.
 from __future__ import annotations
 
 import json as _json
-import smtplib
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from html import escape as _html_escape  # DA R4 CIDI-drift fold (2026-07-10)
 from typing import Any
 
-from email_triage._isotime import parse_iso
+import httpx
+
+from email_triage._egress import Intent, egress_client
+from email_triage._int_utils import parse_int_or_none  # N-219c/38 R23
+from email_triage._isotime import parse_iso, to_utc_iso
 from email_triage.config import TriageConfig
+from email_triage.secrets import SecretsDecryptError, read_secret
 from email_triage.triage_logging import get_logger, is_hipaa_mode
 from email_triage.web.auth import format_from_header
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
 
 log = get_logger("web.daily_health")
 
@@ -132,8 +136,10 @@ def fetch_latest_release(
 
     Pure-ish: the only side effects are the HTTP request and the
     module-level cache; both are dropped via ``_reset_release_cache``
-    in tests. The fetch path is monkeypatched at
-    ``urllib.request.urlopen`` so tests don't touch the network.
+    in tests. The fetch goes through the egress funnel
+    (``egress_client(intent=Intent.PUBLIC_FETCH)``, run17 #5 — was a raw
+    ``urllib.request.urlopen``); tests monkeypatch ``egress_client`` so
+    they don't touch the network.
     """
     now = now_monotonic if now_monotonic is not None else time.monotonic()
     cached = _release_cache.get(url)
@@ -144,22 +150,27 @@ def fetch_latest_release(
 
     payload: dict[str, Any] | None = None
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "email-triage-daily-health",
-            },
-        )
-        with urllib.request.urlopen(
-            req, timeout=_RELEASE_FETCH_TIMEOUT_SECONDS,
-        ) as resp:
-            body = resp.read().decode("utf-8")
-        data = _json.loads(body)
+        with egress_client(intent=Intent.PUBLIC_FETCH) as c:
+            resp = c.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "email-triage-daily-health",
+                },
+                timeout=_RELEASE_FETCH_TIMEOUT_SECONDS,
+                # urllib.urlopen followed redirects by default — preserve that
+                # (GitHub's API doesn't 302 today, but a future host might); the
+                # funnel's SSRF hook re-runs on each hop.
+                follow_redirects=True,
+            )
+        resp.raise_for_status()
+        data = _json.loads(resp.text)
         if isinstance(data, dict):
             payload = data
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-            ValueError, OSError) as exc:
+    except (httpx.HTTPError, TimeoutError, ValueError, OSError) as exc:
+        # httpx.HTTPError covers both transport failures (RequestError:
+        # connect/timeout) and a non-2xx raise_for_status (HTTPStatusError),
+        # matching the old urllib URLError+HTTPError catch. ValueError = bad JSON.
         log.warning(
             "GitHub Releases fetch failed",
             url=url, error=str(exc),
@@ -224,11 +235,13 @@ def gather_update_available_section(
     db_schema = 0
     if db is not None:
         try:
-            row = db.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()
-            if row and row[0] is not None:
-                db_schema = int(row[0])
+            # census run15  — the conn-based, side-effect-free schema-version
+            # SSOT (NOT a raw MAX(version) re-inline, and NOT migrations
+            # .schema_version, which would _ensure_bookkeeping/CREATE on a
+            # read-only banner render). The path-based branch below uses the
+            # sibling read_db_schema_version, its own SSOT entry point.
+            from email_triage.version import read_schema_version
+            db_schema = read_schema_version(db)
         except sqlite3.Error:
             db_schema = 0
     elif db_path:
@@ -338,10 +351,9 @@ def gather_retry_deads_section(
     if db is None:
         return None
     try:
-        from datetime import datetime, timedelta, timezone
-        since = (
+        since = to_utc_iso(
             datetime.now(timezone.utc) - timedelta(hours=24)
-        ).isoformat()
+        )
 
         # Install-wide total.
         row = db.execute(
@@ -417,7 +429,62 @@ def gather_retry_deads_section(
 # ---------------------------------------------------------------------------
 
 def _iso_ago(hours: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return to_utc_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
+
+
+def gather_n151_soft_gate(
+    db: sqlite3.Connection,
+    config: TriageConfig,
+) -> dict[str, Any]:
+    """Snapshot the N-151 MSAL master-key SOFT-gate state for the digest.
+
+    Composes Part-0's ``providers._msal_cache_crypto.n151_soft_gate_active``
+    /``n151_soft_gate_reason`` LEVEL predicates with the Part-2
+    ``admin_alert:n151_soft_gate`` settings row that records ``since``
+    (the ISO stamp the gate first went active).  Returns a bag with
+    ``{"active": bool, "reason": str, "since": ISO|None}`` — every field
+    populated on every day, so the render path can decide whether to
+    show the dedicated ``Credential store`` section (active=True → yes).
+
+    Fail-CLOSED (PD #8): any probe/read exception treats the gate as
+    ACTIVE with ``reason == "probe_error"`` and ``since=None`` — the
+    render side then still surfaces the section so the operator is not
+    silently left with a broken credential store.
+    """
+    del config  # accessor is process-scoped, no config knob today
+    try:
+        # DB-SME F1 fold (2026-07-10): route through the atomic
+        # ``n151_soft_gate_state()`` SSOT so ``active`` + ``reason`` are
+        # captured in one probe.  The prior dual-call
+        # (``n151_soft_gate_active()`` + ``n151_soft_gate_reason()``)
+        # torn-read on a rotation / backend-flap tick — the two probes
+        # crossed the transition and disagreed.  Sibling render sites
+        # (admin_alerts, routers/ui/_shared) already use the tuple SSOT.
+        from email_triage.providers._msal_cache_crypto import (
+            n151_soft_gate_state,
+        )
+        _active, _reason = n151_soft_gate_state()
+        active = bool(_active)
+        reason = str(_reason)
+    except Exception:
+        # Fail-CLOSED: an import/probe failure IS a credential-store
+        # problem the operator needs to see.
+        return {"active": True, "reason": "probe_error", "since": None}
+
+    since: str | None = None
+    try:
+        from email_triage.web.db import get_setting
+        row = get_setting(db, "admin_alert:n151_soft_gate")
+        if isinstance(row, dict):
+            _since = row.get("since")
+            if isinstance(_since, str) and _since:
+                since = _since
+    except Exception:
+        # Settings row read failure is non-fatal — the section still
+        # renders with since=None (Part-2 primitive owns the write).
+        since = None
+
+    return {"active": active, "reason": reason, "since": since}
 
 
 def gather_health_state(
@@ -439,13 +506,26 @@ def gather_health_state(
     even on a day when nothing else is wrong.
     """
     now = now or datetime.now(timezone.utc)
-    since_24h = (now - timedelta(hours=24)).isoformat()
+    # N-203 R22 (2026-07-02): route through A10 stored-ISO SSOT.
+    since_24h = to_utc_iso(now - timedelta(hours=24))
 
     state: dict[str, Any] = {
         "now": now,
         "hipaa_mode": is_hipaa_mode(),
         "attention_reasons": [],
     }
+
+    # --- N-151 MSAL master-key SOFT-gate ------
+    # Composed via ``gather_n151_soft_gate`` so tests can drive the seam
+    # independently. When active, the digest renders a dedicated
+    # ``Credential store`` section FIRST (above the Status chip row) and
+    # the subject line flips to ``⚠ Attention`` via ``attention_reasons``.
+    state["n151_soft_gate"] = gather_n151_soft_gate(db, config)
+    if state["n151_soft_gate"]["active"]:
+        state["attention_reasons"].append(
+            "MSAL master key unavailable — credential store SOFT-gate "
+            f"active since {state['n151_soft_gate']['since']}"
+        )
 
     # --- Ingestion (per-account, all providers) --------------------------
     # Single source of truth — fold the same per-account verdict the
@@ -459,6 +539,21 @@ def gather_health_state(
         except Exception:
             account_states_list = []
     state["account_states"] = account_states_list
+
+    #  — restore-key freshness (productized reminder, not a verbal nag): the
+    # automated backups are unrecoverable without the operator's key-only
+    # export, so surface when it last happened (None = never on record).
+    try:
+        from pathlib import Path as _P
+
+        from email_triage import backup as _bk
+
+        _dbp = getattr(getattr(config, "persistence", None), "db_path", "")
+        _ddir = _P(_dbp).parent if _dbp else _P("./data")
+        _km = _bk.read_key_export_marker(_ddir)
+        state["last_key_export"] = _km.get("ts") if _km else None
+    except Exception:
+        state["last_key_export"] = None
 
     # Per-provider aggregate (option C — primary mode wins, sums = total).
     providers: dict[str, dict] = {}
@@ -579,9 +674,13 @@ def gather_health_state(
 
     # --- Stale-auth accounts ---------------------------------------------
     # Surface accounts whose OAuth refresh / IMAP password is no longer
-    # valid. Set by _maybe_mark_auth_stale on a "Token has been expired
-    # or revoked" / "AUTHENTICATIONFAILED" exception. Cleared
-    # automatically on the next successful provider call.
+    # valid. The auth_stale flag is maintained by the lifecycle SSOT
+    # ``record_provider_outcome`` (web/app.py): SET (needle-filtered via
+    # web/_auth_revoked) on an auth-revoked failure, CLEARED on the next
+    # successful credentialed provider call — across ALL ingestion surfaces
+    # (poll / Gmail+O365 push / IMAP IDLE / watch+subscription renewers /
+    # sent-mail capture / the Test action), not just the poll path. Census
+    # 2026-06-09 #1.
     stale_auth_accounts: list[dict[str, Any]] = []
     try:
         rows = db.execute(
@@ -591,12 +690,9 @@ def gather_health_state(
             "  ON ea.id = CAST(SUBSTR(s.key, length('auth_stale:') + 1) AS INTEGER) "
             "WHERE s.key LIKE 'auth_stale:%'"
         ).fetchall()
-        import json as _json
+        from email_triage.db._helpers import load_json_col
         for r in rows:
-            try:
-                payload = _json.loads(r["value_json"]) if r["value_json"] else {}
-            except (ValueError, TypeError):
-                payload = {}
+            payload = load_json_col(r["value_json"], default={})  # census 
             if not payload.get("at"):
                 continue
             stale_auth_accounts.append({
@@ -757,21 +853,20 @@ def gather_health_state(
         # attention_reasons + row_dicts surface the operator-set
         # name; numeric id rides along as a tiebreaker only.
         _name_by_id: dict[int, str] = {}
+        # census run17  — account_email SSOT, not the open-coded key.
+        from email_triage.db.accounts import account_email
         try:
             for a in list_email_accounts(db) or []:
                 aid = a.get("id")
                 if aid is not None:
                     _name_by_id[int(aid)] = (
-                        a.get("name") or a.get("email_address") or ""
+                        a.get("name") or account_email(a) or ""
                     )
         except Exception:
             pass
 
         def _label(account_id) -> str:
-            try:
-                aid_int = int(account_id) if account_id is not None else None
-            except (TypeError, ValueError):
-                aid_int = None
+            aid_int = parse_int_or_none(account_id)  # N-219c/38 R23: SSOT
             name = (
                 _name_by_id.get(aid_int)
                 if aid_int is not None else ""
@@ -882,6 +977,12 @@ def is_interesting(state: dict[str, Any]) -> bool:
     """
     if state["attention_reasons"]:
         return True
+    #  Part 3 — N-151 credential-store SOFT-gate active is a
+    # first-class quiet-mode wake-up: the operator MUST see it even
+    # when nothing else is off.  (Kept as its own arm so a future
+    # refactor of ``attention_reasons`` doesn't accidentally hide it.)
+    if state.get("n151_soft_gate", {}).get("active"):
+        return True
     if state.get("error_count_24h", 0) > 0:
         return True
     if state.get("warning_count_24h", 0) > 0:
@@ -944,6 +1045,49 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             'border-left: 3px solid #2e7d32; margin: 0.5rem 0;">'
             '<strong>All green</strong></div>'
         )
+
+    # 0.5. Credential store (N-151 SOFT-gate) —  REDESIGNED v3 Part 3.
+    # Renders as the FIRST content section (above the Status chip row)
+    # ONLY when the SOFT-gate is active — the operator's eye lands on
+    # it right after the ⚠ Attention banner because a broken MSAL
+    # master key means Office 365 accounts silently stop fetching mail.
+    # Silent on a healthy day so the digest doesn't grow a permanent
+    # "credentials OK" line.
+    _n151 = state.get("n151_soft_gate") or {}
+    if _n151.get("active"):
+        parts.append("<h3>Credential store</h3>")
+        parts.append(
+            '<div style="padding: 0.5rem 1rem; background: #fff4e5; '
+            'border-left: 3px solid #d17b00; margin: 0.5rem 0;">'
+        )
+        # DA R4 CIDI-drift fold (2026-07-10): escape the reason + since
+        # before interpolating.  The sibling render site
+        # ``_assemble_n151_soft_gate_alert`` in ``web/admin_alerts.py``
+        # already ``html.escape``s both fields; mirroring the escape
+        # here converges the two render sites (Prime Directive #5).
+        _reason_raw = _n151.get("reason", "unavailable")
+        parts.append(
+            "<p><strong>MSAL master key unavailable.</strong> "
+            f"Reason: <code>{_html_escape(str(_reason_raw))}</code>.</p>"
+        )
+        _since = _n151.get("since")
+        if _since:
+            parts.append(
+                f"<p>SOFT-gate active since <code>{_html_escape(str(_since))}</code>.</p>"
+            )
+        else:
+            parts.append(
+                "<p>SOFT-gate active (start time not recorded).</p>"
+            )
+        parts.append(
+            '<p style="font-size:0.9em;color:#555;">'
+            'Office 365 accounts cannot decrypt cached refresh tokens '
+            'until the master key is restored — new mail will not be '
+            'ingested.  Restore the key or re-authenticate the affected '
+            'account(s) from Admin → Accounts.'
+            '</p>'
+        )
+        parts.append("</div>")
 
     # 1. Status chip row.
     if config.health_email.include_health:
@@ -1264,6 +1408,22 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             f"<p>IMAP folders: {m['watching']}/{m['total']} watching.</p>"
         )
 
+    #  — restore-key freshness: the automated backups can't be restored
+    # without the operator's key-only export.
+    _lke = state.get("last_key_export")
+    if _lke:
+        parts.append(
+            f"<p>Last key export: <strong>{_lke[:10]}</strong> "
+            "<small>(keep your key-only backup current — it's the restore key)"
+            "</small></p>"
+        )
+    else:
+        parts.append(
+            "<p style='color:#c00'><strong>No restore-key export on record</strong>"
+            " — export the key-only backup (Admin → Backup); the automated "
+            "backups cannot be restored without it.</p>"
+        )
+
     parts.append("</div>")
     return "".join(parts)
 
@@ -1281,6 +1441,27 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
     else:
         lines.append("All green.")
     lines.append("")
+
+    # Credential store (N-151 SOFT-gate) — text twin of the HTML block.
+    # Silent on a healthy day; when active it sits ABOVE the Status
+    # block so the operator sees it first.
+    _n151 = state.get("n151_soft_gate") or {}
+    if _n151.get("active"):
+        lines.append("Credential store:")
+        lines.append(
+            f"  MSAL master key unavailable "
+            f"(reason: {_n151.get('reason', 'unavailable')})."
+        )
+        _since = _n151.get("since")
+        if _since:
+            lines.append(f"  SOFT-gate active since {_since}.")
+        else:
+            lines.append("  SOFT-gate active (start time not recorded).")
+        lines.append(
+            "  Office 365 accounts cannot decrypt cached refresh tokens "
+            "until the master key is restored."
+        )
+        lines.append("")
 
     if config.health_email.include_health:
         lines.append("Status:")
@@ -1465,6 +1646,21 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         m = state["mailboxes"]
         lines.append(f"IMAP folders: {m['watching']}/{m['total']} watching.")
 
+    #  — restore-key freshness (the automated backups need this key).
+    _lke = state.get("last_key_export")
+    lines.append("")
+    if _lke:
+        lines.append(
+            f"Last key export: {_lke[:10]} "
+            "(keep your key-only backup current -- it's the restore key)."
+        )
+    else:
+        lines.append(
+            "WARNING: no restore-key export on record -- export the key-only "
+            "backup (Admin -> Backup); the automated backups cannot be restored "
+            "without it."
+        )
+
     return "\n".join(lines)
 
 
@@ -1479,10 +1675,14 @@ def assemble_daily_health_email(
     from email_triage.mail_headers import (
         X_EMAIL_TRIAGE_HEADER, build_triage_header,
     )
+    from email_triage.web.smtp_send import stamp_default_message_headers
+
     msg = EmailMessage()
     date_str = state["now"].strftime("%Y-%m-%d")
     flag = "⚠ Attention" if state["attention_reasons"] else "OK"
     msg["Subject"] = f"[email-triage] Daily health {date_str} — {flag}"
+    # N-272b R28 SSOT — RFC-preferred GMT Date + Message-Id at build time.
+    stamp_default_message_headers(msg)
     # Loop-prevention stamp: the daily-health recipients are often
     # operator inboxes, some of which are watched by triage. If a
     # health email is ever re-ingested the pipeline entry check on
@@ -1546,17 +1746,20 @@ def send_daily_health_email(
     password = ""
     if secrets is not None:
         try:
-            password = secrets.get("SMTP_PASSWORD") or ""
-        except Exception:
-            password = ""
+            password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            # A5 — fail closed + diagnose distinctly: unreadable secret
+            # store (master-key mismatch) is not "no password set".
+            log.error("Daily health email aborted — SMTP password "
+                      "unreadable (corrupt secret row or master-key mismatch)")
+            return False, "secret store unreadable: SMTP_PASSWORD"
 
     try:
-        with smtplib.SMTP(smtp.host, smtp.port) as server:
-            if smtp.use_tls:
-                server.starttls()
-            if smtp.username:
-                server.login(smtp.username, password)
-            server.send_message(msg)
+        from email_triage.web.smtp_send import send_smtp_message
+        send_smtp_message(
+            msg, smtp_host=smtp.host, smtp_port=smtp.port,
+            smtp_user=smtp.username, smtp_password=password, use_tls=smtp.use_tls,
+        )
     except Exception as exc:
         log.error("Daily health email send failed", error=str(exc))
         return False, f"send failed: {exc}"
@@ -1666,8 +1869,12 @@ def _assemble_update_failed_email(
     from email_triage.mail_headers import (
         X_EMAIL_TRIAGE_HEADER, build_triage_header,
     )
+    from email_triage.web.smtp_send import stamp_default_message_headers
+
     msg = EmailMessage()
     msg["Subject"] = subject
+    # N-272b R28 SSOT — RFC-preferred GMT Date + Message-Id at build time.
+    stamp_default_message_headers(msg)
     # Loop-prevention stamp — same rationale as the daily-health email:
     # admin recipients are often operator inboxes that are themselves
     # watched by triage.
@@ -1741,17 +1948,19 @@ def send_update_failed_email(
     password = ""
     if secrets is not None:
         try:
-            password = secrets.get("SMTP_PASSWORD") or ""
-        except Exception:
-            password = ""
+            password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            # A5 — fail closed + diagnose distinctly (see sibling sender).
+            log.error("Update-failed email aborted — SMTP password "
+                      "unreadable (corrupt secret row or master-key mismatch)")
+            return False, "secret store unreadable: SMTP_PASSWORD"
 
     try:
-        with smtplib.SMTP(smtp.host, smtp.port) as server:
-            if smtp.use_tls:
-                server.starttls()
-            if smtp.username:
-                server.login(smtp.username, password)
-            server.send_message(msg)
+        from email_triage.web.smtp_send import send_smtp_message
+        send_smtp_message(
+            msg, smtp_host=smtp.host, smtp_port=smtp.port,
+            smtp_user=smtp.username, smtp_password=password, use_tls=smtp.use_tls,
+        )
     except Exception as exc:
         log.error(
             "Update-failed email send failed",

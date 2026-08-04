@@ -98,7 +98,12 @@ def parse_ssh_ed25519_pubkey(text: str) -> ParsedDevKey:
         )
 
     try:
-        blob = base64.b64decode(b64, validate=True)
+        #  tail — operator-typed SSH ed25519 pubkey blob; paste may
+        # be trimmed of trailing ``=`` padding. Route through the SSOT
+        # (validate=True preserved) so a length-not-multiple-of-4 blob
+        # decodes correctly instead of raising ``binascii.Error``.
+        from email_triage._base64url import b64decode_permissive
+        blob = b64decode_permissive(b64, urlsafe=False, validate=True)
     except (ValueError, base64.binascii.Error) as e:
         raise DevKeyParseError(f"Invalid base64 in key blob: {e}") from e
 

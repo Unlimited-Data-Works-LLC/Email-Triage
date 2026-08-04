@@ -1,0 +1,45 @@
+{# Rolled-up cross-account mail-search-index update progress.
+   A partial, HTMX-swapped into #reindex-agg on the Bulk runs page. Renders the
+   wave (one bar + per-account rows) ONLY while a reindex is active; otherwise
+   empty, so the self-poll below stops on its own.
+   AUDIENCE: operator. Copy: "mail search index", not "embedding"/"reindex";
+   status words render verbatim. No admin-only paths. Account by name, never
+   by bare number (feedback_no_account_id_alone). #}
+{% if agg and agg.active %}
+<section id="reindex-agg-inner"
+         hx-get="/triage/jobs/reindex-progress"
+         hx-trigger="every 3s"
+         hx-target="#reindex-agg"
+         hx-swap="innerHTML"
+         aria-live="polite"
+         style="margin:0 0 1.5rem 0;padding:0.9rem 1.1rem;border:1px solid var(--pico-muted-border-color);border-radius:6px;background:var(--pico-card-background-color);">
+    <strong>Updating the mail search index —
+        {{ agg.done }} of {{ agg.accounts }} account{{ '' if agg.accounts == 1 else 's' }} done</strong>
+    <div role="progressbar" aria-valuenow="{{ agg.pct }}" aria-valuemin="0" aria-valuemax="100"
+         style="margin:0.45rem 0;background:var(--pico-secondary-background,#ddd);border-radius:4px;height:0.6rem;overflow:hidden;">
+        <div style="width:{{ agg.pct }}%;height:100%;background:var(--pico-primary);transition:width 0.4s;"></div>
+    </div>
+    <small style="color:var(--pico-muted-color);">
+        {{ agg.processed }} of {{ agg.total }} message{{ '' if agg.total == 1 else 's' }} re-indexed ({{ agg.pct }}%)
+    </small>
+    <table style="margin-top:0.6rem;">
+        <thead>
+            <tr><th>Account</th><th>Status</th><th>Progress</th></tr>
+        </thead>
+        <tbody>
+            {% for r in agg.rows %}
+            {% set a = accts_by_id.get(r.account_id) %}
+            <tr>
+                <td>
+                    {% if a %}{{ a.name }}
+                    <small style="color:var(--pico-muted-color);">({{ a.owner_email or "" }})</small>
+                    {% else %}<small>Account {{ r.account_id }}</small>{% endif %}
+                </td>
+                <td>{{ r.status|capitalize }}</td>
+                <td>{{ r.processed }} / {{ r.total }} ({{ r.pct }}%)</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}

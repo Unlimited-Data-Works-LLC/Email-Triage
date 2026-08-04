@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}My Settings - Deadline reminders - Email Triage{% endblock %}
+{% block content %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (site PI / research coordinator / admin) setting
+                up their institution's own reporting-deadline reminders.
+   TECH-SKILL:  computer-literate professional (doctor, researcher,
+                coordinator). No terminal, no regulations jargon, no
+                provider internals.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*). No env-var names.
+     - Plain language: "deadline reminder" not "regulatory clock def";
+       "how many days" not "duration_value"; "AI" not "LLM".
+     - The built-in FDA / EU reminders are FIXED by law — shown
+       read-only, never editable here.
+     - Tooltips lead with a concrete example.
+   ─────────────────────────────────────────────────────────── #}
+
+<h2>My Settings</h2>
+{% set active = "regulatory-clocks" %}
+{% include "_settings_tabs.html" %}
+<h3>Deadline reminders{{ m.help("Set up reminders for your site's own reporting deadlines — for example an IRB report that's due a set number of days after you learn of an event. The built-in FDA and EU sponsor deadlines are fixed by law and shown for reference; the reminders YOU add are yours to edit.") }}</h3>
+
+{% if error_msg %}
+  <p role="alert" style="color:#b00020;">{{ error_msg }}</p>
+{% endif %}
+{% if save_msg %}
+  <p style="color:var(--pico-ins-color, #208020);">{{ save_msg }}</p>
+{% endif %}
+
+{% if not admin_accounts %}
+  <p>You don't have administrator access to any mailbox, so there are no
+     deadline reminders to set up here.</p>
+{% else %}
+
+  {# ── Account picker (owner + name, never a bare id) ─────────── #}
+  <form method="get" action="/profile/regulatory-clocks" style="margin:0 0 1rem 0;">
+    <label>Mailbox
+      <select name="account_id" onchange="this.form.submit()" style="width:auto;">
+        {% for a in admin_accounts %}
+          <option value="{{ a.id }}"
+            {% if selected_account and a.id == selected_account.id %}selected{% endif %}>
+            {{ a.name or a.email_address or ("Account " ~ a.id) }}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+  </form>
+
+  {% if selected_account %}
+    {% if not working_day_calendar_configured %}
+      <p style="color:#8a6d00;">Tip: set up your working-day calendar (holidays
+        and work week) before adding a reminder that counts in working days, so
+        dates land correctly.</p>
+    {% endif %}
+
+    {# ── Your own reminders ───────────────────────────────────── #}
+    <h4>Your reminders for “{{ selected_account.name or selected_account.email_address }}”</h4>
+    {% if owned_defs %}
+      <table>
+        <thead><tr><th>Name</th><th>When it's due</th><th>Type</th><th>Status</th><th></th></tr></thead>
+        <tbody>
+        {% for d in owned_defs %}
+          <tr>
+            <td>{{ d.title }}{% if not d.enabled %} <small>(off)</small>{% endif %}</td>
+            <td>{% if d.duration_value and d.duration_value > 0 %}
+                  {{ d.duration_value }}
+                  {{ "working day(s)" if d.duration_unit == "working_day" else "calendar day(s)" }}
+                {% else %}Not set yet{% endif %}</td>
+            <td>{{ "IRB" if d.regime == "IRB" else "Internal" }}</td>
+            {# D2 fix 2026-07-16 — enable/disable toggle. Button label MUST
+               stay "Turn off" / "Turn on" verbatim: the delete-refusal in
+               db/regulatory_clock.py:544-547 tells the operator to "turn
+               it off instead of deleting it", so the button label must
+               match the referenced verb to close the copy-to-mechanism
+               loop. #}
+            <td>
+              <form method="post" action="/profile/regulatory-clocks/set-enabled">
+                {{ csrf_input(request) }}
+                <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+                <input type="hidden" name="def_id" value="{{ d.id }}">
+                <input type="hidden" name="enabled" value="{% if d.enabled %}0{% else %}1{% endif %}">
+                <button type="submit" class="secondary">{% if d.enabled %}Turn off{% else %}Turn on{% endif %}</button>
+              </form>
+            </td>
+            <td>
+              <details>
+                <summary>Edit</summary>
+                <form method="post" action="/profile/regulatory-clocks/update">
+                  {{ csrf_input(request) }}
+                  <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+                  <input type="hidden" name="def_id" value="{{ d.id }}">
+                  <input type="hidden" name="regime" value="{{ d.regime }}">
+                  <label>Name<input type="text" name="title" value="{{ d.title }}" required></label>
+                  <label>How many days (leave blank to keep “{{ d.duration_value }}”)
+                    <input type="number" name="duration_value" min="0" max="365"
+                           placeholder="keep current"></label>
+                  <label>Day type
+                    <select name="duration_unit">
+                      <option value="working_day" {% if d.duration_unit == "working_day" %}selected{% endif %}>Working days</option>
+                      <option value="calendar_day" {% if d.duration_unit == "calendar_day" %}selected{% endif %}>Calendar days</option>
+                    </select></label>
+                  <fieldset style="margin:0.4rem 0;">
+                    <legend><small>Remind me before it's due{{ m.help("Pick when to nudge you ahead of the deadline. Leave all unticked to keep the current reminders. Example: a reminder when there's about a quarter of the time left.") }}</small></legend>
+                    {% set _leads = d.lead_pcts or [] %}
+                    {% for pct, lbl in [(50,'About halfway'),(25,'A quarter of the time left'),(10,'Almost due')] %}
+                      <label style="display:inline-flex;gap:0.3rem;margin-right:0.8rem;">
+                        <input type="checkbox" name="escalation_lead_pcts" value="{{ pct }}"
+                               {% if pct in _leads %}checked{% endif %}>{{ lbl }}</label>
+                    {% endfor %}
+                  </fieldset>
+                  <input type="hidden" name="ack_required_submitted" value="1">
+                  <label style="display:flex;gap:0.4rem;align-items:center;">
+                    <input type="checkbox" name="ack_required" value="1" {% if d.ack_required %}checked{% endif %}>
+                    Ask me to confirm I've handled it</label>
+                  <button type="submit">Save changes</button>
+                </form>
+                <form method="post" action="/profile/regulatory-clocks/delete"
+                      onsubmit="return confirm('Delete this reminder template?');">
+                  {{ csrf_input(request) }}
+                  <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+                  <input type="hidden" name="def_id" value="{{ d.id }}">
+                  <button type="submit" class="secondary">Delete</button>
+                </form>
+                {# D2 fix 2026-07-16 — micro-copy pre-empts the common
+                   operator misconception that turning a template off
+                   halts already-armed deadlines. It does NOT: each
+                   armed regulatory_clock_instance carries a frozen-
+                   policy snapshot and keeps ticking. #}
+                <small>Turning this off stops future reminders; anything already ticking keeps its deadline.</small>
+              </details>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>You haven't added any reminders for this mailbox yet.</p>
+    {% endif %}
+
+    {# ── Add a new reminder ───────────────────────────────────── #}
+    <details>
+      <summary><strong>Add a reminder</strong></summary>
+      <form method="post" action="/profile/regulatory-clocks/create">
+        {{ csrf_input(request) }}
+        <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+        <label>Name{{ m.help("A short label, e.g. 'IRB unanticipated-problem report' or 'Internal SAE notification'.") }}
+          <input type="text" name="title" required placeholder="e.g. IRB report"></label>
+        <label>Kind
+          <select name="regime">
+            <option value="IRB">IRB / human-research-protection report</option>
+            <option value="INTERNAL">Internal (sponsor / safety committee)</option>
+          </select></label>
+        <label>How many days until it's due{{ m.help("Leave at 0 to add the reminder now and fill in your institution's number later. Example: 10 working days after you learn of the event.") }}
+          <input type="number" name="duration_value" min="0" max="365" value="0"></label>
+        <label>Day type
+          <select name="duration_unit">
+            <option value="working_day">Working days</option>
+            <option value="calendar_day">Calendar days</option>
+          </select></label>
+        <fieldset style="margin:0.4rem 0;">
+          <legend><small>Remind me before it's due{{ m.help("Pick when to nudge you ahead of the deadline. Example: a reminder when there's about a quarter of the time left.") }}</small></legend>
+          {% for pct, lbl in [(50,'About halfway'),(25,'A quarter of the time left'),(10,'Almost due')] %}
+            <label style="display:inline-flex;gap:0.3rem;margin-right:0.8rem;">
+              <input type="checkbox" name="escalation_lead_pcts" value="{{ pct }}"
+                     {% if pct in [25, 10] %}checked{% endif %}>{{ lbl }}</label>
+          {% endfor %}
+        </fieldset>
+        <input type="hidden" name="ack_required_submitted" value="1">
+        <label style="display:flex;gap:0.4rem;align-items:center;">
+          <input type="checkbox" name="ack_required" value="1" checked>
+          Ask me to confirm I've handled it</label>
+        <button type="submit">Add reminder</button>
+      </form>
+    </details>
+  {% endif %}
+
+  {# ── Built-in reference deadlines (read-only) ─────────────────── #}
+  <h4>Built-in deadlines (for reference){{ m.help("These are set by law (FDA / EU) or are standard IRB report types. The FDA and EU ones are fixed and can't be changed. The IRB ones are starting points — add your own above with your institution's exact number of days.") }}</h4>
+  <table>
+    <thead><tr><th>Name</th><th>Set by</th><th>Days</th></tr></thead>
+    <tbody>
+    {% for d in base_defs %}
+      <tr>
+        <td>{{ d.title }}</td>
+        <td>{{ {"FDA":"FDA (fixed)","EU_CTR":"EU (fixed)","IRB":"IRB (starting point)","INTERNAL":"Internal (starting point)"}.get(d.regime, d.regime) }}</td>
+        <td>{% if d.duration_value and d.duration_value > 0 %}{{ d.duration_value }}{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+{% endif %}
+{% endblock %}

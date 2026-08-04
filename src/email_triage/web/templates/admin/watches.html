@@ -64,7 +64,7 @@
                 {{ acts | join(" + ") if acts else "(none)" }}
             </td>
             <td style="font-size:0.85em;color:var(--pico-muted-color);">
-                {{ w.updated_at[:19] }}
+                {% if w.updated_at %}<time datetime="{{ w.updated_at }}" data-us-datetime>{{ w.updated_at | us_datetime }}</time>{% else %}—{% endif %}
             </td>
             <td>
                 {% if w.account_id %}

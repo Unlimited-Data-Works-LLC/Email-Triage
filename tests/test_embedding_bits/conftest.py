@@ -120,7 +120,7 @@ def url_to_bytes(
 
 
 @pytest.fixture
-def test_db(tmp_path: Path) -> sqlite3.Connection:
+def test_db(tmp_path: Path) -> "Iterator[sqlite3.Connection]":
     """Migrated DB for install_state row writes.
 
     init_db creates the canonical settings/email_accounts/etc tables
@@ -142,7 +142,13 @@ def test_db(tmp_path: Path) -> sqlite3.Connection:
         (1, "test@example.com", "Test User", "admin", now),
     )
     conn.commit()
-    return conn
+    #  (ResourceWarning bucket 1): yield + close so the fixture doesn't leak
+    # the SQLite connection (a bare ``return conn`` left GC to close it later
+    # and warn). pytest finalizes the generator on teardown.
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 @pytest.fixture(autouse=True)

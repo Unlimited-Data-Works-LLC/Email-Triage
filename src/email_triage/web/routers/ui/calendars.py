@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from email_triage.engine.models import Classification, EmailMessage, UserRole
+from email_triage.web._flash import scrub_exc  # N-179 R21_2 SSOT
 from email_triage.web.db import can_manage_account
 from email_triage.web import settings_keys as _S
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
@@ -38,6 +39,7 @@ from email_triage.web.auth import (
     verify_otp,
 )
 from email_triage.web.db_threadpool import db_call
+from email_triage.web._audit import safe_audit_write
 from email_triage.web.dependencies import (
     OwnedAccount,
     OwnedAccountOrLogin,
@@ -48,30 +50,12 @@ from email_triage.web.dependencies import (
 )
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c/39 R23
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.calendars")
 
 router = APIRouter()
-
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 
 from . import _shared
@@ -84,13 +68,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -187,8 +190,11 @@ async def calendars_discover(
             "Calendar discovery failed",
             account_id=account_id, error=fmt_exc(e),
         )
+        # N-179 R21_2 (2026-07-02): scrub exception via _flash SSOT before
+        # the helper renders it. Calendar discovery errors can carry OAuth
+        # provider-error content.
         return HTMLResponse(_render_calendars_table(
-            account_id, [], error=fmt_exc(e),
+            account_id, [], error=scrub_exc(e, purpose='provider'),
         ))
 
     stored = (acct.get("config") or {}).get("calendars") or []
@@ -309,9 +315,9 @@ async def calendar_surrogate_save(
     if raw and is_account_hipaa(acct):
         def _hipaa_refusal_audit() -> None:
             """/ — best-effort refusal audit row off the loop."""
-            try:
-                from email_triage.web.db import record_access_event
-                record_access_event(
+            from email_triage.web.db import record_access_event
+            safe_audit_write(
+                lambda: record_access_event(
                     db,
                     actor_user_id=user.get("id"),
                     method="POST",
@@ -324,9 +330,9 @@ async def calendar_surrogate_save(
                         f"hipaa_account=yes attempted_surrogate={raw} "
                         "reason=hipaa_self_only"
                     ),
-                )
-            except Exception:
-                pass
+                ),
+                description=f"surrogate_hipaa_refused account_id={account_id} status=403",
+            )
 
         await db_call(_hipaa_refusal_audit)
         return HTMLResponse(
@@ -350,9 +356,8 @@ async def calendar_surrogate_save(
             "Calendar surrogate cleared. This IMAP account has "
             "no calendar until you pick a new one.</small>"
         )
-    try:
-        sid = int(raw)
-    except (TypeError, ValueError):
+    sid = parse_int_or_none(raw)  # N-219c/39 R23: SSOT
+    if sid is None:
         return HTMLResponse(
             "<small style='color:var(--pico-del-color);'>"
             "Invalid surrogate selection.</small>"
@@ -400,6 +405,6 @@ async def calendar_surrogate_save(
 
 
 # ---------------------------------------------------------------------------
-# OpenClaw per-account quiet-hours / pause editor
+# Outbound-webhook per-account quiet-hours / pause editor
 # ---------------------------------------------------------------------------
 

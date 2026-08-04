@@ -37,6 +37,8 @@ write can never leave a torn pair on disk.
 
 from __future__ import annotations
 
+from email_triage.secrets import read_secret
+
 import asyncio
 import os
 import secrets
@@ -45,6 +47,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email_triage._errfmt import fmt_exc
+from email_triage._isotime import assume_utc_if_naive, now_utc_iso  # N-357b R31
 from pathlib import Path
 from typing import Any
 
@@ -52,9 +56,49 @@ from email_triage.config import AcmeConfig, Rfc2136Config
 from email_triage.single_flight import single_flight
 from email_triage.triage_logging import get_logger
 from email_triage.web.db_auth_helpers import insert_acme_renewal_log
+from email_triage._secret_keys import ACME_ACCOUNT_KEY_KEY  # N-231 R22 stored-secret-key SSOT
 
 
 log = get_logger("web.acme")
+
+
+# -d/DA-F1 (2026-07-11) — CONFIG-DRIVEN DNS query timeouts. Two
+# knobs because DA panel refutation caught that dns.query.udp probes
+# (12 sites in this file) run under a SHORTER 5s budget than the
+# dns.query.tcp UPDATE/delete-TXT paths (10s). Same-drive fold per
+# operator directive "expose ALL".
+#   _ACME_DNS_UPDATE_TIMEOUT_SECS — dns.query.tcp UPDATE / delete-TXT
+#      (RFC 2136 signed operations); default 10s preserves prior
+#      hardcoded value at :498, :527, :1213.
+#   _ACME_DNS_PROBE_TIMEOUT_SECS — dns.query.udp probes (CAA lookup,
+#      NS resolution, propagation-verify, resolver iteration); default
+#      5s preserves prior hardcoded value at :124, :558, :672, :693,
+#      :723, :809, :836, :953, :995, :1135.
+_ACME_DNS_UPDATE_TIMEOUT_SECS: float = 10.0
+_ACME_DNS_PROBE_TIMEOUT_SECS: float = 5.0
+
+
+def configure_acme_dns_query_timeout(
+    timeout_secs: float,
+    probe_timeout_secs: float | None = None,
+) -> None:
+    """-d — set the ACME dns.query.* budgets.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    ``config.tls.acme.dns_query_timeout_secs`` (UPDATE/tcp path) and
+    optionally ``dns_probe_timeout_secs`` (udp probe path). Rejects
+    non-positive values. Old single-knob call shape still works and
+    only tunes the UPDATE budget; new callers pass both.
+    """
+    global _ACME_DNS_UPDATE_TIMEOUT_SECS, _ACME_DNS_PROBE_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _ACME_DNS_UPDATE_TIMEOUT_SECS = float(timeout_secs)
+    if (
+        probe_timeout_secs is not None
+        and isinstance(probe_timeout_secs, (int, float))
+        and probe_timeout_secs > 0
+    ):
+        _ACME_DNS_PROBE_TIMEOUT_SECS = float(probe_timeout_secs)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +140,7 @@ def caa_preflight(
             try:
                 q = dns.message.make_query(zone, dns.rdatatype.CAA)
                 resp = dns.query.udp(
-                    q, resolver_ip, port=53, timeout=5,
+                    q, resolver_ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS,
                 )
                 if resp.rcode() != dns.rcode.NOERROR:
                     continue
@@ -201,11 +245,31 @@ def cname_preflight(
     if not update_zone:
         return True, []
 
-    import dns.message
-    import dns.query
-    import dns.rcode
-    import dns.rdatatype
     import dns.name as _dnsname
+
+    from email_triage._egress import Intent, egress_client
+
+    # N-374: query over DoH (HTTPS:443) instead of dns.query.udp on port 53.
+    # On split-horizon LANs the operator's `public_resolvers` list (e.g.
+    # `[8.8.8.8, 1.1.1.1, 9.9.9.9]`) reaches the LAN authoritative NS
+    # transparently — every "public" UDP:53 query gets intercepted and
+    # answered by the LAN NS, so a pre-flight against the LAN copy of the
+    # zone silently reports the wrong view as public. DoH escapes the
+    # intercept: HTTPS to `dns.google` / `cloudflare-dns.com` /
+    # `dns.quad9.net` reaches the actual public resolver.
+    #
+    # Preserve the operator's choice of resolver family by mapping each
+    # configured IP to its provider's DoH endpoint. Unknown IPs fall back
+    # to Google (same as the original code path's default).
+    _DOH_ENDPOINTS = {
+        "8.8.8.8": "https://dns.google/resolve",
+        "8.8.4.4": "https://dns.google/resolve",
+        "1.1.1.1": "https://cloudflare-dns.com/dns-query",
+        "1.0.0.1": "https://cloudflare-dns.com/dns-query",
+        "9.9.9.9": "https://dns.quad9.net/dns-query",
+        "149.112.112.112": "https://dns.quad9.net/dns-query",
+    }
+    _DEFAULT_DOH = "https://dns.google/resolve"
 
     resolvers = public_resolvers or ["8.8.8.8"]
     expected_target = (
@@ -214,66 +278,89 @@ def cname_preflight(
     messages: list[str] = []
     any_ok_for_each_domain: dict[str, bool] = {}
 
-    for d in domains:
-        cert_subject = d.rstrip(".")
-        cname_q_name = f"_acme-challenge.{cert_subject}."
-        any_ok_for_each_domain[d] = False
-        for resolver_ip in resolvers:
-            try:
-                q = dns.message.make_query(
-                    cname_q_name, dns.rdatatype.CNAME,
+    # Route through the egress funnel — Intent.PUBLIC_FETCH applies the
+    # SSRF-guard-only pass-through policy so a compromised _DOH_ENDPOINTS
+    # entry can't become a link-local/metadata probe. Non-PHI: ACME
+    # pre-flight on public domain names. Fixes the N-374b egress-funnel-
+    # pin regression the DoH switch introduced.
+    with egress_client(intent=Intent.PUBLIC_FETCH,
+                       timeout=float(timeout_secs)) as client:
+        for d in domains:
+            cert_subject = d.rstrip(".")
+            cname_q_name = f"_acme-challenge.{cert_subject}."
+            any_ok_for_each_domain[d] = False
+            for resolver_ip in resolvers:
+                endpoint = _DOH_ENDPOINTS.get(
+                    resolver_ip.strip(), _DEFAULT_DOH,
                 )
-                resp = dns.query.udp(
-                    q, resolver_ip, port=53, timeout=timeout_secs,
-                )
-                if resp.rcode() == dns.rcode.NXDOMAIN:
-                    messages.append(
-                        f"{d}: NXDOMAIN at {cname_q_name} via "
-                        f"{resolver_ip} -- the CNAME isn't "
-                        f"published yet (or not visible externally)."
+                try:
+                    resp = client.get(
+                        endpoint,
+                        params={"name": cname_q_name, "type": "CNAME"},
+                        headers={"accept": "application/dns-json"},
                     )
-                    continue
-                if resp.rcode() != dns.rcode.NOERROR:
-                    messages.append(
-                        f"{d}: rcode={resp.rcode()} at {cname_q_name} "
-                        f"via {resolver_ip}"
-                    )
-                    continue
-                # Look for a CNAME RRset in the answer section.
-                got_target: str | None = None
-                for rrset in resp.answer:
-                    if rrset.rdtype == dns.rdatatype.CNAME:
-                        for rr in rrset:
-                            got_target = str(rr.target).rstrip(".") + "."
+                    if resp.status_code != 200:
+                        messages.append(
+                            f"{d}: DoH HTTP {resp.status_code} at "
+                            f"{endpoint} for {cname_q_name} "
+                            f"(resolver {resolver_ip})"
+                        )
+                        continue
+                    data = resp.json()
+                    # RFC 8484 / JSON API: Status field maps to DNS rcode
+                    # (0=NOERROR, 3=NXDOMAIN).
+                    status = data.get("Status")
+                    if status == 3:
+                        messages.append(
+                            f"{d}: NXDOMAIN at {cname_q_name} via "
+                            f"{resolver_ip} (DoH) -- the CNAME isn't "
+                            f"published yet (or not visible externally)."
+                        )
+                        continue
+                    if status != 0:
+                        messages.append(
+                            f"{d}: rcode={status} at {cname_q_name} "
+                            f"via {resolver_ip} (DoH)"
+                        )
+                        continue
+                    # DoH JSON answer entries: {"name":.., "type":<int>,
+                    # "TTL":.., "data":..}. CNAME is dnstype 5.
+                    got_target: str | None = None
+                    for ans in data.get("Answer", []) or []:
+                        if ans.get("type") == 5:
+                            got_target = (
+                                str(ans.get("data", "")).rstrip(".") + "."
+                            )
                             break
-                if got_target is None:
+                    if got_target is None:
+                        messages.append(
+                            f"{d}: no CNAME at {cname_q_name} via "
+                            f"{resolver_ip} (DoH; answer had no "
+                            f"CNAME record)"
+                        )
+                        continue
+                    # Compare expected vs got, label-insensitive (DNS
+                    # names are case-insensitive). Allow the operator to
+                    # CNAME to a deeper name within the update zone --
+                    # the right end-state is "name lives somewhere under
+                    # update_zone", not "exactly equal to update_zone".
+                    got_name = _dnsname.from_text(got_target)
+                    if got_name == expected_target or got_name.is_subdomain(
+                        expected_target,
+                    ):
+                        any_ok_for_each_domain[d] = True
+                        break  # one good resolver = ok for this domain
                     messages.append(
-                        f"{d}: no CNAME at {cname_q_name} via "
-                        f"{resolver_ip} (answer was empty)"
+                        f"{d}: CNAME at {cname_q_name} points to "
+                        f"{got_target!r} via {resolver_ip} (DoH); "
+                        f"expected target under {update_zone!r}"
+                    )
+                except Exception as exc:
+                    messages.append(
+                        f"{d}: DoH lookup failed via {resolver_ip} "
+                        f"({endpoint}): {fmt_exc(exc, with_class=True)}"
                     )
                     continue
-                # Compare expected vs got, label-insensitive (DNS
-                # names are case-insensitive). Allow the operator to
-                # CNAME to a deeper name within the update zone --
-                # the right end-state is "name lives somewhere under
-                # update_zone", not "exactly equal to update_zone".
-                got_name = _dnsname.from_text(got_target)
-                if got_name == expected_target or got_name.is_subdomain(
-                    expected_target,
-                ):
-                    any_ok_for_each_domain[d] = True
-                    break  # one good resolver = ok for this domain
-                messages.append(
-                    f"{d}: CNAME at {cname_q_name} points to "
-                    f"{got_target!r} via {resolver_ip}; expected "
-                    f"target under {update_zone!r}"
-                )
-            except Exception as exc:
-                messages.append(
-                    f"{d}: CNAME lookup failed via {resolver_ip}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                continue
 
     overall_ok = all(any_ok_for_each_domain.values())
     return overall_ok, messages
@@ -324,7 +411,7 @@ class TestRunResult:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_iso()
 
 
 def _elapsed_ms(t0: float) -> int:
@@ -429,7 +516,7 @@ class Rfc2136Publisher:
         update.add(rel, ttl, "TXT", f'"{value}"')
         resp = dns.query.tcp(
             update, self.cfg.nameserver, port=self.cfg.nameserver_port,
-            timeout=10,
+            timeout=_ACME_DNS_UPDATE_TIMEOUT_SECS,
         )
         if resp.rcode() != 0:
             raise RuntimeError(
@@ -457,7 +544,7 @@ class Rfc2136Publisher:
         try:
             dns.query.tcp(
                 update, self.cfg.nameserver, port=self.cfg.nameserver_port,
-                timeout=10,
+                timeout=_ACME_DNS_UPDATE_TIMEOUT_SECS,
             )
         except Exception:
             log.warning(
@@ -487,7 +574,7 @@ class Rfc2136Publisher:
         while time.monotonic() < deadline:
             try:
                 resp = dns.query.udp(
-                    q, target, port=target_port, timeout=5,
+                    q, target, port=target_port, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS,
                 )
                 # Filter by rdtype FIRST. When the recursor follows a
                 # CNAME (CNAME-delegation pattern), resp.answer
@@ -600,7 +687,7 @@ class Rfc2136Publisher:
                 continue
             try:
                 q = dns.message.make_query(zone, dns.rdatatype.NS)
-                resp = dns.query.udp(q, seed_ip, port=53, timeout=5)
+                resp = dns.query.udp(q, seed_ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
             except Exception:
                 continue
             ns_targets: list[str] = []
@@ -621,7 +708,7 @@ class Rfc2136Publisher:
             for ns_name in ns_targets:
                 try:
                     a_q = dns.message.make_query(ns_name, dns.rdatatype.A)
-                    a_resp = dns.query.udp(a_q, seed_ip, port=53, timeout=5)
+                    a_resp = dns.query.udp(a_q, seed_ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
                     for rrset in a_resp.answer:
                         if rrset.rdtype == dns.rdatatype.A:
                             for rr in rrset:
@@ -651,7 +738,7 @@ class Rfc2136Publisher:
                 return [], f"no_authoritative_ns:{current}"
             try:
                 q = dns.message.make_query(current, rdtype)
-                resp = dns.query.udp(q, ns_ip, port=53, timeout=5)
+                resp = dns.query.udp(q, ns_ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
             except Exception as e:
                 return [], f"query_error:{type(e).__name__}"
             if resp.rcode() == dns.rcode.NXDOMAIN:
@@ -737,7 +824,7 @@ class Rfc2136Publisher:
         q = dns.message.make_query(".", dns.rdatatype.SOA)
         for ip in ROOT_IPS:
             try:
-                resp = dns.query.udp(q, ip, port=53, timeout=5)
+                resp = dns.query.udp(q, ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
             except Exception:
                 continue
             if resp.rcode() != dns.rcode.NOERROR:
@@ -764,7 +851,7 @@ class Rfc2136Publisher:
                             parent_zone, dns.rdatatype.NS,
                         )
                         nsresp = dns.query.udp(
-                            nsq, ip, port=53, timeout=5,
+                            nsq, ip, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS,
                         )
                     except Exception:
                         continue
@@ -881,7 +968,7 @@ class Rfc2136Publisher:
         for r in resolvers:
             try:
                 q = dns.message.make_query(fqdn, dns.rdatatype.TXT)
-                resp = dns.query.udp(q, r, port=53, timeout=5)
+                resp = dns.query.udp(q, r, port=53, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
                 if resp.rcode() == dns.rcode.NXDOMAIN:
                     out[r] = "nxdomain"
                     continue
@@ -923,7 +1010,7 @@ class Rfc2136Publisher:
         import dns.message, dns.query, dns.rdatatype
         try:
             q = dns.message.make_query(fqdn, dns.rdatatype.TXT)
-            resp = dns.query.udp(q, resolver, port=port, timeout=5)
+            resp = dns.query.udp(q, resolver, port=port, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS)
             for rrset in resp.answer:
                 if rrset.rdtype != dns.rdatatype.TXT:
                     continue
@@ -1039,20 +1126,6 @@ def _retry_delay_secs(
     return min(cap, seq[idx])
 
 
-def _fmt_exc(e: Exception) -> str:
-    """Render an exception in a way that's never empty.
-
-    Some libraries raise bare ``ValueError()`` / ``OSError()`` with no
-    args — ``str(e)`` returns ``""`` and the operator sees nothing
-    actionable. Fall back to ``repr`` (which always carries the type)
-    in that case.
-    """
-    msg = str(e)
-    if msg:
-        return f"{type(e).__name__}: {msg}"
-    return repr(e)
-
-
 def test_dns_reachability(cfg: AcmeConfig) -> TestStepResult:
     """Probe the configured nameserver: open UDP+TCP, fire an SOA
     query for the zone, return success on rcode==0 or NOERROR."""
@@ -1077,7 +1150,7 @@ def test_dns_reachability(cfg: AcmeConfig) -> TestStepResult:
     try:
         q = dns.message.make_query(name, dns.rdatatype.SOA)
         resp = dns.query.udp(
-            q, rfc.nameserver, port=rfc.nameserver_port, timeout=5,
+            q, rfc.nameserver, port=rfc.nameserver_port, timeout=_ACME_DNS_PROBE_TIMEOUT_SECS,
         )
         rcode = resp.rcode()
         elapsed = _elapsed_ms(t0)
@@ -1097,7 +1170,7 @@ def test_dns_reachability(cfg: AcmeConfig) -> TestStepResult:
         return TestStepResult(
             "DNS reachability", False, _elapsed_ms(t0),
             error=(
-                f"{_fmt_exc(e)} "
+                f"{fmt_exc(e, with_class=True)} "
                 f"(server={rfc.nameserver!r}, "
                 f"port={rfc.nameserver_port}, zone={name!r})"
             ),
@@ -1121,7 +1194,7 @@ def test_tsig_authentication(
     except Exception as e:
         return TestStepResult(
             "TSIG authentication", False, 0,
-            error=f"Publisher config invalid: {_fmt_exc(e)}",
+            error=f"Publisher config invalid: {fmt_exc(e, with_class=True)}",
         )
     t0 = time.monotonic()
     try:
@@ -1157,7 +1230,7 @@ def test_tsig_authentication(
         update.delete(rel, "TXT")
         resp = dns.query.tcp(
             update, pub.cfg.nameserver, port=pub.cfg.nameserver_port,
-            timeout=10,
+            timeout=_ACME_DNS_UPDATE_TIMEOUT_SECS,
         )
         rc = resp.rcode()
         elapsed = _elapsed_ms(t0)
@@ -1215,7 +1288,7 @@ def test_tsig_authentication(
         return TestStepResult(
             "TSIG authentication", False, _elapsed_ms(t0),
             error=(
-                f"{_fmt_exc(e)} "
+                f"{fmt_exc(e, with_class=True)} "
                 f"(server={cfg.rfc2136.nameserver!r}, "
                 f"key={cfg.rfc2136.tsig_key_name!r}, "
                 f"algo={cfg.rfc2136.tsig_algorithm!r})"
@@ -1242,7 +1315,7 @@ def test_publish_record(
     except Exception as e:
         return TestStepResult(
             "Publish & verify TXT", False, 0,
-            error=f"Publisher config invalid: {_fmt_exc(e)}",
+            error=f"Publisher config invalid: {fmt_exc(e, with_class=True)}",
         )
     cert_subject = cfg.domains[0]
     probe_value = f"et-acme-probe-{secrets.token_hex(8)}"
@@ -1252,7 +1325,7 @@ def test_publish_record(
     except Exception as e:
         return TestStepResult(
             "Publish & verify TXT", False, _elapsed_ms(t0),
-            error=f"Publish failed: {_fmt_exc(e)}",
+            error=f"Publish failed: {fmt_exc(e, with_class=True)}",
         )
     visible = pub.poll_for_value(fqdn, probe_value, timeout_secs=30)
     elapsed = _elapsed_ms(t0)
@@ -1339,7 +1412,7 @@ class AcmeRenewer:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.hazmat.primitives import serialization
 
-        existing = self.secrets.get("acme_account_key")
+        existing = read_secret(self.secrets, ACME_ACCOUNT_KEY_KEY)
         if existing:
             return existing.encode("utf-8") if isinstance(existing, str) else existing
         priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -1348,7 +1421,7 @@ class AcmeRenewer:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        self.secrets.set("acme_account_key", pem.decode("utf-8"))
+        self.secrets.set(ACME_ACCOUNT_KEY_KEY, pem.decode("utf-8"))
         log.info("ACME: account key generated (RSA-2048) + stored in secrets")
         return pem
 
@@ -1367,12 +1440,10 @@ class AcmeRenewer:
             from cryptography import x509
             data = crt.read_bytes()
             cert = x509.load_pem_x509_certificate(data)
-            na = cert.not_valid_after_utc
-            if na.tzinfo is None:
-                na = na.replace(tzinfo=timezone.utc)
-            return na
+            # N-357b (2026-07-06 baseline shrink): assume_utc_if_naive SSOT.
+            return assume_utc_if_naive(cert.not_valid_after_utc)
         except Exception as e:
-            log.warning("ACME: cert parse failed", error=_fmt_exc(e))
+            log.warning("ACME: cert parse failed", error=fmt_exc(e, with_class=True))
             return None
 
     def cert_metadata(self) -> dict[str, Any]:
@@ -1461,15 +1532,13 @@ class AcmeRenewer:
         """
         self.cert_dir.mkdir(parents=True, exist_ok=True)
         crt, key = self.cert_paths()
+        # census  — route through the _atomicio SSOT (was a hand-rolled
+        # temp+replace+chmod copy). Key first, cert second (the hot-reload
+        # order — see the docstring); both land 0o600 via the mode param
+        # (preserving this site's original perms).
+        from email_triage._atomicio import atomic_write_bytes
         for path, data in ((key, key_pem), (crt, fullchain_pem)):
-            tmp = path.with_suffix(path.suffix + ".new")
-            tmp.write_bytes(data)
-            try:
-                if hasattr(os, "chmod"):
-                    os.chmod(tmp, 0o600)
-            except Exception:
-                pass
-            os.replace(tmp, path)
+            atomic_write_bytes(path, data, mode=0o600)
 
     # -- ACME order flow --
 
@@ -1516,83 +1585,96 @@ class AcmeRenewer:
         # (cheap; one DNS query per label per domain). Hard-fail only
         # when caa_enforce is set; otherwise log + proceed so operators
         # see what would have happened before opting in.
-        try:
-            caa_ok, caa_problems = caa_preflight(
-                domains,
-                public_resolvers=self.cfg.rfc2136.public_resolvers,
-            )
-        except Exception as exc:
-            # Pre-flight itself blowing up is a soft failure — never
-            # block issuance because of a bug in the probe.
-            log.warning(
-                "ACME: CAA pre-flight crashed; proceeding without check",
-                error=_fmt_exc(exc),
-            )
-            caa_ok, caa_problems = True, []
-        if not caa_ok:
-            log.warning(
-                "ACME: CAA pre-flight found hostile records",
-                problems=caa_problems,
-                enforce=self.cfg.caa_enforce,
-            )
-            if self.cfg.caa_enforce:
-                raise RuntimeError(
-                    "ACME aborted: CAA records forbid letsencrypt.org "
-                    "for one or more configured domains. "
-                    f"Problems: {caa_problems}"
-                )
-        elif caa_problems:
-            # Inconclusive lookups, not blocking.
-            log.info(
-                "ACME: CAA pre-flight had inconclusive lookups",
-                notes=caa_problems,
-            )
-
-        #  -- CNAME pre-flight. When the operator uses the
-        # CNAME-delegation pattern (rfc2136.update_zone set to
-        # something different from the cert subject), LE will query
-        # _acme-challenge.<cert_subject> and follow the CNAME to the
-        # update-zone target. If that CNAME isn't published yet (or
-        # points wrong, or hasn't propagated externally), the
-        # publish/poll cycle is ~8min wasted before LE NXDOMAINs out.
-        # Pre-flight catches this in seconds, with an actionable
-        # error message. Direct mode (no update_zone) is a no-op
-        # since there's no CNAME to verify.
-        if (
-            getattr(self.cfg.rfc2136, "update_zone", None)
-            and self.cfg.rfc2136.update_zone.strip()
-        ):
+        # HTTP-01 branch skips this pre-flight — CAA records constrain
+        # the CA choice regardless of challenge mechanism, but the
+        # RFC-2136 resolver plumbing lives inside the DNS-01 branch.
+        # The HTTP-01 path uses a simpler public-resolver probe (below).
+        _preflights_apply = self.cfg.challenge == "dns-01"
+        if _preflights_apply:
             try:
-                cname_ok, cname_problems = cname_preflight(
+                caa_ok, caa_problems = caa_preflight(
                     domains,
-                    update_zone=self.cfg.rfc2136.update_zone,
                     public_resolvers=self.cfg.rfc2136.public_resolvers,
                 )
             except Exception as exc:
+                # Pre-flight itself blowing up is a soft failure — never
+                # block issuance because of a bug in the probe.
                 log.warning(
-                    "ACME: CNAME pre-flight crashed; proceeding without check",
-                    error=_fmt_exc(exc),
+                    "ACME: CAA pre-flight crashed; proceeding without check",
+                    error=fmt_exc(exc, with_class=True),
                 )
-                cname_ok, cname_problems = True, []
-            if not cname_ok:
-                err = (
-                    "ACME aborted at CNAME pre-flight: "
-                    "the _acme-challenge.<cert_subject> CNAME isn't "
-                    "visible at every public resolver, OR doesn't "
-                    "point under the configured update_zone. "
-                    "Publishing forward will NXDOMAIN at LE after "
-                    "wasting the publish/poll/answer cycle. "
-                    f"Problems: {cname_problems}"
+                caa_ok, caa_problems = True, []
+            if not caa_ok:
+                log.warning(
+                    "ACME: CAA pre-flight found hostile records",
+                    problems=caa_problems,
+                    enforce=self.cfg.caa_enforce,
                 )
-                acme_job_state.finish_failure(
-                    err, kind="cname_preflight",
-                )
-                raise RuntimeError(err)
-            elif cname_problems:
+                if self.cfg.caa_enforce:
+                    raise RuntimeError(
+                        "ACME aborted: CAA records forbid letsencrypt.org "
+                        "for one or more configured domains. "
+                        f"Problems: {caa_problems}"
+                    )
+            elif caa_problems:
+                # Inconclusive lookups, not blocking.
                 log.info(
-                    "ACME: CNAME pre-flight had inconclusive lookups",
-                    notes=cname_problems,
+                    "ACME: CAA pre-flight had inconclusive lookups",
+                    notes=caa_problems,
                 )
+
+            #  -- CNAME pre-flight. When the operator uses the
+            # CNAME-delegation pattern (rfc2136.update_zone set to
+            # something different from the cert subject), LE will query
+            # _acme-challenge.<cert_subject> and follow the CNAME to the
+            # update-zone target. If that CNAME isn't published yet (or
+            # points wrong, or hasn't propagated externally), the
+            # publish/poll cycle is ~8min wasted before LE NXDOMAINs out.
+            # Pre-flight catches this in seconds, with an actionable
+            # error message. Direct mode (no update_zone) is a no-op
+            # since there's no CNAME to verify.
+            if (
+                getattr(self.cfg.rfc2136, "update_zone", None)
+                and self.cfg.rfc2136.update_zone.strip()
+            ):
+                try:
+                    cname_ok, cname_problems = cname_preflight(
+                        domains,
+                        update_zone=self.cfg.rfc2136.update_zone,
+                        public_resolvers=self.cfg.rfc2136.public_resolvers,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "ACME: CNAME pre-flight crashed; proceeding without check",
+                        error=fmt_exc(exc, with_class=True),
+                    )
+                    cname_ok, cname_problems = True, []
+                if not cname_ok:
+                    err = (
+                        "ACME aborted at CNAME pre-flight: "
+                        "the _acme-challenge.<cert_subject> CNAME isn't "
+                        "visible at every public resolver, OR doesn't "
+                        "point under the configured update_zone. "
+                        "Publishing forward will NXDOMAIN at LE after "
+                        "wasting the publish/poll/answer cycle. "
+                        f"Problems: {cname_problems}"
+                    )
+                    acme_job_state.finish_failure(
+                        err, kind="cname_preflight",
+                    )
+                    raise RuntimeError(err)
+                elif cname_problems:
+                    # hipaa-sme MUST-FIX-1 fold — this elif MUST pair with the
+                    # `if not cname_ok:` above, not the enclosing
+                    # `if (update_zone):`. The earlier `if _preflights_apply:`
+                    # wrap accidentally left this at the outer indent, which
+                    # both (a) unbinds `cname_problems` on direct-DNS-01 mode
+                    # (no update_zone) and (b) silently lost the inconclusive-
+                    # lookups info log on the delegation path.
+                    log.info(
+                        "ACME: CNAME pre-flight had inconclusive lookups",
+                        notes=cname_problems,
+                    )
 
         account_pem = self.ensure_account_key()
         account_key = serialization.load_pem_private_key(
@@ -1617,7 +1699,7 @@ class AcmeRenewer:
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption(),
             )
-            self.secrets.set("acme_account_key", account_pem.decode("utf-8"))
+            self.secrets.set(ACME_ACCOUNT_KEY_KEY, account_pem.decode("utf-8"))
 
         jose_key = jose.JWKRSA(key=account_key)
         # Directory + ACME client setup.
@@ -1697,363 +1779,477 @@ class AcmeRenewer:
         csr = csr_builder.sign(cert_key, hashes.SHA256())
         csr_pem = csr.public_bytes(serialization.Encoding.PEM)
 
-        if self.cfg.challenge != "dns-01":
+        # Challenge dispatch. Config load rejects unsupported challenge
+        # types when ACME is enabled (config.py:AcmeConfig validation);
+        # defense-in-depth for callers that built the renewer directly.
+        _SUPPORTED = ("dns-01", "http-01")
+        if self.cfg.challenge not in _SUPPORTED:
             raise NotImplementedError(
-                f"Only dns-01 implemented; got {self.cfg.challenge!r}. "
-                "HTTP-01 stub lives in this module — see  followups."
+                f"Only {list(_SUPPORTED)} ACME challenges are implemented; got "
+                f"{self.cfg.challenge!r}. Set tls.acme.challenge to a supported "
+                f"value, or disable acme and use operator-managed/external TLS."
             )
 
-        tsig_secret = self.secrets.get(self.cfg.rfc2136.tsig_secret_ref)
-        if not tsig_secret:
-            raise RuntimeError(
-                f"Secrets store missing key "
-                f"{self.cfg.rfc2136.tsig_secret_ref!r}"
+        publisher: Rfc2136Publisher | None = None
+        _http01_publisher: Any = None
+        if self.cfg.challenge == "dns-01":
+            tsig_secret = read_secret(
+                self.secrets, self.cfg.rfc2136.tsig_secret_ref,
             )
-        publisher = Rfc2136Publisher(self.cfg.rfc2136, tsig_secret)
-
-        # Validation-retry loop. Each attempt: new_order, publish
-        # TXTs, poll local + public resolvers, sleep grace, answer,
-        # finalize. On ValidationError (LE-side recursive lookup
-        # failed — e.g. negative cache, slow downstream resolver),
-        # delete the TXTs, sleep ``validation_retry_delay_secs``,
-        # and start a fresh order. Matches acme.sh's "retry on
-        # transient DNS failure" behavior.
-        max_attempts = max(1, int(self.cfg.validation_retries) + 1)
-        last_error: Exception | None = None
-        final_order = None
-        # #78a -- per-issue correlation id. Stamped on every issuance
-        # log line below + on the publisher's per-attempt sweep so a
-        # multi-attempt failure in journalctl can be filtered down to
-        # one specific issue_now invocation. attempt=N already
-        # distinguishes within a run; attempt_id distinguishes across
-        # runs / processes / parallel-tab-clicks.
-        import secrets as _secrets
-        attempt_id = _secrets.token_hex(4)
-        log.info(
-            "ACME: issue_now starting",
-            attempt_id=attempt_id, domains=domains,
-            directory=("staging" if "staging" in directory else "prod"),
-        )
-        for attempt in range(1, max_attempts + 1):
-            #  -- cancel check at the top of every retry-loop
-            # iteration. A click while we were sleeping between
-            # attempts (or sitting in propagation poll) takes effect
-            # within ~one poll-cycle of the click. Mid-finalizing
-            # cancels are intentionally ignored (see check before
-            # the finalize call below) -- discarding a successful
-            # issuance because the operator clicked while LE was
-            # already validating wastes a duplicate-cert rate slot
-            # for nothing.
-            if acme_job_state.is_cancel_requested():
-                err_msg = (
-                    "ACME issuance cancelled by operator before "
-                    f"attempt {attempt}/{max_attempts}."
+            if not tsig_secret:
+                raise RuntimeError(
+                    f"Secrets store missing key "
+                    f"{self.cfg.rfc2136.tsig_secret_ref!r}"
                 )
-                acme_job_state.finish_failure(err_msg, kind="cancelled")
-                raise RuntimeError(err_msg)
-            #  -- live re-attach phase tracking. transition() updates
-            # the singleton so the page can poll /admin/acme-status/job
-            # and re-attach mid-issue.
-            acme_job_state.transition(
-                "publishing", attempt=attempt, max_attempts=max_attempts,
-            )
-            order = client.new_order(csr_pem)
-            #  -- persist the LE order URL so a process kill
-            # mid-finalize can resume from the same order rather
-            # than burning a fresh duplicate-cert slot.
+            publisher = Rfc2136Publisher(self.cfg.rfc2136, tsig_secret)
+        else:  # http-01
+            from email_triage.web.acme_http01 import Http01Publisher
+            _http01_publisher = Http01Publisher(self.cfg.http01)
             try:
-                order_url_val = getattr(order, "uri", None) or getattr(
-                    getattr(order, "body", None), "uri", None,
+                _http01_publisher.start()
+            except OSError as _bind_exc:
+                # DA-SB1 fold — actionable message for the port-bind
+                # failure class. Bare OSError bubbles as e.g.
+                # `[Errno 98] Address already in use` which is not
+                # actionable and leaves acme_job_state singleton
+                # inconsistent.
+                _err_msg = (
+                    f"HTTP-01 standalone listener failed to bind "
+                    f"{self.cfg.http01.bind_host}:{self.cfg.http01.bind_port}: "
+                    f"{_bind_exc}. Common causes: (a) port already in "
+                    f"use — check `ss -tlnp | grep :{self.cfg.http01.bind_port}` "
+                    f"on the host; (b) permission denied — low ports "
+                    f"require CAP_NET_BIND_SERVICE or root; consider "
+                    f"webroot mode (set tls.acme.http01.mode=webroot + "
+                    f"tls.acme.http01.webroot_path) to let the operator's "
+                    f"existing proxy serve /.well-known/acme-challenge/ "
+                    f"on port 80, OR fall back to tls.acme.challenge=dns-01 "
+                    f"if RFC-2136 is configured."
                 )
-            except Exception:
-                order_url_val = None
-            if order_url_val:
+                acme_job_state.finish_failure(
+                    _err_msg, kind="http01_bind_failure",
+                )
+                raise RuntimeError(_err_msg) from _bind_exc
+
+        try:
+            # Validation-retry loop. Each attempt: new_order, publish
+            # TXTs, poll local + public resolvers, sleep grace, answer,
+            # finalize. On ValidationError (LE-side recursive lookup
+            # failed — e.g. negative cache, slow downstream resolver),
+            # delete the TXTs, sleep ``validation_retry_delay_secs``,
+            # and start a fresh order. Matches acme.sh's "retry on
+            # transient DNS failure" behavior.
+            max_attempts = max(1, int(self.cfg.validation_retries) + 1)
+            last_error: Exception | None = None
+            final_order = None
+            # #78a -- per-issue correlation id. Stamped on every issuance
+            # log line below + on the publisher's per-attempt sweep so a
+            # multi-attempt failure in journalctl can be filtered down to
+            # one specific issue_now invocation. attempt=N already
+            # distinguishes within a run; attempt_id distinguishes across
+            # runs / processes / parallel-tab-clicks.
+            import secrets as _secrets
+            attempt_id = _secrets.token_hex(4)
+            log.info(
+                "ACME: issue_now starting",
+                attempt_id=attempt_id, domains=domains,
+                directory=("staging" if "staging" in directory else "prod"),
+            )
+            for attempt in range(1, max_attempts + 1):
+                #  -- cancel check at the top of every retry-loop
+                # iteration. A click while we were sleeping between
+                # attempts (or sitting in propagation poll) takes effect
+                # within ~one poll-cycle of the click. Mid-finalizing
+                # cancels are intentionally ignored (see check before
+                # the finalize call below) -- discarding a successful
+                # issuance because the operator clicked while LE was
+                # already validating wastes a duplicate-cert rate slot
+                # for nothing.
+                if acme_job_state.is_cancel_requested():
+                    err_msg = (
+                        "ACME issuance cancelled by operator before "
+                        f"attempt {attempt}/{max_attempts}."
+                    )
+                    acme_job_state.finish_failure(err_msg, kind="cancelled")
+                    raise RuntimeError(err_msg)
+                #  -- live re-attach phase tracking. transition() updates
+                # the singleton so the page can poll /admin/acme-status/job
+                # and re-attach mid-issue.
                 acme_job_state.transition(
-                    "publishing", order_url=order_url_val,
+                    "publishing", attempt=attempt, max_attempts=max_attempts,
                 )
-            published_for: list[str] = []
-            try:
-                for authz in order.authorizations:
-                    domain = authz.body.identifier.value
-                    # Pick the dns-01 challenge.
-                    challenge = None
-                    for c in authz.body.challenges:
-                        if c.typ == "dns-01":
-                            challenge = c
-                            break
-                    if challenge is None:
-                        raise RuntimeError(
-                            f"Directory did not offer dns-01 for {domain}"
-                        )
-                    response, validation = challenge.response_and_validation(jose_key)
-                    # #78a -- stray TXT cleanup at attempt start. If a
-                    # prior process crashed mid-flow, an orphaned
-                    # _acme-challenge.* TXT can sit in the zone forever
-                    # and confuse LE's recursive lookup (multiple TXTs
-                    # at the same name, only one of which matches the
-                    # current order). Sweep before publishing: a
-                    # delete_txt is idempotent and the publish_txt
-                    # immediately after restores the right value.
-                    try:
-                        publisher.delete_txt(domain)
-                    except Exception as exc:
-                        log.warning(
-                            "ACME: pre-publish TXT sweep failed; continuing",
-                            domain=domain, attempt=attempt,
-                            attempt_id=attempt_id,
-                            error=_fmt_exc(exc),
-                        )
-                    fqdn = publisher.publish_txt(domain, validation, ttl=60)
-                    published_for.append(domain)
-                    log.info(
-                        "ACME: published challenge TXT",
-                        domain=domain, fqdn=fqdn, attempt=attempt,
-                        attempt_id=attempt_id,
+                order = client.new_order(csr_pem)
+                #  -- persist the LE order URL so a process kill
+                # mid-finalize can resume from the same order rather
+                # than burning a fresh duplicate-cert slot.
+                try:
+                    order_url_val = getattr(order, "uri", None) or getattr(
+                        getattr(order, "body", None), "uri", None,
                     )
-                    # Two-stage propagation check:
-                    # 1. Configured authoritative server — confirms
-                    #    dynamic update applied.
-                    # 2. Public recursive resolvers — confirms the
-                    #    delegation chain LE queries serves the
-                    #    record. When an operator's authoritative
-                    #    setup separates the update target from the
-                    #    public-facing nameservers, propagation can
-                    #    lag a single ACME validation window.
-                    acme_job_state.transition("polling_local")
-                    if not publisher.poll_for_value(
-                        fqdn, validation, timeout_secs=120,
-                    ):
-                        raise RuntimeError(
-                            f"Challenge TXT not visible on the "
-                            f"configured nameserver "
-                            f"({publisher.cfg.nameserver}) within "
-                            f"120s of publish — the dynamic update "
-                            f"may have been rejected silently."
-                        )
-                    acme_job_state.visibility(domain, local=True)
-                    # B3 — gate by the cert-subject FQDN, not the
-                    # update-zone FQDN. LE will query
-                    # ``_acme-challenge.<cert_subject>`` and follow the
-                    # CNAME (if any) to the update-zone target. The
-                    # recursor follows CNAMEs on TXT lookups
-                    # automatically, so querying the cert-subject
-                    # validates the *exact* path LE takes — including
-                    # that the CNAME at the cert subject is publicly
-                    # visible. The previous gate queried the
-                    # update-zone target, which goes green even when
-                    # the CNAME is unpropagated externally.
-                    cert_subject_fqdn = (
-                        f"_acme-challenge.{domain.rstrip('.')}."
+                except Exception:
+                    order_url_val = None
+                if order_url_val:
+                    acme_job_state.transition(
+                        "publishing", order_url=order_url_val,
                     )
-                    log.info(
-                        "ACME: TXT visible on local authority; polling "
-                        "authoritative NS chain (bypasses recursor cache)",
-                        domain=domain,
-                        publish_fqdn=fqdn,
-                        query_fqdn=cert_subject_fqdn,
-                    )
-                    # PR-4 / B3 follow-up: query authoritative servers
-                    # directly instead of public recursors. Bypasses
-                    # anycast-POP cache roulette where one recursor POP
-                    # holds a stale NXDOMAIN while another sees the
-                    # record. LE will follow the same authoritative
-                    # chain; cache lag on LE's side is handled by the
-                    # outer retry loop + pre-validation grace pause.
-                    acme_job_state.transition("polling_authoritative")
-                    ok, info = publisher.poll_for_value_authoritative(
-                        cert_subject_fqdn, validation,
-                    )
-                    if ok:
-                        acme_job_state.visibility(
-                            domain, authoritative=True,
-                        )
-                    if not ok:
-                        raise RuntimeError(
-                            f"Challenge TXT not visible at the "
-                            f"authoritative NS chain within "
-                            f"{publisher.cfg.public_propagation_timeout_secs}s "
-                            f"when querying {cert_subject_fqdn}. "
-                            f"State: {info.get('state')}. "
-                            f"Values: {info.get('values') or 'none'}. "
-                            f"Verify the CNAME at {cert_subject_fqdn} "
-                            f"is published to the registrar's "
-                            f"authoritative NS AND that the TXT at "
-                            f"{fqdn} reached the public-facing "
-                            f"nameserver for that zone."
-                        )
-                    # Grace pause: even after the public resolvers
-                    # we poll see the record, LE's own recursive
-                    # path may still be holding a negative cache
-                    # entry from an earlier NXDOMAIN. Sleep before
-                    # signaling LE so that cache has time to expire.
-                    grace = max(0, int(self.cfg.pre_validation_grace_secs))
-                    if grace:
-                        acme_job_state.transition("grace")
-                        log.info(
-                            "ACME: pre-validation grace pause",
-                            secs=grace, domain=domain,
-                        )
-                        time.sleep(grace)
-                    acme_job_state.transition("answering")
-                    client.answer_challenge(challenge, response)
-                    log.info(
-                        "ACME: challenge answered, awaiting validation",
-                        domain=domain, attempt=attempt,
-                        attempt_id=attempt_id,
-                    )
+                published_for: list[str] = []
+                # HTTP-01 cleanup needs the token, not the domain — track a
+                # sidecar dict so the cleanup helper can dispatch. DNS-01
+                # leaves this empty.
+                _published_http01_tokens: dict[str, str] = {}
 
-                acme_job_state.transition("finalizing")
-                # Finalize. acme.client uses naive datetimes
-                # (implicit UTC) internally — passing a tz-aware
-                # datetime raises "can't compare offset-naive and
-                # offset-aware datetimes" inside its poll loop.
-                deadline = datetime.utcnow() + timedelta(seconds=120)
-                final_order = client.poll_and_finalize(
-                    order, deadline=deadline,
-                )
-                fullchain_pem = final_order.fullchain_pem.encode("utf-8")
-                # Success — break out of retry loop.
-                break
-            except ValidationError as e:
-                last_error = e
-                #  -- classify before deciding to retry. CAA / badCSR
-                # / accountDoesNotExist / etc are permanent: retrying
-                # just burns the validation_retries budget and may
-                # rate-limit-trip the directory. rateLimited aborts
-                # immediately (retrying makes it worse).
-                err_kind, err_typ = _classify_acme_error(e)
-                # B4 — diagnostic re-probe. LE returned NXDOMAIN /
-                # similar; immediately probe each public resolver for
-                # the cert-subject FQDN and log per-resolver state.
-                # Helps the operator triage:
-                #   all green   -> LE recursor lagging; quick retry.
-                #   some red    -> propagation incomplete; longer wait.
-                #   all red     -> CNAME / publication gap; abort.
-                diagnostics: dict[str, dict[str, str]] = {}
-                for d in [a.body.identifier.value for a in order.authorizations]:
-                    cert_subject_fqdn = (
-                        f"_acme-challenge.{d.rstrip('.')}."
-                    )
-                    try:
-                        diagnostics[d] = publisher.diagnose_resolvers(
-                            cert_subject_fqdn,
-                        )
-                    except Exception as probe_exc:
-                        diagnostics[d] = {
-                            "_probe_error": _fmt_exc(probe_exc),
-                        }
-                log.warning(
-                    "ACME: validation failed (LE-side DNS lookup)",
-                    attempt=attempt, max_attempts=max_attempts,
-                    attempt_id=attempt_id,
-                    error=_fmt_exc(e),
-                    classification=err_kind,
-                    error_typ=err_typ,
-                    resolver_diagnostics=diagnostics,
-                )
-                # Permanent / rate-limited errors abort the retry loop.
-                # Clean up TXTs in the finally below, then re-raise so
-                # the outer try/except marks finish_failure with the
-                # right kind.
-                if err_kind in ("permanent", "rate_limited"):
-                    for d in published_for:
+                def _cleanup_published_domain(_dom: str) -> None:
+                    """Dispatch cleanup to the active publisher. Idempotent —
+                    a missing entry is not an error (protects against a
+                    pre-publish sweep on the very first attempt)."""
+                    if self.cfg.challenge == "dns-01":
                         try:
-                            publisher.delete_txt(d)
+                            publisher.delete_txt(_dom)
                         except Exception:
                             pass
-                    err_msg = (
-                        f"ACME validation aborted after {attempt} attempts "
-                        f"(kind={err_kind}, typ={err_typ or 'unknown'}). "
-                        f"Last error: {_fmt_exc(e)}"
-                        + (
-                            " (retrying makes rate-limit worse; "
-                            "wait for the limit window to reset.)"
-                            if err_kind == "rate_limited" else ""
+                    else:  # http-01
+                        _tok = _published_http01_tokens.pop(_dom, None)
+                        if _tok:
+                            try:
+                                _http01_publisher.delete_token(_tok)
+                            except Exception:
+                                pass
+
+                try:
+                    for authz in order.authorizations:
+                        domain = authz.body.identifier.value
+                        # Pick the challenge matching our configured type.
+                        challenge = None
+                        for c in authz.body.challenges:
+                            if c.typ == self.cfg.challenge:
+                                challenge = c
+                                break
+                        if challenge is None:
+                            raise RuntimeError(
+                                f"Directory did not offer "
+                                f"{self.cfg.challenge!r} for {domain}"
+                            )
+                        response, validation = challenge.response_and_validation(jose_key)
+                        if self.cfg.challenge == "dns-01":
+                            # #78a -- stray TXT cleanup at attempt start. If a
+                            # prior process crashed mid-flow, an orphaned
+                            # _acme-challenge.* TXT can sit in the zone forever
+                            # and confuse LE's recursive lookup (multiple TXTs
+                            # at the same name, only one of which matches the
+                            # current order). Sweep before publishing: a
+                            # delete_txt is idempotent and the publish_txt
+                            # immediately after restores the right value.
+                            try:
+                                publisher.delete_txt(domain)
+                            except Exception as exc:
+                                log.warning(
+                                    "ACME: pre-publish TXT sweep failed; continuing",
+                                    domain=domain, attempt=attempt,
+                                    attempt_id=attempt_id,
+                                    error=fmt_exc(exc, with_class=True),
+                                )
+                            fqdn = publisher.publish_txt(domain, validation, ttl=60)
+                            published_for.append(domain)
+                            log.info(
+                                "ACME: published challenge TXT",
+                                domain=domain, fqdn=fqdn, attempt=attempt,
+                                attempt_id=attempt_id,
+                            )
+                            # Two-stage propagation check:
+                            # 1. Configured authoritative server — confirms
+                            #    dynamic update applied.
+                            # 2. Public recursive resolvers — confirms the
+                            #    delegation chain LE queries serves the
+                            #    record. When an operator's authoritative
+                            #    setup separates the update target from the
+                            #    public-facing nameservers, propagation can
+                            #    lag a single ACME validation window.
+                            acme_job_state.transition("polling_local")
+                            if not publisher.poll_for_value(
+                                fqdn, validation, timeout_secs=120,
+                            ):
+                                raise RuntimeError(
+                                    f"Challenge TXT not visible on the "
+                                    f"configured nameserver "
+                                    f"({publisher.cfg.nameserver}) within "
+                                    f"120s of publish — the dynamic update "
+                                    f"may have been rejected silently."
+                                )
+                            acme_job_state.visibility(domain, local=True)
+                            # B3 — gate by the cert-subject FQDN, not the
+                            # update-zone FQDN. LE will query
+                            # ``_acme-challenge.<cert_subject>`` and follow the
+                            # CNAME (if any) to the update-zone target. The
+                            # recursor follows CNAMEs on TXT lookups
+                            # automatically, so querying the cert-subject
+                            # validates the *exact* path LE takes — including
+                            # that the CNAME at the cert subject is publicly
+                            # visible. The previous gate queried the
+                            # update-zone target, which goes green even when
+                            # the CNAME is unpropagated externally.
+                            cert_subject_fqdn = (
+                                f"_acme-challenge.{domain.rstrip('.')}."
+                            )
+                            log.info(
+                                "ACME: TXT visible on local authority; polling "
+                                "authoritative NS chain (bypasses recursor cache)",
+                                domain=domain,
+                                publish_fqdn=fqdn,
+                                query_fqdn=cert_subject_fqdn,
+                            )
+                            # PR-4 / B3 follow-up: query authoritative servers
+                            # directly instead of public recursors. Bypasses
+                            # anycast-POP cache roulette where one recursor POP
+                            # holds a stale NXDOMAIN while another sees the
+                            # record. LE will follow the same authoritative
+                            # chain; cache lag on LE's side is handled by the
+                            # outer retry loop + pre-validation grace pause.
+                            acme_job_state.transition("polling_authoritative")
+                            ok, info = publisher.poll_for_value_authoritative(
+                                cert_subject_fqdn, validation,
+                            )
+                            if ok:
+                                acme_job_state.visibility(
+                                    domain, authoritative=True,
+                                )
+                            if not ok:
+                                raise RuntimeError(
+                                    f"Challenge TXT not visible at the "
+                                    f"authoritative NS chain within "
+                                    f"{publisher.cfg.public_propagation_timeout_secs}s "
+                                    f"when querying {cert_subject_fqdn}. "
+                                    f"State: {info.get('state')}. "
+                                    f"Values: {info.get('values') or 'none'}. "
+                                    f"Verify the CNAME at {cert_subject_fqdn} "
+                                    f"is published to the registrar's "
+                                    f"authoritative NS AND that the TXT at "
+                                    f"{fqdn} reached the public-facing "
+                                    f"nameserver for that zone."
+                                )
+                        else:  # http-01
+                            # HTTP-01 flow: publish the token → key_auth
+                            # pair (in-mem for standalone, file for webroot),
+                            # then self-check by fetching our own URL.
+                            # The `validation` here is the HTTP-01
+                            # keyAuthorization string; the token is on the
+                            # challenge object at `.chall.token`.
+                            chall_obj = getattr(challenge, "chall", challenge)
+                            token = getattr(chall_obj, "token", None)
+                            if not token:
+                                raise RuntimeError(
+                                    f"HTTP-01 challenge for {domain} has no "
+                                    f"token attribute — python-acme API drift?"
+                                )
+                            # Stray-token pre-sweep for retry resilience
+                            # (mirrors DNS-01 delete_txt sweep).
+                            try:
+                                _http01_publisher.delete_token(token)
+                            except Exception:
+                                pass
+                            _http01_publisher.publish_token(token, validation)
+                            _published_http01_tokens[domain] = token
+                            published_for.append(domain)
+                            log.info(
+                                "ACME: published HTTP-01 challenge token",
+                                domain=domain,
+                                mode=self.cfg.http01.mode,
+                                attempt=attempt,
+                                attempt_id=attempt_id,
+                            )
+                            acme_job_state.transition("polling_local")
+                            if not _http01_publisher.poll_local(
+                                token, validation,
+                            ):
+                                raise RuntimeError(
+                                    f"HTTP-01 token not retrievable via the "
+                                    f"local self-check within "
+                                    f"{self.cfg.http01.self_check_timeout_secs}s. "
+                                    f"Mode={self.cfg.http01.mode!r}. "
+                                    f"Standalone: verify the listener bound "
+                                    f"({self.cfg.http01.bind_host}:"
+                                    f"{self.cfg.http01.bind_port}). "
+                                    f"Webroot: verify the proxy serves "
+                                    f"/.well-known/acme-challenge/ from "
+                                    f"{self.cfg.http01.webroot_path!r}."
+                                )
+                            acme_job_state.visibility(domain, local=True)
+                        # Grace pause: even after our local check sees the
+                        # challenge, LE's own path may still be holding a
+                        # stale negative cache entry. Sleep before signaling
+                        # LE so that cache has time to expire. This applies
+                        # to both dns-01 and http-01 branches — LE fronts
+                        # every validation via its recursive resolvers.
+                        grace = max(0, int(self.cfg.pre_validation_grace_secs))
+                        if grace:
+                            acme_job_state.transition("grace")
+                            log.info(
+                                "ACME: pre-validation grace pause",
+                                secs=grace, domain=domain,
+                            )
+                            time.sleep(grace)
+                        acme_job_state.transition("answering")
+                        client.answer_challenge(challenge, response)
+                        log.info(
+                            "ACME: challenge answered, awaiting validation",
+                            domain=domain, attempt=attempt,
+                            attempt_id=attempt_id,
                         )
+
+                    acme_job_state.transition("finalizing")
+                    # Finalize. acme.client uses naive datetimes
+                    # (implicit UTC) internally — passing a tz-aware
+                    # datetime raises "can't compare offset-naive and
+                    # offset-aware datetimes" inside its poll loop. So we
+                    # need a NAIVE-UTC now: take the aware UTC time and drop
+                    # the tzinfo (the non-deprecated path; datetime.utcnow()
+                    # is deprecated in 3.12+).
+                    deadline = (
+                        datetime.now(timezone.utc).replace(tzinfo=None)
+                        + timedelta(seconds=120)
                     )
-                    acme_job_state.finish_failure(err_msg, kind=err_kind)
-                    raise RuntimeError(err_msg) from e
-                # Transient: fall through to finally → cleans up TXTs,
-                # then the loop sleeps and starts a fresh order.
-            finally:
-                for d in published_for:
-                    try:
-                        publisher.delete_txt(d)
-                    except Exception:
-                        pass
+                    final_order = client.poll_and_finalize(
+                        order, deadline=deadline,
+                    )
+                    fullchain_pem = final_order.fullchain_pem.encode("utf-8")
+                    # Success — break out of retry loop.
+                    break
+                except ValidationError as e:
+                    last_error = e
+                    #  -- classify before deciding to retry. CAA / badCSR
+                    # / accountDoesNotExist / etc are permanent: retrying
+                    # just burns the validation_retries budget and may
+                    # rate-limit-trip the directory. rateLimited aborts
+                    # immediately (retrying makes it worse).
+                    err_kind, err_typ = _classify_acme_error(e)
+                    # B4 — diagnostic re-probe. LE returned NXDOMAIN /
+                    # similar; immediately probe each public resolver for
+                    # the cert-subject FQDN and log per-resolver state.
+                    # Helps the operator triage:
+                    #   all green   -> LE recursor lagging; quick retry.
+                    #   some red    -> propagation incomplete; longer wait.
+                    #   all red     -> CNAME / publication gap; abort.
+                    diagnostics: dict[str, dict[str, str]] = {}
+                    # B4 diagnostics probe queries DNS resolvers directly — only
+                    # meaningful for dns-01. HTTP-01 has no DNS component to probe;
+                    # the outer log line still fires (without per-resolver map).
+                    if self.cfg.challenge == "dns-01":
+                        for d in [a.body.identifier.value for a in order.authorizations]:
+                            cert_subject_fqdn = (
+                                f"_acme-challenge.{d.rstrip('.')}."
+                            )
+                            try:
+                                diagnostics[d] = publisher.diagnose_resolvers(
+                                    cert_subject_fqdn,
+                                )
+                            except Exception as probe_exc:
+                                diagnostics[d] = {
+                                    "_probe_error": fmt_exc(probe_exc, with_class=True),
+                                }
+                    log.warning(
+                        "ACME: validation failed (LE-side DNS lookup)",
+                        attempt=attempt, max_attempts=max_attempts,
+                        attempt_id=attempt_id,
+                        error=fmt_exc(e, with_class=True),
+                        classification=err_kind,
+                        error_typ=err_typ,
+                        resolver_diagnostics=diagnostics,
+                    )
+                    # Permanent / rate-limited errors abort the retry loop.
+                    # Clean up TXTs in the finally below, then re-raise so
+                    # the outer try/except marks finish_failure with the
+                    # right kind.
+                    if err_kind in ("permanent", "rate_limited"):
+                        for d in published_for:
+                            _cleanup_published_domain(d)
+                        err_msg = (
+                            f"ACME validation aborted after {attempt} attempts "
+                            f"(kind={err_kind}, typ={err_typ or 'unknown'}). "
+                            f"Last error: {fmt_exc(e, with_class=True)}"
+                            + (
+                                " (retrying makes rate-limit worse; "
+                                "wait for the limit window to reset.)"
+                                if err_kind == "rate_limited" else ""
+                            )
+                        )
+                        acme_job_state.finish_failure(err_msg, kind=err_kind)
+                        raise RuntimeError(err_msg) from e
+                    # Transient: fall through to finally → cleans up TXTs,
+                    # then the loop sleeps and starts a fresh order.
+                finally:
+                    for d in published_for:
+                        _cleanup_published_domain(d)
 
-            # Only reached on retry path (success path 'break'-ed above).
-            if attempt < max_attempts:
-                #  -- backoff curve. Exponential / fibonacci default;
-                # operator can pin to "fixed" via config.
-                delay = _retry_delay_secs(
-                    attempt=attempt,
-                    backoff=getattr(
-                        self.cfg, "validation_retry_backoff", "exponential",
-                    ),
-                    configured_secs=self.cfg.validation_retry_delay_secs,
+                # Only reached on retry path (success path 'break'-ed above).
+                if attempt < max_attempts:
+                    #  -- backoff curve. Exponential / fibonacci default;
+                    # operator can pin to "fixed" via config.
+                    delay = _retry_delay_secs(
+                        attempt=attempt,
+                        backoff=getattr(
+                            self.cfg, "validation_retry_backoff", "exponential",
+                        ),
+                        configured_secs=self.cfg.validation_retry_delay_secs,
+                    )
+                    acme_job_state.transition(
+                        "retrying",
+                        last_error=fmt_exc(last_error, with_class=True) if last_error else None,
+                    )
+                    log.info(
+                        "ACME: sleeping before retry",
+                        secs=delay, next_attempt=attempt + 1,
+                        attempt_id=attempt_id,
+                        backoff=getattr(
+                            self.cfg, "validation_retry_backoff", "exponential",
+                        ),
+                    )
+                    time.sleep(delay)
+            else:
+                # Loop exhausted without break → all attempts failed.
+                err_msg = (
+                    f"ACME validation failed after {max_attempts} attempts. "
+                    f"Last error: "
+                    f"{fmt_exc(last_error, with_class=True) if last_error else 'unknown'}"
                 )
-                acme_job_state.transition(
-                    "retrying",
-                    last_error=_fmt_exc(last_error) if last_error else None,
-                )
-                log.info(
-                    "ACME: sleeping before retry",
-                    secs=delay, next_attempt=attempt + 1,
-                    attempt_id=attempt_id,
-                    backoff=getattr(
-                        self.cfg, "validation_retry_backoff", "exponential",
-                    ),
-                )
-                time.sleep(delay)
-        else:
-            # Loop exhausted without break → all attempts failed.
-            err_msg = (
-                f"ACME validation failed after {max_attempts} attempts. "
-                f"Last error: "
-                f"{_fmt_exc(last_error) if last_error else 'unknown'}"
+                acme_job_state.finish_failure(err_msg, kind="validation")
+                raise RuntimeError(err_msg)
+
+            if final_order is None:
+                raise RuntimeError("ACME: no final_order — internal flow bug")
+
+            # Persist atomically.
+            cert_key_pem = cert_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
             )
-            acme_job_state.finish_failure(err_msg, kind="validation")
-            raise RuntimeError(err_msg)
+            self._atomic_write_cert(fullchain_pem, cert_key_pem)
 
-        if final_order is None:
-            raise RuntimeError("ACME: no final_order — internal flow bug")
-
-        # Persist atomically.
-        cert_key_pem = cert_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        self._atomic_write_cert(fullchain_pem, cert_key_pem)
-
-        meta = self.cert_metadata()
-        insert_acme_renewal_log(
-            self.db,
-            domain=domains[0],
-            outcome="renewed",
-            not_before=meta.get("not_before"),
-            not_after=meta.get("not_after"),
-        )
-        # PR 10 / E — metrics. Outcome is bounded (renewed | failed |
-        # skipped_fresh | deferred) so cardinality stays small.
-        try:
-            from email_triage import metrics as metrics_mod
-            metrics_mod.counter(
-                "et_acme_renewals_total",
-                "ACME issuance outcomes by directory and result.",
-            ).inc(
-                directory="staging" if "staging" in directory else "prod",
+            meta = self.cert_metadata()
+            insert_acme_renewal_log(
+                self.db,
+                domain=domains[0],
                 outcome="renewed",
+                not_before=meta.get("not_before"),
+                not_after=meta.get("not_after"),
             )
-        except Exception:
-            pass
-        log.info("ACME: cert issued + written",
-                 domain=domains[0], not_after=meta.get("not_after"),
-                 attempt_id=attempt_id)
-        #  -- terminal-success state for the live re-attach.
-        acme_job_state.finish_success(meta)
-        return meta
+            # PR 10 / E + run17 #9 — metric. Routes through the ONE funnel so the
+            # ``renewed`` edge shares the directory/outcome label vocabulary with
+            # the failed / skipped_fresh / deferred edges (which were previously
+            # uncounted). ``directory`` is the one THIS issuance actually used (the
+            # manual Issue-Now path may override cfg).
+            self._record_renewal_metric("renewed", directory=directory)
+            log.info("ACME: cert issued + written",
+                     domain=domains[0], not_after=meta.get("not_after"),
+                     attempt_id=attempt_id)
+            #  -- terminal-success state for the live re-attach.
+            acme_job_state.finish_success(meta)
+            return meta
+        finally:
+            if _http01_publisher is not None:
+                try:
+                    _http01_publisher.stop()
+                except Exception:
+                    pass
 
     @single_flight(
         lambda self, **kw: f"acme:issue:{(self.cfg.domains or ['_'])[0]}"
@@ -2093,10 +2289,42 @@ class AcmeRenewer:
             snap = acme_job_state.current_state()
             if snap.get("in_flight"):
                 acme_job_state.finish_failure(
-                    f"{type(exc).__name__}: {exc}",
+                    fmt_exc(exc, with_class=True),
                     kind=type(exc).__name__,
                 )
             raise
+
+    def _record_renewal_metric(
+        self, outcome: str, *, directory: str | None = None,
+    ) -> None:
+        """Best-effort: bump ``et_acme_renewals_total{directory, outcome}``.
+
+        run17 #9 (devils-advocate observability gap): the counter was emitted
+        ONLY on the ``renewed`` edge, while the renewal LOG
+        (``insert_acme_renewal_log``) already recorded all four bounded
+        outcomes — so ``/metrics`` showed renewals but was BLIND to ``failed``
+        / ``skipped_fresh`` / ``deferred``. Every edge now routes through THIS
+        one funnel (PD#5) so the label vocabulary can't drift across sites.
+
+        ``directory`` overrides the configured directory (the manual Issue-Now
+        path passes the directory it actually used); default is the configured
+        ``directory_url``. Swallowed — a metrics fault must never break a
+        renewal tick.
+        """
+        try:
+            from email_triage import metrics as metrics_mod
+            d = directory if directory is not None else (
+                self.cfg.directory_url or ""
+            )
+            metrics_mod.counter(
+                "et_acme_renewals_total",
+                "ACME issuance outcomes by directory and result.",
+            ).inc(
+                directory="staging" if "staging" in d else "prod",
+                outcome=outcome,
+            )
+        except Exception:
+            pass
 
     async def check_and_renew_async(self) -> dict[str, Any]:
         """Async background-task entrypoint with single-flight on
@@ -2117,6 +2345,7 @@ class AcmeRenewer:
                 outcome="skipped_fresh",
                 not_after=self.cert_metadata().get("not_after"),
             )
+            self._record_renewal_metric("skipped_fresh")
             return {"action": "skipped", "reason": "fresh"}
         try:
             meta = await self.issue_now_async()
@@ -2126,14 +2355,16 @@ class AcmeRenewer:
                 "ACME: renewal tick saw issue in progress; deferring",
                 domain=self.cfg.domains[0],
             )
+            self._record_renewal_metric("deferred")
             return {"action": "deferred", "reason": "issue_in_progress"}
         except Exception as e:
             await db_call(
                 insert_acme_renewal_log,
                 self.db, domain=self.cfg.domains[0],
                 outcome="failed",
-                error=_fmt_exc(e),
+                error=fmt_exc(e, with_class=True),
             )
+            self._record_renewal_metric("failed")
             log.error(
                 "ACME renewal failed; existing cert unchanged",
                 exc_info=e,
@@ -2153,6 +2384,7 @@ class AcmeRenewer:
                 outcome="skipped_fresh",
                 not_after=self.cert_metadata().get("not_after"),
             )
+            self._record_renewal_metric("skipped_fresh")
             return {"action": "skipped", "reason": "fresh"}
         try:
             meta = self.issue_now()
@@ -2161,8 +2393,9 @@ class AcmeRenewer:
             insert_acme_renewal_log(
                 self.db, domain=self.cfg.domains[0],
                 outcome="failed",
-                error=_fmt_exc(e),
+                error=fmt_exc(e, with_class=True),
             )
+            self._record_renewal_metric("failed")
             log.error(
                 "ACME renewal failed; existing cert unchanged",
                 exc_info=e,
@@ -2262,6 +2495,8 @@ async def acme_cert_renewer(app) -> None:
     from email_triage.web.task_supervisor import supervised_interval_loop
 
     async def _tick() -> None:
+        # N-227c R22 — heartbeat stamp for /admin observability.
+        app.state.acme_cert_renewer_status = {"at": now_utc_iso()}
         renewer = _build_renewer_from_app(app)
         # Resume-worker step first: clear any restart-orphaned job so a
         # fresh check_and_renew below isn't blocked behind a stuck
@@ -2271,14 +2506,14 @@ async def acme_cert_renewer(app) -> None:
         except Exception as e:
             log.warning(
                 "ACME: resume-pending sweep raised (non-fatal)",
-                error=_fmt_exc(e),
+                error=fmt_exc(e, with_class=True),
             )
         try:
             await renewer.check_and_renew_async()
         except Exception as e:
             # check_and_renew_async already logged + wrote an
             # acme_renewal_log row; swallow so the loop survives.
-            log.error("ACME: renewal tick raised", error=_fmt_exc(e))
+            log.error("ACME: renewal tick raised", error=fmt_exc(e, with_class=True))
 
     interval_secs = max(1, app.state.config.tls.acme.check_interval_hours) * 3600
     await supervised_interval_loop(
@@ -2319,7 +2554,7 @@ async def _resume_pending_acme_jobs(app, renewer: "AcmeRenewer") -> int:
     except Exception as e:
         log.warning(
             "ACME: find_resumable raised in resume worker",
-            error=_fmt_exc(e),
+            error=fmt_exc(e, with_class=True),
         )
         return 0
     resolved = 0
@@ -2359,7 +2594,7 @@ async def _resume_pending_acme_jobs(app, renewer: "AcmeRenewer") -> int:
         except Exception as e:
             log.warning(
                 "ACME: resume worker could not close job row",
-                job_id=job_id, error=_fmt_exc(e),
+                job_id=job_id, error=fmt_exc(e, with_class=True),
             )
             continue
         resolved += 1
@@ -2416,5 +2651,5 @@ def read_tls_cert_health(app) -> dict[str, Any]:
             "present": False,
             "not_after": None,
             "days_remaining": None,
-            "error": _fmt_exc(e),
+            "error": fmt_exc(e, with_class=True),
         }

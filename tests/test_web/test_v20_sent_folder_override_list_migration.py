@@ -15,6 +15,7 @@ initialised in-memory DB so we can pre-seed legacy shapes.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -63,7 +64,7 @@ def _config_after(conn: sqlite3.Connection, acct_id: int) -> dict:
 
 class TestV20Backfill:
     def test_legacy_scalar_string_wraps_to_list(self):
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         # init_db already runs all registered migrations. Drop our
         # legacy row in, then re-run v19's body directly to simulate
         # the upgrade.
@@ -79,7 +80,7 @@ class TestV20Backfill:
         assert cfg["sent_folder_override"] == ["Sent Mail"]
 
     def test_missing_key_left_alone(self):
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,
@@ -90,7 +91,7 @@ class TestV20Backfill:
         assert "sent_folder_override" not in cfg
 
     def test_already_list_left_alone(self):
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,
@@ -101,7 +102,7 @@ class TestV20Backfill:
         assert cfg["sent_folder_override"] == ["Sent", "Sent Items"]
 
     def test_empty_string_collapses_to_empty_list(self):
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,
@@ -112,7 +113,7 @@ class TestV20Backfill:
         assert cfg["sent_folder_override"] == []
 
     def test_whitespace_string_collapses_to_empty_list(self):
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,
@@ -124,7 +125,7 @@ class TestV20Backfill:
 
     def test_idempotent_on_re_run(self):
         """Running v19 body twice in a row leaves the row identical."""
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,
@@ -139,7 +140,7 @@ class TestV20Backfill:
 
     def test_non_string_non_list_collapses_to_empty_list(self):
         """Defensive: numeric / dict / None shapes collapse to []."""
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         user_id = _seed_user(conn)
         acct_id = _insert_acct(
             conn, user_id=user_id,

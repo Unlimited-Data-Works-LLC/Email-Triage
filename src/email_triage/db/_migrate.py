@@ -122,7 +122,9 @@ def _is_plaintext_sqlite(db_path: str) -> bool:
     """True if raw stdlib ``sqlite3`` can read ``db_path`` (i.e. it is NOT
     already encrypted). Used to refuse a double-encrypt / double-decrypt."""
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
+        # -b: short-probe budget from PersistenceConfig.
+        from email_triage.db._engine import get_sqlite_probe_timeout_secs
+        conn = sqlite3.connect(db_path, timeout=get_sqlite_probe_timeout_secs())
         try:
             conn.execute("SELECT count(1) FROM sqlite_master").fetchone()
             return True
@@ -141,7 +143,11 @@ def _checkpoint_plaintext(db_path: str) -> None:
     sidecars safe. Also doubles as the quiescence probe: a live writer
     holds the RESERVED lock and trips ``BEGIN IMMEDIATE``.
     """
-    conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None)
+    # -b: standard-opener busy budget from PersistenceConfig.
+    from email_triage.db._engine import get_sqlite_busy_wait_secs
+    conn = sqlite3.connect(
+        db_path, timeout=get_sqlite_busy_wait_secs(), isolation_level=None,
+    )
     try:
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -175,6 +181,16 @@ def encrypt_plaintext_db(
     is missing, already encrypted, locked by a running service, ``sqlcipher3``
     is unavailable, or the post-encrypt verification fails.
     """
+    # N-432 DA NTH-3 (2026-07-19) + DA-MF-1 fold (batched NTH-panel same-day):
+    # Two-layer runtime refusal if a FastAPI app is live on this HOST.
+    # Layer 1 (in-process bool) catches a same-process fold; Layer 2
+    # (filesystem sentinel `<dbdir>/.app-alive.<pid>`) catches the
+    # operator-observable `podman exec ... python -m et migrate` bypass.
+    # MUST fire BEFORE the sqlcipher3 import so the refusal surfaces on
+    # any platform (the sqlcipher3 wheel is Linux-only).
+    from email_triage.db._live_app_gate import assert_no_live_app
+    assert_no_live_app("encrypt_plaintext_db", db_path=db_path)
+
     import sqlcipher3  # lazy: heavy Linux-only binary, mirrors _make_encrypted_conn
 
     db_path = str(db_path)
@@ -190,7 +206,9 @@ def encrypt_plaintext_db(
 
     # 1. Quiesce: checkpoint the WAL into the main file + drop sidecars.
     _checkpoint_plaintext(db_path)
-    src_conn = sqlite3.connect(db_path, timeout=30.0)
+    # -b: standard-opener busy budget from PersistenceConfig.
+    from email_triage.db._engine import get_sqlite_busy_wait_secs
+    src_conn = sqlite3.connect(db_path, timeout=get_sqlite_busy_wait_secs())
     try:
         source_tables, source_rows = _table_stats(src_conn)
     finally:
@@ -282,6 +300,12 @@ def decrypt_encrypted_db(
     original up to ``<db>.encrypted.bak`` and verifies raw ``sqlite3`` can
     read the result (table/row-count match + integrity_check) before swapping.
     """
+    # N-432 DA NTH-3 (2026-07-19) + DA-MF-1 fold: two-layer refusal (in-process
+    # bool + filesystem sentinel). See `encrypt_plaintext_db` for full
+    # rationale.
+    from email_triage.db._live_app_gate import assert_no_live_app
+    assert_no_live_app("decrypt_encrypted_db", db_path=db_path)
+
     import sqlcipher3
 
     db_path = str(db_path)
@@ -345,7 +369,9 @@ def decrypt_encrypted_db(
             "Verification FAILED: decrypted file is still not readable by "
             "raw sqlite3. Original left intact."
         )
-    vconn = sqlite3.connect(plain_tmp, timeout=30.0)
+    # -b: standard-opener busy budget from PersistenceConfig.
+    from email_triage.db._engine import get_sqlite_busy_wait_secs
+    vconn = sqlite3.connect(plain_tmp, timeout=get_sqlite_busy_wait_secs())
     try:
         plain_tables, plain_rows = _table_stats(vconn)
         integrity_ok = _integrity_ok(vconn)

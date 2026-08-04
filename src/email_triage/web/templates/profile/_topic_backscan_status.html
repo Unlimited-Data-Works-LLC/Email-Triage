@@ -1,0 +1,79 @@
+{# AUDIENCE: end-user (the Topic owner). A self-polling LIVE status for a
+   running Re-Triage back-scan. Polls every 2s and swaps ITSELF (outerHTML),
+   self-stopping at a terminal status (the hx-get is omitted when terminal).
+   Shows an advancing scanned-count + a staleness heartbeat (so a STALLED scan
+   is visibly distinct from an alive one — per feedback_long_running_check_in:
+   alive == output advancing, not just status='running'), plus a Stop button.
+   No PHI: only integer counts + the job status are shown (no folder names, no
+   message content). #}
+{% set is_terminal = job.status in ("done", "cancelled", "failed") %}
+{% set _colors = {"running": "var(--pico-ins-color)", "queued": "var(--pico-muted-color)",
+                  "done": "var(--pico-ins-color)", "cancelled": "var(--pico-muted-color)",
+                  "failed": "var(--pico-del-color)"} %}
+<div id="topic-retriage-status"
+     {% if not is_terminal %}hx-get="/profile/topic-digest/{{ topic_id }}/retriage/{{ job.job_id }}/progress"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"{% endif %}
+     style="margin-top:0.25rem;">
+  <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap;">
+    <span style="font-size:0.8em;font-weight:600;padding:0.1rem 0.5rem;border-radius:0.4rem;
+                 background:var(--pico-secondary-background);
+                 color:{{ _colors.get(job.status, 'var(--pico-color)') }};">
+      {{ job.status|upper }}
+    </span>
+    {% if job.status == 'running' %}<progress style="width:7rem;margin:0;"></progress>{% endif %}
+    <span><strong>{{ job.total_seen or 0 }}</strong> scanned</span>
+    {% if job.total_processed %}<small style="color:var(--pico-muted-color);">{{ job.total_processed }} examined</small>{% endif %}
+    {% if job.total_cache_skipped %}<small style="color:var(--pico-muted-color);">{{ job.total_cache_skipped }} from a previous scan</small>{% endif %}
+  </div>
+
+  {# #296 — the user-facing ceiling banner. When window enumeration hit the cap,
+     the oldest mail past it was NOT reached this run. Shown on running AND
+     terminal states so the operator always sees it. Cleared at requeue
+     (web/db.py::requeue_orphaned_triage_jobs, N-427) so a resumed narrower
+     run whose cache-warmed enumeration falls below the ceiling doesn't
+     leave a stale advisory — if the resumed run genuinely re-hits the cap,
+     the SET at topic_backscan.py:351-352 re-fires idempotently and the
+     banner returns. The "run again" advice is honest because #295 makes a
+     re-run RESUME into the dropped tail. No PHI: a boolean flag only. #}
+  {% if job.ceiling_hit %}
+  <small style="display:block;margin-top:0.3rem;color:var(--pico-color-amber-500, #b54708);">
+    ⚠ This window has more mail than a single scan can reach, so the oldest
+    messages past the limit weren't scanned this time. Narrow the date window —
+    or run Re-Triage again, which picks up where this scan left off.
+  </small>
+  {% endif %}
+
+  {% if not is_terminal %}
+    {% if stale_secs is none %}
+      <small style="color:var(--pico-muted-color);">Starting…</small>
+    {% elif stale_secs > 180 %}
+      {# 180s comfortably exceeds a healthy batch (FETCH_BATCH_SIZE msgs ×
+         per-message LLM latency) so a slow-but-alive mailbox does not false-warn
+         (db-sme 2026-06-11). #}
+      <small style="color:var(--pico-color-amber-500, #b54708);">⚠ No new progress for {{ (stale_secs // 60) }}m {{ stale_secs % 60 }}s — the scan may be stalled (slow mailbox or a stuck connection). You can Stop it and retry.</small>
+    {% else %}
+      <small style="color:var(--pico-ins-color);">● Live — last update {{ stale_secs }}s ago.</small>
+    {% endif %}
+    <form hx-post="/profile/topic-digest/{{ topic_id }}/retriage/{{ job.job_id }}/cancel"
+          hx-target="#topic-retriage-status" hx-swap="outerHTML"
+          style="display:inline-block;margin:0.35rem 0 0 0;">
+      {{ csrf_input(request) }}
+      <button type="submit" class="outline secondary"
+              style="padding:0.2rem 0.7rem;font-size:0.82em;margin:0;">Stop scan</button>
+    </form>
+  {% else %}
+    <small style="color:var(--pico-muted-color);">
+      {# 'done' = THIS mailbox finished. A Topic with multiple mailboxes scans
+         one at a time (one back-scan runs install-wide), so be honest that more
+         may remain rather than implying the whole Topic is covered (DA
+         2026-06-11). error_text is NEVER rendered here — it can carry a raw
+         str(exc) with a Subject/address (PHI) and dev jargon (hipaa-sme/db-sme
+         2026-06-11); the full detail lives in the CRITICAL log + /health. #}
+      {% if job.status == 'done' %}✓ This mailbox's scan finished — Preview to see what it found. If this Topic covers more mailboxes, run Re-Triage again to scan the next.
+      {% elif job.status == 'cancelled' %}Stopped. Any matches already found are kept.
+      {% else %}The scan hit an unexpected problem — it's been logged for the administrator. You can try Re-Triage again.
+      {% endif %}
+    </small>
+  {% endif %}
+</div>

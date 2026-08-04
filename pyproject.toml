@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=75.0"]
+requires = ["setuptools>=78.1.1"]  # >=78.1.1: PYSEC-2025-49 (build-env path-traversal RCE)
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-triage"
-version = "0.1.2"
+version = "0.2.0"
 description = "Portable email triage system with LLM classification and configurable routing"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -12,20 +12,31 @@ license-files = ["LICENSE"]
 dependencies = [
     "pyyaml>=6.0",
     "httpx>=0.27.0",
-    "mcp>=1.0.0",
+    "mcp>=1.28.1",  # CVE-2026-59950 fix — 2026-07-16 pre-push pip-audit; bump-forward per feedback_push_forward_not_pin_old
     "fastapi>=0.115.0",
+    # Starlette is FastAPI's ASGI core (normally transitive via fastapi).
+    # Pinned explicitly >=1.3.1 for CVE-2026-54283 (request.form() field/
+    # size-limit bypass DoS — reachable via our form routes). Push forward,
+    # never pin fastapi back. NOTE 1.3.1 newly ENFORCES form-parser limits.
+    "starlette>=1.3.1",
     "uvicorn[standard]>=0.30.0",
     "jinja2>=3.1.0",
-    "python-multipart>=0.0.9",
+    "python-multipart>=0.0.31",  # >=0.0.31: CVE-2026-53538/53539/53540 (form-parse DoS)
     "itsdangerous>=2.2.0",
-    "pyjwt[crypto]>=2.8.0",
+    "pyjwt[crypto]>=2.13.0",  # >=2.13.0: CVE-2026-48522..48526 (JWT hardening)
     "icalendar>=5.0",
+    #  Regulatory clock awareness: OFFLINE natural-language date arithmetic
+    # for the safety-reporting detector (the LLM proposes a deadline/anchor
+    # PHRASE; dateparser resolves it to a date with RELATIVE_BASE — the LLM
+    # never computes a date). No network use.
+    "dateparser>=1.2",
     # Auth-surface upgrade: dev-keypair + WebAuthn + ACME automation.
     # cryptography was previously transitive via pyjwt[crypto]; promoting
     # to direct dep because dev_keypair + acme_renewer use it directly.
-    "cryptography>=43.0.0",
+    "cryptography>=50.0.0",  # >=50.0.0: clears CVE-2026-69247 (PKCS#7 Bleichenbacher oracle, fix 50.0.0) + CVE-2026-69248/69249 (X.509 name-constraint escape + path-build DoS, fix 49.0.0). Prior >=48.0.1: GHSA-537c-gmf6-5ccf (bundled-OpenSSL OOB read).
     # WebAuthn / FIDO2 hardware-key auth (Duo's library, BSD).
     "webauthn>=2.0",
+    "pyasn1>=0.6.4",  # CVE-2026-59885/59886 fix (webauthn transitive via pyasn1)
     # ACME client (Let's Encrypt) + JOSE for protocol-level signing.
     # Same library certbot uses internally.
     "acme>=2.10",
@@ -58,22 +69,45 @@ dependencies = [
     # zero callsite changes per §7.
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # ``packaging`` for PEP-440 Version parsing. Required transitive of
+    # ``transformers`` (``transformers.utils.versions`` does ``from packaging
+    # import version`` at module load) via the embedding_bits install path;
+    # declared direct so a stripped prod venv on the deploy host can't raise uncaught
+    # ImportError at first model load. (Formerly also served cve-arc's D-gate
+    # Version compare; that tool was extracted to C-Doe/cve-arc 2026-07-31,
+    # transformers keeps the dep live.)
+    "packaging>=24.0",
 ]
 
 [project.optional-dependencies]
-keyfile = ["cryptography>=43.0.0"]
+keyfile = ["cryptography>=50.0.0"]
 keyring = ["keyring>=25.0.0"]
-# v0.1.2 single-file encryption: SQLCipher single-file encryption-at-rest. The
-# coleifer ``sqlcipher3`` fork (actively maintained, ships
-# ``sqlcipher3-binary`` wheels for CPython 3.11+) — NOT the deprecated
-# rigglemania ``pysqlcipher3`` (last release 2019, no 3.11+/ARM64
-# wheels). ARM64 wheel availability is verified at execution-time per
-# internal documentation §4; fallback is a source build
-# against system libsqlcipher-dev. Linux/container ONLY (no Windows
-# wheel). Required only when persistence.encryption_enabled is ON; the
-# rest of the codebase imports cleanly without it (the boot path
-# fail-closes if encryption is requested but this extra is absent).
-encryption = ["sqlcipher3-binary>=0.5.4,<0.6"]
+# v0.1.2 single-file encryption + N-432 Path-3 hybrid (2026-07-20): SQLCipher
+# single-file encryption-at-rest, UNIFIED across arches (superseded the
+# per-arch  split — the Containerfile now source-builds ``sqlcipher3``
+# on BOTH x86_64 and aarch64 from the coleifer 0.6.2 sdist with a freshly-
+# generated SQLCipher v4.17.0 amalgamation, SQLite 3.53.3 — the first
+# walresetbug-clean SQLCipher). Prior x86_64 pin ``sqlcipher3-binary>=0.5.4,<0.6``
+# vendored SQLCipher 4.6.0 = SQLite 3.45.3 — UNPATCHED for walresetbug on
+# the actual prod arch; Path-3 closes that on BOTH arches uniformly.
+# ``sqlcipher3`` here is the first-party coleifer project (Charles Leifer) —
+# NOT the deprecated rigglemania ``pysqlcipher3`` (2019, no 3.11+) and NOT
+# a third-party republish. It exposes ``import sqlcipher3`` with AES-256-CBC
+# + HMAC-SHA512 (SQLCipher 4.x, cipher_compatibility=4), IDENTICAL on-disk
+# format across arches so a DB written on one arch opens unchanged on the
+# other (zero migration; Zetetic 4.x-major-format-compatibility contract).
+# The Containerfile install uses ``--no-binary sqlcipher3 --no-build-isolation``
+# to force the source build against our SHA-pinned amalgamation (skips the
+# 0.6.2 sdist's conan build-require whose OpenSSL 3.6.0 rebuild aborts
+# under QEMU; setup.py links Debian's -lcrypto from libssl-dev instead).
+# Decision docs: internal documentation +
+# STATE_2026-07-20_0030_edt_walresetbug_path3_containerfile_drafted.md.
+# Linux/container ONLY (no Windows wheel). Required only when
+# persistence.encryption_enabled is ON; rest of the codebase imports cleanly
+# without it (boot fail-closes if encryption is requested but module absent).
+encryption = [
+    "sqlcipher3==0.6.2",
+]
 imap = ["aioimaplib>=1.1.0"]
 office365 = ["msal>=1.30.0"]
 openai = ["openai>=1.0.0"]
@@ -102,6 +136,10 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "httpx>=0.27.0",
+    # Starlette's TestClient is built on httpx2 (Pydantic's httpx fork) as of
+    # starlette 1.3.x; without it TestClient warns + falls back to httpx. Test/
+    # dev-only — never in the prod image (the lock doesn't compile the dev extra).
+    "httpx2>=2.4",
     # Parallel test runner — invoke via ``pytest -n auto``.
     # Cuts the full web/cache/privacy/providers sweep from
     # ~50 min to ~12-15 min on a 4-core box (4x speedup; some
@@ -111,6 +149,14 @@ dev = [
     # runs serially so anyone debugging a single test isn't
     # confused by worker output.
     "pytest-xdist>=3.5",
+]
+# Browser end-to-end harness (tests/e2e). Kept OUT of ``dev`` so the
+# normal unit run neither needs Playwright nor downloads a browser; the
+# e2e suite is opt-in via ``scripts/test-e2e.sh`` + the dedicated CI job.
+# After installing: ``playwright install chromium``.
+e2e = [
+    "pytest-playwright>=0.5",
+    "playwright>=1.49",
 ]
 
 [project.scripts]
@@ -122,7 +168,70 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests", "openclaw/skills/email-triage-api/tests"]
+# The browser e2e suite (tests/e2e) is opt-in: it needs Playwright + a
+# downloaded browser and boots a real server, so the default run IGNORES
+# it (no accidental browser launch, no import error when the e2e extra
+# isn't installed). Run it explicitly via ``scripts/test-e2e.sh`` (which
+# clears this with ``-o addopts=``) or the CI e2e job.
+addopts = "--ignore=tests/e2e"
+markers = [
+    "e2e: browser end-to-end test (boots a real server; opt-in, not in the default run)",
+]
+# Test-harness warnings gate (internal documentation, step 4). The
+# full-suite audit (2026-06-13, `-W default`) found exactly THREE warning
+# categories: RuntimeWarning (0 — no never-awaited coroutine), DeprecationWarning
+# (2 distinct, both third-party, allow-listed below), and ResourceWarning (591 —
+# pervasive test-fixture DB-handle hygiene; see note).
+filterwarnings = [
+    # THE GATE — a NEW DeprecationWarning or RuntimeWarning from OUR code is real
+    # signal: FAIL it, so a future framework/stdlib deprecation we introduce, or
+    # a never-awaited coroutine (a correctness smell), can't scroll past unseen.
+    # (pytest applies LATER filters with higher priority, so the message-scoped
+    # ``ignore``s below override these for their exact, known messages only.)
+    "error::DeprecationWarning",
+    "error::RuntimeWarning",
+    # --- KNOWN / ACCEPTED, scoped to the exact message so they cannot mask any
+    # OTHER warning of the same category ---
+    # bucket 3 — Starlette TestClient per-request ``cookies=`` (~832 call sites
+    # across 77 files that switch identity admin/user/anon PER REQUEST; the proper
+    # fix — per-identity client cookie jars — is a large, tracked refactor).
+    "ignore:Setting per-request cookies=:DeprecationWarning",
+    # httpx ``data=``→``content=`` upload deprecation, triggered TEST-side by the
+    # ``client.post(..., data=[(...)])`` calls in test_web/test_calendars_route.py
+    # (not product code). Tracked: migrate those calls to ``content=``.
+    "ignore:Use 'content=<...>' to upload raw bytes/text content.:DeprecationWarning",
+    # uvicorn pulls in the legacy ``websockets`` impl when it spins up the e2e
+    # server thread (tests/e2e drives a real uvicorn), which emits a FAMILY of
+    # "websockets.<x> is deprecated" warnings (websockets.legacy,
+    # websockets.server.WebSocketServerProtocol, …). All THIRD-PARTY + un-fixable
+    # by us (uvicorn's own dep on the legacy impl); email-triage is a pure-HTTP app
+    # and never imports websockets directly, so masking the whole family is safe.
+    # Without this the gate elevates them to an ERROR *in the server thread*,
+    # crashing uvicorn at import so /health never responds and EVERY e2e test fails
+    # at server-readiness. One regex covers the family. Drop once uvicorn/websockets
+    # stop importing the legacy module.
+    "ignore:websockets.* deprecated:DeprecationWarning",
+    # ResourceWarning (unclosed database) — the 591-strong dominant bucket is left
+    # at the pytest DEFAULT action (shown, NOT error) on purpose: it is pervasive
+    # TEST-fixture hygiene across ~150 in-body ``init_db()`` openers (GC-attributed,
+    # so unpinnable per-site), and PRODUCT code is audited leak-free (every
+    # ``open_dedicated_conn`` closes via try/finally). Test fixtures/helpers funnel
+    # through ``tests/_db_tracking.track()`` + the autouse closer in conftest — use
+    # that funnel when you touch a leaking opener. Forcing ``error`` here would fail
+    # CI on 591 pre-existing test-only warns with no product risk. bucket 1.
+    # ResourceWarning: unclosed event loop — Windows-LOCAL-only noise (asyncio
+    # ``ProactorEventLoop``, GC-attributed at interpreter teardown from the
+    # pytest-asyncio / harness loop lifecycle, NOT product code and NOT the
+    # unclosed-database hygiene bucket above). Linux CI uses ``SelectorEventLoop``
+    # and never emits it, so it only surfaces in a local Windows audit run.
+    # Scoped to the exact message so it can never mask the SHOWN unclosed-database
+    # bucket. bucket 5 (folded 2026-06-14 audit).
+    "ignore:unclosed event loop:ResourceWarning",
+]
 # Resolve ``email_triage`` from this worktree's local ``src/`` regardless
 # of which sibling worktree's editable install last claimed the shared
 # site-packages ``.pth`` file. Removes the need for ``PYTHONPATH=src``.
-pythonpath = ["src"]
+# ``tests`` is on the path so the structural-drift pins can ``from
+# _pin_harness import ...`` (the shared count-agnostic-pin harness,
+# tests/_pin_harness.py) without a per-pin sys.path shim.
+pythonpath = ["src", "tests"]

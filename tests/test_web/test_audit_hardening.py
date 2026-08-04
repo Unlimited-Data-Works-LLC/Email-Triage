@@ -93,11 +93,11 @@ def test_record_auth_event_records_failed_outcome(db):
         db, event_type="login_dev_keypair",
         email="bad@x", user_id=None, key_id=99,
         outcome="denied:hardware_key_wins",
-        detail="user has hardware key",
+        detail="user has passkey",
     )
     rows = list_auth_events(db)
     assert rows[0]["outcome"] == "denied:hardware_key_wins"
-    assert rows[0]["detail"] == "user has hardware key"
+    assert rows[0]["detail"] == "user has passkey"
 
 
 # ---------------------------------------------------------------------------

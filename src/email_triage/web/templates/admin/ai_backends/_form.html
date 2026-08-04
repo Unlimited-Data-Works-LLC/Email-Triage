@@ -71,17 +71,31 @@
 
     <label>
         Endpoint URL{{ m.help("Base URL the adapter posts to. Examples — Ollama: http://localhost:11434 . Azure OpenAI: https://your-resource.openai.azure.com/ . OpenAI: https://api.openai.com/v1 . Gemini: https://generativelanguage.googleapis.com/v1beta") }}
-        <input type="text" name="endpoint" required maxlength="500"
-               value="{{ row.endpoint }}"
-               placeholder="https://...">
+        {{ m.combo_input(
+            "endpoint", row.endpoint,
+            ["http://localhost:11434",
+             "https://api.openai.com/v1",
+             "https://your-resource.openai.azure.com/",
+             "https://generativelanguage.googleapis.com/v1beta"],
+            type="url",
+            placeholder="https://...",
+            attrs="required maxlength=500") }}
     </label>
 
-    <label>
-        Model{{ m.help("Specific model identifier. Examples — Ollama: 'qwen3.6:8b' or 'llama3.1:8b' . Azure OpenAI: the deployment name you set in Azure portal (NOT the OpenAI model name). OpenAI: 'gpt-4o-mini' or 'gpt-4o'. Gemini: 'gemini-2.0-flash'. Leave empty to use the adapter's default.") }}
-        <input type="text" name="model" maxlength="120"
-               value="{{ row.model or '' }}"
-               placeholder="e.g. qwen3.6:8b">
+    {# #44 — model picker replaces the bare free-text Model input.
+       Submits the SAME name="model" (single string) plus a new
+       name="backup_models" (comma-separated, ordered). Probes the live
+       [name=type] + [name=endpoint] on this form. The free-text escape
+       hatch inside the macro keeps Azure deployment names + offline use
+       working — name="model" is always submittable. #}
+    <label style="margin-bottom:0.25rem;">
+        Model{{ m.help("Specific model identifier. Pick from the probed list, or tick 'Enter manually' to type it. Examples — Ollama: 'qwen3.6:8b' or 'llama3.1:8b' . Azure OpenAI: the deployment name you set in Azure portal (NOT the OpenAI model name) — use Enter manually. OpenAI: 'gpt-4o-mini' or 'gpt-4o'. Gemini: 'gemini-2.0-flash'. Leave empty to use the adapter's default.") }}
     </label>
+    {# #45 — show_backups=true: the style-learning complete() path now has the
+       SAME bounded backup-model failover as classify (the loader threads
+       backup_models_json -> OllamaAdapter -> OllamaClassifier), so the backups
+       control is LIVE, not inert. #}
+    {{ m.model_picker("model", "backup_models", row.model, row.backup_models, "[name=type]", "[name=endpoint]", show_backups=true) }}
 
     {# ── API key section ─────────────────────────────────────────
        Never round-trip the plaintext. Show "set" / "not set" + an
@@ -124,9 +138,7 @@
         </label>
         <label style="margin:0.5rem 0 0 0;">
             New key{{ m.help("Pasted plaintext. The server stores it encrypted in the secrets store under a backend-id-keyed name; the value is never displayed back on this page. To rotate a key: tick 'Replace key', paste the new value, hit Save.") }}
-            <input type="password" name="api_key_plain"
-                   autocomplete="off" maxlength="500"
-                   placeholder="sk-... or your Azure key">
+            {{ m.secret_input("api_key_plain", false, "sk-... or your Azure key", 'maxlength="500"') }}
         </label>
         {% else %}
         <p style="margin:0 0 0.5rem 0;color:var(--pico-muted-color);">
@@ -139,9 +151,7 @@
         </p>
         <label style="margin:0;">
             API key{{ m.help("Pasted plaintext. The server stores it encrypted in the secrets store under a backend-id-keyed name; the value is never displayed back on this page.") }}
-            <input type="password" name="api_key_plain"
-                   autocomplete="off" maxlength="500"
-                   placeholder="sk-... or your Azure key">
+            {{ m.secret_input("api_key_plain", false, "sk-... or your Azure key", 'maxlength="500"') }}
         </label>
         {% endif %}
     </fieldset>

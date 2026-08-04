@@ -128,26 +128,26 @@
     </form>
     {% endif %}
 
-    {# Terminal status footnote. Timestamps use .local-datetime so
-       client JS converts the UTC ISO string the server emits to the
-       operator's wall clock. The literal "UTC" suffix on display
-       was operator-noted 2026-05-12 as inconsistent with the rest
-       of the UI (logs, calendar, dashboard) which all convert. #}
+    {# Terminal status footnote. Timestamps use the [data-us-datetime]
+       progressive-enhancement pattern: server renders US-locale via
+       the us_datetime filter (SSOT src/email_triage/_us_datetime.py);
+       the global JS twin in base.html walks [data-us-datetime] and
+       swaps in the browser wall-clock rendering. #}
     {% if is_terminal %}
     <p style="margin:0.5rem 0;font-size:0.9em;color:var(--pico-muted-color);">
         {% if job.status == 'done' %}
             ✓ Finished at
-            <span class="local-datetime"
-                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+            <time datetime="{{ job.ended_at or '' }}"
+                  data-us-datetime>{{ (job.ended_at or '') | us_datetime }}</time>.
         {% elif job.status == 'cancelled' %}
             Cancelled at
-            <span class="local-datetime"
-                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+            <time datetime="{{ job.ended_at or '' }}"
+                  data-us-datetime>{{ (job.ended_at or '') | us_datetime }}</time>.
             Messages already processed are saved; the rest were not touched.
         {% elif job.status == 'failed' %}
             Failed at
-            <span class="local-datetime"
-                  data-utc="{{ job.ended_at or '' }}">{{ (job.ended_at or "")[:19] }}</span>.
+            <time datetime="{{ job.ended_at or '' }}"
+                  data-us-datetime>{{ (job.ended_at or '') | us_datetime }}</time>.
             {% if job.error_text %}
             <br><code style="font-size:0.85em;">{{ job.error_text }}</code>
             {% endif %}

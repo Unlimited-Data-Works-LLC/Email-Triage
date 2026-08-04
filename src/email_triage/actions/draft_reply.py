@@ -6,8 +6,9 @@ This is a safety feature: drafts require human review before sending.
 Prompt-prefix order (highest precedence first)
 ==============================================
 
-When the LLM-prompt build path is wired up, the prompt for the
-draft-reply LLM call is assembled in this canonical order:
+The prompt for the draft-reply LLM call is assembled in this canonical
+order (wired live in ``DraftReplyAction._generate_body`` ->
+``build_prompt_messages``):
 
     1. M-1+M-2: user-stated style knobs (explicit operator preference)
     2. M-3:     system-derived profile (general voice from past sent mail)
@@ -55,6 +56,7 @@ Every layer respects three independent toggles:
 from __future__ import annotations
 
 import logging
+import types
 from typing import Any
 
 from email_triage.actions.base import Action
@@ -66,9 +68,12 @@ from email_triage.engine.models import (
     FlowState,
 )
 from email_triage.providers.base import EmailProvider
+from email_triage.llm_safety import DATA_FENCE_SECURITY_RULE, fence_data
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c/36 R23
 
-logger = logging.getLogger("email_triage.actions.draft_reply")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.draft_reply")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +119,7 @@ def _should_use_rag(
         return False
 
     account_id_raw = account.get("id") if isinstance(account, dict) else None
-    try:
-        account_id = int(account_id_raw) if account_id_raw is not None else None
-    except (TypeError, ValueError):
-        account_id = None
+    account_id = parse_int_or_none(account_id_raw)  # N-219c/36 R23: SSOT (None input → None; non-numeric → None)
     if account_id is None:
         return False
 
@@ -241,10 +243,7 @@ async def build_prompt_messages(
     profile = None
     account_id = None
     if account is not None and isinstance(account, dict):
-        try:
-            account_id = int(account.get("id")) if account.get("id") else None
-        except (TypeError, ValueError):
-            account_id = None
+        account_id = parse_int_or_none(account.get("id"))  # N-219c/36 R23: SSOT
     try:
         knobs = (
             await db_call(get_user_style_knobs, db, user_id)
@@ -518,15 +517,93 @@ async def build_prompt_messages(
                 messages.append({"role": "assistant", "content": excerpt})
 
     # ---- Layer 4: the actual task message ----------------------------
+    # The whole incoming email — subject, sender AND body — is
+    # attacker-controlled, so it is wrapped in ONE closed, sanitized DATA
+    # fence (mirrors classify.prompts.build_email_block). Only our own
+    # framing and the classifier's closed-vocab category slug sit outside
+    # the fence. The RAG few-shot turns (Layer 3) are the operator's own past
+    # sent mail rendered as assistant-role voice examples — deliberately NOT
+    # fenced (fencing them would defeat their few-shot purpose, and an
+    # assistant-role turn can't carry a data fence). Note the residual: the
+    # excerpt is quoted-inbound-stripped at index time (``_strip_quoted`` in
+    # sent_mail_index.py), a heuristic — an imperfect strip could leave a
+    # sliver of inbound text in the high-trust assistant position. Bounded
+    # (self-poisoning of one's own corpus, not live inbound injection) and
+    # accepted, since fencing is structurally impossible here.
+    # The treat-as-data security rule rides INSIDE this task message, right
+    # before the fenced email — so it travels with the data it governs and
+    # is present on EVERY path, including the HIPAA path where the style
+    # system prefix is suppressed and this user message is the only one. The
+    # HIPAA contract ("prompt collapses to a single user task message") is
+    # preserved precisely because the rule lives here, not in a separate
+    # system turn.
+    email_block = "\n".join([
+        f"Subject: {message.subject or '(no subject)'}",
+        f"From: {message.sender}",
+        "",
+        message.body_text or "(no body)",
+    ])
     task = (
-        f"Draft a reply to the following email. "
-        f"Classification: {classification.category}. "
-        f"Subject: {message.subject or '(no subject)'}\n\n"
-        f"From: {message.sender}\n\n"
-        f"{message.body_text or '(no body)'}"
+        DATA_FENCE_SECURITY_RULE
+        + "\n\n"
+        + f"Draft a reply to the following email. "
+        + f"Classification: {classification.category}.\n\n"
+        + fence_data(email_block)
     )
     messages.append({"role": "user", "content": task})
     return messages
+
+
+# ---------------------------------------------------------------------------
+# Draft runtime (process-singleton fallback)
+# ---------------------------------------------------------------------------
+# build_prompt_messages needs an ``app`` (for app.state.embedding_backend on
+# the non-HIPAA RAG path) and load_backend needs the install ``config`` -- but
+# the action layer reaches neither directly (it only gets ``flow.state_bag``).
+# Rather than thread app.state through all 8 TriageContext constructors + both
+# dispatch paths, register these process-singletons ONCE at web-app startup
+# (web/app.py) and resolve them here. state_bag values take precedence, so the
+# triage_one path (which carries the per-run config) still wins.
+_DRAFT_RUNTIME: dict[str, Any] = {}
+
+
+def register_draft_runtime(
+    *,
+    config: Any = None,
+    embedding_backend: Any = None,
+    embedding_model: str = "",
+    sqlite_vec_available: bool = False,
+) -> None:
+    """Stash the process-wide draft runtime (called once at app startup)."""
+    _DRAFT_RUNTIME["config"] = config
+    _DRAFT_RUNTIME["embedding_backend"] = embedding_backend
+    _DRAFT_RUNTIME["embedding_model"] = embedding_model or ""
+    _DRAFT_RUNTIME["sqlite_vec_available"] = bool(sqlite_vec_available)
+
+
+def _resolve_draft_runtime(state_bag: dict) -> tuple[Any, Any]:
+    """Return ``(config, app_like)`` for body generation.
+
+    ``config`` comes from ``state_bag['config']`` (the per-run config on the
+    triage_one path), falling back to the process singleton. ``app_like``
+    exposes ``.state.embedding_backend`` etc. -- the real ``app`` if state_bag
+    carries one, else a shim from the registered singletons (HIPAA accounts
+    skip RAG, so the embedding backend is only consulted for non-HIPAA).
+    """
+    sb = state_bag or {}
+    config = sb.get("config") or _DRAFT_RUNTIME.get("config")
+    app = sb.get("app")
+    if app is None:
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                embedding_backend=_DRAFT_RUNTIME.get("embedding_backend"),
+                embedding_model=_DRAFT_RUNTIME.get("embedding_model", ""),
+                sqlite_vec_available=_DRAFT_RUNTIME.get(
+                    "sqlite_vec_available", False,
+                ),
+            ),
+        )
+    return config, app
 
 
 # ---------------------------------------------------------------------------
@@ -536,14 +613,189 @@ async def build_prompt_messages(
 class DraftReplyAction(Action):
     """Create a draft reply to the email via the provider.
 
-    Currently creates a placeholder draft. The LLM-call path is
-    forthcoming; the prompt-builder + RAG stitch (M-5) ships now
-    so the wiring is in place when that lands.
+    Generates the reply body with the local LLM -- the M-1..M-7 style
+    prompt (:func:`build_prompt_messages`) through the install-default
+    backend (:func:`load_backend`) -- threaded back into the original
+    conversation, never sent. Fails CLOSED (no draft) on a BAA/secret
+    error; degrades to a safe static placeholder only on a non-security
+    generation failure (the one permitted, non-decisional fail-open).
     """
 
     @property
     def name(self) -> str:
         return "draft_reply"
+
+    _DRAFT_MAX_TOKENS = 1024
+
+    @staticmethod
+    def _placeholder_body(classification: Classification) -> str:
+        """The pre-LLM safe fallback -- non-PHI, only the category slug."""
+        return (
+            f"[Auto-drafted reply for {classification.category} email]\n\n"
+            f"This is a draft reply. Please review and edit before sending."
+        )
+
+    @staticmethod
+    def _acct_field(account: Any, key: str) -> Any:
+        """Read ``key`` from an account dict OR sqlite3.Row OR object."""
+        if account is None:
+            return None
+        if isinstance(account, dict):
+            return account.get(key)
+        try:
+            return account[key]
+        except (KeyError, IndexError, TypeError):
+            return getattr(account, key, None)
+
+    async def _generate_body(
+        self,
+        flow: FlowState,
+        message: EmailMessage,
+        classification: Classification,
+    ) -> str:
+        """Generate the reply body with the local LLM.
+
+        Fail-CLOSED on a BAA / secret error (re-raise -> the action FAILs, no
+        draft). Degrade to the safe placeholder on a non-security generation
+        failure (timeout / empty / unwired runtime) -- the one permitted fail-
+        OPEN (non-decisional render degradation; every draft is human-reviewed).
+        """
+        from email_triage.triage_logging import account_hipaa_effective
+        from email_triage.web.db_threadpool import db_call
+        from email_triage.ai_backends.base import (
+            BackendBAARequiredError,
+            BackendError,
+        )
+        from email_triage.ai_backends.loader import load_backend
+
+        sb = flow.state_bag or {}
+        db = sb.get("db")
+        account = sb.get("account")
+        secrets = sb.get("secrets")
+        actor_user_id = sb.get("actor_user_id")
+        config, app = _resolve_draft_runtime(sb)
+
+        if db is None or config is None:
+            logger.info(
+                "draft_reply: runtime unwired; using placeholder body",
+                extra={
+                    "flow_id": flow.flow_id,
+                    "have_db": db is not None,
+                    "have_config": config is not None,
+                },
+            )
+            return self._placeholder_body(classification)
+
+        # SSOT HIPAA verdict (account_hipaa_effective, PD#8 / N-77) — drives
+        # BOTH the PHI-egress gate and the audit trigger, so it must be the SSOT
+        # (covers the message.hipaa axis + the account-None edge), not the
+        # weaker is_account_hipaa. Prefer the verdict already resolved upstream
+        # (triage_one plants it in state_bag); fall back to recomputing it.
+        hipaa = sb.get("account_hipaa")
+        if hipaa is None:
+            hipaa = account_hipaa_effective(account=account, message=message)
+        hipaa = bool(hipaa)
+        owner_id = self._acct_field(account, "user_id")
+        account_id = self._acct_field(account, "id")
+        from_address = sb.get("self_email") or None
+
+        # Build the style-aware prompt. On HIPAA this collapses to the single
+        # DATA-fenced task message (style prefix suppressed, M-4 RAG hard-off);
+        # non-HIPAA layers M-1..M-4.
+        messages = await build_prompt_messages(
+            db=db,
+            app=app,
+            account=account,
+            user_id=owner_id,
+            message=message,
+            classification=classification,
+            from_address=from_address,
+        )
+
+        # Resolve the install-default (local Ollama) adapter. require_baa_
+        # certified=hipaa so a HIPAA account whose default endpoint is non-
+        # local + unacked REFUSES rather than egress PHI.
+        try:
+            adapter = await db_call(
+                load_backend,
+                None,
+                db_conn=db,
+                secrets=secrets,
+                config=config,
+                require_baa_certified=hipaa,
+            )
+        except BackendBAARequiredError:
+            logger.error(
+                "draft_reply: refusing draft -- backend BAA not satisfied for "
+                "a HIPAA account (fail-closed; no draft created)",
+                extra={"flow_id": flow.flow_id},
+            )
+            raise
+        except BackendError as be:
+            # Non-BAA backend-resolution failure: the adapter was never built,
+            # so NO PHI egressed. Degrade to the safe non-PHI placeholder (the
+            # permitted non-decisional fail-open) on HIPAA and non-HIPAA alike —
+            # refusing here would block drafting on a transient/config error for
+            # zero PHI-safety gain. The genuine egress boundary is
+            # BackendBAARequiredError above (refused, not degraded).
+            logger.warning(
+                "draft_reply: backend resolution failed; placeholder body",
+                extra={
+                    "flow_id": flow.flow_id,
+                    "error_type": type(be).__name__,
+                },
+            )
+            return self._placeholder_body(classification)
+
+        # HIPAA PHI-access audit: the draft-gen reads inbound PHI. The
+        # actor!=owner predicate is the shared SSOT (phi_access_audit_required:
+        # owner self-draft exempt, NOT actor!=null — PD-5/PD-14). Routed through
+        # the emitter SSOT (HMAC chain), body-text-free, emitted BEFORE the LLM
+        # hop so the access is recorded even if generation then fails. A failure
+        # here propagates (fail-closed: no audit -> no draft).
+        from email_triage.db.audit import (
+            phi_access_audit_required,
+            record_hipaa_access_event,
+        )
+        if account_id is not None and phi_access_audit_required(
+            account_hipaa=hipaa,
+            actor_user_id=actor_user_id,
+            owner_id=owner_id,
+        ):
+            await db_call(
+                record_hipaa_access_event,
+                db,
+                actor_user_id,
+                int(account_id),
+                "draft_reply_generate",
+                outcome="ok",
+            )
+
+        try:
+            body_text = await adapter.chat_complete(
+                messages, max_tokens=self._DRAFT_MAX_TOKENS,
+            )
+        except Exception as ce:
+            # NOTE (hipaa-sme 2026-06-19): this broad catch -> placeholder is
+            # the ONE permitted fail-OPEN, and it is SAFE only because the
+            # install-default backend is LOCAL + keyless (no secret/key error
+            # is reachable inside chat_complete here). If a KEYED / non-local
+            # backend is ever wired for HIPAA draft-gen, NARROW this catch to
+            # let a typed secret/key error PROPAGATE (fail-closed) rather than
+            # degrade to a placeholder.
+            logger.warning(
+                "draft_reply: LLM generation failed; placeholder body",
+                extra={
+                    "flow_id": flow.flow_id,
+                    "error_type": type(ce).__name__,
+                },
+            )
+            return self._placeholder_body(classification)
+
+        body_text = (body_text or "").strip()
+        if not body_text:
+            return self._placeholder_body(classification)
+        return body_text
 
     async def execute(
         self,
@@ -583,20 +835,22 @@ class DraftReplyAction(Action):
                 build_triage_header,
                 encode_draft_body_header,
             )
-            # N-01.c (Cycle 7 2026-05-24 per hipaa-sme-3 Cycle 5 second-pass
-            # preventative warning): the draft_body below is a STATIC
-            # template — only `classification.category` (non-PHI metadata)
-            # is interpolated. N-01 REFUTED at HEAD c7462cc on this basis.
-            # **FUTURE LLM-LANDERS: do NOT introduce PHI interpolation
-            # here without (a) cross-routing to hipaa-sme for §164.502(b)
-            # minimum-necessary review AND (b) walking the actor!=owner
-            # gate from `feedback_hipaa_actor_owner_gate.md` AND (c) the
-            # N-01-forward pre-landing gate per docs/hipaa-findings-
-            # register.md §4.2.** If LLM-draft generation lands here, this
-            # comment becomes load-bearing — re-walk N-01 disposition.
-            draft_body = (
-                f"[Auto-drafted reply for {classification.category} email]\n\n"
-                f"This is a draft reply. Please review and edit before sending."
+            # N-01 REOPENED at the LLM-draft landing (hipaa-sme RULING 2,
+            # 2026-06-19; internal documentation CR-01 7.4). The
+            # draft body below is now LLM-GENERATED (no longer static): PHI
+            # flows incoming-message -> prompt -> local Ollama -> generated
+            # body -> state_bag['action_results']. Disposition (re-walked,
+            # hipaa-sme): reply-drafting is a 164.502 USE within the owner's
+            # existing authorization (the owner holds the inbound message;
+            # the draft returns to the same correspondent; the LLM hop is
+            # local-only) -- NOT a new disclosure. Controls in _generate_body:
+            # encrypt-at-rest EM affirmed for action_results (SQLCipher/
+            # EQM-08); actor!=owner PHI-access audit; fail-CLOSED on BAA/
+            # secret error. HIPAA prompts carry NO verbatim few-shot (the M-4
+            # index is HIPAA-hard-off); the M-3/M-7 signal is the closed-
+            # vocab, Safe-Harbor-scrubbed descriptor only.
+            draft_body = await self._generate_body(
+                flow, message, classification,
             )
             # Account name isn't threaded to actions; pull from state_bag
             # when the runner plants it, otherwise leave empty (the
@@ -615,36 +869,41 @@ class DraftReplyAction(Action):
             # M-6 edit-feedback capture loop: stamp a base64-encoded
             # snapshot of the AI-drafted body so that when the user
             # edits + sends, the M-6 scanner can compare draft vs sent.
-            # The header rides as a custom RFC 5322 header on every
-            # draft. It is INDEXED only when the install is non-HIPAA
-            # (M-6 hard-off on PHI); the header itself is plaintext at
-            # draft time because providers don't redact arbitrary
-            # X-* headers and a HIPAA install never executes the M-6
-            # scanner that would consume it.
             extra: dict[str, str] = {X_EMAIL_TRIAGE_HEADER: stamp}
-            try:
-                draft_body_header = encode_draft_body_header(draft_body)
-                if draft_body_header:
-                    extra[X_EMAIL_TRIAGE_DRAFT_BODY_HEADER] = draft_body_header
-            except Exception as enc_exc:
-                # Encoding failure should never poison draft creation.
-                # Log + continue without the M-6 capture header; the
-                # outbound draft still ships with X-Email-Triage so
-                # the loop-prevention skip still fires.
-                logger.warning(
-                    "M-6 draft-body header encode failed; continuing",
-                    extra={
-                        "flow_id": flow.flow_id,
-                        "error_type": type(enc_exc).__name__,
-                    },
-                )
+            # MUST-FIX (hipaa-sme 2026-06-19, CR-02): the draft body is now
+            # LLM-GENERATED, so the M-6 base64 snapshot is a PHI duplicate in
+            # message metadata. The M-6 scanner is hard-OFF for HIPAA, so on a
+            # HIPAA account this header would carry PHI with ZERO consumer
+            # benefit -- a 164.502(b) minimum-necessary violation (and X-*
+            # headers travel / log / raw-source-view differently than the
+            # body). SUPPRESS it on HIPAA; the non-PHI X-Email-Triage
+            # loop-prevention stamp above still rides so the inbound skip fires.
+            from email_triage.triage_logging import is_account_hipaa
+            _hdr_hipaa = is_account_hipaa(
+                flow.state_bag.get("account")
+            ) or bool(getattr(message, "hipaa", False))
+            if not _hdr_hipaa:
+                try:
+                    draft_body_header = encode_draft_body_header(draft_body)
+                    if draft_body_header:
+                        extra[X_EMAIL_TRIAGE_DRAFT_BODY_HEADER] = draft_body_header
+                except Exception as enc_exc:
+                    # Encoding failure should never poison draft creation.
+                    # Log + continue without the M-6 capture header; the
+                    # outbound draft still ships with X-Email-Triage so
+                    # the loop-prevention skip still fires.
+                    logger.warning(
+                        "M-6 draft-body header encode failed; continuing",
+                        extra={
+                            "flow_id": flow.flow_id,
+                            "error_type": type(enc_exc).__name__,
+                        },
+                    )
             # 2026-05-13 — In-Reply-To must be the RFC 5322
             # Message-Id; IMAP UID would silently break threading.
-            from email_triage.mail_headers import get_rfc_message_id
-            _rfc_id = (
-                get_rfc_message_id(message.headers)
-                or message.message_id
-            )
+            # A6 (census 2026-06-09): header-then-provider-id = SSOT.
+            from email_triage.mail_headers import get_message_rfc_id
+            _rfc_id = get_message_rfc_id(message)
             draft_id = await provider.create_draft(
                 to=[message.sender],
                 subject=f"Re: {message.subject}",
@@ -667,9 +926,8 @@ class DraftReplyAction(Action):
             )
         except NotImplementedError:
             logger.info(
-                "Provider %s does not support drafts, skipping",
-                provider.name,
-                extra={"flow_id": flow.flow_id},
+                "Provider does not support drafts, skipping",
+                extra={"flow_id": flow.flow_id, "provider": provider.name},
             )
             return ActionOutput(
                 result=ActionResult.SKIPPED,

@@ -46,6 +46,7 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import parse_module
 from email_triage.engine.models import Attachment
 
 
@@ -60,9 +61,10 @@ _PROVIDER_FILES = (
 )
 
 
-def _attachment_constructor_calls(src: str) -> list[ast.Call]:
-    """Every ``Attachment(...)`` Call node in the given source."""
-    tree = ast.parse(src)
+def _attachment_constructor_calls(path: Path) -> list[ast.Call]:
+    """Every ``Attachment(...)`` Call node in the file at ``path``."""
+    tree = parse_module(path)
+    assert tree is not None, f"expected parseable source at {path}"
     return [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -92,8 +94,7 @@ def test_provider_attachment_constructor_passes_data_none(
     this guard to scope the exemption.
     """
     repo_root = Path(__file__).resolve().parents[2]
-    src = (repo_root / provider_path).read_text(encoding="utf-8")
-    calls = _attachment_constructor_calls(src)
+    calls = _attachment_constructor_calls(repo_root / provider_path)
     assert calls, (
         f"expected at least one Attachment(...) constructor in "
         f"{provider_path}; AST walk found none"

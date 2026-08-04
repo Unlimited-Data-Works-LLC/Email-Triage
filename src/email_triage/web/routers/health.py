@@ -22,18 +22,28 @@ can decide whether to trust 200 alone or to also inspect ``status``.
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Request
 
-from email_triage._isotime import parse_iso
+from email_triage._errfmt import scrub_class_error_for_persist, scrub_error_for_persist
+from email_triage._int_utils import bounded_int  # N-219c R23
+from email_triage._isotime import (
+    parse_iso, parse_iso_aware, to_utc_iso, now_utc_iso_z,
+)  # N-357b R31 + N-316b R32
+from email_triage.llm_truncation import llm_truncated_1h  # N-372 obs fold
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import get_current_user as _get_current_user
+from email_triage.web.dependencies import is_admin  # N-222 R22 bool SSOT
+from email_triage.web.dependencies import request_meta  # N-187 R20_12 SSOT
 
-logger = logging.getLogger("email_triage.web.health")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.web.health")  # N-196b R21_4
 
 router = APIRouter()
 
@@ -49,11 +59,133 @@ _STALE_TRIAGE_SECONDS = 24 * 60 * 60  # 24 hours
 # retry-deads threshold in daily_health.py for consistency.
 _STYLE_DISTILL_FAILURE_DEGRADE_THRESHOLD = 5
 
+# ``message_gone`` now means the AMBIGUOUS empty-fetch case ONLY: a 0-byte
+# IMAP fetch whose UID SEARCH could NOT confirm the message is gone (still
+# present, or unverifiable) — i.e. the systematic-fetch-degradation signal the
+# spike fail-safe exists to catch. A CONFIRMED expunge (a provider 404, or a
+# 0-byte fetch whose UID SEARCH confirms absent) is the distinct, BENIGN
+# ``message_expunged`` reason that never degrades (see the classifier below).
+# With that verified split (2026-06-19), ordinary mailbox churn (genuine
+# deletions, now ``message_expunged``) no longer lands here — it was tripping
+# the old count of 5 on a high-churn account. ``message_gone`` should now spike
+# only on a REAL fetch degradation (present-but-empty), so degrade at/above
+# this higher 24h count.
+_MESSAGE_GONE_DEGRADE_THRESHOLD = 30
+
+# N-372 (2026-07-05): per-reason threshold for ``max_attempts_exceeded``.
+# BEFORE: a SINGLE ``max_attempts_exceeded`` dead row flipped /health to 503
+# for a full 24h window until ``resolved_at`` slid past the cutoff, even when
+# the message that broke was a low-signal FedEx delivery notification tripping
+# a transient LLM parse edge (see 2026-07-05 incident). That collapsed the
+# operator surface into a single-message-noise → full-CRIT ratio.
+# AFTER: aggregate at/above 3 within the last 24h. Rationale:
+#   * 1 stuck message per day = the ordinary long-tail residual (transient
+#     model burp, a message whose text happens to trip a parser edge). Not
+#     systemic.
+#   * 2 stuck = still noisy but a low-signal shape.
+#   * 3+ stuck in 24h = the systemic-classify-fail curve worth alerting on
+#     (backend regression, prompt drift, format-schema misconfig).
+# LOWER than ``_MESSAGE_GONE_DEGRADE_THRESHOLD=30`` because ``message_gone`` is
+# an AMBIGUOUS churn signal (30 tolerates high-churn accounts), whereas
+# ``max_attempts_exceeded`` is a HARD terminal failure post-5-retries and
+# already carries strong signal per event. Keeping this tight preserves the
+# "fail-safe toward alerting" posture the ``degraded`` OR-chain codifies at
+# the site — same design, better SNR.
+# the backlog — revisit ~2026-08-05 (N-372 landing 2026-07-05 + 30d):
+# threshold=3 is a heuristic chosen at N-372 close to debounce a single
+# content-triggered `max_attempts_exceeded` (Ollama upstream #15260
+# format-schema bypass, closed via `c53a760e`) from flipping /health for
+# 24h. After 30 days of prod signal on the retry-queue's actual
+# max_attempts_exceeded arrival rate + distribution, re-evaluate:
+# (a) if 30d shows 0-1 hits total, threshold=3 is over-tolerant — tighten
+#     back toward 1 (a real dead-row on the post-N-372 stack is a signal
+#     worth alerting on, not debouncing);
+# (b) if 30d shows a genuine multi-per-week baseline, threshold=3 is
+#     right-sized;
+# (c) if 30d shows spikes tied to specific accounts / senders, add a
+#     per-source dimension instead of a global counter.
+# TaskList  tracks the revisit.
+_MAX_ATTEMPTS_EXCEEDED_DEGRADE_THRESHOLD = 3
+
 #  — degrade /health when a present TLS cert is at or within this
 # many days of expiry. The ACME auto-renewer rolls well before this,
 # so reaching it means the renewer failed — surface it before the
 # listener serves a dead cert.
 _TLS_CERT_DEGRADE_DAYS = 7
+
+# Container-internal ops access to /health/detail (the admin-session bypass).
+# A token shorter than this is treated as UNSET — a blank/weak/default value
+# never enables the bypass.
+_OPS_TOKEN_MIN_LEN = 16
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _ops_token_authorized(
+    *, client_host: str, presented: str, env_token: str,
+) -> bool:
+    """True only when ALL of the layered conditions hold for the
+    /health/detail ops bypass:
+
+      * the request originates from the container's OWN loopback — the
+        ``podman exec ... curl https://localhost:8080`` path. The published
+        LAN port (0.0.0.0:8080) arrives with the container GATEWAY ip, NOT
+        loopback, so a LAN caller can NEVER use the token even if it leaks;
+      * a token of at least ``_OPS_TOKEN_MIN_LEN`` chars is configured (a
+        blank / weak / unset ``ET_HEALTH_OPS_TOKEN`` disables the bypass —
+        the install is then admin-session-only, unchanged);
+      * the presented ``X-Ops-Token`` matches, compared in constant time.
+
+    Pure + side-effect-free so the loopback×entropy×match matrix is unit-tested
+    directly (the TestClient reports a non-loopback host, which is exactly the
+    LAN-denied case)."""
+    token = (env_token or "").strip()
+    if len(token) < _OPS_TOKEN_MIN_LEN:
+        return False
+    host = client_host or ""
+    if host not in _LOOPBACK_HOSTS and not host.startswith("127."):
+        return False
+    return hmac.compare_digest((presented or "").strip(), token)
+
+
+def _read_ops_token() -> str | None:
+    """Single reader for the ``ET_HEALTH_OPS_TOKEN`` ops-bypass secret (run18 #6).
+
+    The ONE place the raw ``os.environ`` read for this token lives. The three
+    callers route through it: ``/health/detail`` (here), ``/ops/db-backup``
+    (``backup.py``), and the ``backup now`` CLI trigger (``cli.py``). Funnelling
+    the read keeps the env-var NAME a single literal, so a future rename / alias is
+    a one-line change (PD#1/#5 — drift-prevention; ``test_ops_token_read_pin`` bans
+    a raw read elsewhere). §164.312(d)+(a)(1) credential-handling hygiene; NOT a
+    live defect — the auth DECISION already funnels through ``_ops_token_authorized``.
+
+    Returns the raw env value (``None`` when unset); callers apply their own
+    ``or ""`` coalescing exactly as before, so the behaviour is byte-identical to
+    the inline reads it replaces. Deliberately logic-free (no ``.strip()`` / length
+    floor / loopback gate): ``_ops_token_authorized`` stays the param-pure DECISION
+    SSOT and owns all of that — this is only the thin READER half.
+
+    **N-365 R31 (2026-07-05 trust-repair fix-forward per Census run22 §5 +
+    the backlog  = TASK ):** the secret-read funnel pin (`test_secret_
+    read_funnel_pin.py`) is structurally blind to this env-read (it walks
+    `SecretsProvider.get`-shape sites, not `os.environ.get` sites). This
+    is a DOCUMENTED DEVIATION, not a pin gap:
+
+    * The env-var is an OPERATOR-CONTROLLED break-glass override for the
+      /health detail endpoint (bootstraps before the DbSecrets store is
+      readable — the /health endpoint is used for post-container-restart
+      readiness probing).
+    * Migrating to `DbSecrets` would create a bootstrapping chicken-and-egg
+      (readiness probe depends on DB readable, which depends on readiness).
+    * The auth DECISION `_ops_token_authorized` provides the fail-CLOSED
+      surface (blank / weak / unset disables the bypass); the backlog 
+      tracks token-rotation hygiene.
+
+    Sentinel below is a NAMED-DEVIATION marker for future funnel-pin
+    tightening (Census run22 §7#4 self-eval: pin walker should surface
+    named deviations distinctly from unresolved ones).
+    """
+    # secret-read: env-ops-token (N-365 named-deviation — bootstrap surface)
+    return os.environ.get("ET_HEALTH_OPS_TOKEN")
 
 
 def _db_ok(db) -> bool:
@@ -92,13 +224,12 @@ def _last_triage_iso(db) -> str | None:
         if not val:
             return None
         # Convert stored UTC string to the container's local tz.
-        dt = parse_iso(val)
+        # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+        dt = parse_iso_aware(val)
         if dt is None:
             # Unparseable — fall back to raw string so the endpoint
             # still reports something rather than None.
             return val
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone().isoformat()
     except Exception:
         return None
@@ -290,21 +421,26 @@ def _aggregate_account_states(account_states: list[dict]) -> dict:
         prov = s.get("provider", "unknown")
         b = by_provider.setdefault(prov, {
             "total": 0, "push": 0, "poll": 0, "uncovered": 0,
-            "push_plus_poll": 0,
+            "watching_off": 0, "push_plus_poll": 0,
         })
         b["total"] += 1
         primary = s.get("primary", "none")
+        watching_off = bool(s.get("watching_off"))
         if primary == "push":
             b["push"] += 1
         elif primary == "poll":
             b["poll"] += 1
+        elif watching_off:
+            # Operator turned push+poll off on purpose — a neutral "watching
+            # off" state, NOT uncovered and NOT an alert.
+            b["watching_off"] += 1
         else:
             b["uncovered"] += 1
         if s.get("mode") == "push+poll":
             b["push_plus_poll"] += 1
         if s.get("alert"):
             any_alert = True
-        if primary == "none":
+        if primary == "none" and not watching_off:
             any_uncovered = True
     return {
         "providers": by_provider,
@@ -447,6 +583,28 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         "lifetime": _cc_lifetime,
     }
 
+    # N-93 — topic-match parse-failure + retry-outcome counters. Surfaces how
+    # often the §4.4 fail-open valve opens (the qwen3.x format-JSON malformation
+    # rate) as a NUMBER, not a log-grep. Process-local snapshot + Redis lifetime,
+    # same shape as the cache block; integers only (no PHI).
+    try:
+        from email_triage.classify.base import get_topic_match_counters
+        _tm_snap = get_topic_match_counters().snapshot()
+    except Exception:
+        _tm_snap = {
+            "parse_retried": 0, "retry_recovered": 0,
+            "retry_failed_dropped": 0, "salvage_recovered": 0,
+        }
+    try:
+        from email_triage.engine.persistent_counters import (
+            get_install_counter_backend as _tm_pc,
+        )
+        _tm_be = _tm_pc()
+        _tm_lifetime = _tm_be.fetch("topic_match") if _tm_be is not None else {}
+    except Exception:
+        _tm_lifetime = {}
+    topic_match_block = {**_tm_snap, "lifetime": _tm_lifetime}
+
     # Embedding backend live metrics (#m4-status). Surfaces what's
     # actually loaded + per-call counters so the operator can tell
     # whether the in-process primary is doing the work or the
@@ -570,13 +728,14 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
             "explanation": _vs_dict.get("explanation"),
         }
     except Exception as exc:  # pragma: no cover - failure-safe
-        logger.warning(
-            "version_status lookup failed for /health/detail: %s",
-            exc, exc_info=True,
+        logger.error(  # N-332 + N-338c: extras carry structured error
+            "version_status lookup failed for /health/detail",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+            exc_info=True,
         )
         version_status_block = {
             "state": "unknown",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": scrub_class_error_for_persist(exc),
         }
 
     #  phases 3-4 S4 follow-up — 24h counters for the HIPAA distill
@@ -596,15 +755,16 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
                 "total_24h": 0,
             }
     except Exception as exc:  # pragma: no cover - failure-safe
-        logger.warning(
-            "style_distill counters failed for /health/detail: %s",
-            exc, exc_info=True,
+        logger.error(  # N-332 + N-338c: extras carry structured error
+            "style_distill counters failed for /health/detail",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+            exc_info=True,
         )
         style_distill_block = {
             "local_24h": 0, "cloud_24h": 0,
             "failures_24h": 0, "scrubber_rejects_24h": 0,
             "total_24h": 0,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": scrub_class_error_for_persist(exc),
         }
 
     #  R-B — per-message retry-queue rollup for the monitoring system polling.
@@ -622,13 +782,14 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     try:
         retry_queue_block = _compute_retry_queue_block(db)
     except Exception as exc:  # pragma: no cover - failure-safe
-        logger.warning(
-            "retry_queue rollup failed for /health/detail: %s",
-            exc, exc_info=True,
+        logger.error(  # N-332 + N-338c: extras carry structured error
+            "retry_queue rollup failed for /health/detail",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+            exc_info=True,
         )
         retry_queue_block = {
             "state": "unknown",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": scrub_class_error_for_persist(exc),
         }
 
     #  — every failure signal /health/detail already computes
@@ -665,29 +826,70 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     tasks_tick_failing = bool(tasks_block.get("any_loop_tick_failing"))
     tasks_tick_stale = bool(tasks_block.get("any_loop_tick_stale"))
 
+    # Only GENUINE-FAULT dead retries degrade /health (fire a the monitoring system CRITICAL):
+    #   - ``operator_abandoned`` — a deliberate human action; NEVER degrades.
+    #   - ``message_expunged`` — a VERIFIED-absent expunge (provider 404, or a
+    #     0-byte IMAP fetch whose UID SEARCH confirms gone); benign, NEVER
+    #     degrades. Normal mailbox churn (deletions) lands here post-2026-06-19.
+    #   - ``message_gone`` — the AMBIGUOUS empty-fetch case: a 0-byte fetch whose
+    #     UID could NOT be confirmed gone (still present, or unverifiable). A
+    #     SPIKE (>= _MESSAGE_GONE_DEGRADE_THRESHOLD/24h) means systematic fetch
+    #     degradation mis-tombstoning real mail → degrade.
+    #   - ``max_attempts_exceeded`` (N-372, 2026-07-05) — hard classify /
+    #     action failure after N retries. A SINGLE dead row (this incident's
+    #     trigger, one FedEx delivery notification tripping a transient LLM
+    #     parse edge) previously flipped /health for 24h. Now degrades only at
+    #     a SPIKE (>= _MAX_ATTEMPTS_EXCEEDED_DEGRADE_THRESHOLD/24h) — see the
+    #     constant's docblock for the rationale.
+    #   - everything else (``auth_revoked``, ``uidvalidity_changed`` (the mail-
+    #     loss reason), and any FUTURE unclassified reason) always degrades —
+    #     fail-safe toward alerting.
+    # Benign rows stay VISIBLE in the body's ``dead_breakdown_24h`` — only the
+    # degrade DECISION is narrowed, the event is not hidden. Falls back to the
+    # ``dead_24h`` total when the breakdown is absent (older block shape).
     retry_dead = 0
     if retry_queue_block.get("state") != "unknown":
-        try:
-            retry_dead = int(retry_queue_block.get("dead_24h", 0) or 0)
-        except (TypeError, ValueError):
-            retry_dead = 0
+        breakdown = retry_queue_block.get("dead_breakdown_24h")
+        # N-219c/38 R23: bounded_int SSOT — parse each count with default=0.
+        # A non-numeric value in the breakdown map (extremely unlikely for a
+        # Redis-sourced dead-queue count) previously zeroed the WHOLE total;
+        # post-migration it zeroes just that entry, which is a strictly-more-
+        # granular signal for /health.
+        if isinstance(breakdown, dict):
+            total = 0
+            for reason, raw in breakdown.items():
+                n = bounded_int(raw or 0, default=0)
+                if reason in ("operator_abandoned", "message_expunged"):
+                    continue
+                if (
+                    reason == "message_gone"
+                    and n < _MESSAGE_GONE_DEGRADE_THRESHOLD
+                ):
+                    continue
+                if (
+                    reason == "max_attempts_exceeded"
+                    and n < _MAX_ATTEMPTS_EXCEEDED_DEGRADE_THRESHOLD
+                ):
+                    continue
+                total += n
+            retry_dead = total
+        else:
+            retry_dead = bounded_int(
+                retry_queue_block.get("dead_24h", 0) or 0, default=0,
+            )
 
     version_state = version_status_block.get("state")
     version_incompatible = version_state in {
         "incompatible_rollback", "downgrade_not_supported",
     }
 
-    try:
-        o365_errored = int(o365_push_block.get("errored", 0) or 0)
-    except (TypeError, ValueError):
-        o365_errored = 0
+    o365_errored = bounded_int(  # N-219c R23: SSOT
+        o365_push_block.get("errored", 0) or 0, default=0,
+    )
 
-    try:
-        distill_failures = int(
-            style_distill_block.get("failures_24h", 0) or 0,
-        )
-    except (TypeError, ValueError):
-        distill_failures = 0
+    distill_failures = bounded_int(  # N-219c R23: SSOT
+        style_distill_block.get("failures_24h", 0) or 0, default=0,
+    )
     distill_failing = (
         distill_failures >= _STYLE_DISTILL_FAILURE_DEGRADE_THRESHOLD
     )
@@ -695,10 +897,21 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
     # Computed once here; reused in the body payload below so the BAA
     # bucket query runs a single time per /health probe.
     baa_status_block = _compute_baa_status_block(request)
-    try:
-        baa_expired = int(baa_status_block.get("expired", 0) or 0)
-    except (TypeError, ValueError):
-        baa_expired = 0
+    baa_expired = bounded_int(  # N-219c R23: SSOT
+        baa_status_block.get("expired", 0) or 0, default=0,
+    )
+
+    # the backlog  — N-151-tail db-sme fold: /health/detail observability
+    # bucket for the MSAL master-key availability. Sibling to `baa_status`:
+    # a single, cheap, process-level probe of `_get_master_key()` — the
+    # exact accessor `Office365Provider.__init__` uses to set
+    # `self._master_key_available`. Restores the compensating control the
+    # SOFT gate variant traded away (a boot-time hard raise → boot-time
+    # WARN + first-save fail-closed) so operator + the monitoring system can observe the
+    # misconfig BEFORE the first re-auth prompt lands in production.
+    msal_master_key_status_block = _compute_msal_master_key_status_block(
+        request,
+    )
 
     #  — on-disk TLS cert expiry surface. Pure file read (no ACME
     # directory call) so a healthy probe doesn't depend on network.
@@ -711,15 +924,16 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         from email_triage.web.acme_renewer import read_tls_cert_health
         tls_cert_block = read_tls_cert_health(app)
     except Exception as exc:  # pragma: no cover - failure-safe
-        logger.warning(
-            "tls_cert read failed for /health/detail: %s",
-            exc, exc_info=True,
+        logger.error(  # N-332 + N-338c: extras carry structured error
+            "tls_cert read failed for /health/detail",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+            exc_info=True,
         )
         tls_cert_block = {
             "present": False,
             "not_after": None,
             "days_remaining": None,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": scrub_class_error_for_persist(exc),
         }
     # / — a present cert at/near expiry degrades /health: the
     # auto-renewer should have rolled it well before this point.
@@ -748,6 +962,14 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         or distill_failing
         or baa_expired > 0
         or cert_degraded
+        # the backlog  REDESIGNED v3 Part 1: MSAL master-key SOFT gate
+        # ACTIVE + reason=="unavailable" (SOFT path) degrades /health so
+        # the monitoring system pages the operator on the N-151 SOFT unavailable signal —
+        # restores the compensating control the SOFT variant traded away.
+        # STRICT `is False`: only the expected SOFT `unavailable` path fires.
+        # `probe_error` / `import_error` surface as `available is None`
+        # (UNKNOWN) and do NOT degrade — unknown ≠ WARN (the monitoring system tri-state).
+        or msal_master_key_status_block.get("available") is False
     )
     status = "degraded" if degraded else "ok"
 
@@ -815,6 +1037,7 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         "csrf_rejects": csrf_rejects,
         "schema_version": schema_version_value,
         "classification_cache": classification_cache_block,
+        "topic_match": topic_match_block,
         "embedding": embedding_block,
         "webhooks": webhooks_block,
         #  partial follow-up — schema-compat verdict in
@@ -843,6 +1066,16 @@ def _compute_health_detail_sync(request: Request) -> tuple[dict[str, Any], bool]
         # days_remaining}. Pure file read; lets a monitor fire before
         # the cert actually expires under the listener.
         "tls_cert": tls_cert_block,
+        # the backlog  — N-151-tail db-sme fold: MSAL master-key
+        # availability sibling to baa_status. Shape:
+        # {"available": bool | None, "reason": str | None}. `available`
+        # is None on a probe error (rare — the check is a single
+        # secrets-backend read). `reason` is a short slug on the
+        # unavailable / probe-failed paths (unset when available == True).
+        # Sibling the monitoring system alert on `available in (False, None)` restores
+        # the compensating control the N-151 SOFT gate variant traded
+        # away — see the backlog  for the pattern-alert build-out.
+        "msal_master_key_status": msal_master_key_status_block,
     }
     return body, degraded
 
@@ -885,7 +1118,7 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
     except Exception as exc:
         return {
             "state": "unknown",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": scrub_class_error_for_persist(exc),
         }
 
     pending = 0
@@ -913,13 +1146,11 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
                 row["oldest"] if hasattr(row, "keys") else row[1]
             )
             if oldest_iso:
-                from datetime import datetime, timezone
-                dt = parse_iso(oldest_iso)
+                # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+                dt = parse_iso_aware(oldest_iso)
                 if dt is None:
                     oldest_age = None
                 else:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
                     delta = datetime.now(timezone.utc) - dt
                     oldest_age = int(delta.total_seconds())
     except Exception:
@@ -928,10 +1159,9 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
 
     # Dead-in-24h count + breakdown.
     try:
-        from datetime import datetime, timedelta, timezone
-        since = (
+        since = to_utc_iso(
             datetime.now(timezone.utc) - timedelta(hours=24)
-        ).isoformat()
+        )
         row = db.execute(
             "SELECT COUNT(*) AS c FROM watcher_retry_queue "
             "WHERE state = 'dead' AND resolved_at >= ?",
@@ -955,11 +1185,24 @@ def _compute_retry_queue_block(db) -> dict[str, Any]:
         # Same older-schema path; leave the prefilled zeros.
         pass
 
+    # N-372 observability fold — surface the cross-backend LLM
+    # unclean-finish rolling-window count so a  truncation warning
+    # can't go unobserved (the 2-day silent-warning window the N-372
+    # incident exposed). Sibling to retry_queue rather than a top-level
+    # block per the operator resume directive; the classify layer is
+    # upstream of the retry-queue so a spike here PREDICTS retry-queue
+    # dead-row arrival, which is why they read together.
+    try:
+        truncated_1h = int(llm_truncated_1h())
+    except Exception:  # never let observability wiring break /health
+        truncated_1h = 0
+
     return {
         "pending": pending,
         "dead_24h": dead_24h,
         "oldest_pending_age_sec": oldest_age,
         "dead_breakdown_24h": breakdown,
+        "classify_truncated_1h": truncated_1h,
     }
 
 
@@ -982,15 +1225,145 @@ def _compute_baa_status_block(request: Request) -> dict[str, int]:
             db, auto_disabled_count=auto_disabled_count,
         )
     except Exception as exc:  # pragma: no cover
-        logger.warning(
-            "baa_status compute failed for /health/detail: %s",
-            exc, exc_info=True,
+        logger.error(  # N-332 + N-338c: extras carry structured error
+            "baa_status compute failed for /health/detail",
+            extra={"error_type": type(exc).__name__, "error_msg": str(exc)},
+            exc_info=True,
         )
         return {
             "expiring_soon": 0,
             "expired": 0,
             "expired_hipaa_accounts_disabled": 0,
         }
+
+
+_MSAL_MASTER_KEY_REASON_ENUM: frozenset[str] = frozenset({
+    "available",         # probe returned a key
+    "unavailable",       # probe raised — expected N-151 SOFT path
+    "probe_error",       # probe raised an unexpected class
+    "import_error",      # module import failed
+})
+
+
+def _compute_msal_master_key_status_block(
+    request: Request,
+) -> dict[str, Any]:
+    """Return the ``msal_master_key_status`` block for /health/detail.
+
+    the backlog  REDESIGNED v3 Part 1: reduced from a bespoke inline
+    probe to a thin SHIM over the Part-0 SSOT accessor
+    ``providers._msal_cache_crypto.n151_soft_gate_state()`` — the
+    canonical (active, reason) tuple for the N-151 SOFT gate. The
+    class-name partition + reason enum + fail-CLOSED posture live at
+    Part-0 (single SSOT), so a future consumer (the monitoring system circuit-breaker,
+    boot-time WARN) cannot drift from the /health surface's view of
+    the gate.
+
+    DB-SME F1 fold (2026-07-10): the shim was previously two probes
+    (``n151_soft_gate_active()`` then ``n151_soft_gate_reason()``) — a
+    torn-read seam on the transition tick between them. Collapsed onto
+    the single-call ``n151_soft_gate_state()`` SSOT so ``active`` and
+    ``reason`` are always sourced from ONE underlying probe.
+
+    Shape preserved verbatim from the Part-0-preceding revision (no
+    schema break for /health/detail consumers):
+
+      * ``available: bool | None`` — True on success, False on the
+        expected N-151 SOFT unavailable path (fail-CLOSED / feeds the
+        aggregate degrade OR-term), None on probe_error / import_error
+        (unknown ≠ WARN — does NOT degrade the top-line).
+      * ``reason: str`` — one of ``_MSAL_MASTER_KEY_REASON_ENUM``.
+      * ``error_type: str | None`` — class name on the import_error
+        outer path; None on the accessor-covered inner paths (the
+        accessor SSOT does NOT expose the class name — Part-0 chose the
+        reason-enum partition over the class-name slug so a secrets-
+        backend rewrite can't destabilise the surface).
+      * ``last_probed_at: str`` — UTC ISO-8601 Z-suffixed timestamp of
+        THIS probe (seam retained for the future the backlog 
+        pattern-alert `probe_stale` circuit-breaker per DA #3).
+
+    Failure-safe: never raises. On accessor import failure the fail-safe
+    posture is `{available: None, reason: "import_error"}`.
+
+    Log-storm discipline (hipaa-sme MUST-FIX #3 + DA #1) PRESERVED: the
+    WARN fires ONCE per process boot on the FIRST non-available
+    observation, and again ONLY on a state transition. Track LAST reason
+    on ``app.state._msal_master_key_last_reason``.
+    """
+    # N-316b R32 CI-red fix-forward: use the `_isotime` SSOT
+    # (`now_utc_iso_z`) rather than an inline `datetime.now(tz).isoformat().
+    # replace(...)` chain — N-357 R31's SSOT-and-drift-prevention rule
+    # for aware-now ISO strings + N-335b function-scope shadow-import pin
+    # both fire on the inline shape.
+    now_iso = now_utc_iso_z()
+
+    def _log_transition_warn(
+        request: Request, reason: str, err_type: str | None,
+    ) -> None:
+        # Once-per-boot + on-transition WARN per hipaa-sme MUST-FIX #3.
+        # Track LAST reason on app.state; log only when a reason first
+        # appears OR flips from a prior different value.
+        state = request.app.state
+        prev = getattr(state, "_msal_master_key_last_reason", None)
+        if prev == reason:
+            return
+        state._msal_master_key_last_reason = reason
+        logger.warning(
+            "msal_master_key_status transition",
+            extra={
+                "reason": reason,
+                "prev_reason": prev,
+                "error_type": err_type,
+            },
+        )
+
+    try:
+        from email_triage.providers._msal_cache_crypto import (
+            n151_soft_gate_state,
+        )
+    except Exception as exc:  # pragma: no cover — import-time fail
+        _log_transition_warn(request, "import_error", type(exc).__name__)
+        return {
+            "available": None,
+            "reason": "import_error",
+            "error_type": type(exc).__name__,
+            "last_probed_at": now_iso,
+        }
+
+    # DB-SME F1 fold (2026-07-10): single-call SSOT — the prior two-probe
+    # pair (`n151_soft_gate_active()` then `n151_soft_gate_reason()`) was a
+    # torn-read seam on the transition tick (a healthy→degraded flip landing
+    # between the two calls would surface `active=True, reason="available"`).
+    # `n151_soft_gate_state()` returns the (active, reason) tuple from ONE
+    # underlying probe — both fields agree by construction.
+    active, reason = n151_soft_gate_state()
+
+    if not active:
+        # On the healthy path, only log a transition if we were previously
+        # unavailable — restores the "master key came back" signal for the
+        # operator + the monitoring system timeline (a monitor cleared on the healthy poll).
+        _log_transition_warn(request, "available", None)
+        return {
+            "available": True,
+            "reason": "available",
+            "error_type": None,
+            "last_probed_at": now_iso,
+        }
+
+    # Gate ACTIVE. Strict-False-only aggregate semantics
+    # (v3 Part 1 flip): `available is False` ONLY on the expected N-151
+    # SOFT `unavailable` path so it can feed the top-line degrade term.
+    # `probe_error` (unexpected class) surfaces as `available=None` —
+    # unknown ≠ WARN, and it does NOT flip /health, matching the monitoring system
+    # tri-state posture (WARN vs UNKNOWN).
+    available: bool | None = False if reason == "unavailable" else None
+    _log_transition_warn(request, reason, None)
+    return {
+        "available": available,
+        "reason": reason,
+        "error_type": None,
+        "last_probed_at": now_iso,
+    }
 
 
 async def _compute_health_detail(request: Request) -> tuple[dict[str, Any], bool]:
@@ -1050,18 +1423,42 @@ async def health_detail(request: Request) -> Any:
     Returns 401/303 redirect for unauthenticated callers, 403 for
     authenticated non-admins. Same 503-on-degraded behaviour as
     /health for status-code consistency.
+
+    Container-internal ops access: a LOOPBACK-origin request whose
+    ``X-Ops-Token`` header matches ``ET_HEALTH_OPS_TOKEN`` (set in the container
+    env, NEVER published) gets the detail WITHOUT an admin session — so an
+    operator can troubleshoot from inside the container:
+        podman exec <ctr> sh -c 'curl -sk -H "X-Ops-Token: $ET_HEALTH_OPS_TOKEN" \
+            https://localhost:8080/health/detail'
+    Layered (see _ops_token_authorized): loopback-origin AND a >=16-char token
+    AND a constant-time match — so the published LAN port can't honor the token
+    even if it leaks, and a blank/weak/unset token disables the bypass entirely
+    (admin-session-only, unchanged). The body is ops METADATA (no PHI / no
+    credentials) — pinned PHI-free by test_health_detail_body_is_phi_free.
     """
     from fastapi.responses import JSONResponse, RedirectResponse
-    #  — get_current_user does a sync DB read; route it off the
-    # event loop so it cannot collide with a db_call worker on the
-    # shared connection.
-    user = await db_call(_get_current_user, request)
-    if user is None:
-        return RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return JSONResponse(
-            {"error": "admin role required"}, status_code=403,
-        )
+
+    # N-187 R20_12: authz-boundary host read routes through the request_meta
+    # SSOT (consistent empty-string-on-unknown, never None, matches the
+    # `""` fallback _ops_token_authorized expects). Imported at module top.
+    _meta = request_meta(request)
+    _ops_authed = _ops_token_authorized(
+        client_host=_meta.host,
+        presented=request.headers.get("X-Ops-Token") or "",
+        env_token=_read_ops_token() or "",
+    )
+    if not _ops_authed:
+        #  — get_current_user does a sync DB read; route it off the
+        # event loop so it cannot collide with a db_call worker on the
+        # shared connection.
+        user = await db_call(_get_current_user, request)
+        if user is None:
+            return RedirectResponse("/login", status_code=303)
+        # N-222 R22: is_admin bool SSOT.
+        if not is_admin(user):
+            return JSONResponse(
+                {"error": "admin role required"}, status_code=403,
+            )
     body, degraded = await _compute_health_detail(request)
     if degraded:
         return JSONResponse(content=body, status_code=503)

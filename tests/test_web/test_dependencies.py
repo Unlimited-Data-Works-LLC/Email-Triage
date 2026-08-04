@@ -1,5 +1,6 @@
 """Tests for FastAPI dependency injection helpers."""
 
+from _db_tracking import track
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,7 +62,7 @@ class TestGetCurrentUser:
         secret = "test-secret"
         token = create_session_token(secret, "ghost@example.com", "user")
         from email_triage.web.db import init_db
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
 
         request = _make_request(
             cookies={SESSION_COOKIE_NAME: token},
@@ -75,7 +76,7 @@ class TestGetCurrentUser:
         from email_triage.web.db import init_db
 
         secret = "test-secret"
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         db.execute(
             "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
             ("alice@example.com", "Alice", "admin", datetime.now(timezone.utc).isoformat()),
@@ -116,7 +117,7 @@ class TestRequireRole:
         from email_triage.web.db import init_db
 
         secret = "test-secret"
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         db.execute(
             "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
             ("admin@test.com", "Admin", "admin", datetime.now(timezone.utc).isoformat()),
@@ -140,7 +141,7 @@ class TestRequireRole:
         from fastapi import HTTPException
 
         secret = "test-secret"
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         db.execute(
             "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
             ("user@test.com", "User", "user", datetime.now(timezone.utc).isoformat()),
@@ -186,7 +187,7 @@ class TestRequireOwnedAccount:
         from email_triage.config import TriageConfig
 
         config = TriageConfig()
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         seed_categories(db, config.classifier.categories)
 
         # Owner exists at id=1 always (so account FK is satisfied).
@@ -351,7 +352,7 @@ class TestOwnedAccountForProvider:
         from email_triage.config import TriageConfig
 
         config = TriageConfig()
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         seed_categories(db, config.classifier.categories)
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
@@ -412,7 +413,7 @@ class TestRequireOwnedAccountOrLogin:
         from email_triage.config import TriageConfig
 
         config = TriageConfig()
-        db = init_db(":memory:")
+        db = track(init_db(":memory:"))
         seed_categories(db, config.classifier.categories)
 
         now = datetime.now(timezone.utc).isoformat()

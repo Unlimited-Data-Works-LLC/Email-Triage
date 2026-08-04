@@ -139,7 +139,7 @@
                         <td>
                             {% if sub.last_error %}
                             <code style="font-size:0.85em;">{{ sub.last_error }}</code>
-                            <small style="color:var(--pico-muted-color);">{{ sub.last_error_at[:19] }}</small>
+                            <small style="color:var(--pico-muted-color);">{% if sub.last_error_at %}<time datetime="{{ sub.last_error_at }}" data-us-datetime>{{ sub.last_error_at | us_datetime }}</time>{% else %}—{% endif %}</small>
                             {% else %}
                             <small style="color:var(--pico-muted-color);">—</small>
                             {% endif %}
@@ -169,7 +169,7 @@
             {% if _m.last_error %}
             <p style="margin:0.25rem 0;font-size:0.9em;color:var(--pico-del-color);">
                 Last error: <code>{{ _m.last_error }}</code>
-                <small>at {{ _m.last_error_at[:19] }}</small>
+                <small>at {% if _m.last_error_at %}<time datetime="{{ _m.last_error_at }}" data-us-datetime>{{ _m.last_error_at | us_datetime }}</time>{% else %}—{% endif %}</small>
             </p>
             {% endif %}
             {% endif %}
@@ -205,16 +205,28 @@
                     </select>
                 </label>
                 <label>
-                    Model name{{ m.help("For sentence_transformers: a HuggingFace model id like all-MiniLM-L6-v2 (80 MB, fast) or nomic-ai/nomic-embed-text-v1.5 (260 MB, higher quality). For ollama: the model tag as it appears in `ollama list`, e.g. nomic-embed-text:latest. Container ships with all-MiniLM-L6-v2 pre-cached so it works on first boot without a download.") }}
-                    <input type="text" name="embedding_model_name"
-                           value="{{ embedding_model_name }}"
-                           placeholder="all-MiniLM-L6-v2">
+                    Model name{{ m.help("Recommended: intfloat/multilingual-e5-base (768-dim, MIT, 100+ languages) — the #37 multilingual default. Other sentence_transformers ids: all-MiniLM-L6-v2 (80 MB, fast, English-leaning, ships pre-cached) or nomic-ai/nomic-embed-text-v1.5 (260 MB). For ollama: the tag as it appears in `ollama list`, e.g. nomic-embed-text:latest. Pick a suggestion or type any model. CHANGING this re-embeds every account's index.") }}
+                    {{ m.combo_input(
+                        "embedding_model_name", embedding_model_name,
+                        ["intfloat/multilingual-e5-base",
+                         "intfloat/multilingual-e5-small",
+                         "intfloat/multilingual-e5-large",
+                         "all-MiniLM-L6-v2",
+                         "nomic-ai/nomic-embed-text-v1.5"],
+                        placeholder="intfloat/multilingual-e5-base") }}
+                    {# #37 — original value for client-side change
+                       detection; the save handler also re-checks
+                       server-side (defence in depth). #}
+                    <input type="hidden" name="embedding_model_original"
+                           value="{{ embedding_model_name }}">
                 </label>
                 <label>
                     Ollama URL (only used when backend = ollama){{ m.help("HTTP URL of the local Ollama instance. Example: http://ollama.home.example.local:11434. Must resolve to a LAN host — the privacy gate rejects public-internet URLs at startup. For sentence_transformers this field is ignored.") }}
-                    <input type="text" name="embedding_ollama_url"
-                           value="{{ embedding_ollama_url }}"
-                           placeholder="http://localhost:11434">
+                    {{ m.combo_input(
+                        "embedding_ollama_url", embedding_ollama_url,
+                        ["http://localhost:11434", "http://ollama.home:11434"],
+                        type="url",
+                        placeholder="http://localhost:11434") }}
                 </label>
             </div>
         </article>
@@ -246,9 +258,11 @@
                 </label>
                 <label>
                     Fallback Ollama URL{{ m.help("HTTP URL for the fallback Ollama. Leave blank to inherit the primary's URL. Example: http://ollama.home.example.local:11434 — same LAN-only privacy gate.") }}
-                    <input type="text" name="fallback_ollama_url"
-                           value="{{ fallback_ollama_url }}"
-                           placeholder="(inherits primary URL)">
+                    {{ m.combo_input(
+                        "fallback_ollama_url", fallback_ollama_url,
+                        ["http://localhost:11434", "http://ollama.home:11434"],
+                        type="url",
+                        placeholder="(inherits primary URL)") }}
                 </label>
             </div>
         </article>
@@ -257,6 +271,12 @@
            (operator-policy 2026-05-13). Form fields, counters, and
            the Redis URL all surface there. AI Backends scopes to the
            LLM-side configuration only. #}
+
+        {# #37 — set to "1" by the submit-time confirm dialog when the
+           operator changes the embedding model. The save handler will
+           NOT apply a model change without this flag (keeps the old
+           model so recall can't break silently). #}
+        <input type="hidden" name="embedding_reindex_confirm" value="">
 
         <button type="submit" class="contrast"
                 style="margin-top:0.5rem;">
@@ -269,4 +289,43 @@
             equivalent on this install) to pick up the change.
         </p>
     </form>
+    <script>
+    // #37 — confirm-gate an embedding-model change. Switching the model
+    // re-stamps future writes; existing sent_mail_index vectors keep the
+    // OLD stamp and silently stop matching retrieval until re-embedded.
+    // So a change must be acknowledged, after which the save handler
+    // auto-enqueues a background reindex for all active accounts.
+    (function () {
+        var form = document.querySelector('form[action="/config/ai-backends/save"]');
+        if (!form) return;
+        form.addEventListener("submit", function (ev) {
+            var modelEl = form.querySelector('[name="embedding_model_name"]');
+            var origEl = form.querySelector('[name="embedding_model_original"]');
+            var backendEl = form.querySelector('[name="embedding_backend"]');
+            var confirmEl = form.querySelector('[name="embedding_reindex_confirm"]');
+            if (!modelEl || !origEl || !confirmEl) return;
+            var now = (modelEl.value || "").trim();
+            var was = (origEl.value || "").trim();
+            var backend = backendEl ? (backendEl.value || "").trim() : "";
+            // Only a real change, and only when retrieval is active.
+            if (!backend || !now || now === was) {
+                confirmEl.value = "";
+                return;
+            }
+            var ok = window.confirm(
+                "Change the embedding model from '" + (was || "(none)") +
+                "' to '" + now + "'?\n\n" +
+                "This re-embeds EVERY active account's sent-mail index in " +
+                "the background. Until each reindex finishes, similarity " +
+                "search for that account returns no results. Proceed?"
+            );
+            if (ok) {
+                confirmEl.value = "1";
+            } else {
+                confirmEl.value = "";
+                ev.preventDefault();
+            }
+        });
+    })();
+    </script>
 </section>

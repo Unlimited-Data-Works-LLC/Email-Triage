@@ -76,12 +76,11 @@
             if (!r.ok) return;
             const body = await r.json();
             const opts = body.options;
-            // Convert base64url challenge / allowCredentials ids to ArrayBuffer.
-            const b64ToBuf = (s) => Uint8Array.from(
-                atob(s.replace(/-/g, "+").replace(/_/g, "/")
-                       .padEnd(s.length + (4 - s.length % 4) % 4, "=")),
-                c => c.charCodeAt(0)
-            ).buffer;
+            // #130 — base64url routes through `window.ETBase64` SSOT
+            // (loaded via base.html). WebAuthn spec accepts BufferSource,
+            // so passing the Uint8Array directly (or its .buffer for
+            // strict-ArrayBuffer callers) both work.
+            const b64ToBuf = (s) => window.ETBase64.b64urlToBytes(s).buffer;
             opts.challenge = b64ToBuf(opts.challenge);
             (opts.allowCredentials || []).forEach(c => {
                 c.id = b64ToBuf(c.id);
@@ -91,10 +90,9 @@
                 mediation: "conditional",
             });
             if (!cred) return;
-            // Send the assertion back. Encode buffers as base64url.
-            const bufToB64 = (buf) => btoa(
-                String.fromCharCode(...new Uint8Array(buf))
-            ).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            // Send the assertion back. Encode buffers as base64url via
+            // the `window.ETBase64` SSOT.
+            const bufToB64 = window.ETBase64.bytesToB64url;
             const payload = {
                 response: {
                     id: cred.id,
@@ -126,13 +124,13 @@
     })();
     </script>
     {% elif step == "choose" %}
-    {# #67 — user has a registered hardware key. Default to touch;
+    {# #67 — user has a registered passkey. Default to touch;
        OTP fallback link reposts to /login/email with otp_fallback=1
        to skip the picker on the second pass. #}
-    <p>You have a hardware key registered. Touch it to sign in as
+    <p>You have a passkey registered. Touch it to sign in as
        <strong>{{ email }}</strong>.</p>
     <button id="hw-login-btn" type="button" autofocus>
-        Touch your security key
+        Touch your passkey
     </button>
     <p id="hw-login-status" style="margin:0.5rem 0;"></p>
     <p>

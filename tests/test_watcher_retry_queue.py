@@ -12,6 +12,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -39,7 +40,7 @@ from email_triage.web.db import (
 @pytest.fixture
 def conn() -> sqlite3.Connection:
     """Fresh in-memory DB with all migrations applied."""
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     yield c
     c.close()
 
@@ -489,6 +490,7 @@ class TestStateMachine:
         "max_attempts_exceeded",
         "uidvalidity_changed",
         "message_gone",
+        "message_expunged",
         "auth_revoked",
         "operator_abandoned",
     ])
@@ -519,6 +521,7 @@ class TestStateMachine:
             "max_attempts_exceeded",
             "uidvalidity_changed",
             "message_gone",
+            "message_expunged",
             "auth_revoked",
             "operator_abandoned",
         })

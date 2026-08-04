@@ -74,6 +74,34 @@ def _reset_app_state(_session_app):
     per test.
     """
     application, base_state = _session_app
+    #  — SETUP-side audit-write drain (belt to ``_drain_audit_writes_after_
+    # test``'s teardown braces). A prior test's fire-and-forget audit task can
+    # register on ``_audit_pending`` slightly AFTER its response returned, so
+    # that test's TEARDOWN drain may have polled an empty set and passed before
+    # the task appeared. The undrained task then runs into THIS test and bumps
+    # the session-shared ``audit_failures`` counter / races the about-to-be-
+    # swapped db conn — the run-to-run full-tree flake (; e.g.
+    # test_audit_failure_increments_counter intermittently seeing 2, not 1).
+    # Draining here BEFORE the state swap guarantees any lagging task finishes
+    # (bumping the about-to-be-discarded OLD state) so THIS test starts clean,
+    # regardless of the prior test's exit timing. Bounded poll; absent set =
+    # nothing to drain.
+    import time as _time
+    _pending = getattr(application.state, "_audit_pending", None)
+    if _pending:
+        _deadline = _time.monotonic() + 5.0
+        # Snapshot before iterating: task.add_done_callback(pending.discard)
+        # mutates the set from the portal thread on task completion, which
+        # concurrently races the main-thread iteration in ``all(...)`` —
+        # under full-sweep timing this raised ``RuntimeError: Set changed
+        # size during iteration`` in the fixture (TaskList #4).
+        while _time.monotonic() < _deadline and not all(t.done() for t in list(_pending)):
+            _time.sleep(0.02)
+    # 2026-07-10 drain-race root-cause fix: reset the swallow stash so a
+    # prior test's swallowed audit-write exception does not false-trip the
+    # next test's fail-fast drain check. See _audit._LAST_AUDIT_EXC.
+    from email_triage.web._audit import clear_last_audit_exc
+    clear_last_audit_exc()
     application.state = State(dict(base_state))
     return None
 
@@ -108,7 +136,9 @@ def _drain_audit_writes_after_test(_session_app):
     deadline = _time.monotonic() + 5.0
     while _time.monotonic() < deadline:
         pending = getattr(application.state, "_audit_pending", None)
-        if pending is None or all(t.done() for t in pending):
+        # Snapshot before iterating — see the SETUP-side drain above
+        # for the RuntimeError-under-load race (TaskList #4).
+        if pending is None or all(t.done() for t in list(pending)):
             return
         _time.sleep(0.02)
     raise AssertionError(
@@ -174,8 +204,11 @@ def _cancel_pending_tasks_after_test(_session_app):
     # the test surfaces it rather than the suite hanging.
     deadline = _time.monotonic() + 5.0
     while _time.monotonic() < deadline:
-        wm_done = all(t.done() for t in wm_tasks.values())
-        pending_done = pending is None or all(t.done() for t in pending)
+        # Snapshot both collections before iterating — cancel-done
+        # callbacks discard entries concurrently from the portal
+        # thread (TaskList #4 race class).
+        wm_done = all(t.done() for t in list(wm_tasks.values()))
+        pending_done = pending is None or all(t.done() for t in list(pending))
         if wm_done and pending_done:
             break
         _time.sleep(0.02)
@@ -205,6 +238,11 @@ class _InMemorySecrets:
         return self._store.get(key)
     def set(self, key: str, value: str) -> None:
         self._store[key] = value
+    def delete(self, key: str) -> bool:
+        if key in self._store:
+            del self._store[key]
+            return True
+        return False
     def list_keys(self) -> list[str]:
         return list(self._store.keys())
 
@@ -260,13 +298,16 @@ def db(app, _reset_app_state):
     app.state.supervisor = TaskSupervisor()
     app.state.started_at = time.monotonic()
     app.state.version = "testsha1"
-    #  — install-wide CSRF default is now True (enforce). The vast
-    # majority of legacy web tests POST without minting a token and
-    # rely on the request reaching the handler. Hold the test fixture
-    # at the legacy soft-launch posture so existing coverage stays
-    # green; individual CSRF tests opt into enforce by setting
-    # ``app.state.csrf_enforce = True`` themselves.
-    app.state.csrf_enforce = False
+    #  — install-wide CSRF default is now True (enforce). The shared `client`
+    # fixture is now the token-injecting `_CsrfClient`, which auto-mints a valid
+    # X-CSRF-Token on guarded requests, so the test posture MATCHES the live prod
+    # posture (enforce=True) and a route that stops requiring a token is caught.
+    # (CSRF-enforcement migration step 2 — flipped from the legacy soft-launch
+    # default.) The hand-rolled negative tests in test_csrf.py mint their own
+    # tokens / set their own headers and are not disturbed (the injector is
+    # idempotent). A test that needs the OLD soft posture sets
+    # ``app.state.csrf_enforce = False`` itself.
+    app.state.csrf_enforce = True
     try:
         yield conn
     finally:
@@ -297,9 +338,156 @@ def db(app, _reset_app_state):
 
 
 @pytest.fixture
+def strict_undefined_templates(app):
+    """Render templates under Jinja ``StrictUndefined`` for this test.
+
+    Production uses Jinja's default lenient ``Undefined`` so a template
+    that reads a missing attribute renders an empty string and never
+    500s the user. The cost: a template↔handler CONTRACT-DRIFT bug (a
+    template reading a key the handler never provides) produces silent
+    blank/wrong output that NO test catches unless it asserts on the
+    rendered content. That blind spot shipped three such bugs in the 
+    Topic editor (the blank account multiselect; the digest options that
+    neither saved nor displayed).
+
+    Opt into this fixture in a render test to make those bugs LOUD: under
+    ``StrictUndefined`` a missing-attr read raises ``UndefinedError`` →
+    the route returns 500, so ``assert resp.status_code == 200`` fails at
+    test time. Save/restore the shared env's undefined handler (the
+    session app's Jinja ``Environment`` is one object across tests).
+
+    Reusable for any page — extend coverage to more routes over time.
+    """
+    from jinja2 import StrictUndefined
+    env = app.state.templates.env
+    prior = env.undefined
+    env.undefined = StrictUndefined
+    try:
+        yield
+    finally:
+        env.undefined = prior
+
+
+@pytest.fixture
 def client(app, db):
-    """TestClient with database initialized."""
+    """TestClient with database initialized.
+
+    Now the token-injecting ``_CsrfClient`` (CSRF-enforcement migration step 2):
+    it auto-mints a valid X-CSRF-Token on guarded POST/PUT/PATCH/DELETE so the
+    functional POST suite runs under enforce=True (matching prod) without each
+    test hand-minting a token. Idempotent — a test that supplies its own token
+    (header / data= / json= csrf_token) is untouched."""
+    return _CsrfClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def raw_client(app, db):
+    """A PLAIN TestClient with NO CSRF auto-injection — for the CSRF negative
+    SSOT (test_csrf.py), which mints / withholds tokens itself to assert the
+    enforce + reject behaviour. The shared ``client`` injects a valid token,
+    which would mask a no-token negative assertion (the exact thing those tests
+    exist to prove)."""
     return TestClient(app, raise_server_exceptions=False)
+
+
+class _CsrfClient(TestClient):
+    """A TestClient that auto-mints + injects a VALID CSRF token (the
+    ``X-CSRF-Token`` header) on guarded POST/PUT/PATCH/DELETE requests, so a
+    functional POST test can run under ``csrf_enforce=True`` WITHOUT hand-minting
+    a token per call.
+
+    Step 1 of the CSRF-test-enforcement migration — this is OPT-IN via the
+    ``csrf_client`` fixture; the shared ``client`` fixture and the soft-launch
+    default (conftest ``app.state.csrf_enforce = False``) are UNCHANGED.
+
+    The token is minted from THIS request's session cookie + the live
+    ``app.state.session_secret`` (the SAME secret the middleware verifies with),
+    so it composes with any user/admin session automatically. Idempotent: if the
+    caller already passed an ``X-CSRF-Token`` header OR a ``csrf_token`` form
+    field, inject NOTHING — so the hand-rolled negative tests in test_csrf.py are
+    never disturbed. No session cookie => inject nothing (preserves the
+    middleware's anonymous short-circuit, csrf.py:295)."""
+
+    _GUARDED = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def __init__(self, app, **kw):
+        super().__init__(app, **kw)
+        self._csrf_app = app
+
+    def request(self, method, url, **kwargs):
+        if str(method).upper() in self._GUARDED:
+            headers = dict(kwargs.get("headers") or {})
+            data = kwargs.get("data")
+            json_body = kwargs.get("json")
+            has_header = any(k.lower() == "x-csrf-token" for k in headers)
+            # Token already supplied as a form field (data=) OR a JSON field
+            # (json=) — inject nothing, so a hand-rolled negative test that posts
+            # a deliberately-bad token (header check runs first, so an injected
+            # header would mask it) is never disturbed.
+            has_field = (
+                (isinstance(data, dict) and "csrf_token" in data)
+                or (isinstance(json_body, dict) and "csrf_token" in json_body)
+            )
+            if not has_header and not has_field:
+                from email_triage.web.auth import SESSION_COOKIE_NAME
+                call_cookies = kwargs.get("cookies") or {}
+                session_token = (
+                    (call_cookies.get(SESSION_COOKIE_NAME)
+                     if isinstance(call_cookies, dict) else None)
+                    or self.cookies.get(SESSION_COOKIE_NAME)
+                )
+                if session_token:
+                    from email_triage.web.csrf import (
+                        CSRF_HEADER_NAME, mint_csrf_token,
+                    )
+                    secret = getattr(
+                        self._csrf_app.state, "session_secret", "") or ""
+                    if secret:
+                        headers[CSRF_HEADER_NAME] = mint_csrf_token(
+                            secret, session_token)
+                        kwargs["headers"] = headers
+        return super().request(method, url, **kwargs)
+
+
+@pytest.fixture
+def csrf_client(app, db):
+    """OPT-IN client that runs with CSRF **enforced** + auto-injects a valid
+    token on guarded requests. Use this for new / migrated POST tests so a route
+    that stops requiring a token is actually caught (the shared ``client`` stays
+    soft-launch until the migration flips the default last)."""
+    app.state.csrf_enforce = True
+    return _CsrfClient(app, raise_server_exceptions=False)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Print the CSRF reject tally at the end of the run — the by-route shapes
+    that POSTed without a valid token under soft-launch (the routes still on the
+    plain ``client``; they shrink as files adopt ``csrf_client``). Best-effort.
+
+    IMPORTANT — this is MIGRATION PROGRESS, **not a CSRF-coverage report**: a
+    route already on ``csrf_client`` (token injected) never appears, and a route
+    with NO csrf test at all is INVISIBLE. An empty tally means "no soft-launch
+    token-less POSTs were seen this run", NOT "every route is csrf-protected" —
+    the negative coverage SSOT is ``test_csrf.py`` (and the step-2 route-table
+    pin). Under ``pytest-xdist`` the tally is PER-WORKER, so this prints once per
+    worker, not a unified suite-wide view."""
+    try:
+        from email_triage.web.csrf import csrf_reject_report
+        report = csrf_reject_report()
+    except Exception:
+        return
+    if not report:
+        return
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+    lines = [f"  {n:>4}  {route}" for route, n in
+             sorted(report.items(), key=lambda kv: (-kv[1], kv[0]))]
+    msg = ("Routes POSTed token-less under soft-launch (route shape -> count) — "
+           "migrate these onto csrf_client. This is MIGRATION PROGRESS, NOT a "
+           "csrf-coverage report (a route with no csrf test is invisible; "
+           "per-worker under xdist):\n" + "\n".join(lines))
+    if tr is not None:
+        tr.write_sep("=", "CSRF migration: token-less POSTs seen (not coverage)")
+        tr.write_line(msg)
 
 
 @pytest.fixture
@@ -355,6 +543,33 @@ def user_cookies(regular_user):
     import time
     token = create_session_token(
         TEST_SECRET, regular_user["email"], regular_user["role"],
+        mfa_verified_at=int(time.time()),
+    )
+    return {SESSION_COOKIE_NAME: token}
+
+
+@pytest.fixture
+def power_user(db):
+    """Create a power_user and return their details (N-60 rule-authz tests).
+
+    A power_user is scoped to own-personal + GLOBAL lists; the rule gates must
+    NOT let them touch another user's personal list (Loop-5 census)."""
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = db.execute(
+        "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
+        ("power@test.com", "Test Power", "power_user", now),
+    )
+    db.commit()
+    return {"id": cursor.lastrowid, "email": "power@test.com",
+            "name": "Test Power", "role": "power_user"}
+
+
+@pytest.fixture
+def power_user_cookies(power_user):
+    """Session cookies for a power_user."""
+    import time
+    token = create_session_token(
+        TEST_SECRET, power_user["email"], power_user["role"],
         mfa_verified_at=int(time.time()),
     )
     return {SESSION_COOKIE_NAME: token}

@@ -203,12 +203,40 @@
             </div>
         </fieldset>
 
-        <label>
-            Labels{{ m.help("Limit by Gmail labels or IMAP keywords. Comma-separated; multiple values AND together (a message must carry ALL of them to be included). Example: '$EmailTriaged' to digest only messages the triage pipeline has already touched; '$Important, $Followup' for important items still on your radar.") }}
+        <fieldset style="margin:0.5rem 0;">
+            <legend><small>Labels{{ m.help("Limit by Gmail labels or IMAP keywords. Multiple values AND together (a message must carry ALL of them to be included). Example: '$EmailTriaged' to digest only messages the triage pipeline has already touched; '$Important, $Followup' for important items still on your radar.") }}</small></legend>
+            {% set _selected_tags = dcfg.filter.tags or [] %}
+            {% if provider_labels_for_account %}
+            {# #37 — discovered Gmail labels / O365 categories. This is a
+               multi-value AND filter, so a MULTI-SELECT (not a datalist —
+               a datalist autocompletes the whole value and would clobber
+               the list). The free-text override below carries any label
+               the operator wants that isn't in the discovered set. #}
+            {% set _label_slugs = provider_labels_for_account | map(attribute='slug') | list %}
+            <select name="tags_select" multiple
+                    size="{{ [provider_labels_for_account|length, 6] | min }}"
+                    style="width:100%;">
+                {% for label in provider_labels_for_account %}
+                <option value="{{ label.slug }}"
+                        {% if label.slug in _selected_tags %}selected{% endif %}>
+                    {{ label.name }}
+                </option>
+                {% endfor %}
+            </select>
+            <small>Pick one or more (a message must carry ALL selected
+                labels). Add any others not listed in the box below.</small>
             <input type="text" name="tags_csv"
-                   value="{{ dcfg.filter.tags | join(', ') }}"
+                   value="{{ _selected_tags | reject('in', _label_slugs) | join(', ') }}"
+                   placeholder="$Custom, $Other"
+                   style="margin-top:0.35rem;">
+            {% else %}
+            <input type="text" name="tags_csv"
+                   value="{{ _selected_tags | join(', ') }}"
                    placeholder="$EmailTriaged, $Important">
-        </label>
+            <small>Comma-separated Gmail labels / IMAP keywords; multiple
+                values AND together.</small>
+            {% endif %}
+        </fieldset>
 
         <div class="grid">
             <label>

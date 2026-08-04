@@ -44,8 +44,10 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from email_triage._errfmt import fmt_exc
+from email_triage._errfmt import scrub_error_for_persist
+from email_triage._isotime import now_utc_iso, to_utc_iso
 from email_triage.triage_logging import get_logger
+from email_triage.web._audit import safe_audit_write_async
 
 log = get_logger("web.o365_renewer")
 
@@ -88,6 +90,11 @@ async def _o365_subscription_renewer_loop(app) -> None:
             24,
         ))
         await _run_o365_renewal_sweep(app, window_hours=window_hours)
+        # N-227c R22 — heartbeat stamp for /admin observability.
+        app.state.o365_subscription_renewer_loop_status = {
+            "at": now_utc_iso(),
+            "window_hours": window_hours,
+        }
 
     # Cron-anchored cadence — sleep to the next HH:00 + jitter boundary,
     # recomputed each tick so wall-clock skew snaps back to schedule —
@@ -145,6 +152,7 @@ async def _run_o365_renewal_sweep(
         list_o365_subscriptions_expiring,
         record_auth_event,
         record_o365_subscription_error,
+        record_o365_subscription_outcome,
         record_o365_subscription_renewal,
     )
     from email_triage.providers.office365 import Office365Provider
@@ -161,10 +169,13 @@ async def _run_o365_renewal_sweep(
     secrets = app.state.secrets
 
     now = datetime.now(timezone.utc)
-    horizon = (now + timedelta(hours=window_hours)).isoformat()
+    horizon = to_utc_iso(now + timedelta(hours=window_hours))
     expiring = await db_call(list_o365_subscriptions_expiring, db, horizon)
 
-    counters = {"considered": len(expiring), "renewed": 0, "failed": 0}
+    counters = {
+        "considered": len(expiring), "renewed": 0, "failed": 0,
+        "skipped_inactive": 0,
+    }
     if not expiring:
         return counters
 
@@ -189,7 +200,29 @@ async def _run_o365_renewal_sweep(
                 )
                 return
 
-            account_email = acct.get("email_address") or ""
+            # Fail-closed is_active gate (Loop-5 census). A deactivated
+            # account's Graph subscription must NOT be renewed — extending
+            # it re-arms live PHI ingestion for a paused account. The
+            # subscription row is left intact; it dies on its own ~3-day
+            # Graph clock (Graph drops it server-side), and re-activation +
+            # a watcher start re-creates it. Default True so a missing
+            # column never silently pauses the account.
+            if not acct.get("is_active", True):
+                log.debug(
+                    "O365 renewer: skipping (account inactive)",
+                    account_id=account_id,
+                    subscription_id=subscription_id,
+                )
+                counters["skipped_inactive"] += 1
+                return
+
+            # census run17  — account_email SSOT, not the open-coded key;
+            # local renamed off the SSOT name to avoid shadowing it.
+            from email_triage.db.accounts import account_email
+            acct_email = account_email(acct)
+            # auth_stale lifecycle SSOT funnel (census 2026-06-09 #1) — late
+            # import to avoid the web/app.py import cycle.
+            from email_triage.web.app import record_provider_outcome
             try:
                 provider = _create_provider_from_account(acct, secrets)
                 if not isinstance(provider, Office365Provider):
@@ -225,50 +258,62 @@ async def _run_o365_renewal_sweep(
                     subscription_id=new_sub_id,
                     new_expiration_at=new_exp,
                 )
-                try:
-                    await db_call(
+                await safe_audit_write_async(
+                    lambda: db_call(
                         record_auth_event,
                         db,
                         event_type="o365_subscription_renewed",
-                        email=account_email,
+                        email=acct_email,
                         outcome="success",
                         detail=f"sub={new_sub_id} exp={new_exp}",
-                    )
-                except Exception as audit_err:
-                    log.warning(
-                        "O365 renewer: audit row insert failed "
-                        "(non-fatal)",
-                        account_id=account_id,
-                        error=fmt_exc(audit_err),
-                    )
+                    ),
+                    description=(
+                        "o365_subscription_renewed "
+                        f"account_id={account_id} outcome=success"
+                    ),
+                )
                 counters["renewed"] += 1
                 log.info(
                     "O365 subscription renewed",
                     account_id=account_id,
                     new_expires_at=new_exp,
                 )
+                # Renewal succeeded → the OAuth credential is alive; clear any
+                # prior auth_stale chip (the renewer previously never cleared).
+                # Census 2026-06-09 #1.
+                await db_call(record_provider_outcome, db, acct, None)
             except Exception as e:
-                err_text = fmt_exc(e)
+                err_text = scrub_error_for_persist(e)  # census run13 #2 — audit detail rides the HMAC chain (both legs)
+                # N-69 — route the failure through the status lifecycle funnel
+                # (record_o365_subscription_outcome) which now owns the error
+                # bookkeeping, replacing the direct record_o365_subscription_error
+                # call. The funnel's failure path is equivalent (scrub + bump +
+                # set errored), keeping record_o365_subscription_error in db.py
+                # as the inner implementation but routing through the funnel so
+                # the lifecycle pin has one canonical entry point.
                 try:
                     await db_call(
-                        record_o365_subscription_error,
+                        record_o365_subscription_outcome,
                         db,
                         account_id=account_id,
                         error_text=err_text,
                     )
                 except Exception:
                     pass
-                try:
-                    await db_call(
+                await safe_audit_write_async(
+                    lambda: db_call(
                         record_auth_event,
                         db,
                         event_type="o365_subscription_renewed",
-                        email=account_email,
+                        email=acct_email,
                         outcome="failure",
                         detail=err_text[:400],
-                    )
-                except Exception:
-                    pass
+                    ),
+                    description=(
+                        "o365_subscription_renewed "
+                        f"account_id={account_id} outcome=failure"
+                    ),
+                )
                 counters["failed"] += 1
                 log.warning(
                     "O365 subscription renewal failed",
@@ -276,6 +321,14 @@ async def _run_o365_renewal_sweep(
                     subscription_id=subscription_id,
                     error=err_text,
                 )
+                # Auth-revoked renewal failure → surface the re-auth chip
+                # (needle-filtered; the renewer previously set nothing, so a
+                # dead token on a push-only O365 account stayed invisible).
+                # Census 2026-06-09 #1.
+                try:
+                    await db_call(record_provider_outcome, db, acct, e)
+                except Exception:
+                    pass
 
     await asyncio.gather(
         *[_renew_one(row) for row in expiring],

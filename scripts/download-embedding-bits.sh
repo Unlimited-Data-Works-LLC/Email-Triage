@@ -22,8 +22,11 @@
 #   <staging>/wheels/                      torch + sentence-
 #                                          transformers wheels +
 #                                          transitives
-#   <staging>/hf-cache/sentence-transformers_all-MiniLM-L6-v2/
-#                                          the model file set
+#   <staging>/hf-cache/<hf_cache_dir>/    one subtree per manifest
+#                                          'models' entry (e.g.
+#                                          sentence-transformers_all-
+#                                          MiniLM-L6-v2/, intfloat_
+#                                          multilingual-e5-base/)
 #
 # Sideload path on the target (inside the container or with shell
 # access to /app/data/runtime-deps):
@@ -58,7 +61,9 @@ fi
 # --- staging dir (deterministic so re-runs are resumable) ---
 STAGING="${EMBEDDING_BITS_STAGING:-${HOME}/.cache/email-triage-embedding-bits}"
 mkdir -p "${STAGING}/wheels"
-mkdir -p "${STAGING}/hf-cache/sentence-transformers_all-MiniLM-L6-v2"
+# Per-model hf-cache subdirs are created in the mirror step below (one
+# per manifest 'models' entry); just create the shared parent here.
+mkdir -p "${STAGING}/hf-cache"
 
 echo "Staging dir: ${STAGING}"
 echo "Manifest:    ${MANIFEST}"
@@ -86,7 +91,7 @@ from pathlib import Path
 manifest = json.loads(Path("${MANIFEST}").read_text(encoding="utf-8"))
 cache = Path("${STAGING}/.builder-cache")
 out_wheels = Path("${STAGING}/wheels")
-out_hf = Path("${STAGING}/hf-cache/sentence-transformers_all-MiniLM-L6-v2")
+out_hf_root = Path("${STAGING}/hf-cache")
 
 for w in manifest.get("wheels", []):
     src = cache / w["filename"]
@@ -96,10 +101,15 @@ for w in manifest.get("wheels", []):
     if not dst.exists() or dst.stat().st_size != src.stat().st_size:
         shutil.copy2(src, dst)
 
+hf_files = 0
 for m in manifest.get("models", []):
+    # Each model lands under its own hf_cache_dir/ — the layout the
+    # installer's per-model verify/stage loops expect. A single shared
+    # dir would collide two models' files.
+    out_hf = out_hf_root / m["hf_cache_dir"]
     for f in m.get("files", []):
         # model files: cache layout flattens '/' to '_'; we restore
-        # the original layout in hf-cache/
+        # the original layout under each model's hf_cache_dir/
         flat = f["name"].replace("/", "_")
         src = cache / m["name"] / flat
         dst = out_hf / f["name"]
@@ -108,9 +118,10 @@ for m in manifest.get("models", []):
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.exists() or dst.stat().st_size != src.stat().st_size:
             shutil.copy2(src, dst)
+        hf_files += 1
 
 print(f"Staged {len(list(out_wheels.iterdir()))} wheels + "
-      f"{sum(1 for _ in out_hf.rglob('*') if _.is_file())} model files")
+      f"{hf_files} model files")
 PYEOF
 
 # --- package into a zstd tarball ---

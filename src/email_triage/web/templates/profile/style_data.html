@@ -535,7 +535,12 @@
             {% endif %}
             {% endif %}
         </p>
-        {% if entry.account.hipaa %}
+        {# N-265 R27: route through the `_hipaa_of` Jinja global (SSOT
+           for effective HIPAA — system_hipaa OR per-account hipaa).
+           Pre-N-265 read `entry.account.hipaa` (raw column), which
+           MISSED system-HIPAA when per-account flag was OFF and
+           LEAKED reply subjects (R27 HIGH #1). #}
+        {% if _hipaa_of(entry.account) %}
         <p class="meta">
             <em>HIPAA-flagged account &mdash; sample subjects are
             hidden from this view.</em>

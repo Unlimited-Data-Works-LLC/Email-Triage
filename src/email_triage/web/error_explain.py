@@ -48,7 +48,10 @@ import logging
 import sqlite3
 from typing import Any
 
-_log = logging.getLogger("email_triage.web.error_explain")
+from email_triage.llm_safety import DATA_FENCE_SECURITY_RULE, fence_data
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.error_explain")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ SYSTEM_PROMPT = (
     "/help/tasks.\n"
     "  * Never echo the operator's email addresses, message ids, "
     "or message content. (None of that is in your input anyway.)\n"
+    "\n" + DATA_FENCE_SECURITY_RULE + "\n"
 )
 
 
@@ -119,20 +123,31 @@ def _build_prompt(
     parts: list[str] = []
     parts.append("An integration error from a mail or calendar provider:")
     parts.append("")
+    # census #4 — provider / error_class / account_name are NOT our-generated
+    # (provider + error_class are admin-form free-text via form.get(); account_name
+    # is an operator-set DB display name + owner_email). Per the operator directive
+    # "anything we didn't generate ourselves needs the wrap", each untrusted VALUE
+    # is fenced — not just error_text below. Previously these three were
+    # f-string-interpolated RAW into the trusted prompt structure, OUTSIDE the
+    # closed fence, so DATA_FENCE_SECURITY_RULE did not govern them and a crafted
+    # provider error label / account name could smuggle instructions (OWASP-LLM01).
     if provider:
-        parts.append(f"Provider: {provider}")
+        parts.append(f"Provider: {fence_data(provider)}")
     if error_class:
-        parts.append(f"Error class / code: {error_class}")
+        parts.append(f"Error class / code: {fence_data(error_class)}")
     if account_name:
         # Owner+account name only — no numeric id, no email body
         # (per feedback_no_account_id_alone.md + privacy invariant).
-        parts.append(f"Affected account: {account_name}")
+        parts.append(f"Affected account: {fence_data(account_name)}")
     parts.append("")
     parts.append("Error text (verbatim from the provider):")
     # Truncate to keep the prompt sane; long stack traces don't
-    # add value past the first ~2 KB.
-    safe_err = (error_text or "").strip()[:2000]
-    parts.append(safe_err if safe_err else "(empty error text)")
+    # add value past the first ~2 KB. The provider error string is
+    # attacker-influenceable (a crafted server response / OAuth error
+    # body could smuggle instructions), so wrap it in the closed,
+    # sanitized DATA fence like every other untrusted->LLM surface.
+    trimmed = (error_text or "").strip()[:2000]
+    parts.append(fence_data(trimmed) if trimmed else "(empty error text)")
     parts.append("")
     parts.append(
         "Explain in 4 to 6 sentences total per the system rules. "

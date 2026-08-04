@@ -54,11 +54,13 @@ from __future__ import annotations
 
 import functools
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import sqlite3
 import threading
 from typing import Any, Callable, TypeVar
 
-_log = logging.getLogger(__name__)
+_log = get_logger(__name__)  # N-196b R21_4
 
 # Module-level reentrant lock. One lock for the whole process — the
 # shared connection is a single resource, so a single mutex is the

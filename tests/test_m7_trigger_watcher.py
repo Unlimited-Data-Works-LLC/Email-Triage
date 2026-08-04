@@ -48,7 +48,8 @@ from email_triage.web.db import (
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:

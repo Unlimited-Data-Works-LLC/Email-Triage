@@ -183,6 +183,43 @@ class TestProcessOffice365PushItem:
         assert row["delta_link"] == "https://graph/new-cursor"
 
     @pytest.mark.asyncio
+    async def test_inactive_account_is_skipped_cursor_not_advanced(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Loop-5 census: a DEACTIVATED account's push delivery is NOT
+        classified/acted, and (mirroring the O365 owner-disabled branch)
+        the delta cursor is NOT advanced — O365 re-walks the delta fresh
+        each webhook, and the dedup table catches anything already
+        processed, so leaving the cursor put means re-activation
+        re-discovers the backlog cleanly. This is the deliberate
+        ASYMMETRY with the Gmail consumer (which DOES advance)."""
+        _make_account(db)
+        _seed_subscription(db, delta_link="https://graph/old-cursor")
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = 1")
+        db.commit()
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_office365_push_item(
+                push_app,
+                {"account_id": 1, "subscription_id": "subscription-fixture-1"},
+            )
+
+        # No live ingestion: no delta walk, no fetch, no classify.
+        fake_provider.poll_delta.assert_not_awaited()
+        fake_provider.fetch_message.assert_not_awaited()
+        fake_classifier.classify.assert_not_awaited()
+        # Cursor UNCHANGED (O365 owner-disabled parity).
+        assert get_o365_subscription(db, 1)["delta_link"] == (
+            "https://graph/old-cursor"
+        )
+
+    @pytest.mark.asyncio
     async def test_first_walk_passes_none_cursor(
         self, push_app, db, fake_provider, fake_classifier,
     ):

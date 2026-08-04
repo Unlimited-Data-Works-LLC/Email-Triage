@@ -55,12 +55,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from urllib.parse import urlsplit
+from email_triage._secret_scrub import strip_url_query_secrets as _strip_sensitive_query_params
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.classify.base import JsonChatClassifier
 
-logger = logging.getLogger("email_triage.ai_backends.gemini_adapter")
+logger = get_logger("email_triage.ai_backends.gemini_adapter")  # N-196b R21_4
 
 # Default Gemini AI Studio endpoint. Operators on Vertex AI override
 # via the ``ai_backends.endpoint`` column to the project-scoped Vertex
@@ -142,40 +143,7 @@ class GeminiAuthError(GeminiError):
     """
 
 
-def _strip_sensitive_query_params(url: str) -> str:
-    """Remove ``key`` / ``api-key`` / ``token`` / ``access_token`` /
-    ``code`` query params from URL.
-
-    For Gemini this is NOT defence-in-depth — Gemini's auth IS the
-    ``?key=…`` query parameter, so every real call carries the
-    plaintext key in the URL. Applying the scrub to URL strings used
-    in rendered exception messages (and in any log line that captures
-    the URL) is the primary safeguard against the key leaking via
-    exception traces.
-    """
-    if not url or "?" not in url:
-        return url
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return url
-    sensitive = {"key", "api-key", "token", "access_token", "code"}
-    pairs = []
-    for raw in parts.query.split("&"):
-        if not raw:
-            continue
-        k, _, _v = raw.partition("=")
-        if k.lower() in sensitive:
-            pairs.append(f"{k}=REDACTED")
-        else:
-            pairs.append(raw)
-    new_query = "&".join(pairs)
-    return f"{parts.scheme}://{parts.netloc}{parts.path}" + (
-        f"?{new_query}" if new_query else ""
-    )
-
-
-from email_triage.ai_backends.base import BackendAdapter
+from email_triage.ai_backends.base import BackendAdapter, meter_chat_complete
 
 
 class GeminiAdapter(BackendAdapter):
@@ -246,7 +214,7 @@ class GeminiAdapter(BackendAdapter):
         # instance, reused across every chat_complete() call instead of
         # a fresh AsyncClient (TLS handshake) per call. Mirrors the
         # classify/* cloud classifiers and OllamaClassifier.
-        self._http = LazyHttpClient(timeout=timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
 
     async def close(self) -> None:
         """Drain the pooled HTTP client (BackendAdapter.close override)."""
@@ -256,6 +224,7 @@ class GeminiAdapter(BackendAdapter):
     # Canonical W1-A method
     # ------------------------------------------------------------------
 
+    @meter_chat_complete  # N-194b R21_9: et_llm_chat_seconds metric
     async def chat_complete(
         self,
         messages: list[dict[str, Any]],
@@ -420,6 +389,13 @@ class GeminiAdapter(BackendAdapter):
                 url,
             ) from e
 
+        #  silent-truncation guard (shared SSOT) — finishReason==MAX_TOKENS
+        # means a cut response (invalid JSON for a classify, mid-word for text).
+        from email_triage.llm_truncation import warn_if_llm_truncated
+        warn_if_llm_truncated(
+            payload, family="gemini", model=str(getattr(self, "_model", "") or ""),
+            context="chat_complete", logger=logger,
+        )
         text = _extract_gemini_text(payload)
         if not text:
             # 2xx with no candidate text is most commonly a safety-

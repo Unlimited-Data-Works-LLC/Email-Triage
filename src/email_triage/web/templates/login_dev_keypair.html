@@ -104,33 +104,14 @@
         $status.style.color = color || "";
     }
 
-    function b64urlToBytes(s) {
-        s = s.replace(/-/g, "+").replace(/_/g, "/");
-        while (s.length % 4) s += "=";
-        const raw = atob(s);
-        const out = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-        return out;
-    }
-    function bytesToB64url(bytes) {
-        let s = "";
-        const a = new Uint8Array(bytes);
-        for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
-        return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    }
-    function bytesToB64(bytes) {
-        let s = "";
-        const a = new Uint8Array(bytes);
-        for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
-        return btoa(s);
-    }
-
-    function decodeBase64ToBytes(b64) {
-        const raw = atob(b64.replace(/\s+/g, ""));
-        const out = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
-        return out;
-    }
+    // #130 — base64url + plain-base64 route through `window.ETBase64`
+    // SSOT (`/static/base64url.js`, loaded in `base.html` before the
+    // template's inline block). Local `bytesToB64` (plain padded encoder)
+    // was dead code — no in-file caller — and was dropped rather than
+    // aliased.
+    const b64urlToBytes = window.ETBase64.b64urlToBytes;
+    const bytesToB64url = window.ETBase64.bytesToB64url;
+    const decodeBase64ToBytes = window.ETBase64.decodeBase64ToBytes;
 
     function pemToPkcs8(pem) {
         const m = pem.match(/-----BEGIN PRIVATE KEY-----\s*([\s\S]*?)\s*-----END PRIVATE KEY-----/);

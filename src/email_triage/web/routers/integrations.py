@@ -33,8 +33,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from email_triage.triage_logging import get_logger
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web._flash import scrub_exc  # N-179 R20_1 sub-4
+from email_triage.web.error_surface import api_error_response  #  tranche 1 R32
+from email_triage.web.routers._redirect import err_qs, qs, read_flash
 from email_triage._errfmt import fmt_exc
+from email_triage.web.routers.ui._shared import _safe_int  # N-282 R29
+from email_triage._isotime import to_utc_iso
 
 log = get_logger("web.integrations")
 router = APIRouter()
@@ -71,13 +75,8 @@ async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None
     return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
-def _require_admin(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: byte-identical UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 def _hours_until(expires_at_iso: str) -> float | None:
@@ -87,17 +86,16 @@ def _hours_until(expires_at_iso: str) -> float | None:
     (the synthetic poll-mode rows carry ``1970-01-01T00:00:00+00:00``
     so they're effectively "no real watch yet").
     """
-    if not expires_at_iso:
-        return None
-    try:
-        dt = datetime.fromisoformat(expires_at_iso)
-    except (TypeError, ValueError):
+    # N-263 R27 + N-357b R31 (2026-07-06 baseline shrink): parse_iso_aware
+    # is the parse_iso composite that also stamps UTC on naive results —
+    # handles the trailing-Z form Gmail emits AND the assume-UTC posture.
+    from email_triage._isotime import parse_iso_aware
+    dt = parse_iso_aware(expires_at_iso)
+    if dt is None:
         return None
     if dt.year < 2000:  # epoch sentinel — not a real watch
         return None
     now = datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return (dt - now).total_seconds() / 3600.0
 
 
@@ -200,7 +198,7 @@ def _gmail_watches_with_account_metadata(db: sqlite3.Connection) -> list[dict]:
     re-register via the Renew button to refresh the row, but the UI
     is no longer misleading in the interim.
     """
-    import json as _json
+    from email_triage.db._helpers import load_json_col
     rows = db.execute(
         "SELECT gw.*, "
         "       ea.name AS account_name, "
@@ -218,10 +216,11 @@ def _gmail_watches_with_account_metadata(db: sqlite3.Connection) -> list[dict]:
         d = dict(r)
         if not (d.get("email_address") or "").strip():
             cfg_raw = d.get("account_config_json") or "{}"
-            try:
-                cfg = _json.loads(cfg_raw) if isinstance(cfg_raw, str) else (cfg_raw or {})
-            except (ValueError, TypeError):
-                cfg = {}
+            # census  SSOT — corrupt account_config_json → {}. The column
+            # is TEXT (ea.config_json AS account_config_json), so cfg_raw is
+            # always a str here (dict(Row) over TEXT); load_json_col never
+            # raises and degrades a corrupt blob to {}.
+            cfg = load_json_col(cfg_raw, default={})
             fallback = (cfg.get("account") or "").strip()
             if fallback:
                 d["email_address"] = fallback
@@ -263,6 +262,37 @@ async def admin_integrations_legacy(request: Request):
     )
 
 
+_OUTBOUND_TARGET_TYPE_ORDER = (
+    "custom", "slack", "pagerduty", "opsgenie", "discord", "teams",
+)
+
+
+def _build_outbound_target_type_options() -> list[dict[str, Any]]:
+    """Return the wizard dropdown option list for the outbound-webhook
+    target-type picker (Drive C of task  / N-419).
+
+    Sourced from ``web/_webhook_target_types.TARGET_TYPES`` — the SSOT
+    registry — so a new target-type addition surfaces in the admin UI
+    without a second edit here. Ordered so the pre-existing default
+    (``custom``) is first and matches the wire-shape docs.
+    """
+    from email_triage.web._webhook_target_types import TARGET_TYPES
+    out: list[dict[str, Any]] = []
+    for key in _OUTBOUND_TARGET_TYPE_ORDER:
+        entry = TARGET_TYPES.get(key)
+        if entry is None:
+            continue
+        out.append({
+            "key": key,
+            "label": entry["label"],
+            "url_shape_hint": entry.get("url_shape_hint") or "",
+            "default_template": entry.get("default_template") or "",
+            "docs_url": entry.get("docs_url") or "",
+            "required_fields": entry.get("required_fields") or [],
+        })
+    return out
+
+
 def build_integrations_context(request: Request) -> dict:
     """Build the context dict the Integrations tab body needs.
 
@@ -277,6 +307,10 @@ def build_integrations_context(request: Request) -> dict:
     push = config.push
     watches = _gmail_watches_with_account_metadata(db)
     o365_subscriptions = _o365_subscriptions_with_account_metadata(db)
+
+    #  Internet Search — optional self-hosted SearXNG host (settings table).
+    from email_triage.web.db import get_web_search_searxng_url
+    web_search_searxng_url = get_web_search_searxng_url(db) or ""
 
     # The webhook URL is push.public_url + the static webhook path.
     # We surface the full URL as a copy-paste hint so operators don't
@@ -294,22 +328,37 @@ def build_integrations_context(request: Request) -> dict:
         if push.public_url else ""
     )
 
-    # Outbound webhook destination (OpenClaw integration). v1 supports
+    # Outbound webhook destination (any receiver — OpenClaw, Slack, an
+    # in-house automation, ...). v1 supports
     # a single target via UI; advanced multi-target setups still edit
     # YAML directly. The WebhookTarget at index 0 is the canonical
-    # OpenClaw destination — its secret lives in the secrets store
+    # The webhook destination — its secret lives in the secrets store
     # under the key named by secret_key (default OPENCLAW_WEBHOOK_SECRET).
     webhooks = list(getattr(config, "webhooks", []) or [])
     outbound_target = webhooks[0] if webhooks else None
     secrets_provider = _get_secrets(request)
     outbound_secret_set = False
+    outbound_secret_unreadable = False
     if outbound_target and outbound_target.secret_key:
+        from email_triage.secrets import SecretsDecryptError, read_secret
         try:
             outbound_secret_set = bool(
-                secrets_provider.get(outbound_target.secret_key) or ""
+                read_secret(secrets_provider, outbound_target.secret_key) or ""
             )
-        except Exception:
-            outbound_secret_set = False
+        except SecretsDecryptError:
+            # A5 / SME finding DA-2 — the row EXISTS but won't decrypt
+            # (corrupt / master-key mismatch). This is a THIRD state, not
+            # "set" and not "unset": "leave blank to keep" would tell the
+            # operator to KEEP a broken secret while deliveries silently
+            # drop. Surface it as a distinct unreadable state + log.
+            log.error(
+                "Outbound webhook secret unreadable — corrupt row or "
+                "master-key mismatch; HMAC-signed deliveries are being "
+                "dropped. Check the secrets master key.",
+                secret_key=outbound_target.secret_key,
+            )
+            outbound_secret_set = True
+            outbound_secret_unreadable = True
     webhooks_allow_external = bool(getattr(config, "webhooks_allow_external", False))
 
     # Classification cache section context — extended 2026-05-13
@@ -373,11 +422,15 @@ def build_integrations_context(request: Request) -> dict:
         redis_cache_counters_lifetime = {}
         embedding_counters_lifetime = {}
         webhook_counters_lifetime = {}
-    # Known event-type catalogue rendered as checkboxes. Stable list;
-    # add new events here when the codebase grows them.
+    # Known event-type catalogue rendered as checkboxes. Sourced from
+    # the ONE outbound-event registry (`_KNOWN_OUTBOUND_EVENTS` below) —
+    # a new event type added to the registry surfaces automatically
+    # here + in the preview sample dropdown + in the preview endpoint's
+    # sample envelope table (Prime Directive #5, no mirrored predicate
+    # lists — SME-panel 2026-07-15 DA PD-N-CIDI fold).
     known_events = [
-        ("triage.completed", "Triage completed", "Fires after a triage run finishes. Carries run_id, account_id, account_name, query, total_messages, results_count, errors_count, elapsed_secs, trigger. No message content (no sender, no subject, no body), in any mode. HIPAA-flagged accounts hard-skip emit even before the dispatcher gate."),
-        ("flow.classified", "Flow classified", "Fires when the classifier returns a category. Pre-route firing — used for downstream consumers that want raw classifier output. Metadata-only payload."),
+        (entry["name"], entry["label"], entry["desc"])
+        for entry in _KNOWN_OUTBOUND_EVENTS
     ]
 
     return {
@@ -389,11 +442,31 @@ def build_integrations_context(request: Request) -> dict:
         "o365_webhook_url": o365_webhook_url,
         "outbound_target": outbound_target,
         "outbound_secret_set": outbound_secret_set,
+        "outbound_secret_unreadable": outbound_secret_unreadable,
         "outbound_events_subscribed": (
             set(outbound_target.events) if outbound_target else set()
         ),
         "outbound_event_catalogue": known_events,
+        # Drive C — per-target body-templating wizard (v0.2.0 headline
+        # release-blocking, N-419 §4.35). The dropdown surfaces the 5
+        # built-in target-type shapes (Slack + PagerDuty + Opsgenie +
+        # Discord + Teams) + a "Custom" passthrough; the textarea
+        # exposes the raw operator template for advanced edits.
+        "outbound_target_types": _build_outbound_target_type_options(),
+        "outbound_selected_target_type": (
+            getattr(outbound_target, "target_type", "custom") or "custom"
+            if outbound_target else "custom"
+        ),
+        "outbound_body_template": (
+            getattr(outbound_target, "body_template", None) or ""
+            if outbound_target else ""
+        ),
+        "outbound_account_id": (
+            getattr(outbound_target, "account_id", None) or ""
+            if outbound_target else ""
+        ),
         "webhooks_allow_external": webhooks_allow_external,
+        "web_search_searxng_url": web_search_searxng_url,
         "redis_cache_url": redis_cache_url,
         "redis_cache_ttl": redis_cache_ttl,
         "redis_cache_inner_cap": redis_cache_inner_cap,
@@ -405,19 +478,253 @@ def build_integrations_context(request: Request) -> dict:
         "webhook_counters_lifetime": webhook_counters_lifetime,
         "saved": request.query_params.get("saved") == "1",
         "renewed": request.query_params.get("renewed") or "",
-        "err": request.query_params.get("err") or "",
+        "err": read_flash(request)[1] or "",
         #  — flush button result. ``flushed`` is the int count
         # when the previous POST succeeded; ``flush_err`` is the
         # human-readable error string when it failed.
-        "flushed": (
-            int(request.query_params.get("flushed", "0") or 0)
-            if request.query_params.get("flushed") else None
-        ),
+        # N-282 R29: route through the `_safe_int` SSOT (was walrus-
+        # inside-IfExp with an `.isdigit()` gate — safe today but drift-
+        # risky; the SSOT owns the parse-with-fallback contract).
+        "flushed": _safe_int(request.query_params.get("flushed"), default=None),
         "flush_err": request.query_params.get("flush_err") or "",
         # 2026-05-13 — lifetime-counter reset result (admin button).
         "reset_ok": request.query_params.get("reset_ok") or "",
         "reset_err": request.query_params.get("reset_err") or "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Outbound-webhook body-template LIVE PREVIEW (task )
+# ---------------------------------------------------------------------------
+#
+# The preview reuses the exact ``render_for_target`` SSOT that fires
+# production emit (Prime Directive #1: SSOT reuse over mirrored logic).
+# Task  decision: server-side render via HTMX — NOT a client-side
+# Mustache/Handlebars lib. Rationale: our server-side renderer is
+# substitution-only (no sections, no logic, no helpers); a real
+# Mustache/Handlebars client would let an operator craft a template
+# that renders in preview but strips/breaks on the wire — a WYSIWYG
+# divergence trap. HTMX pipes bytes-for-bytes what production emits.
+#
+# Sample envelopes are canned demo strings only — no real PHI, no
+# real endpoint credentials. The preview endpoint refuses the same
+# ``{{secret}}`` shape parse-time refuses so preview matches production
+# behavior (SME-panel 2026-07-15 DA-F1 belt+suspenders posture).
+
+# SME-panel 2026-07-15 DA PD-N-CIDI fold — the outbound-event registry
+# is ONE list of dicts. Adding an event = one entry here. Consumers:
+# * ``build_integrations_context.known_events`` — event checkbox list.
+# * ``_PREVIEW_SAMPLE_ENVELOPES`` — preview sample-event dropdown +
+#   sample envelope table for the wizard live preview (task ).
+# Two-list drift (checkbox-only event silently rendering an unrelated
+# sample envelope in preview) is prevented by construction.
+_DEMO_ENVELOPE_DATA: dict[str, Any] = {
+    "flow_id": "flow-DEMO-abc123",
+    "category": "sample-category",
+    "subject": "Sample subject line",
+    "sender": "sample-sender@example.com",
+    "summary": "Sample triage summary.",
+    "pd_routing_key": "SAMPLE-PD-ROUTING-KEY",
+    "timestamp": "2026-01-15T14:29:58Z",
+}
+
+_KNOWN_OUTBOUND_EVENTS: list[dict[str, Any]] = [
+    {
+        "name": "triage.completed",
+        "label": "Triage completed",
+        "desc": (
+            "Fires after a triage run finishes. Carries run_id, account_id, "
+            "account_name, query, total_messages, results_count, errors_count, "
+            "elapsed_secs, trigger. No message content (no sender, no subject, "
+            "no body), in any mode. HIPAA-flagged accounts hard-skip emit "
+            "even before the dispatcher gate."
+        ),
+    },
+    {
+        "name": "flow.classified",
+        "label": "Flow classified",
+        "desc": (
+            "Fires when the classifier returns a category. Pre-route firing — "
+            "used for downstream consumers that want raw classifier output. "
+            "Metadata-only payload."
+        ),
+    },
+]
+
+_PREVIEW_SAMPLE_ENVELOPES: dict[str, dict[str, Any]] = {
+    entry["name"]: {
+        "event": entry["name"],
+        "timestamp": "2026-01-15T14:30:00Z",
+        "data": dict(_DEMO_ENVELOPE_DATA),
+    }
+    for entry in _KNOWN_OUTBOUND_EVENTS
+}
+
+
+class _PreviewTarget:
+    """Duck-typed :class:`WebhookTarget` for the preview render path.
+
+    ``render_for_target`` reads ``target_type`` + ``body_template``
+    only — a full :class:`WebhookTarget` construction would drag URL
+    validation into the preview path, but preview does not fire the
+    wire so URL is not relevant. Keep the seam narrow.
+    """
+    __slots__ = ("target_type", "body_template", "url")
+
+    def __init__(self, target_type: str, body_template: str | None):
+        self.target_type = target_type
+        self.body_template = body_template
+        self.url = ""  # HIPAA-lock netloc log path is bypassed on preview
+
+
+# SME-panel 2026-07-15 DA PD-N-operator-mistake fold (task  close-
+# out; the backlog row 415 folded same-drive per feedback_dont_over_defer):
+# static-scan the operator template's ``{{path.to.field}}`` bindings and
+# compare against the target-type's ``required_fields`` list — surface
+# missing bindings inline so the operator sees "your template does not
+# reference: pd_routing_key" at wizard-write time instead of at first
+# prod fire (where RequiredFieldMissing fail-closes the delivery). Only
+# meaningful for an operator OVERRIDE — the built-in default templates
+# reference every required field by design.
+import re as _re_preview
+_PATH_BINDING_RE = _re_preview.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+
+
+def _unreferenced_required_fields(
+    body_template: str, target_type: str,
+) -> list[str]:
+    """Return the ``data.<name>`` required fields the operator template
+    does NOT reference. Returns ``[]`` when no override is present (the
+    default template references every required field by construction).
+    """
+    if not body_template:
+        return []
+    from email_triage.web._webhook_target_types import TARGET_TYPES
+    entry = TARGET_TYPES.get(target_type) or {}
+    required = list(entry.get("required_fields") or [])
+    if not required:
+        return []
+    referenced_paths = {
+        m.group(1) for m in _PATH_BINDING_RE.finditer(body_template)
+    }
+    return [
+        name for name in required
+        if f"data.{name}" not in referenced_paths
+    ]
+
+
+@router.post(
+    "/admin/integrations/webhook-preview", response_class=HTMLResponse,
+)
+async def admin_integrations_webhook_preview(request: Request):
+    """Render a live preview of the outbound-webhook wire body.
+
+    Task . Consumed by the wizard on
+    ``admin/config_tabs/integrations.html`` — HTMX triggers on
+    target-type change, sample-event change, and body-template
+    keyup-changed. Returns an HTML fragment carrying two ``<pre>``
+    blocks (normal + HIPAA-locked shape). Admin-gated.
+
+    The ``{{secret}}`` refusal here mirrors the parse-time refusal in
+    ``config._parse_webhooks`` + the wizard-save refusal in
+    ``admin_integrations_save`` — three places, one contract (belt +
+    suspenders + suspenders' backup so an operator sees the same
+    refusal at preview time, save time, and load time).
+    """
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+
+    from email_triage.web._webhook_target_types import VALID_TARGET_TYPES
+    from email_triage.web._webhook_template import (
+        RequiredFieldMissing,
+        refuses_secret_binding,
+        render_for_target,
+    )
+
+    form = await request.form()
+    target_type_raw = (form.get("target_type") or "custom").strip()
+    target_type = (
+        target_type_raw if target_type_raw in VALID_TARGET_TYPES else "custom"
+    )
+    body_template_raw = form.get("body_template")
+    body_template = (
+        str(body_template_raw).strip() if body_template_raw is not None else ""
+    )
+    # SME-panel 2026-07-15 DA PD-N-honesty fold — echo the RESOLVED
+    # sample_event key, not the raw form value. A bogus form key would
+    # otherwise display "sample event: <bogus>" while rendering
+    # triage.completed bytes — record ≠ HEAD-reality (feedback_just_be_honest).
+    sample_event_raw = (form.get("sample_event") or "triage.completed").strip()
+    sample_event = (
+        sample_event_raw if sample_event_raw in _PREVIEW_SAMPLE_ENVELOPES
+        else "triage.completed"
+    )
+    envelope = _PREVIEW_SAMPLE_ENVELOPES[sample_event]
+
+    # SME-panel 2026-07-15 DA PD-5 fold — delegate to the ``{{secret}}``
+    # refusal SSOT at ``web/_webhook_template.refuses_secret_binding``.
+    # Three sites (parse / wizard-save / wizard-preview) route through
+    # ONE regex + one message. A future tightening lands in the SSOT and
+    # every site inherits (Prime Directive #5, no mirrored predicates).
+    tmpl_effective = body_template
+    template_error = refuses_secret_binding(body_template) if body_template else None
+    if template_error:
+        tmpl_effective = ""
+
+    preview_target = _PreviewTarget(
+        target_type=target_type,
+        body_template=tmpl_effective or None,
+    )
+
+    # Normal (non-HIPAA) render — may raise RequiredFieldMissing when
+    # a typed target's required_fields list is not all populated in
+    # the sample envelope (the sample carries every field so this only
+    # trips if the operator swaps target-type dropdowns to a type not
+    # present in _PREVIEW_SAMPLE_ENVELOPES.data — a defensive branch).
+    normal_body: str | None
+    normal_error: str | None = None
+    try:
+        _bytes = render_for_target(
+            envelope, preview_target, is_hipaa=False, resolved_secret="",
+        )
+        normal_body = _bytes.decode("utf-8", errors="replace")
+    except RequiredFieldMissing as e:
+        normal_body = None
+        normal_error = str(e)
+
+    # SME-panel 2026-07-15 DA PD-1 fold — HIPAA-preview MUST route through
+    # ``render_for_target(is_hipaa=True, _suppress_audit_log=True)``, not
+    # the sibling ``_hipaa_locked_bytes`` directly. Rationale: the whole
+    # Task  WYSIWYG guarantee is "preview bytes == production emit
+    # bytes"; a future addition to the HIPAA branch of
+    # ``render_for_target`` (canary field, tighter scrub, added trace)
+    # must reach preview transparently. The ``_suppress_audit_log`` opt-
+    # in kwarg (leading underscore = "opt in only if you're sure") skips
+    # the INFO log so wizard keystrokes don't drown genuine emit-time
+    # enforcement signal — the render remains bytes-equal.
+    hipaa_bytes = render_for_target(
+        envelope, preview_target, is_hipaa=True, resolved_secret="",
+        _suppress_audit_log=True,
+    )
+    hipaa_body = hipaa_bytes.decode("utf-8", errors="replace")
+
+    return await _render(
+        request,
+        "admin/config_tabs/_webhook_preview_fragment.html",
+        {
+            "sample_event": sample_event,
+            "target_type": target_type,
+            "template_used": tmpl_effective,
+            "template_error": template_error,
+            "normal_body": normal_body,
+            "normal_error": normal_error,
+            "hipaa_body": hipaa_body,
+            "unreferenced_required": _unreferenced_required_fields(
+                tmpl_effective, target_type,
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -460,60 +767,109 @@ async def admin_integrations_save(request: Request):
 
     config.push.public_url = _clean_url(form.get("public_url", ""))
     config.push.gmail_topic_name = (form.get("gmail_topic_name", "") or "").strip()
-    config.push.gmail_subscription_sa_email = (
-        (form.get("gmail_subscription_sa_email", "") or "").strip().lower()
+    from email_triage.mail_headers import canonical_email  # N-346 partial 5 R31
+    config.push.gmail_subscription_sa_email = canonical_email(
+        form.get("gmail_subscription_sa_email", "") or ""
     )
     # Audience defaults to public_url when blank -- explicit empty
     # string is a valid choice (the webhook validator falls back to
     # public_url if audience is empty).
     config.push.gmail_audience = _clean_url(form.get("gmail_audience", ""))
 
-    # ── Google OAuth install-level client credentials ──
-    # Moved from /config/save to here on 2026-05-10 so every
-    # integration-related setting lives on one admin page.
-    # Blank-secret submit preserves the stored value; plaintext IDs
-    # always write what's posted.
+    # ── Google + Office 365 install-level OAuth credentials ──
+    # Moved from /config/save to here on 2026-05-10 so every integration
+    # setting lives on one admin page. Every credential write routes through
+    # the _secret_write SSOT after the 2026-06-08 silent-clobber incident:
+    # saving an unrelated setting (the SearXNG URL) on this bundled form
+    # blanked the Web client id (an UNCONDITIONAL id write from an emptied
+    # field) and let a browser password-manager autofill overwrite the
+    # Web/O365 client secrets (the old `if posted:` guard blocks only the
+    # EMPTY case, not a non-empty autofilled value). The helpers enforce:
+    #   * ids   — blank PRESERVES the stored value (no unconditional write);
+    #   * secrets — blank PRESERVES; a Google secret that isn't a real
+    #     GOCSPX- secret is REJECTED + surfaced (never silently stored).
+    # The companion defense is the template m.secret_input/m.cred_input
+    # macros (readonly-until-focus) so a manager can't autofill at load.
     secrets = _get_secrets(request)
-    config.google_oauth.web_client_id = form.get("google_oauth_web_client_id", "").strip()
-    secrets.set("GOOGLE_OAUTH_WEB_CLIENT_ID", config.google_oauth.web_client_id)
-    _web_secret_posted = form.get("google_oauth_web_client_secret", "")
-    if _web_secret_posted:
-        config.google_oauth.web_client_secret = _web_secret_posted
-        secrets.set("GOOGLE_OAUTH_WEB_CLIENT_SECRET", _web_secret_posted)
+    from email_triage.web.routers._secret_write import (
+        WRITTEN,
+        REJECTED,
+        clear_secret,
+        looks_like_google_secret,
+        set_id_preserve_blank,
+        set_secret_if_changed,
+    )
+    from email_triage.web.oauth_secret_keys import (  # census run13 #9 — OAuth key SSOT
+        GOOGLE_OAUTH_WEB_CLIENT_ID, GOOGLE_OAUTH_WEB_CLIENT_SECRET,
+        GOOGLE_OAUTH_DESKTOP_CLIENT_ID, GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET,
+        O365_OAUTH_TENANT_ID, O365_OAUTH_CLIENT_ID, O365_OAUTH_CLIENT_SECRET,
+    )
+    rejected_creds: list[str] = []
 
-    config.google_oauth.desktop_client_id = form.get("google_oauth_desktop_client_id", "").strip()
-    secrets.set("GOOGLE_OAUTH_DESKTOP_CLIENT_ID", config.google_oauth.desktop_client_id)
-    _desk_secret_posted = form.get("google_oauth_desktop_client_secret", "")
-    if _desk_secret_posted:
-        config.google_oauth.desktop_client_secret = _desk_secret_posted
-        secrets.set("GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET", _desk_secret_posted)
+    # Google — Web (push-enabled) client pair.
+    config.google_oauth.web_client_id = set_id_preserve_blank(
+        secrets, GOOGLE_OAUTH_WEB_CLIENT_ID,
+        form.get("google_oauth_web_client_id"),
+        config.google_oauth.web_client_id,
+    )
+    _web_sec = form.get("google_oauth_web_client_secret")
+    _st = set_secret_if_changed(
+        secrets, GOOGLE_OAUTH_WEB_CLIENT_SECRET, _web_sec,
+        validate=looks_like_google_secret,
+    )
+    if _st == REJECTED:
+        rejected_creds.append("Google Web client secret")
+    elif _st == WRITTEN:
+        config.google_oauth.web_client_secret = _web_sec
+
+    # Google — Desktop (manual-paste) client pair.
+    config.google_oauth.desktop_client_id = set_id_preserve_blank(
+        secrets, GOOGLE_OAUTH_DESKTOP_CLIENT_ID,
+        form.get("google_oauth_desktop_client_id"),
+        config.google_oauth.desktop_client_id,
+    )
+    _desk_sec = form.get("google_oauth_desktop_client_secret")
+    _st = set_secret_if_changed(
+        secrets, GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET, _desk_sec,
+        validate=looks_like_google_secret,
+    )
+    if _st == REJECTED:
+        rejected_creds.append("Google Desktop client secret")
+    elif _st == WRITTEN:
+        config.google_oauth.desktop_client_secret = _desk_sec
 
     # ── Office 365 OAuth install-level credentials ──
     # Single Azure app registration shared across every O365 account on
     # this install. Per-account is_personal_msa flag routes tenant at
     # runtime — "common" if personal, else the install tenant_id below.
-    # Moved from /config/save to here on 2026-05-10 alongside Google
-    # OAuth so every integration-related setting lives on one admin
-    # page.
     _o365_tenant_posted = form.get("office365_oauth_tenant_id", "").strip()
     if _o365_tenant_posted.lower() == "common":
         # "common" is reserved for the per-account "Personal Microsoft
-        # account" checkbox path. Don't let the install-level field
-        # claim it — that would silently break the org-tenant routing
-        # for every non-personal account.
+        # account" checkbox path. At the install level it is the EXPLICIT,
+        # declared "clear the tenant" request (vs. a blank submit, which now
+        # preserves) — so route it through clear_secret, not a value write.
         config.office365_oauth.tenant_id = ""
-        secrets.set("O365_OAUTH_TENANT_ID", "")
+        clear_secret(secrets, O365_OAUTH_TENANT_ID)
     else:
-        config.office365_oauth.tenant_id = _o365_tenant_posted
-        secrets.set("O365_OAUTH_TENANT_ID", _o365_tenant_posted)
-    config.office365_oauth.client_id = form.get("office365_oauth_client_id", "").strip()
-    secrets.set("O365_OAUTH_CLIENT_ID", config.office365_oauth.client_id)
-    _o365_secret_posted = form.get("office365_oauth_client_secret", "")
-    if _o365_secret_posted:
-        config.office365_oauth.client_secret = _o365_secret_posted
-        secrets.set("O365_OAUTH_CLIENT_SECRET", _o365_secret_posted)
+        config.office365_oauth.tenant_id = set_id_preserve_blank(
+            secrets, O365_OAUTH_TENANT_ID,
+            _o365_tenant_posted, config.office365_oauth.tenant_id,
+        )
+    config.office365_oauth.client_id = set_id_preserve_blank(
+        secrets, O365_OAUTH_CLIENT_ID,
+        form.get("office365_oauth_client_id"),
+        config.office365_oauth.client_id,
+    )
+    # O365 client secret has no stable prefix to validate against, so it
+    # relies on the blank-preserve guard + the readonly-until-focus template
+    # layer (which blocks the autofill at page load in the first place).
+    _o365_sec = form.get("office365_oauth_client_secret")
+    if set_secret_if_changed(
+        secrets, O365_OAUTH_CLIENT_SECRET, _o365_sec,
+    ) == WRITTEN:
+        config.office365_oauth.client_secret = _o365_sec
 
-    # ── Outbound webhook destination (OpenClaw) ──
+    # ── Outbound webhook destination ──
     # v1: single target. The form posts:
     #   outbound_webhook_url       — the destination URL (empty clears)
     #   outbound_webhook_event_<n> — checkbox per known event name
@@ -529,23 +885,111 @@ async def admin_integrations_save(request: Request):
                 selected_events.append(event_name)
     selected_events = sorted(set(selected_events))
     secret_key_name = "OPENCLAW_WEBHOOK_SECRET"
+    webhook_body_template_error: str | None = None
     if out_url:
+        # Drive C — wizard fields for per-target body templating (task
+        #  / N-419). The form now posts ``outbound_webhook_target_type``
+        # (dropdown selection, one of ``VALID_TARGET_TYPES``) and
+        # ``outbound_webhook_body_template`` (raw operator template, may
+        # be empty = use the target-type's registered default). If the
+        # form lacks the fields (e.g. pre-wizard client) we preserve the
+        # prior WebhookTarget's values so a hand-edited YAML round-trips
+        # transparently — closes the SME-panel DB-F2 silent-data-loss
+        # regression at every wizard write, no matter which client.
+        from email_triage.web._webhook_target_types import VALID_TARGET_TYPES
+        _prior = config.webhooks[0] if config.webhooks else None
+        _prior_type = getattr(_prior, "target_type", "custom") if _prior else "custom"
+        _prior_template = getattr(_prior, "body_template", None) if _prior else None
+        _prior_acct_id = getattr(_prior, "account_id", None) if _prior else None
+
+        _form_type = (form.get("outbound_webhook_target_type") or "").strip()
+        if _form_type and _form_type in VALID_TARGET_TYPES:
+            target_type_value = _form_type
+        else:
+            target_type_value = _prior_type
+
+        # ``outbound_webhook_body_template``: empty string means "use the
+        # target-type's default"; a non-empty value is the operator's
+        # override. Reject a template that references ``{{secret}}`` at
+        # the wizard boundary too — the parse layer already refuses
+        # this at YAML load, but catching it here surfaces the error
+        # inline instead of on next restart (SME-panel DA-F1 defense-
+        # in-depth).
+        _form_template_raw = form.get("outbound_webhook_body_template")
+        if _form_template_raw is None:
+            body_template_value: str | None = _prior_template
+        else:
+            _form_template = str(_form_template_raw).strip()
+            if not _form_template:
+                body_template_value = None
+            # SME-panel 2026-07-15 DA-A nit — normalize the whitespace
+            # variants of ``{{ secret }}`` so the wizard refusal matches
+            # the parse-time refusal (both use the same regex now).
+            # HIPAA-SME F2 fold — the parse-side refusal raises
+            # ``ConfigError`` at YAML-load time; the wizard-side refusal
+            # here sets a local error flag (surfaced through the same
+            # flash-error path as any other save-side rejection) so an
+            # operator submitting a leaky template gets an inline
+            # message rather than an un-scrubbed 500.
+            # 2026-07-15 task  SME-panel DA PD-5 fold — the regex +
+            # message now live at the ONE SSOT
+            # ``web/_webhook_template.refuses_secret_binding``. Three
+            # sites (parse / wizard-save / wizard-preview) delegate.
+            elif (
+                _refusal := __import__(
+                    "email_triage.web._webhook_template",
+                    fromlist=["refuses_secret_binding"],
+                ).refuses_secret_binding(_form_template)
+            ) is not None:
+                webhook_body_template_error = _refusal
+                # Preserve the prior value so a partial save doesn't
+                # nuke a previously-valid template on a bad edit.
+                body_template_value = _prior_template
+            else:
+                body_template_value = _form_template
+
+        # DA-F3b Drive-C follow-on (task ): the wizard now surfaces
+        # the ``account_id`` field as an advanced text input. Empty =
+        # wildcard (matches every account, backward-compat default);
+        # a specific id closes the cross-account fanning class for
+        # this target. Falls back to ``_prior_acct_id`` when the form
+        # key is absent (pre-Drive-C clients) so YAML-edited scopes
+        # aren't nuked by an admin save.
+        _form_acct_raw = form.get("outbound_webhook_account_id")
+        if _form_acct_raw is None:
+            account_id_value = _prior_acct_id
+        else:
+            _form_acct = str(_form_acct_raw).strip()
+            account_id_value = _form_acct if _form_acct else None
+
         # Build / refresh the single canonical target.
         config.webhooks = [
             WebhookTarget(
                 url=out_url,
                 events=selected_events,
                 secret_key=secret_key_name,
+                target_type=target_type_value,
+                body_template=body_template_value,
+                account_id=account_id_value,
             )
         ]
     else:
         # Empty URL clears the destination entirely.
         config.webhooks = []
     config.webhooks_allow_external = "webhooks_allow_external" in form
-    # Secret is mask-preserve: empty submit keeps the stored value.
-    posted_secret = form.get("outbound_webhook_secret", "")
-    if posted_secret:
-        secrets.set(secret_key_name, posted_secret)
+    # Secret is mask-preserve: blank submit keeps the stored value; an
+    # autofilled value can't slip in because the field is readonly-until-focus
+    # (m.secret_input). Routes through the SSOT like every other secret write.
+    set_secret_if_changed(
+        secrets, secret_key_name, form.get("outbound_webhook_secret"),
+    )
+
+    # ──  Internet Search — optional self-hosted SearXNG host ──
+    # Empty = OFF (the Topic editor then offers registry-number lookups
+    # only). Persisted in the settings table (off the loop via db_call).
+    from email_triage.web.db import set_web_search_searxng_url
+    _ws_url = (form.get("web_search_searxng_url", "") or "").strip().rstrip("/")
+    await db_call(set_web_search_searxng_url, _get_db(request), _ws_url)
 
     # ──  — Classification cache (optional Redis) ──
     # URL empty = OFF (default). TTL clamped to the supported window
@@ -556,27 +1000,23 @@ async def admin_integrations_save(request: Request):
         build_cache_from_config, clamp_ttl_secs,
         set_install_classification_cache,
     )
+    #  — the request-int SSOT (function-local import: avoids a module-top
+    # dependency from this sibling router onto the ui._shared package).
     rc_url = (form.get("redis_cache_url", "") or "").strip()
     rc_ttl = clamp_ttl_secs(form.get("redis_cache_ttl_secs"))
     # 2026-05-13 two-level cache knobs. Out-of-range / non-numeric
-    # falls back to the default.
-    try:
-        rc_inner_cap = max(
-            1, min(10000, int(form.get("redis_cache_inner_cap") or 250)),
-        )
-    except (TypeError, ValueError):
-        rc_inner_cap = 250
+    # falls back to the default (now via _safe_int, never a 500).
+    rc_inner_cap = max(
+        1, min(10000, _safe_int(form.get("redis_cache_inner_cap"), 250)),
+    )
     rc_strategy = (
         form.get("redis_cache_hint_strategy") or "top_k_with_freq"
     ).strip().lower()
     if rc_strategy not in ("top_k_with_freq", "top_1_dominant"):
         rc_strategy = "top_k_with_freq"
-    try:
-        rc_dom_pct = max(
-            50, min(100, int(form.get("redis_cache_dom_pct") or 70)),
-        )
-    except (TypeError, ValueError):
-        rc_dom_pct = 70
+    rc_dom_pct = max(
+        50, min(100, _safe_int(form.get("redis_cache_dom_pct"), 70)),
+    )
     config.redis_cache = RedisCacheConfig(
         url=rc_url, ttl_secs=rc_ttl,
         inner_cap_per_sender=rc_inner_cap,
@@ -617,17 +1057,40 @@ async def admin_integrations_save(request: Request):
         from email_triage.web.routers.ui import _write_config_yaml
         _write_config_yaml(config)
     except Exception as e:
-        save_error = f"YAML write failed: {e}"
+        #  tail — same class as admin.py:830/1304/1448 (raw
+        # exception __str__ echoing to URL-query flash message). Route
+        # through scrub_exc so PHI/secret shapes cannot leak.
+        save_error = f"YAML write failed: {scrub_exc(e, purpose='form')}"
         log.error("Integrations YAML write failed", error=fmt_exc(e))
+
+    # SME-panel 2026-07-15 HIPAA F2 fold — surface the wizard-side
+    # ``{{secret}}`` refusal through the flash-error path so the
+    # operator sees an inline message instead of an un-scrubbed 500.
+    # The other settings still save; only the offending body_template
+    # was preserved-at-prior. Take precedence over YAML write failures
+    # because a ``{{secret}}`` body IS the reason to refuse this save.
+    if webhook_body_template_error and not save_error:
+        save_error = webhook_body_template_error
+
+    # Surface any REJECTED credential (a posted secret that didn't look valid)
+    # so the operator knows it was NOT stored — never silent. The other
+    # settings still saved; this is the one credential that needs re-entry.
+    if not save_error and rejected_creds:
+        save_error = (
+            f"{', '.join(rejected_creds)} not saved — the value didn't look "
+            "like a valid Google client secret (these start with GOCSPX-). "
+            "Re-enter it; other settings were saved."
+        )
 
     log.info(
         "Push config saved",
         actor=user["email"],
         public_url=config.push.public_url,
         topic=config.push.gmail_topic_name,
+        rejected_creds=len(rejected_creds),
     )
 
-    qs = "saved=1" if not save_error else f"err={save_error[:120]}"
+    qs = "saved=1" if not save_error else err_qs(save_error[:200])
     # Redirect to the new /config tab home — legacy /admin/integrations
     # GET 303-bounces here anyway, but bypass the extra hop on success.
     return RedirectResponse(
@@ -656,8 +1119,8 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     user, err = await db_call(_require_admin, request)
     if err:
         if isinstance(err, RedirectResponse):
-            return JSONResponse({"error": "auth_required"}, status_code=401)
-        return JSONResponse({"error": "forbidden"}, status_code=403)
+            return api_error_response("auth_required", status_code=401, purpose="misc")
+        return api_error_response("forbidden", status_code=403, purpose="misc")
 
     db = _get_db(request)
     config = _get_config(request)
@@ -665,10 +1128,9 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
 
     topic = config.push.gmail_topic_name
     if not topic:
-        return JSONResponse(
-            {"error": "topic_unset",
-             "message": "Set push.gmail_topic_name first."},
-            status_code=400,
+        return api_error_response(
+            "topic_unset", status_code=400, purpose="misc",
+            extra={"message": "Set push.gmail_topic_name first."},
         )
 
     from email_triage.web.db import get_email_account, upsert_gmail_watch
@@ -678,14 +1140,11 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     # ASYNC-DB: account read off the loop.
     acct = await db_call(get_email_account, db, account_id)
     if acct is None:
-        return JSONResponse(
-            {"error": "account_not_found"}, status_code=404,
-        )
+        return api_error_response("account_not_found", status_code=404, purpose="misc")
     if acct.get("provider_type") != "gmail_api":
-        return JSONResponse(
-            {"error": "not_gmail",
-             "message": "Account is not a Gmail API account."},
-            status_code=400,
+        return api_error_response(
+            "not_gmail", status_code=400, purpose="misc",
+            extra={"message": "Account is not a Gmail API account."},
         )
 
     # Resolve email_address. The email_accounts table stores it inside
@@ -696,11 +1155,12 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     # carry the right email, so we also fall back to whatever's there.
     cfg_email = (acct.get("config") or {}).get("account", "")
     profile_email = ""
+    from email_triage.web.app import record_provider_outcome
     try:
         provider = _create_provider_from_account(acct, secrets)
         if not isinstance(provider, GmailApiProvider):
-            return JSONResponse(
-                {"error": "provider_build_failed"}, status_code=500,
+            return api_error_response(
+                "provider_build_failed", status_code=500, purpose="misc",
             )
         try:
             # Capture the live profile email FIRST -- if register_watch
@@ -725,17 +1185,46 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
             "Manual watch renewal failed",
             account_id=account_id, error=fmt_exc(e),
         )
-        return JSONResponse(
-            {"error": "renew_failed", "message": str(e)},
-            status_code=500,
+        # #5 (census 2026-06-10) — a manual force-renew failing on a dead
+        # credential routes through the auth_stale funnel (SET iff the error
+        # is an auth-revoked signal; a transient API error is needle-filtered).
+        # get_profile above fails non-fatally; register_watch is the auth edge.
+        await db_call(record_provider_outcome, db, acct, e)
+        # Census run23 #1 — mirror the gmail_watches lifecycle SSOT SET
+        # half so the row flips to 'errored' immediately on the failed
+        # force-renew instead of staying 'active' until the next renewer
+        # sweep. Success branch already CLEARs broadly at :1204.
+        try:
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=fmt_exc(e),
+            )
+        except Exception:
+            pass
+        return api_error_response(
+            "renew_failed", status_code=500, purpose="misc",
+            extra={"message": scrub_exc(e, purpose="provider")},
         )
 
+    # register_watch succeeded → the credential is alive → CLEAR any stale
+    # auth_stale chip NOW, before the email-resolution branch below. Placing
+    # the clear here (not after the upsert) keeps the CLEAR edge as broad as
+    # the success: an account whose watch registers but whose email field is
+    # unmigrated still must not stay stuck on the chip (DA MUST-FIX #1, #5 —
+    # the clear-narrow asymmetry this fix exists to kill). Mirrors push.py's
+    # Gmail Start-Push which clears immediately after register_watch.
+    await db_call(record_provider_outcome, db, acct, None)
+
     from datetime import timedelta
-    exp_ms = int(data.get("expiration", 0))
+    # /run18 : ``data`` is the Gmail register_watch API RESPONSE — a
+    # malformed ``expiration`` must not 500 (external-API robustness). Coerce via
+    # the _safe_int SSOT, not a bare int().
+    exp_ms = _safe_int(data.get("expiration"), 0)
     now = datetime.now(timezone.utc)
     exp_iso = (
-        datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc).isoformat()
-        if exp_ms else (now + timedelta(days=7)).isoformat()
+        to_utc_iso(datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc))
+        if exp_ms else to_utc_iso(now + timedelta(days=7))
     )
     history_id = str(data.get("historyId") or "")
 
@@ -749,11 +1238,10 @@ async def admin_integrations_renew_watch(account_id: int, request: Request):
     existing_email = (existing or {}).get("email_address") or ""
     email_address = profile_email or cfg_email or existing_email
     if not email_address:
-        return JSONResponse(
-            {"error": "missing_email_address",
-             "message": "Could not resolve the Gmail address for this "
-                        "account. Re-save the account or re-authenticate."},
-            status_code=400,
+        return api_error_response(
+            "missing_email_address", status_code=400, purpose="misc",
+            extra={"message": "Could not resolve the Gmail address for this "
+                              "account. Re-save the account or re-authenticate."},
         )
 
     # ASYNC-DB: gmail_watches upsert off the loop.
@@ -818,10 +1306,12 @@ async def admin_integrations_cache_flush(request: Request):
         # an admin flush doesn't stall every other in-flight request.
         deleted = await cache.aflush_all()
     except Exception as e:
+        #  tail — Redis flush failures may echo credential fragments
+        # from the driver's error path; scrub before URL-embedding.
         log.error("Classification cache flush failed", error=fmt_exc(e))
-        msg = str(e)[:120].replace(" ", "+")
+        msg = scrub_exc(e, purpose="form")[:120]
         return RedirectResponse(
-            f"/admin/integrations?flush_err={msg}",
+            f"/admin/integrations?{qs(flush_err=msg)}",
             status_code=303,
         )
 
@@ -897,10 +1387,11 @@ async def admin_integrations_counters_reset(request: Request):
         )
         deleted = sum(be.reset(ns) for ns in targets)
     except Exception as e:
+        #  tail — same class as :923 (URL-embedded flash message).
         log.error("Lifetime counter reset failed", error=fmt_exc(e))
-        msg = str(e)[:120].replace(" ", "+")
+        msg = scrub_exc(e, purpose="form")[:120]
         return RedirectResponse(
-            f"/admin/integrations?reset_err={msg}",
+            f"/admin/integrations?{qs(reset_err=msg)}",
             status_code=303,
         )
 
@@ -911,6 +1402,6 @@ async def admin_integrations_counters_reset(request: Request):
         keys_deleted=deleted,
     )
     return RedirectResponse(
-        f"/admin/integrations?reset_ok={namespace}",
+        f"/admin/integrations?{qs(reset_ok=namespace)}",
         status_code=303,
     )

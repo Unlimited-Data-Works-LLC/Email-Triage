@@ -310,7 +310,7 @@ def test_grouped_list_cheap_preview_pulls_lede_and_h1_h2():
     )
     row["body_html"] = (
         "<html><body><h1>OpenAI announces o5</h1>"
-        "<h2>Anthropic ships Sonnet 5</h2>"
+        "<h2>AI provider ships Sonnet 5</h2>"
         "<h2>Mistral raises 2B</h2>"
         "<p>filler...</p>"
         "<h2>SHOULD NOT APPEAR — fourth heading</h2></body></html>"
@@ -324,7 +324,7 @@ def test_grouped_list_cheap_preview_pulls_lede_and_h1_h2():
     assert "Top stories this week" in out
     # First three H1/H2 surface; fourth dropped.
     assert "OpenAI announces o5" in out
-    assert "Anthropic ships Sonnet 5" in out
+    assert "AI provider ships Sonnet 5" in out
     assert "Mistral raises 2B" in out
     assert "fourth heading" not in out
 

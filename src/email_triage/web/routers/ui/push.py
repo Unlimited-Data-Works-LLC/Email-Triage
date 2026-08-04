@@ -23,8 +23,13 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage.web.error_html import error_chip
+from email_triage.web._flash import scrub_exc  # N-179 R21_2 SSOT
+
+from email_triage._isotime import to_utc_iso
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
+from email_triage.web._audit import safe_audit_write
 from email_triage.web import settings_keys as _S
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
 from email_triage.web.auth import (
@@ -39,6 +44,7 @@ from email_triage.web.auth import (
 )
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import (
+    is_admin as _is_admin,  # N-222h R22 SSOT alias (local `is_admin` shadows callable)
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
@@ -55,25 +61,6 @@ _log = get_logger("web.ui.push")
 router = APIRouter()
 
 
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-
 from . import _shared
 # Snapshot every helper from _shared into this module's globals so
 # handler bare-name references resolve. globals().update is used
@@ -84,13 +71,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -106,7 +112,7 @@ async def gmail_api_watch_start(
     #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
     config = get_config(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     from email_triage.web.db import upsert_gmail_watch
 
@@ -116,7 +122,7 @@ async def gmail_api_watch_start(
         # the topic isn't configured, but a rapid double-click or stale
         # page can still hit this. Hide the admin path from non-admin
         # users -- they can't act on it and shouldn't be told it exists.
-        is_admin = user.get("role") == "admin"
+        is_admin = _is_admin(user)  # N-222h R22 (was: user.get("role") == "admin")
         if is_admin:
             msg = (
                 'Gmail push topic is not configured. Set it on '
@@ -133,6 +139,7 @@ async def gmail_api_watch_start(
     if not isinstance(provider, GmailApiProvider):
         return HTMLResponse("Not a Gmail-native account", status_code=400)
 
+    from email_triage.web.app import record_provider_outcome
     try:
         data = await provider.register_watch(topic)
     except GmailApiError as e:
@@ -140,23 +147,53 @@ async def gmail_api_watch_start(
             await provider.close()
         except Exception:
             pass
+        # #5 (census 2026-06-10) — a manual Start-Push that fails on a dead
+        # credential must route the outcome through the auth_stale funnel
+        # (SET iff the error is an auth-revoked signal; transient/API errors
+        # are needle-filtered out). Mirrors the continuous push/poll surfaces.
+        await db_call(record_provider_outcome, db, acct, e)
+        # Census run23 #1 — a failed manual Start-Push is exactly the
+        # /health signal the operator most wants visible. Route the
+        # gmail_watches.status lifecycle SSOT SET half alongside the
+        # auth_stale chip so any prior watch row flips 'active' →
+        # 'errored' immediately on failure (pre-fix it stayed 'active'
+        # until the next renewer sweep caught up).
+        try:
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=fmt_exc(e),
+            )
+        except Exception:
+            pass
         return HTMLResponse(
-            f'<small style="color:var(--pico-del-color);">Failed to register watch: {e}</small>'
+            error_chip(e, prefix='Failed to register watch: ')
         )
 
     try:
         await provider.close()
     except Exception:
         pass
+    # register_watch succeeded → the credential is alive → CLEAR any stale
+    # auth_stale chip immediately (don't wait a poll cycle). #5.
+    await db_call(record_provider_outcome, db, acct, None)
 
-    exp_ms = int(data.get("expiration", 0))
+    # /run18 : ``data`` is the Gmail register_watch API RESPONSE — a
+    # malformed ``expiration`` must not 500 (external-API robustness). Coerce via
+    # the _safe_int SSOT, not a bare int().
+    exp_ms = _shared._safe_int(data.get("expiration"), 0)
     if exp_ms:
-        exp_iso = datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc).isoformat()
+        exp_iso = to_utc_iso(datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc))
     else:
         from datetime import timedelta
-        exp_iso = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        exp_iso = to_utc_iso(datetime.now(timezone.utc) + timedelta(days=7))
 
-    email_address = (acct.get("config") or {}).get("account", "")
+    # census run17  — route through the account_email SSOT instead of the
+    # config["account"]-only open-code (the 2026-05-05 bug shape). This is a
+    # Gmail-API watch path, so account_email resolves to config["account"]
+    # here exactly as before — equivalent value, no bypass.
+    from email_triage.db.accounts import account_email
+    email_address = account_email(acct)
     if not email_address:
         return HTMLResponse(
             '<small style="color:var(--pico-del-color);">'
@@ -188,7 +225,7 @@ async def gmail_api_watch_stop(
     """Unregister the Gmail watch and drop the local row."""
     #  phase 2 — ``OwnedGmailApiAccount`` enforces auth + provider gate.
     user, acct, db, secrets = owned
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     from email_triage.web.db import delete_gmail_watch
 
@@ -253,17 +290,17 @@ async def office365_push_start(
         """/ — single best-effort o365_push_start audit row,
         off the event loop. Wrapped at each call site via db_call.
         """
-        try:
-            record_auth_event(
+        safe_audit_write(
+            lambda: record_auth_event(
                 db,
                 event_type="o365_push_start",
                 email=user.get("email", ""),
                 user_id=user.get("id"),
                 outcome=outcome,
                 detail=detail,
-            )
-        except Exception:
-            pass
+            ),
+            description=f"o365_push_start account_id={account_id} outcome={outcome}",
+        )
 
     if not webhook_url:
         await db_call(_audit_o365_start, "failure", "public_url_unset")
@@ -295,6 +332,7 @@ async def office365_push_start(
     if not isinstance(provider, Office365Provider):
         return HTMLResponse("Not an Office 365 account", status_code=400)
 
+    from email_triage.web.app import record_provider_outcome
     try:
         try:
             data = await provider.create_subscription(
@@ -313,6 +351,21 @@ async def office365_push_start(
             error=fmt_exc(e),
         )
         await db_call(_audit_o365_start, "failure", str(e)[:200])
+        # #5 — a manual O365 Start-Push failing on a dead credential routes
+        # through the auth_stale funnel (SET iff auth-revoked; create_failed
+        # from a transient Graph 5xx is needle-filtered out).
+        await db_call(record_provider_outcome, db, acct, e)
+        # Census run23 #1 — mirror the O365 subscription lifecycle SSOT
+        # SET half. Pre-fix a prior subscription row stayed 'active' on
+        # /health while the operator's manual restart was failing.
+        try:
+            from email_triage.web.db import record_o365_subscription_outcome
+            await db_call(
+                record_o365_subscription_outcome, db,
+                account_id=account_id, error_text=fmt_exc(e),
+            )
+        except Exception:
+            pass
         return RedirectResponse(
             f"/accounts/{account_id}/edit?tab=integrations"
             f"&o365_err=create_failed",
@@ -342,6 +395,8 @@ async def office365_push_start(
         _audit_o365_start("success", f"account_id={account_id}")
 
     await db_call(_o365_start_success_db_work)
+    # create_subscription succeeded → credential alive → CLEAR any stale chip. #5.
+    await db_call(record_provider_outcome, db, acct, None)
     _log.info(
         "Office 365 push started",
         actor=user.get("email"),
@@ -408,17 +463,17 @@ async def office365_push_stop(
     def _o365_stop_db_work() -> None:
         """/ — local-row delete + success audit in one hop."""
         delete_o365_subscription(db, account_id)
-        try:
-            record_auth_event(
+        safe_audit_write(
+            lambda: record_auth_event(
                 db,
                 event_type="o365_push_stop",
                 email=user.get("email", ""),
                 user_id=user.get("id"),
                 outcome="success",
                 detail=f"account_id={account_id}",
-            )
-        except Exception:
-            pass
+            ),
+            description=f"o365_push_stop account_id={account_id}",
+        )
 
     await db_call(_o365_stop_db_work)
     _log.info(
@@ -495,10 +550,15 @@ async def office365_probe(
             status_code=200,
         )
     except Exception as exc:
+        # N-179 R21_2 (2026-07-02): scrub exception via _flash SSOT before
+        # the helper renders it. `_render_o365_probe_chip_failure` HTML-
+        # escapes but doesn't PHI-scrub; scrub_exc adds the shape-strip
+        # layer (OAuth error_description / WWW-Authenticate can carry
+        # client_secret fragments — purpose='provider' returns generic).
         return HTMLResponse(
             _render_o365_probe_chip_failure(
                 f"Couldn't build the Microsoft Graph client: "
-                f"{fmt_exc(exc)}"
+                f"{scrub_exc(exc, purpose='provider')}"
             ),
             status_code=200,
         )
@@ -521,6 +581,7 @@ async def office365_probe(
             status_code=400,
         )
 
+    from email_triage.web.app import record_provider_outcome
     chip_html = ""
     chip_status = 200
     try:
@@ -556,6 +617,9 @@ async def office365_probe(
             msg, code=code, account_id=account_id,
         )
         chip_status = 200
+        # #5 — the probe IS an auth-liveness check; a Graph auth-error
+        # routes through the funnel (SET iff auth-revoked, needle-filtered).
+        await db_call(record_provider_outcome, db, acct, ge)
     except Exception as exc:
         # MSAL / RuntimeError out of acquire_token — this is where
         # AADSTS codes typically surface (msal embeds them in
@@ -565,6 +629,9 @@ async def office365_probe(
             msg, code=code, account_id=account_id,
         )
         chip_status = 200
+        # #5 — MSAL/token-acquire failure on the probe → funnel (SET iff
+        # auth-revoked; a transient acquire error is needle-filtered out).
+        await db_call(record_provider_outcome, db, acct, exc)
     else:
         # /me returns userPrincipalName + mail; either is fine for
         # the chip subtitle. Prefer mail (operator-readable address)
@@ -579,6 +646,8 @@ async def office365_probe(
                 or ""
             )
         chip_html = _render_o365_probe_chip_success(account_id, signed_in)
+        # /me succeeded → credential alive → CLEAR any stale auth_stale chip. #5.
+        await db_call(record_provider_outcome, db, acct, None)
         _log.info(
             "Office 365 probe succeeded",
             actor=user.get("email"),
@@ -594,7 +663,7 @@ async def office365_probe(
 
 #  retired the per-account /accounts/{id}/watches/{...} UI routes.
 # The match-and-fire watch editor now lives at /profile/watches with a
-# multi-account picker; the OpenClaw API (/api/openclaw/accounts/.../watches)
+# multi-account picker; the integration API (/api/v1/accounts/.../watches)
 # still owns the JSON CRUD surface for programmatic clients.
 #
 # Legacy bookmarks for /accounts/{id}/watches/new and
@@ -786,7 +855,7 @@ async def watch_set_hwm_current(
     #  phase 2 — OwnedAccount dep collapses preamble.
     user, acct, db, secrets = owned
     templates = get_templates(request)
-    from email_triage.web.db import set_setting
+    from email_triage.web.db import set_setting, make_hwm_value
 
     # Connect to each configured mailbox in turn, grab the latest UID,
     # and set it as the per-mailbox HWM. UIDs are per-mailbox so a
@@ -795,7 +864,7 @@ async def watch_set_hwm_current(
     from email_triage.web.app import get_watcher_manager
     from email_triage.web.db import _account_mailboxes
     mailboxes = _account_mailboxes((acct.get("config") or {}))
-    results: list[tuple[str, int]] = []
+    results: list[tuple[str, int, int | None]] = []
     failures: list[tuple[str, str]] = []
     for mb in mailboxes:
         try:
@@ -806,8 +875,23 @@ async def watch_set_hwm_current(
                 acct, secrets, mailbox_override=mb,
             )
             latest_uid = await provider.get_latest_uid()
+            # census  — capture UIDVALIDITY before closing so the stored
+            # HWM carries the epoch. Without it the UIDVALIDITY-change reset
+            # guard (_resolve_hwm_with_uidvalidity) can't fire and new mail
+            # is silently SKIPPED after a mailbox rebuild/index reset. Safe
+            # across providers (IMAP exposes it; Gmail/O365 don't → None),
+            # mirroring the hasattr+try pattern in app._resolve_hwm_with_uidvalidity.
+            uidvalidity: int | None = None
+            if hasattr(provider, "get_uidvalidity"):
+                try:
+                    uidvalidity = await provider.get_uidvalidity()
+                except Exception as _uv_e:
+                    _log.warning(
+                        "Could not read UIDVALIDITY for HWM snapshot",
+                        account_id=account_id, mailbox=mb, error=fmt_exc(_uv_e),
+                    )
             await provider.close()
-            results.append((mb, int(latest_uid)))
+            results.append((mb, int(latest_uid), uidvalidity))
         except Exception as e:
             failures.append((mb, fmt_exc(e)))
 
@@ -825,29 +909,26 @@ async def watch_set_hwm_current(
         })
 
     def _watch_set_hwm_current_snapshot(
-        db, account_id: int, results: list[tuple[str, int]],
+        db, account_id: int, results: list[tuple[str, int, int | None]],
     ) -> tuple[int, dict]:
         """ phase 2 — bundle every settings write + the hwm-context
-        re-read into one threadpool hop."""
-        from datetime import datetime, timezone as _tz
+        re-read into one threadpool hop. Every persisted HWM value is built
+        by ``make_hwm_value`` (census /N-50) so the ``uidvalidity`` epoch
+        the reset guard needs can't be omitted."""
         set_count = 0
-        for mb, latest_uid in results:
+        for mb, latest_uid, uidvalidity in results:
             if latest_uid > 0:
-                set_setting(db, _S.watch_hwm_mailbox(account_id, mb), {
-                    "uid": latest_uid,
-                    "updated_at": datetime.now(_tz.utc).isoformat(),
-                })
+                set_setting(db, _S.watch_hwm_mailbox(account_id, mb),
+                            make_hwm_value(latest_uid, uidvalidity))
                 set_count += 1
         if results:
-            primary_uid = next(
-                (uid for mb, uid in results if mb == "INBOX"),
-                results[0][1],
+            primary_uid, primary_uidvalidity = next(
+                ((uid, uv) for mb, uid, uv in results if mb == "INBOX"),
+                (results[0][1], results[0][2]),
             )
             if primary_uid > 0:
-                set_setting(db, _S.watch_hwm(account_id), {
-                    "uid": primary_uid,
-                    "updated_at": datetime.now(_tz.utc).isoformat(),
-                })
+                set_setting(db, _S.watch_hwm(account_id),
+                            make_hwm_value(primary_uid, primary_uidvalidity))
         return set_count, _get_hwm_context(db, account_id)
 
     set_count, hwm_ctx = await db_call(

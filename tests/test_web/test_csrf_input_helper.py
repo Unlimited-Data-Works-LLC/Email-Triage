@@ -79,10 +79,8 @@ def test_every_post_form_template_carries_csrf_token_field():
       * literal `name="csrf_token"` hidden input (a few templates
         had this pre-helper and don't need a refactor)
     """
-    template_root = (
-        Path(__file__).resolve().parents[2]
-        / "src" / "email_triage" / "web" / "templates"
-    )
+    from _pin_harness import TEMPLATES_ROOT, iter_template_files
+    template_root = TEMPLATES_ROOT
     assert template_root.is_dir(), template_root
 
     # Forms whose action lives on a CSRF-exempt path prefix never
@@ -99,7 +97,7 @@ def test_every_post_form_template_carries_csrf_token_field():
     )
 
     missing: list[str] = []
-    for tpl in template_root.rglob("*.html"):
+    for tpl in iter_template_files():
         if tpl.name in EXEMPT_FILENAMES:
             continue
         text = tpl.read_text(encoding="utf-8")

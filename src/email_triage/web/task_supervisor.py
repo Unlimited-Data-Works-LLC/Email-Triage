@@ -43,7 +43,8 @@ from typing import Any, Awaitable, Callable
 from email_triage.triage_logging import new_request_context
 
 
-_log = logging.getLogger("email_triage.web.task_supervisor")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.task_supervisor")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +277,15 @@ class TaskState:
             "name": self.name,
             "status": self.status,
             "crashes": self.crashes,
+            # N-339 R31 (2026-07-04): ``last_crash_ts`` +
+            # ``last_crash_error_type`` are HISTORIC DIAGNOSTIC fields —
+            # never cleared on recovery per :meth:`_record_recovery`'s
+            # documented rationale + the ``test_crash_triggers_respawn_
+            # with_backoff`` contract. A consumer reading these fields
+            # in isolation would see stale-looking values on a running
+            # task; the authoritative "healthy now" signal is
+            # ``status``. Downstream `/health` consumers MUST gate any
+            # "task X failing" surface on ``status`` first.
             "last_crash_ts": self.last_crash_ts,
             "last_crash_error_type": self.last_crash_error_type,
             "last_request_id": self.last_request_id,
@@ -283,6 +293,59 @@ class TaskState:
             "backoff_secs": self.backoff_secs,
             "quarantined_reason": self.quarantined_reason,
         }
+
+
+# ---------------------------------------------------------------------------
+# Module-level backoff-math SSOT
+# ---------------------------------------------------------------------------
+
+
+def next_backoff_delay(current: float, *, factor: float = 2.0,
+                       max_delay: float = 300.0,
+                       min_step: float = 1.0) -> float:
+    """N-228 R22: capped exponential-backoff step SSOT.
+
+    Given the CURRENT delay, return the NEXT delay:
+    ``min(max(current, min_step) * factor, max_delay)``. Used by
+    long-lived retry loops that don't route through
+    :class:`TaskSupervisor` (CLI push watcher, IMAP idle re-connect) —
+    those loops previously in-lined the same
+    `min(backoff * 2, max_backoff)` shape, so a factor change or a
+    jitter addition drifted in exactly one loop. Route every backoff
+    step through this SSOT.
+
+    :class:`TaskSupervisor._compute_backoff` is a DIFFERENT signature
+    (crash-count-driven, not step-driven); the two coexist by intent
+    per PD#1 (one SSOT per concern-shape).
+
+    **N-308 R30 (tranche  batch B DA fix-forward on N-228)**: DA
+    panel flagged two live defects on the raw
+    ``min(current * factor, max_delay)`` shape:
+
+    1. ``current == 0`` (or any value below ``min_step``) → next delay
+       stays 0/tiny forever → hot spin loop (thundering herd on any
+       shared provider outage). Fix: ``min_step`` floor + a
+       ``max(current, min_step)`` clamp so the geometric progression
+       always starts above zero even if a caller re-uses a stale-zero
+       ``current``.
+    2. ``factor <= 1.0`` → no geometric growth → same hot-spin failure
+       mode. Fix: ``ValueError`` on ``factor <= 1.0`` and on
+       ``max_delay <= 0`` (fail-CLOSED at the caller boundary — a
+       nonsense config should not silently degrade the retry loop).
+
+    Callers pass a positive ``current`` (the previous tick's delay) or
+    ``0`` to start; the ``min_step`` clamp makes both safe.
+    """
+    if factor <= 1.0:
+        raise ValueError(
+            f"next_backoff_delay: factor={factor!r} must be > 1.0 for "
+            "geometric growth (factor <= 1 → no backoff, hot-spin)."
+        )
+    if max_delay <= 0:
+        raise ValueError(
+            f"next_backoff_delay: max_delay={max_delay!r} must be > 0."
+        )
+    return min(max(current, min_step) * factor, max_delay)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +422,16 @@ class TaskSupervisor:
             factory = self._factories[name]
             with new_request_context(f"task.{name}") as rid:
                 state.last_request_id = rid
+                # N-270 R28: if we're restarting FROM the crashed
+                # state (i.e. a prior tick recorded a crash + the
+                # supervisor decided to retry), route the recovery
+                # clear through the SSOT. Both edges (SET via
+                # `_record_crash`, CLEAR via `_record_recovery`) go
+                # through their own funnels — same PD#18 pattern as
+                # the sibling `_mark_failing`/`_mark_recovered` in
+                # watcher.py (N-49/N-246).
+                if state.status == "crashed":
+                    self._record_recovery(state)
                 state.status = "running"
                 try:
                     await factory()
@@ -428,6 +501,64 @@ class TaskSupervisor:
         state.crash_history = [t for t in state.crash_history if t >= cutoff]
         state.crash_history.append(now)
         state.status = "crashed"
+
+    def _record_recovery(self, state: TaskState) -> None:
+        """N-270 R28 — PD#18 lifecycle-flag SSOT for the CLEAR edge on
+        a recovering task. Sibling to :func:`_record_crash`. Called
+        when a task that was previously ``"crashed"`` transitions back
+        to ``"running"`` (the restart-after-crash path in
+        :func:`_run_supervised`).
+
+        Same lifecycle-tally-decay class as ``_mark_recovered`` in
+        ``watcher.py`` (N-49/N-246) and ``record_message_result``
+        success branch (N-257). Both edges (SET on crash, CLEAR on
+        recovery) now flow through the same funnel — /health no
+        longer advertises stale error kind + non-zero backoff on
+        tasks that have been ``"running"`` for hours.
+
+        Preserves ``crashes`` (lifetime counter) + ``crash_history``
+        (rolling-window count) — those are load-bearing on the
+        quarantine decision.
+
+        N-303 R30 (CI-red fix-forward on N-270): keep
+        ``last_crash_ts`` + ``last_crash_error_type`` HISTORIC (never
+        cleared) so a recovering task can still be inspected for
+        "what crashed last time" (the original test contract at
+        `test_task_supervisor.py::test_crash_triggers_respawn_with_
+        backoff`). `/health` should derive "healthy now" from
+        ``status`` — the historic fields are for diagnostics.
+
+        Clears only the CURRENT-FAILURE-STATE fields (``backoff_secs``,
+        ``quarantined_reason``) which advertise stale severity if left
+        set.
+
+        N-339 R31 (2026-07-04 verify-don't-accept refuted-claim close):
+        the 2026-07-03 trust-audit damage-report DA agent flagged this
+        as a "set-broad/clear-narrow PD  lie" recommending
+        expansion to a "4-field clear". Verification against HEAD
+        REFUTES that recommendation:
+
+        - The test contract at :func:`test_crash_triggers_respawn_with_backoff`
+          (line 69) explicitly asserts ``last_crash_error_type ==
+          "RuntimeError"`` AFTER two crashes + one clean recovery to
+          ``status="stopped"``. A 4-field clear would break the
+          documented contract.
+        - The `/health` derived flags (``any_crashed_recently``,
+          ``any_quarantined``) filter on ``status``, not on the
+          historic diagnostic fields. There is no "STATUS FLAG" lie
+          in the `/health` snapshot itself; the historic fields are
+          exposed as diagnostics via ``to_dict()`` (see the
+          "authoritative flag is ``status``" note in
+          :meth:`TaskState.to_dict`).
+
+        Anti-clear structural pin at
+        ``tests/test_n339_task_supervisor_historic_fields_pin.py``
+        enforces the docstring rationale: any future ``_record_recovery``
+        that touches ``last_crash_ts``, ``last_crash_error_type``,
+        ``crashes``, or ``crash_history`` fails the pin loudly + must
+        route through a rename + a `/health` contract update."""
+        state.backoff_secs = 0.0
+        state.quarantined_reason = None
 
     def _should_quarantine(self, state: TaskState) -> bool:
         return len(state.crash_history) >= self._quarantine_after_crashes
@@ -689,47 +820,66 @@ async def supervised_interval_loop(
         # the staleness budget on every tick-result record (a callable
         # interval changes cycle-to-cycle).
         delay = interval_secs() if callable(interval_secs) else interval_secs
-        try:
-            if lease_name is not None:
-                await _run_leased_tick(
-                    name, lease_name, lease_conn, ttl, tick,
+        #  — rotate request_id PER TICK inside the supervised
+        # interval loop. Pre-fix, ``_run_supervised`` bound
+        # ``new_request_context`` ONCE per outer factory-restart
+        # iteration (task_supervisor.py:423); an interval-loop
+        # factory's inner ``while True: await sleep(interval)`` shared
+        # that rid across every tick, so log lines from different
+        # sweeps of ``sent-mail-capture-loop`` (and every other
+        # long-running interval factory) collapsed under one
+        # ``request_id`` and prod log-correlation broke across ticks.
+        # A nested ``new_request_context`` here creates a stack
+        # (contextvar-based), so the outer rid is preserved for the
+        # crash-recovery path in ``_run_supervised`` while each tick
+        # gets a fresh ``tick.<name>`` rid; the outer rid re-establishes
+        # on ``__exit__``. the deploy host prod evidence 2026-07-10:
+        # ``request_id=30a7d3ecac4c`` seen at 00:56, 02:01, 08:05,
+        # 14:03 EDT across four separate ``sent-mail-capture-loop``
+        # ticks. Bonus finding from the +#92 batched SME panel
+        # (verdict 3a64dc7ce31befe1); the backlog .
+        with new_request_context(f"tick.{name}"):
+            try:
+                if lease_name is not None:
+                    await _run_leased_tick(
+                        name, lease_name, lease_conn, ttl, tick,
+                    )
+                else:
+                    await tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A per-tick failure must not kill the loop — log and carry
+                # on to the next interval. (The supervisor's crash handling
+                # is the safety net for a failure of the loop scaffolding,
+                # which this except deliberately does not let through.)
+                #
+                #  — but a swallowed tick failure was previously
+                # *invisible*: a loop whose every tick fails stays
+                # ``status="running"`` and /health can't tell. Record the
+                # outcome in the tick-health registry so a sustained
+                # failure run surfaces (``any_loop_tick_failing`` →
+                # /health ``degraded``). A single transient failure is
+                # cleared by the next good tick before it crosses the
+                # threshold, so the signal does not flap.
+                th = record_tick_result(
+                    name, ok=False, error_type=type(exc).__name__,
+                    interval_secs=delay,
+                )
+                log_fn = _log.error if th.failing else _log.warning
+                log_fn(
+                    "interval loop tick failed",
+                    extra={"_extra": {
+                        "loop": name,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:300],
+                        "consecutive_failures": th.consecutive_failures,
+                        "tick_failing": th.failing,
+                    }},
                 )
             else:
-                await tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # A per-tick failure must not kill the loop — log and carry
-            # on to the next interval. (The supervisor's crash handling
-            # is the safety net for a failure of the loop scaffolding,
-            # which this except deliberately does not let through.)
-            #
-            #  — but a swallowed tick failure was previously
-            # *invisible*: a loop whose every tick fails stays
-            # ``status="running"`` and /health can't tell. Record the
-            # outcome in the tick-health registry so a sustained
-            # failure run surfaces (``any_loop_tick_failing`` →
-            # /health ``degraded``). A single transient failure is
-            # cleared by the next good tick before it crosses the
-            # threshold, so the signal does not flap.
-            th = record_tick_result(
-                name, ok=False, error_type=type(exc).__name__,
-                interval_secs=delay,
-            )
-            log_fn = _log.error if th.failing else _log.warning
-            log_fn(
-                "interval loop tick failed",
-                extra={"_extra": {
-                    "loop": name,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:300],
-                    "consecutive_failures": th.consecutive_failures,
-                    "tick_failing": th.failing,
-                }},
-            )
-        else:
-            # Clean tick — clear any prior consecutive-failure streak.
-            record_tick_result(name, ok=True, interval_secs=delay)
+                # Clean tick — clear any prior consecutive-failure streak.
+                record_tick_result(name, ok=True, interval_secs=delay)
 
         try:
             await asyncio.sleep(delay)

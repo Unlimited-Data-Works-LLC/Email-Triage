@@ -29,6 +29,8 @@ callers on the legacy path — pass in a connection from
 
 from __future__ import annotations
 
+from email_triage.db._helpers import dump_json_col, load_json_col
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -283,8 +285,10 @@ class DuplicateFlow(Exception):
 # Periodic-review cadence: per `internal documentation`
 # §6.1 (release-aligned + quarterly-minimum), this EM's continued
 # adequacy is re-verified at every release-cut. As a durable
-# Addressable EM (no sunset milestone — unlike EQM-05's v0.2.0/v0.3.0
-# legacy-SHA-256 sunset), the periodic-review cadence IS the
+# Addressable EM (no sunset milestone — unlike EQM-05's legacy-SHA-256
+# sunset, whose removal timeline is pending explicit operator directive
+# per the 2026-07-06 correction; see `db/audit.py`), the periodic-review
+# cadence IS the
 # §164.316(b)(2)(iii) "review documentation periodically" surface for
 # EQM-04. Triggers for re-verification:
 #   - Any change to controls 1-3 or the WAL supporting control.
@@ -360,32 +364,70 @@ CREATE INDEX IF NOT EXISTS idx_flows_provider_message ON flows(provider, message
 # ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    from email_triage._isotime import now_utc_iso
+    return now_utc_iso()
 
 
 def _parse_dt(s: str) -> datetime:
-    return datetime.fromisoformat(s)
+    # N-263b R31 fromisoformat sweep — route through `_isotime.parse_iso`
+    # SSOT while preserving the raise-on-unparseable contract callers
+    # depend on (all five callers pass stored-column-values or
+    # freshly-emitted `now`, so the raise-arm is a defensive fallback,
+    # not a normal path).
+    from email_triage._isotime import parse_iso
+    dt = parse_iso(s)
+    if dt is None:
+        raise ValueError(f"Unparseable datetime: {s!r}")
+    return dt
 
 
-def _cls_to_json(cls: Classification | None) -> str | None:
+def redact_reason(reason: str, *, account_hipaa: bool) -> str:
+    """SSOT for Classification.reason redaction at write time.
+
+    N-74 / §164.312(a)(2)(iv) — redact when EITHER the install-wide HIPAA
+    mode OR the per-account HIPAA flag is set (fail-closed: either condition
+    alone is sufficient; combining never loosens — PD#8 /
+    feedback_most_restrictive_wins). Previously the store layer gated only
+    on ``is_hipaa_mode()`` (install-wide), so a per-account-HIPAA mailbox
+    on a non-HIPAA install wrote cleartext PHI to flows.classification_json.
+
+    The cache layer (cache/classification.py) and web layer (triage_one.py)
+    already gate on per-account hipaa; this SSOT aligns the store layer.
+
+    Callers: ``_cls_to_json`` (the only site that writes classification_json
+    to the DB) — all other reason-serialization goes through here.
+    """
+    from email_triage.triage_logging import is_hipaa_mode
+    if account_hipaa or is_hipaa_mode():
+        return ""
+    return reason
+
+
+def _cls_to_json(cls: Classification | None, *, account_hipaa: bool = False) -> str | None:
     """Serialise ``Classification`` for the ``flows.classification_json``
     column.
 
     HIPAA redaction
-    ────────────────────────────
+    ────────────────────────────────────
     ``Classification.reason`` is the LLM's free-text justification for
     the assigned category and typically cites email content (sender,
     subject snippets, body excerpts). In HIPAA mode that text is PHI.
-    When ``is_hipaa_mode()`` is True we persist an empty ``reason`` so
-    no PHI lands at rest in this column.
+    When ``is_hipaa_mode()`` OR ``account_hipaa`` is True we persist an
+    empty ``reason`` so no PHI lands at rest in this column.
 
-    This mirrors the existing redaction precedent at two other layers
-    that recognise the same PHI vector:
+    N-74 fix: the previous gate checked only ``is_hipaa_mode()`` (the
+    install-wide flag). A per-account-HIPAA mailbox on a non-HIPAA
+    install therefore wrote cleartext PHI here. The new gate delegates
+    to ``redact_reason`` (the SSOT) which checks EITHER condition —
+    fail-closed. The ``account_hipaa`` value flows from
+    ``_capture_baseline`` via ``flow.state_bag["account_hipaa"]`` (set
+    by the triage runner / caller that has account context).
+
+    This mirrors the existing redaction precedent at two other layers:
       * ``engine/models.py`` ``Classification.log_repr(hipaa=True)``
         omits ``reason`` from log lines.
       * ``cache/classification.py`` ``cache_store_for_message`` omits
-        ``reason`` from cache values when ``is_hipaa=True`` (line ~1195
-        comment: "PHI-shape free-text leak surface").
+        ``reason`` from cache values when ``is_hipaa=True``.
 
     Regulatory framing — 45 CFR §164.306(d)(3)(ii)(B)
     ──────────────────────────────────────────────────
@@ -396,24 +438,15 @@ def _cls_to_json(cls: Classification | None) -> str | None:
       (a) ``Classification.reason`` is the only PHI-vector field in
           this column; stripping it at write leaves only category +
           confidence + source — non-PHI install-metadata.
-      (b) The same redaction pattern is already applied at the log and
-          cache layers (see above); redact-at-write is the pattern-
-          consistent fix and avoids introducing a new credential-
-          management surface for an at-rest encryption key.
-      (c) Stripped PHI cannot be recovered by master-key compromise,
+      (b) Stripped PHI cannot be recovered by master-key compromise,
           key-management error, or backup leak.
     Documented per §164.306(d)(3)(ii)(B). Source: 45 CFR §164.312 via
     Cornell LII, fetched 2026-05-23.
     """
     if cls is None:
         return None
-    # is_hipaa_mode() is imported at call time, not module-load — keeps
-    # the engine layer free of a hard dep on triage_logging's module-
-    # level state during import-graph traversal (matches the late-import
-    # pattern used elsewhere in this module for runtime predicates).
-    from email_triage.triage_logging import is_hipaa_mode
-    reason = "" if is_hipaa_mode() else cls.reason
-    return json.dumps({
+    reason = redact_reason(cls.reason, account_hipaa=account_hipaa)
+    return dump_json_col({
         "category": cls.category,
         "confidence": cls.confidence,
         "reason": reason,
@@ -424,8 +457,12 @@ def _cls_to_json(cls: Classification | None) -> str | None:
 def _cls_from_json(s: str | None) -> Classification | None:
     if s is None:
         return None
-    d = json.loads(s)
-    return Classification(**d)
+    # census  SSOT — a corrupt/wrong-shape classification_json degrades
+    # to None (flow loads, classification absent) instead of raising out of
+    # _row_to_flow and crashing the engine load — the same corruption
+    # survival _safe_json_load_dict (C4) gives the sibling state_bag_json.
+    d = load_json_col(s, default=None)
+    return Classification(**d) if isinstance(d, dict) else None
 
 
 #  — list of the 4 JSON-serialized FlowState columns the baseline-
@@ -451,12 +488,34 @@ def _capture_baseline(flow: "FlowState") -> dict[str, str | None]:
     Called by ``_row_to_flow`` to stamp ``flow._baseline`` post-load,
     and by ``update_flow`` to compute the post-write current form for
     the dirty-column comparison.
+
+    N-74 — ``account_hipaa`` is read from ``flow.state_bag`` so the
+    per-account HIPAA flag reaches ``_cls_to_json`` without threading
+    through every caller's signature. The WRITER of this key is
+    ``FlowEngine.classify`` (engine/flow.py), which stamps
+    ``flow.state_bag["account_hipaa"] = bool(message.hipaa)`` from the
+    provider-resolved per-account flag (engine/models.py
+    ``EmailMessage.hipaa`` = system_hipaa OR account.hipaa) BEFORE the
+    first ``update_flow`` of the classification — so the value is present
+    on every code path that persists ``classification_json``. (The
+    original L8-4 fix wired only the READ here and relied on a setter that
+    never ran on the FlowEngine DB-write path; the stamp in ``classify``
+    closes that vacuum — proven by
+    tests/test_n74_flowengine_per_account_redaction_integration.py.)
+    Flows whose classification is written without ever entering
+    ``classify`` (none exist today — ``classify`` is the sole
+    classification writer) would default to ``False``, which is still
+    safe: global ``is_hipaa_mode()`` independently fires the redaction
+    on a HIPAA install — the per-account gate is additive, not the only
+    gate.
     """
+    # N-74: extract per-account hipaa flag from state_bag (safe default False).
+    account_hipaa = bool(flow.state_bag.get("account_hipaa", False))
     return {
-        "classification_json": _cls_to_json(flow.classification),
-        "actions_completed_json": json.dumps(flow.actions_completed),
-        "actions_pending_json": json.dumps(flow.actions_pending),
-        "state_bag_json": json.dumps(flow.state_bag),
+        "classification_json": _cls_to_json(flow.classification, account_hipaa=account_hipaa),
+        "actions_completed_json": dump_json_col(flow.actions_completed),
+        "actions_pending_json": dump_json_col(flow.actions_pending),
+        "state_bag_json": dump_json_col(flow.state_bag),
     }
 
 
@@ -490,9 +549,11 @@ def _safe_json_load_dict(
             )
         return out, None
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        from email_triage._errfmt import scrub_class_error_for_persist
         snippet = (raw[:256] if isinstance(raw, str) else str(raw)[:256])
         return {}, (
-            f"{label}_corrupt: {type(exc).__name__}: {exc}; "
+            f"{label}_corrupt: "
+            f"{scrub_class_error_for_persist(exc)}; "
             f"raw_snippet={snippet!r}"
         )
 
@@ -509,8 +570,8 @@ def _row_to_flow(row: sqlite3.Row) -> FlowState:
         status=FlowStatus(row["status"]),
         revision=row["revision"],
         classification=_cls_from_json(row["classification_json"]),
-        actions_completed=json.loads(row["actions_completed_json"]),
-        actions_pending=json.loads(row["actions_pending_json"]),
+        actions_completed=load_json_col(row["actions_completed_json"], default=[]),
+        actions_pending=load_json_col(row["actions_pending_json"], default=[]),
         state_bag=state_bag,
         error=row["error"],
         created_at=_parse_dt(row["created_at"]),

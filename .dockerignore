@@ -29,5 +29,5 @@ dist
 build
 
 # Plans and CI
-.claude
+.internal-config
 .github

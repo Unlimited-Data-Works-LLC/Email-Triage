@@ -4,7 +4,7 @@ fallback that bypasses aioimaplib's broken parser.
 These tests stub out ``imaplib.IMAP4_SSL`` / ``imaplib.IMAP4`` so we
 exercise the code paths without a live IMAP server. End-to-end
 verification against a real server is done via the post-deploy
-reproduce against ``/api/openclaw/accounts/{id}/bulk/mail``.
+reproduce against ``/api/v1/accounts/{id}/bulk/mail``.
 """
 
 from __future__ import annotations

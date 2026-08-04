@@ -23,13 +23,19 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage._envbool import parse_bool
+from email_triage.engine.models import WEB_ALLOWED_RULE_TYPES
+from email_triage.web._flash import scrub_exc  # N-179 R21_2 sub-3 SSOT
+from email_triage.web.error_html import error_chip
+
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.providers.provider_labels import (
     list_provider_labels_for_account,
 )
-from email_triage.triage_logging import is_account_hipaa
-from email_triage.web.db import can_manage_account
+from email_triage.web.db import can_manage_account, get_email_account
 from email_triage.web import settings_keys as _S
+from email_triage.web._list_authz import may_manage_global_lists
+from email_triage.web._audit import safe_audit_write
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
 from email_triage.web.auth import (
     SESSION_COOKIE_NAME,
@@ -42,42 +48,27 @@ from email_triage.web.auth import (
     verify_otp,
 )
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import (
+from email_triage.web.dependencies import (  # N-337: audit-XFF SSOT
+    audit_forwarded_for,
+    request_meta,
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
     RequireUser,
     RequireUserFragment,
+    admin_gate_response,
     get_session_secret,
     require_auth,
     require_role,
 )
 from email_triage.triage_logging import get_logger
-from email_triage._errfmt import fmt_exc
+from email_triage._errfmt import fmt_exc, scrub_error_for_persist
+from email_triage._int_utils import parse_int_or_none  # N-219c/8 R23
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.categories")
 
 router = APIRouter()
-
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 
 from . import _shared
@@ -90,13 +81,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -125,12 +135,45 @@ def _parse_provider_labels_form(raw_values: list[str]) -> list[dict]:
         slug = slug.strip()
         if not slug:
             continue
-        try:
-            aid = int(aid_str)
-        except (TypeError, ValueError):
+        aid = parse_int_or_none(aid_str)  # N-219c/8 R23: SSOT
+        if aid is None:
             continue
         out.append({"account_id": aid, "label_slug": slug})
     return out
+
+
+def _gate_provider_labels(conn, user: dict, parsed: list[dict]) -> list[dict]:
+    """A1 (2026-06-09 divergence census, CRITICAL) — fail-closed account-scope
+    gate for client-supplied provider-label targets.
+
+    The ``provider_labels`` form value is ``<account_id>:<label_slug>`` — the
+    ``account_id`` prefix is fully attacker-controllable (a tampered DOM value
+    or a hand-crafted POST). Without this gate, a user could submit ANOTHER
+    user's ``account_id`` and have the saved rule write a provider-label-apply
+    into a mailbox they do not manage; the background rule-runner later applies
+    it with no actor gate — a cross-account §164.312(a)(1) WRITE.
+
+    Drops every entry whose account the actor cannot manage (owner / delegate /
+    admin, via :func:`can_manage_account`), fail-closed, logging the drop count
+    (PHI-free). Mirrors the N-28 read-side gate on the search-details path; this
+    is the write-side sibling.
+    """
+    if not parsed:
+        return parsed
+    gated: list[dict] = []
+    dropped = 0
+    for pl in parsed:
+        acct = get_email_account(conn, pl["account_id"])
+        if acct is not None and can_manage_account(conn, user, acct):
+            gated.append(pl)
+        else:
+            dropped += 1
+    if dropped:
+        _log.warning(
+            "provider_label account-scope: dropped unmanageable target(s)",
+            extra={"_extra": {"user_id": user.get("id"), "dropped": dropped}},
+        )
+    return gated
 
 
 @router.get("/rules", response_class=HTMLResponse)
@@ -145,13 +188,13 @@ async def rules_page(request: Request, user: RequireUser):
         "global_lists": snap["global_lists"],
         "categories": snap["categories"],
         "all_labels": snap.get("all_labels", []),
-        "rule_types": ["sender", "sender_domain", "subject"],
+        "rule_types": list(WEB_ALLOWED_RULE_TYPES),
     })
 
 
 @router.get("/rules/global", response_class=HTMLResponse)
 async def global_rules_page(request: Request, user: RequireUser):
-    if user["role"] not in ("admin", "power_user"):
+    if not may_manage_global_lists(user["role"]):
         return HTMLResponse("Forbidden", status_code=403)
 
     db = get_db(request)
@@ -163,7 +206,7 @@ async def global_rules_page(request: Request, user: RequireUser):
         "global_lists": snap["global_lists"],
         "categories": snap["categories"],
         "all_labels": snap.get("all_labels", []),
-        "rule_types": ["sender", "sender_domain", "subject"],
+        "rule_types": list(WEB_ALLOWED_RULE_TYPES),
     })
 
 
@@ -178,8 +221,8 @@ async def create_list(
     pattern: str = Form(""),
     skip_ai: str = Form("0"),
 ):
-    global_flag = is_global == "1"
-    if global_flag and user["role"] not in ("admin", "power_user"):
+    global_flag = parse_bool(is_global)
+    if global_flag and not may_manage_global_lists(user["role"]):
         return HTMLResponse("Forbidden", status_code=403)
 
     db = get_db(request)
@@ -197,6 +240,11 @@ async def create_list(
     # ``<account_id>:<label_slug>``; parse + drop malformed entries.
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
+    )
+    # A1 (census 2026-06-09) — fail-closed account-scope gate: drop any
+    # client-supplied provider-label target the actor can't manage.
+    provider_labels = await db_call(
+        _gate_provider_labels, db, user, provider_labels,
     )
 
     await db_call(
@@ -249,6 +297,11 @@ async def add_rule(
     #  — "Also apply provider labels" multi-select.
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
+    )
+    # A1 (census 2026-06-09) — fail-closed account-scope gate: drop any
+    # client-supplied provider-label target the actor can't manage.
+    provider_labels = await db_call(
+        _gate_provider_labels, db, user, provider_labels,
     )
 
     status, is_global = await db_call(
@@ -315,7 +368,11 @@ async def edit_rule_form(
     update-paths' role gate).
 
      — also builds ``provider_label_groups``: one entry per
-    non-HIPAA managed account, each carrying the labels / folders /
+    managed account (the account list is requester-scoped to the
+    accounts this user owns/manages — that access boundary, NOT the
+    HIPAA flag, is the control; the is_account_hipaa pre-filter was
+    removed 2026-06-06 per the §160.103 use-vs-disclosure SME ruling),
+    each carrying the labels / folders /
     categories that already exist on the provider. The template
     renders the picker so the operator can pick from labels they
     ALREADY HAVE rather than re-defining everything in the install-
@@ -335,27 +392,34 @@ async def edit_rule_form(
         return HTMLResponse("Forbidden", status_code=403)
     all_labels = await db_call(list_labels, db)
 
-    #  — provider-native labels per account. HIPAA accounts
-    # NEVER expose the picker (per actor != owner gate); skip them
-    # both at the picker route AND inside the helper as defense-in-
-    # depth.
+    #  — provider-native labels per account. The account list is
+    # already requester-scoped: list_email_accounts(user_id=requester)
+    # returns ONLY accounts this user owns or is a delegate of, so every
+    # account here is one the requester is authorized to MANAGE. That
+    # access boundary IS the control — surfacing an account's own labels
+    # to its authorized manager is an intra-entity §160.103 "use" (the
+    # strings never leave the install), NOT a third-party disclosure, so
+    # the HIPAA flag is the wrong axis to gate on (SME ruling 2026-06-06:
+    # owner self-access is §164.502(b)(2)-exempt + §164.524-favored;
+    # delegate/admin access is §164.514(d) role-based use). The prior
+    # is_account_hipaa pre-filter was removed as over-reach.
+    # N-109: this feeds the provider-label picker (a human picks from labels
+    # that exist on their managed accounts). A deactivated (creds-purged)
+    # account's provider label fetch would fail, so active_only hides it.
     accounts = await db_call(
-        list_email_accounts, db, user_id=user.get("id"),
+        list_email_accounts, db, user_id=user.get("id"), active_only=True,
     )
     secrets = request.app.state.secrets
     #  — the per-account provider-label lookups are independent
-    # provider round-trips (Gmail/O365 list_labels, IMAP
-    # list_folders); run them concurrently rather than awaiting each
-    # in turn. HIPAA accounts are excluded (the helper also returns
-    # [] for them as a second layer). list_provider_labels_for_account
-    # is fail-soft — returns [] and never raises — so a plain gather
-    # can't be tripped by one bad provider.
-    _visible = [a for a in accounts if not is_account_hipaa(a)]
+    # provider round-trips (Gmail/O365 list_labels, IMAP list_folders);
+    # run them concurrently. list_provider_labels_for_account is
+    # fail-soft — returns [] and never raises — so a plain gather can't
+    # be tripped by one bad provider.
     _label_lists = await asyncio.gather(*(
         list_provider_labels_for_account(
             db=db, secrets=secrets, account_id=int(a["id"]),
         )
-        for a in _visible
+        for a in accounts
     ))
     provider_label_groups = [
         {
@@ -364,13 +428,13 @@ async def edit_rule_form(
             "provider_type": a.get("provider_type", "") or "",
             "labels": labels,
         }
-        for a, labels in zip(_visible, _label_lists)
+        for a, labels in zip(accounts, _label_lists)
     ]
     return await _render(templates, request, "rules/_rule_edit.html", {
         "user": user,
         "lst": lst,
         "rule": rule,
-        "rule_types": ["sender", "sender_domain", "subject"],
+        "rule_types": list(WEB_ALLOWED_RULE_TYPES),
         "all_labels": all_labels,
         "provider_label_groups": provider_label_groups,
     })
@@ -433,6 +497,11 @@ async def save_rule(
     provider_labels = _parse_provider_labels_form(
         form.getlist("provider_labels"),
     )
+    # A1 (census 2026-06-09) — fail-closed account-scope gate: drop any
+    # client-supplied provider-label target the actor can't manage.
+    provider_labels = await db_call(
+        _gate_provider_labels, db, user, provider_labels,
+    )
 
     status, rule, lst = await db_call(
         _save_rule_snapshot, db, list_id, rule_id, rule_type, pattern,
@@ -451,7 +520,7 @@ async def save_rule(
 
     # HTMX request → return the row partial. Plain form POST →
     # 303 back to the page (let the browser refresh).
-    if request.headers.get("HX-Request") == "true":
+    if _shared.is_htmx(request):
         return await _render(templates, request, "rules/_rule_row.html", {
             "user": user,
             "lst": lst,
@@ -666,7 +735,7 @@ async def categories_promote(request: Request, cat_id: int):
     db = get_db(request)
     templates = get_templates(request)
 
-    client_host = (request.client.host if request.client else None)
+    client_host = audit_forwarded_for(request).host or None  # N-337: XFF-aware SSOT (§164.312(b))
     user_agent = request.headers.get("user-agent")
 
     def _promote_db_work() -> tuple[str, dict]:
@@ -686,25 +755,26 @@ async def categories_promote(request: Request, cat_id: int):
         try:
             ok = promote_category_to_system(db, cat_id)
         except ValueError as e:
-            try:
-                record_auth_event(
+            safe_audit_write(
+                lambda: record_auth_event(
                     db, event_type="category_promote",
                     email=user.get("email", ""),
                     user_id=user["id"], ip=client_host,
                     user_agent=user_agent,
                     outcome="failure",
-                    detail=f"cat_id={cat_id} slug={pre_slug} reason={e}",
-                )
-            except Exception:
-                pass
+                    detail=scrub_error_for_persist(
+                        f"cat_id={cat_id} slug={pre_slug} reason={e}"),  # run13 #2 — chained audit detail
+                ),
+                description=f"category_promote user_id={user['id']} cat_id={cat_id} outcome=failure",
+            )
             cat = get_category(db, cat_id) or {
                 "id": cat_id, "slug": "?", "description": str(e),
             }
-            return "value_error", {"cat": cat, "error": fmt_exc(e)}
+            return "value_error", {"cat": cat, "error": scrub_exc(e, purpose="misc")}  # N-179 R21_2
 
         if not ok:
-            try:
-                record_auth_event(
+            safe_audit_write(
+                lambda: record_auth_event(
                     db, event_type="category_promote",
                     email=user.get("email", ""),
                     user_id=user["id"], ip=client_host,
@@ -714,13 +784,13 @@ async def categories_promote(request: Request, cat_id: int):
                         f"cat_id={cat_id} "
                         "reason=not_found_or_already_system"
                     ),
-                )
-            except Exception:
-                pass
+                ),
+                description=f"category_promote user_id={user['id']} cat_id={cat_id} outcome=failure",
+            )
             return "not_found", {}
 
-        try:
-            record_auth_event(
+        safe_audit_write(
+            lambda: record_auth_event(
                 db, event_type="category_promote",
                 email=user.get("email", ""),
                 user_id=user["id"], ip=client_host, user_agent=user_agent,
@@ -729,9 +799,9 @@ async def categories_promote(request: Request, cat_id: int):
                     f"cat_id={cat_id} slug={pre_slug} "
                     f"from_user_id={pre_owner}"
                 ),
-            )
-        except Exception:
-            pass
+            ),
+            description=f"category_promote user_id={user['id']} cat_id={cat_id} outcome=success",
+        )
 
         cat = get_category(db, cat_id)
         user_rows = db.execute(
@@ -797,7 +867,7 @@ async def categories_demote(
     db = get_db(request)
     templates = get_templates(request)
 
-    client_host = (request.client.host if request.client else None)
+    client_host = audit_forwarded_for(request).host or None  # N-337: XFF-aware SSOT (§164.312(b))
     user_agent = request.headers.get("user-agent")
 
     def _demote_db_work() -> tuple[str, dict]:
@@ -811,28 +881,28 @@ async def categories_demote(
         try:
             ok = demote_category_to_user(db, cat_id, target_user_id)
         except ValueError as e:
-            try:
-                record_auth_event(
+            safe_audit_write(
+                lambda: record_auth_event(
                     db, event_type="category_demote",
                     email=user.get("email", ""),
                     user_id=user["id"], ip=client_host,
                     user_agent=user_agent,
                     outcome="failure",
-                    detail=(
+                    detail=scrub_error_for_persist(
                         f"cat_id={cat_id} slug={pre_slug} "
                         f"to_user_id={target_user_id} reason={e}"
-                    ),
-                )
-            except Exception:
-                pass
+                    ),  # run13 #2 — chained audit detail
+                ),
+                description=f"category_demote user_id={user['id']} cat_id={cat_id} to_user_id={target_user_id} outcome=failure",
+            )
             cat = get_category(db, cat_id) or {
                 "id": cat_id, "slug": "?", "description": str(e),
             }
-            return "value_error", {"cat": cat, "error": fmt_exc(e)}
+            return "value_error", {"cat": cat, "error": scrub_exc(e, purpose="misc")}  # N-179 R21_2
 
         if not ok:
-            try:
-                record_auth_event(
+            safe_audit_write(
+                lambda: record_auth_event(
                     db, event_type="category_demote",
                     email=user.get("email", ""),
                     user_id=user["id"], ip=client_host,
@@ -842,13 +912,13 @@ async def categories_demote(
                         f"cat_id={cat_id} to_user_id={target_user_id} "
                         "reason=not_found_or_already_personal"
                     ),
-                )
-            except Exception:
-                pass
+                ),
+                description=f"category_demote user_id={user['id']} cat_id={cat_id} to_user_id={target_user_id} outcome=failure",
+            )
             return "not_found", {}
 
-        try:
-            record_auth_event(
+        safe_audit_write(
+            lambda: record_auth_event(
                 db, event_type="category_demote",
                 email=user.get("email", ""),
                 user_id=user["id"], ip=client_host, user_agent=user_agent,
@@ -857,9 +927,9 @@ async def categories_demote(
                     f"cat_id={cat_id} slug={pre_slug} "
                     f"to_user_id={target_user_id}"
                 ),
-            )
-        except Exception:
-            pass
+            ),
+            description=f"category_demote user_id={user['id']} cat_id={cat_id} to_user_id={target_user_id} outcome=success",
+        )
 
         cat = get_category(db, cat_id)
         user_rows = db.execute(
@@ -892,8 +962,9 @@ async def categories_demote(
 @router.post("/categories/add-discovered", response_class=HTMLResponse)
 async def add_discovered_category(request: Request, user: RequireUserFragment):
     """HTMX endpoint to add a single discovered category (admin only)."""
-    if user["role"] != "admin":
-        return HTMLResponse("Forbidden", status_code=403)
+    _admin_err = admin_gate_response(user)
+    if _admin_err is not None:
+        return _admin_err
 
     db = get_db(request)
     form = await request.form()
@@ -914,7 +985,7 @@ async def add_discovered_category(request: Request, user: RequireUserFragment):
     except Exception as e:
         _log.error("Failed to add discovered category", slug=slug, error=fmt_exc(e))
         return HTMLResponse(
-            f'<span style="color:var(--pico-del-color);">Error: {e}</span>'
+            error_chip(e, prefix='Error: ')
         )
 
 

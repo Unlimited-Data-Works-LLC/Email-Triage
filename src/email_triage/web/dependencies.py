@@ -43,6 +43,7 @@ API keys.  The Bearer token is checked first.
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 import sqlite3
 from typing import Annotated, Any
@@ -52,6 +53,8 @@ from fastapi.responses import RedirectResponse
 
 from email_triage.engine.models import UserRole
 from email_triage.secrets import SecretsProvider
+from email_triage._secret_keys import SESSION_SECRET_KEY  # N-231 R22 stored-secret-key SSOT
+from email_triage.web.error_surface import raise_api_error  #  tranche 5 R32
 from email_triage.web.auth import (
     SESSION_COOKIE_NAME,
     get_user_by_email,
@@ -65,6 +68,194 @@ from email_triage.web.auth import (
 # request reads. The fallback exists so unit tests that build a bare
 # FastAPI app without going through the lifespan don't crash.
 _session_secret: str = ""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RequestMeta:
+    """N-187 R20_12: (host, ua) SSOT return type for `request_meta`.
+
+    `host` is always a string (empty on unknown, NEVER None), so callsites
+    at authz boundaries (e.g. `_ops_token_authorized`) get consistent
+    semantics without a per-site `... if request.client else ""` /
+    `... else None` fork. `ua` follows the same rule.
+
+    ``@dataclass(frozen=True)`` (not ``NamedTuple``) per DA N-187 must-fix #6:
+    prevents 2-tuple unpackers (`host, ua = request_meta(r)`) from breaking
+    silently on a future field-3 addition — callers MUST address by name.
+    """
+    host: str
+    ua: str
+
+
+def request_meta(request: Request) -> RequestMeta:
+    """SSOT for reading client host + user-agent off a FastAPI Request.
+
+    Before N-187 R20_12 the tree hand-rolled `request.client.host if
+    request.client else None` (~14 sites), `.scope.get("client")[0] if _c
+    else ""` (health.py:1197 — the authz boundary), and
+    `request.headers.get("user-agent")` (~9 sites) with drifting fallback
+    conventions (None vs "" vs missing). The scope-form `""` fallback fed
+    `_ops_token_authorized`; a divergence between fallback conventions is
+    an authz-boundary drift shape.
+
+    ONE reader. Every caller gets `RequestMeta(host, ua)` with `host` and
+    `ua` guaranteed non-None (empty string on unknown). Pinned by
+    `test_n187_request_meta_ssot_pin.py`.
+
+    **Semantics (DA + db-sme N-187 must-fix — read before consuming):**
+
+    * ``host`` is the SOCKET PEER address (from ``request.client.host``
+      OR the raw ASGI scope's ``("host", port)`` tuple). It is NEVER
+      ``X-Forwarded-For`` — a proxy in front of email-triage means the
+      value seen here is the PROXY's IP, not the end user's. If a
+      future proxy deploy needs X-F-F trust, add an EXPLICIT SSOT
+      (`request_forwarded_for(request)`) — do NOT quietly widen this
+      one's semantics (that would silently invalidate the loopback gate
+      in ``_ops_token_authorized``).
+    * ``host == ""`` means "unknown peer" (no ASGI client info). It is
+      NEVER a valid authorization identity — callers at authz boundaries
+      (loopback allowlists, per-IP RBAC) MUST treat ``""`` as
+      "reject" / "fail-closed", per PD#8. The strict pin
+      ``test_loopback_hosts_never_include_empty_string`` structurally
+      forbids ``""`` from ``_LOOPBACK_HOSTS`` (hipaa-sme must-fix).
+    * ``ua`` is the raw ``User-Agent`` header value (or ``""``). It is
+      operator-facing metadata, not an authorization signal.
+    """
+    # request.client is the parsed form (a `starlette.datastructures.Address`
+    # namedtuple with `.host` + `.port`). If missing, fall back to the raw
+    # scope (`("host", port)` tuple) — the shape health.py:1197 was reading.
+    if request.client is not None:
+        host = request.client.host or ""
+    else:
+        _c = request.scope.get("client") if hasattr(request, "scope") else None
+        host = (_c[0] if _c else "") or ""
+    ua = request.headers.get("user-agent") or ""
+    return RequestMeta(host=host, ua=ua)
+
+
+def request_forwarded_for(
+    request: "Request",
+    trusted_proxies: list[str],
+) -> RequestMeta:
+    """N-321 R30 (task  tranche  DA follow-up — operator-approved
+    2026-07-03): §164.312(b) audit-identity SSOT that CONSUMES the
+    ``X-Forwarded-For`` header when the direct-connect peer is a
+    KNOWN, TRUSTED reverse proxy.
+
+    Explicit sibling of :func:`request_meta` per the design note in
+    `request_meta`'s docstring — DO NOT quietly widen `request_meta`
+    (that would silently invalidate the loopback gate in
+    `_ops_token_authorized`). Callers on the audit path (record_
+    hipaa_access_event / record_auth_event / etc.) MIGRATE to this
+    SSOT; every other caller stays on `request_meta`.
+
+    **Semantics (BINDING — read before consuming):**
+
+    * ``trusted_proxies`` is a list of CIDR strings from
+      `config.audit.trusted_proxies`. Empty list = current behavior
+      (ignore XFF, return the raw peer identical to `request_meta`).
+    * The direct-connect peer (`request.client.host`) is matched
+      against every CIDR. If ANY match → trust the XFF header.
+    * When trusted, walk `X-Forwarded-For` from RIGHTMOST to leftmost
+      and return the first entry whose IP is NOT in a trusted CIDR
+      (that's the true client; leftmost entries are earlier hops
+      whose trust we can't verify). If every entry is trusted →
+      return the leftmost (originator claim).
+    * When NOT trusted → return the direct peer. XFF is a client-
+      controllable header; unauthenticated XFF is spoofable identity.
+    * ``host == ""`` still means "unknown peer"; still MUST fail
+      closed at authz boundaries per PD#8.
+    """
+    import ipaddress
+
+    # N-324 R30 (CI-red fix-forward on N-321): the N-187 ratchet
+    # pinned `request.client.host` + `.headers.get("user-agent")` to
+    # a fixed baseline. My original `request_forwarded_for` hand-
+    # rolled both reads (an SSOT violation). Delegate to
+    # `request_meta` instead — the SSOT was designed for exactly
+    # this and the ratchet stays clean.
+    _base = request_meta(request)
+    peer_host = _base.host
+    ua = _base.ua
+
+    def _in_trusted_cidr(ip_str: str) -> bool:
+        if not ip_str or not trusted_proxies:
+            return False
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        for cidr in trusted_proxies:
+            try:
+                if ip in ipaddress.ip_network(cidr, strict=False):
+                    return True
+            except ValueError:
+                # Malformed CIDR in config — treat as no-match so a
+                # broken config fails CLOSED (raw peer used).
+                continue
+        return False
+
+    if not _in_trusted_cidr(peer_host):
+        return RequestMeta(host=peer_host, ua=ua)
+
+    # Direct peer is trusted → consume XFF (rightmost-first walk).
+    xff_raw = request.headers.get("x-forwarded-for", "") or ""
+    if not xff_raw:
+        return RequestMeta(host=peer_host, ua=ua)
+    entries = [e.strip() for e in xff_raw.split(",") if e.strip()]
+    if not entries:
+        return RequestMeta(host=peer_host, ua=ua)
+
+    for entry in reversed(entries):
+        try:
+            ipaddress.ip_address(entry)
+        except ValueError:
+            continue
+        if not _in_trusted_cidr(entry):
+            return RequestMeta(host=entry, ua=ua)
+
+    # Every XFF entry was trusted → return the leftmost (originator
+    # claim per the standard XFF walk).
+    # N-337: fail-CLOSED on all-malformed. Trust-audit Phase 2 DA flagged:
+    # if EVERY entry is either trusted OR malformed, the pre-N-337 code
+    # returned entries[0] even when that string was non-IP (a client-
+    # controllable header writing a raw non-IP shape into audit rows).
+    # If entries[0] itself doesn't parse as an IP, fall back to peer_host —
+    # never write a raw non-IP string as audit actor.
+    try:
+        ipaddress.ip_address(entries[0])
+    except ValueError:
+        return RequestMeta(host=peer_host, ua=ua)
+    return RequestMeta(host=entries[0], ua=ua)
+
+
+def audit_forwarded_for(request: "Request") -> RequestMeta:
+    """N-337: audit-path convenience wrapper on :func:`request_forwarded_for`.
+
+    Pulls ``trusted_proxies`` from ``request.app.state.config.audit`` so
+    callers on the audit path (record_hipaa_access_event / record_auth_event
+    / record_api_key_event bookends) don't need to plumb ``config`` through.
+    N-321 shipped the primitive but Phase 2 DA + hipaa-sme + db-sme all
+    flagged that the ~14 audit-emit call sites remained on ``request_meta``,
+    so every audit row on the deploy host still recorded the podman NAT peer (127.0.0.1)
+    instead of the real client. This wrapper closes that migration path with
+    a zero-config-at-callsite API.
+
+    Fail-soft: on any lookup miss (`app.state.config` unset, `audit`
+    attribute missing, config not fully initialized in a test harness),
+    falls back to an empty trusted-proxies list = raw peer identity via
+    :func:`request_forwarded_for` (which itself matches
+    :func:`request_meta` when the list is empty). Same posture as
+    ``request_meta`` at that point — never worse.
+    """
+    trusted: list[str] = []
+    try:
+        cfg = request.app.state.config  # type: ignore[union-attr]
+    except AttributeError:
+        cfg = None
+    if cfg is not None:
+        trusted = list(getattr(getattr(cfg, "audit", None), "trusted_proxies", []) or [])
+    return request_forwarded_for(request, trusted)
 
 
 def get_session_secret(request: Request) -> str:
@@ -82,7 +273,7 @@ def get_session_secret(request: Request) -> str:
     session cookie.
     """
     global _session_secret
-    secret = getattr(request.app.state, "session_secret", None)
+    secret = getattr(request.app.state, SESSION_SECRET_KEY, None)
     if secret:
         return secret
     if not _session_secret:
@@ -184,8 +375,7 @@ def require_auth(request: Request) -> dict[str, Any]:
     user = get_current_user(request)
     if user is None:
         if request.url.path.startswith("/api/"):
-            raise HTTPException(status_code=401, detail="Not authenticated")
-        from fastapi.responses import RedirectResponse
+            raise raise_api_error("Not authenticated", status_code=401, purpose="misc")
         raise HTTPException(
             status_code=303,
             headers={"Location": "/login"},
@@ -202,9 +392,8 @@ def require_auth(request: Request) -> dict[str, Any]:
         }
         if session_needs_mfa_step_up(session_view):
             if request.url.path.startswith("/api/"):
-                raise HTTPException(
-                    status_code=401,
-                    detail="mfa_required",
+                raise raise_api_error(
+                    "mfa_required", status_code=401, purpose="misc",
                 )
             raise HTTPException(
                 status_code=303,
@@ -229,12 +418,96 @@ def require_role(*roles: str):
             # authenticated (require_auth passed), just not authorised,
             # so a /login redirect would not help. The former
             # api-vs-ui branch raised an identical 403 on both arms.
-            raise HTTPException(
-                status_code=403, detail="Insufficient permissions",
+            raise raise_api_error(
+                "Insufficient permissions", status_code=403, purpose="misc",
             )
         return user
 
     return _dependency
+
+
+def require_admin_ui(request: Request) -> tuple[dict[str, Any] | None, Any]:
+    """UI admin gate, the ``(user, error_response)`` tuple shape — the SSOT that
+    the 8 byte-identical ``_require_admin`` / ``_require_admin_user`` copies
+    across the UI routers (auth_keys, backup, integrations, tls_csr,
+    ai_backends_crud, embedding_install, retry_queue, _shared) collapse to
+    (divergence census 2026-06-09 #3).
+
+    Returns ``(user, None)`` for an authenticated admin; ``(None,
+    RedirectResponse("/login", 303))`` for an anonymous user; ``(None,
+    HTMLResponse("Forbidden", 403))`` for an authenticated non-admin. The caller
+    does ``user, err = require_admin_ui(request)`` then ``if err: return err``.
+
+    Distinct from ``require_role("admin")`` (the ``Depends`` factory that RAISES
+    a 403) on purpose: the UI callers want a redirect-to-login for anon + an HTML
+    Forbidden body, returned inline — not an exception. The ``api.py`` router
+    keeps its own exception-style gate (API contract: 401/403, never a /login
+    redirect), so it is intentionally NOT routed through this.
+    """
+    from fastapi.responses import HTMLResponse
+    user = get_current_user(request)
+    if user is None:
+        return None, RedirectResponse("/login", status_code=303)
+    err = admin_gate_response(user)
+    if err is not None:
+        return None, err
+    return user, None
+
+
+def is_admin(user: dict[str, Any] | None) -> bool:
+    """The admin-ROLE boolean SSOT (divergence census R22 HIGH #4, 2026-07-02).
+
+    Prior to N-222 the role predicate `user.get("role") == "admin"` was
+    duplicated across 60+ Python sites and 6 Jinja `user.role` reads. The
+    existing gate SSOTs `admin_gate_response` + `assert_admin` covered only
+    the "return 403 / raise" branches; conditional logic that needs a bare
+    bool (e.g. "hide the delete button unless admin", "log admin-only field
+    if is_admin") had no funnel — so the raw comparison drifted into the
+    domain-gate SSOTs (`can_manage_account`, `can_modify_owned_resource`,
+    `is_list_*_by`), extending the drift INTO the security domain.
+
+    Fail-closed on: `None` user, missing `role` key, `role` non-string.
+    """
+    if not user:
+        return False
+    role = user.get("role")
+    return isinstance(role, str) and role == "admin"
+
+
+def admin_gate_response(user: dict[str, Any] | None) -> Any | None:
+    """The admin-ROLE gate predicate SSOT (divergence census run12): returns an
+    ``HTMLResponse("Forbidden", 403)`` for an authenticated NON-admin user, else
+    ``None``. Shared by :func:`require_admin_ui` (after its auth-check) AND the UI
+    handlers that already hold an authenticated ``user: RequireUser`` — those need
+    only the admin-role half, not the anon redirect, and several lack ``request``
+    in scope. Collapses the ~16 inline ``if user["role"] != "admin": return
+    HTMLResponse("Forbidden", 403)`` copies to ONE predicate; pinned by
+    ``tests/test_admin_gate_ssot_pin.py`` (no raw inline copy in a UI router)."""
+    from fastapi.responses import HTMLResponse
+    # N-222 R22: fold onto the boolean SSOT.
+    if not is_admin(user):
+        return HTMLResponse("Forbidden", status_code=403)
+    return None
+
+
+def assert_admin(user: dict[str, Any] | None) -> None:
+    """The admin-ROLE gate for the API/raise contract (divergence census run12) —
+    the RAISE-twin of :func:`admin_gate_response`. Given an ALREADY-authenticated
+    ``user``, raises ``HTTPException(403)`` if the user is not an admin (or is
+    None/role-less, fail-closed), else returns ``None``.
+
+    Distinct from :func:`admin_gate_response` (which *returns* an HTMLResponse for
+    the UI/redirect contract) only in the response mechanism — same role predicate.
+    It is the role-only half kept SEPARATE from auth on purpose: callers that
+    interleave work between auth and the role check (e.g. ``webhook._require_user``
+    runs ``enforce_rate_limit`` first) call ``user = <auth>(...)`` then
+    ``assert_admin(user)`` without losing that step. ``api.py::_require_admin``
+    (the auth+admin combo, dispatched via ``db_call`` 8×) routes its role-check
+    through this. Pinned by ``tests/test_admin_gate_ssot_pin.py`` (no raw inline
+    ``role != "admin" -> raise/return 403`` in api.py/webhook.py)."""
+    # N-222 R22: fold onto the boolean SSOT.
+    if not is_admin(user):
+        raise raise_api_error("Insufficient permissions", status_code=403, purpose="misc")
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +546,7 @@ def _require_user_fragment(request: Request) -> dict[str, Any]:
     """
     user = get_current_user(request)
     if user is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise raise_api_error("Unauthorized", status_code=401, purpose="misc")
     return user
 
 
@@ -354,7 +627,7 @@ def _require_owned_account(
     """
     user = get_current_user(request)
     if user is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise raise_api_error("Unauthorized", status_code=401, purpose="misc")
     db: sqlite3.Connection = request.app.state.db
     secrets_provider: SecretsProvider = request.app.state.secrets
     # Lazy import: web.db imports trigger the full schema-helper
@@ -363,9 +636,9 @@ def _require_owned_account(
     from email_triage.web.db import can_manage_account, get_email_account
     acct = get_email_account(db, account_id)
     if acct is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise raise_api_error("Not found", status_code=404, purpose="misc")
     if not can_manage_account(db, user, acct):
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise raise_api_error("Forbidden", status_code=403, purpose="misc")
     return user, acct, db, secrets_provider
 
 
@@ -410,9 +683,9 @@ def OwnedAccountForProvider(provider_type: str):
         result = _require_owned_account(request, account_id)
         _, acct, _, _ = result
         if acct["provider_type"] != provider_type:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Wrong provider type (expected {provider_type})",
+            raise raise_api_error(
+                f"Wrong provider type (expected {provider_type})",
+                status_code=400, purpose="misc",
             )
         return result
 
@@ -488,9 +761,9 @@ def _require_owned_account_or_login(
     from email_triage.web.db import can_manage_account, get_email_account
     acct = get_email_account(db, account_id)
     if acct is None:
-        raise HTTPException(status_code=404, detail="Not found")
+        raise raise_api_error("Not found", status_code=404, purpose="misc")
     if not can_manage_account(db, user, acct):
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise raise_api_error("Forbidden", status_code=403, purpose="misc")
     return user, acct, db, secrets_provider
 
 

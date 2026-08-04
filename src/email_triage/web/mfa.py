@@ -47,10 +47,10 @@ Read-only by default at the lookup layer; writes guarded by
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from email_triage._isotime import now_utc_iso, to_utc_iso
 from typing import Any
 
 from email_triage.web.db_writelock import db_write
@@ -106,11 +106,13 @@ with the printable recovery codes (long-lived until used)."""
 def _hash_code(code: str) -> str:
     """SHA-256 hex of a recovery code or operator-recovery token.
 
-    Identical mechanism to ``email_triage.web.auth._hash_code`` —
-    duplicated by-name to keep the import surface narrow + because
-    H-05 is the only caller of this hash today.
+    Routes through the credential-hash SSOT
+    (``email_triage.web._credhash.hash_credential``) — was a by-name duplicate
+    of ``auth._hash_code``; census run14 #1 collapsed both onto the one
+    definition so a future KDF migration can't desync hash from verify.
     """
-    return hashlib.sha256(code.encode()).hexdigest()
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(code)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,7 @@ def issue_recovery_codes(
         # in one set, and the upper bound protects against operator-
         # typo at CLI.
         raise ValueError(f"count must be <= 100; got {count}")
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     plaintexts: list[str] = []
     for _ in range(count):
         code = _generate_recovery_code()
@@ -196,7 +198,7 @@ def consume_recovery_code(
     Caller is responsible for rate-limiting per the  login_guard
     precedent so brute-force is bounded.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     h = _hash_code(code)
     row = conn.execute(
         "SELECT id, used_at FROM recovery_codes "
@@ -299,8 +301,8 @@ def issue_operator_recovery_token(
             target_user_id,
             operator_user_id,
             _hash_code(token),
-            now.isoformat(),
-            expires_at.isoformat(),
+            to_utc_iso(now),
+            to_utc_iso(expires_at),
         ),
     )
     conn.commit()
@@ -324,7 +326,7 @@ def consume_operator_recovery_token(
     job (or operator-driven cleanup) sweeps the table; for v1 the
     table is small enough that prune cadence is operator-discretionary.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     h = _hash_code(token)
     row = conn.execute(
         "SELECT id, target_user_id, expires_at, used_at "

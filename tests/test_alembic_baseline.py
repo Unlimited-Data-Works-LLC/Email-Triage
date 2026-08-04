@@ -33,6 +33,7 @@ in the baseline migration.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 import subprocess
@@ -54,7 +55,7 @@ _ALEMBIC_BASELINE = (
 def init_db_schema(tmp_path: Path) -> dict[str, dict]:
     """Build a fresh DB via init_db(); return its sqlite_master snapshot."""
     db_path = tmp_path / "init.db"
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     try:
         return _snapshot_schema(conn)
     finally:

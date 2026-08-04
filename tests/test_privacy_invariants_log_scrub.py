@@ -51,6 +51,8 @@ _CANONICAL_PHI_KEYS: frozenset[str] = frozenset({
     "sender", "senders", "recipients", "subject", "body",
     "body_text", "body_html", "links", "attachment", "attachments",
     "reason", "classification_reason", "headers",
+    # census run17 #1 — LLM-over-PHI output keys (pinned as required).
+    "raw", "prompt", "completion", "llm_response",
 })
 
 
@@ -220,7 +222,8 @@ class _SentinelEmbeddingBackend:
 
 def _make_db() -> sqlite3.Connection:
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -414,3 +417,163 @@ class TestSanitiseCanonical:
             )
         assert out.get("safe_field") == 42
         assert "PHI_VALUE_SENTINEL" not in repr(out)
+
+
+# ---------------------------------------------------------------------------
+# run17 #1 — persisted-log redaction SSOT (sink ALLOWLIST, fail-closed)
+# ---------------------------------------------------------------------------
+# The field-strip used to live ONLY on the TriageLogger path (``_sanitise``);
+# a raw ``logging.getLogger`` bypassed it and free-text PHI rode into the
+# un-expungeable HMAC ``log_entries`` table (census run17 #1). The fix relocates
+# a FAIL-CLOSED ALLOWLIST (``triage_logging.redact_persisted_extra``) into the
+# persisted-log sinks, applied BEFORE the hash preimage (so hash == store). The
+# 3-SME panel (hipaa-sme + db-sme + devils-advocate, 2026-06-27) hard-gated on
+# ALLOWLIST-not-denylist: the ``raw`` key was absent from the ``_PHI_KEYS``
+# denylist, which is exactly how it leaked — a denylist on a write-once table is
+# fail-OPEN by construction.
+
+class TestPersistedExtraRedaction:
+    """``redact_persisted_extra`` — the sink ALLOWLIST chokepoint."""
+
+    def test_hipaa_mode_redacts_non_allowlisted_keys(self):
+        from email_triage.triage_logging import (
+            redact_persisted_extra, _REDACTED_PLACEHOLDER,
+        )
+        out = redact_persisted_extra(
+            {"raw": "PATIENT LAB RESULT PHI", "subject": "Dx diabetes",
+             "flow_id": "f1", "account_id": 7},
+            hipaa=True,
+        )
+        # non-allowlisted PHI-shaped keys → placeholder (value gone)...
+        assert out["raw"] == _REDACTED_PLACEHOLDER
+        assert out["subject"] == _REDACTED_PLACEHOLDER
+        # ...allowlisted operator/plumbing keys keep their value.
+        assert out["flow_id"] == "f1"
+        assert out["account_id"] == 7
+        # No PHI substring survives anywhere in the persisted dict.
+        assert "PATIENT LAB RESULT PHI" not in repr(out)
+        assert "diabetes" not in repr(out)
+
+    def test_raw_llm_key_is_redacted_at_sink(self):
+        """The exact run17 #1 leak: ``extra={"raw": <llm-over-PHI>}`` reaching
+        the HMAC sink. ``raw`` is NOT in the operator allowlist."""
+        from email_triage.triage_logging import (
+            redact_persisted_extra, _REDACTED_PLACEHOLDER, _PERSIST_SAFE_KEYS,
+        )
+        assert "raw" not in _PERSIST_SAFE_KEYS
+        out = redact_persisted_extra({"raw": "verbatim model output"}, hipaa=True)
+        assert out["raw"] == _REDACTED_PLACEHOLDER
+
+    def test_tokens_redacted_in_both_modes(self):
+        from email_triage.triage_logging import (
+            redact_persisted_extra, _REDACTED_PLACEHOLDER, TriageLogger,
+        )
+        tok = next(iter(TriageLogger._TOKEN_KEYS))
+        for hipaa in (True, False):
+            out = redact_persisted_extra({tok: "SECRETVALUE"}, hipaa=hipaa)
+            assert out[tok] == _REDACTED_PLACEHOLDER, hipaa
+            assert "SECRETVALUE" not in repr(out)
+
+    def test_non_hipaa_keeps_operator_extras(self):
+        """A non-HIPAA install has no PHI to protect → rich logging stays
+        (only token-shaped keys are stripped)."""
+        from email_triage.triage_logging import redact_persisted_extra
+        out = redact_persisted_extra(
+            {"raw": "x", "custom_diag": "y", "flow_id": "f1"}, hipaa=False,
+        )
+        assert out == {"raw": "x", "custom_diag": "y", "flow_id": "f1"}
+
+    def test_placeholder_preserves_key_name(self):
+        """Redacted keys keep their NAME so the /logs viewer shows the field
+        existed (value-strip, not key-drop) — hipaa-sme adjustment."""
+        from email_triage.triage_logging import redact_persisted_extra
+        out = redact_persisted_extra({"subject": "PHI"}, hipaa=True)
+        assert "subject" in out  # key preserved, value redacted
+
+    def test_operator_context_survives_allowlist(self):
+        """/logs render-survival (style rule 17 + dynamic-over-hardcoding): the
+        keys the template ACTUALLY reads — its ``priority_keys`` pill list AND
+        the named ``e.extra.<key>`` styling reads — must NOT be redacted by the
+        HIPAA persist-allowlist, else the operator-facing /logs view silently
+        loses fields. DERIVED FROM logs.html so the allowlist can't fall behind
+        the view. (devils-advocate caught the prior hand-picked set as a
+        false-green: it passed while run_id/elapsed_secs/error_class/
+        provider_type all redacted.)"""
+        import re
+        from pathlib import Path
+
+        import email_triage
+        from email_triage.triage_logging import (
+            redact_persisted_extra, _REDACTED_PLACEHOLDER,
+        )
+
+        tmpl = (
+            Path(email_triage.__file__).parent
+            / "web" / "templates" / "logs.html"
+        ).read_text(encoding="utf-8")
+
+        # The pill list: ``{% set priority_keys = priority_keys or [ '...' ] %}``
+        m = re.search(r"priority_keys\s+or\s*\[(.*?)\]", tmpl, re.DOTALL)
+        assert m, "could not find the priority_keys default list in logs.html"
+        pill_keys = set(
+            re.findall(r"['\"]([a-zA-Z_]\w*)['\"]", m.group(1))
+        )
+        # Named ``e.extra.<key>`` styling reads (error_class / provider_type /
+        # error / account_id) — exclude method calls like ``.items()``/``.get()``.
+        # ``(?![\w(])`` rejects BOTH a trailing word-char (so greedy backtracking
+        # can't yield ``item`` out of ``items()``) and a method call ``(`` (so
+        # ``.items()``/``.get()`` are excluded) — only true attribute reads.
+        extra_reads = set(re.findall(r"e\.extra\.([a-zA-Z_]\w*)(?![\w(])", tmpl))
+        required = pill_keys | extra_reads
+        assert required, "derived no template keys — the logs.html regex drifted"
+
+        redacted = sorted(
+            k for k in required
+            if redact_persisted_extra({k: "operatorvalue"}, hipaa=True)[k]
+            == _REDACTED_PLACEHOLDER
+        )
+        assert not redacted, (
+            "/logs renders these keys but the HIPAA persist-allowlist redacts "
+            f"them (operator-context loss): {redacted}. Add each (after "
+            "confirming non-PHI) to triage_logging._PERSIST_SAFE_KEYS."
+        )
+
+
+def test_log_entries_insert_only_in_sanctioned_sinks():
+    """Inverse-INSERT structural pin (db-sme deliverable): a row may enter the
+    HMAC ``log_entries`` table ONLY via the two sinks that call
+    ``redact_persisted_extra`` first — ``SQLiteLogHandler.emit`` (triage_logging)
+    and ``insert_log_entry`` (db/audit). A NEW ``INSERT INTO log_entries``
+    anywhere else would bypass the fail-closed redaction. Count-agnostic."""
+    import re
+
+    from _pin_harness import iter_src_files, relpath
+
+    _ALLOW = {"triage_logging.py", "db/audit.py"}
+    pat = re.compile(r"INSERT\s+INTO\s+log_entries", re.IGNORECASE)
+    offenders = sorted(
+        relpath(p)
+        for p in iter_src_files()
+        if pat.search(p.read_text(encoding="utf-8")) and relpath(p) not in _ALLOW
+    )
+    assert not offenders, (
+        "INSERT INTO log_entries outside the two redaction-applying sinks "
+        "(would bypass redact_persisted_extra → PHI into the HMAC chain): "
+        f"{offenders}"
+    )
+
+
+def test_inverse_insert_pin_has_teeth():
+    """The sanctioned sinks MUST actually contain the INSERT the pin allows —
+    else the allow-list is stale (PD#7) and the pin is vacuous."""
+    import re
+
+    from _pin_harness import iter_src_files, relpath
+
+    pat = re.compile(r"INSERT\s+INTO\s+log_entries", re.IGNORECASE)
+    sinks = {
+        relpath(p)
+        for p in iter_src_files()
+        if pat.search(p.read_text(encoding="utf-8"))
+    }
+    assert sinks == {"triage_logging.py", "db/audit.py"}, sinks

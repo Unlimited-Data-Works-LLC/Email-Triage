@@ -20,12 +20,21 @@
     <div class="grid">
         <label>
             Host{{ m.help("The IMAP server's address. Example: imap.gmail.com for Gmail, outlook.office365.com for Office 365, mail.fastmail.com for Fastmail. Your provider's IMAP help page lists this.") }}
-            <input type="text" name="host" value="{{ acct.config.host or acct.config.get('host', '') if acct is defined else '' }}" required
-                   placeholder="mail.example.com">
+            {{ m.combo_input(
+                "host",
+                acct.config.host or acct.config.get('host', '') if acct is defined else '',
+                ["imap.gmail.com", "outlook.office365.com", "mail.fastmail.com", "imap.aol.com", "imap.mail.yahoo.com"],
+                placeholder="mail.example.com",
+                attrs="required") }}
         </label>
         <label>
             Port{{ m.help("The IMAP server port. 993 for SSL/TLS (default and recommended), 143 for plain (avoid).") }}
-            <input type="number" name="port" value="{{ acct.config.port or acct.config.get('port', 993) if acct is defined else 993 }}" required>
+            {{ m.combo_input(
+                "port",
+                acct.config.port or acct.config.get('port', 993) if acct is defined else 993,
+                ["993", "143"],
+                type="number",
+                attrs="required min=1 max=65535") }}
         </label>
     </div>
     <div class="grid">
@@ -43,8 +52,7 @@
     <div class="grid">
         <label>
             Password{{ m.help("Your IMAP password. For Gmail / Outlook / Fastmail and most modern providers this needs to be an APP password — not your regular login password — because of two-factor authentication. Generate one in your provider's account-security page.") }}
-            <input type="password" name="password" value=""
-                   placeholder="{{ '********' if (acct is defined and acct.get('has_password', false)) else 'Enter password' }}">
+            {{ m.secret_input("password", (acct is defined and acct.get('has_password', false)), "Enter password") }}
             {% if acct is defined and acct.get('has_password', false) %}
             <small>Leave blank to keep existing password.</small>
             {% endif %}

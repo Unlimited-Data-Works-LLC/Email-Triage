@@ -6,10 +6,15 @@ OpenAI chat completions API (e.g. vLLM, LM Studio, text-generation-webui).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.classify.base import JsonChatClassifier
+from email_triage.llm_truncation import warn_if_llm_truncated
+
+logger = get_logger("email_triage.classify.openai_compat")  # N-196b R21_4
 
 
 class OpenAICompatClassifier(JsonChatClassifier):
@@ -47,7 +52,7 @@ class OpenAICompatClassifier(JsonChatClassifier):
         # The classifier is rebuilt per triage batch and reused for
         # every message in that batch, so pooling collapses N
         # per-message TLS handshakes into one. Mirrors OllamaClassifier.
-        self._http = LazyHttpClient(timeout=timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
         self._extra_headers = extra_headers or {}
         # OpenAI-compatible endpoint can be local (LiteLLM proxy on
         # the homelab) or external (api.openai.com). Classify the
@@ -125,6 +130,12 @@ class OpenAICompatClassifier(JsonChatClassifier):
             resp.raise_for_status()
 
         body = resp.json()
+        #  silent-truncation guard (shared SSOT) — a max_tokens cut yields
+        # invalid JSON → the classify parse falls open.
+        warn_if_llm_truncated(
+            body, family="openai", model=self._model or "",
+            context="classify", logger=logger,
+        )
         return (
             body.get("choices", [{}])[0]
             .get("message", {})
@@ -159,6 +170,10 @@ class OpenAICompatClassifier(JsonChatClassifier):
             resp.raise_for_status()
 
         body = resp.json()
+        warn_if_llm_truncated(
+            body, family="openai", model=self._model or "",
+            context="complete", logger=logger,
+        )
         return (
             body.get("choices", [{}])[0]
             .get("message", {})

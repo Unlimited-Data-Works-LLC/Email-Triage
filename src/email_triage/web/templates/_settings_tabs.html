@@ -1,8 +1,13 @@
 {# Shared tab-strip nav for the My Settings cluster.
 
    Pass active="X" where X is one of:
-   notifications | meeting | hardware-keys | accounts | api-keys |
-   style-data | watches | labels | rules
+   notifications | meeting | security | accounts |
+   style-data | watches | labels | rules | writing | topic-digest
+
+   (2026-06-07) The standalone "Passkeys" + "API Keys" tabs, plus
+   the page-header "Sign out all sessions" button that used to show on
+   every tab, were consolidated into a single "Security" tab —
+   /profile/security. The legacy URLs 303-redirect there.
 
    Sibling pages collected here under the unified "My Settings"
    top-nav slot. Top-nav has My Settings as a single link to /profile;
@@ -30,9 +35,9 @@
 <nav style="margin:0 0 1.5rem 0;border-bottom:1px solid var(--pico-muted-border-color);padding-bottom:0;">
     <ul style="list-style:none;padding:0;margin:0;display:flex;gap:0.25rem;flex-wrap:wrap;">
         {# Tab order revised 2026-05-10: Accounts first (most-visited
-           settings surface for end users); Hardware Keys + API Keys
-           last (security-credential surfaces accessed less often).
-           #158 (2026-05-11): Labels + Rules inserted between
+           settings surface for end users); Security last (the
+           credential / account-protection surface, accessed less
+           often). #158 (2026-05-11): Labels + Rules inserted between
            Notifications and Writing — they're triage-shape config
            that operators touch alongside notification preferences
            when tuning their inbox, not credential / hardware config. #}
@@ -46,10 +51,11 @@
             ("labels",         "/labels",                    "Labels"),
             ("rules",          "/rules",                     "Rules"),
             ("writing",        "/profile?tab=writing",       "Writing"),
+            ("topic-digest",   "/profile?tab=topic-digest",  "Topic Digest"),
+            ("regulatory-clocks", "/profile/regulatory-clocks", "Deadline reminders"),
             ("style-data",     "/profile/style-data",        "Style data"),
             ("meeting",        "/profile?tab=meeting",       "Meeting prefs"),
-            ("hardware-keys",  "/profile/hardware-keys",     "Hardware keys"),
-            ("api-keys",       "/accounts/api-keys",         "API Keys"),
+            ("security",       "/profile/security",          "Security"),
         ] %}
         {% for slug, href, label in _tabs %}
         {% set is_active = (active == slug) %}

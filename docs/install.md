@@ -39,7 +39,7 @@ podman run -d --name email-triage \
     -v ./data:/app/data \
     -v ./config:/app/config \
     --secret ET_MASTER_KEY \
-    ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+    ghcr.io/unlimited-data-works-llc/email-triage:0.2.0
 ```
 
 The container's built-in healthcheck reports readiness on `/health`.
@@ -79,9 +79,9 @@ warning. **HIPAA mode rejects the `env` backend at boot unconditionally**
 — the carve-out var does not bypass it. (Sunset: hard error in v0.2.0
 non-HIPAA, removed in v0.3.0.)
 
-## Encryption at rest (v0.1.2)
+## Encryption at rest (v0.2.0)
 
-v0.1.2 can encrypt the single SQLite database file with **SQLCipher
+v0.2.0 can encrypt the single SQLite database file with **SQLCipher
 (AES-256)**, keyed by an HKDF-SHA256 derivation of the master key — no
 new key to manage. **New installs are encrypted by default** — the `init`
 scaffold and the example configs set `encryption_enabled: true`. The setting
@@ -124,6 +124,140 @@ On encrypted installs the backup bundle's SQLite snapshot is itself
 SQLCipher-encrypted before the Fernet wrap, so the export never stages
 plaintext data on disk.
 
+## Automated backup
+
+Beyond the on-demand bundle export (above), the app can write **scheduled,
+verified, encrypted snapshots** on its own. Configure it either in the UI
+(**Admin → Config → Backup**) or in the `backup:` section of
+`email-triage.yaml` — both write the same config:
+
+```yaml
+backup:
+  enabled: false        # master switch; leave OFF until a restore path exists
+  cadence: manual       # manual (CLI/host-cron only) | daily | weekly
+  format: etbk          # etbk (full bundle: DB+config+certs) | db (raw snapshot)
+  retention: "14"       # keep-count, or "14d" (days) / "2w" (weeks)
+  dir: ""               # blank -> <data_dir>/backups
+  encryption: master-key  # master-key | public-key
+  public_key: ""        # public-key mode only (see below)
+```
+
+These are config-file (or UI) settings, **not** environment variables — a
+backup toggle buried in an env block is invisible and easy to lose.
+
+**Triggering a run.** The in-app sweeper fires on `cadence` (`daily`/`weekly`);
+`manual` runs no timer. Any time, you can force a run from inside the container:
+
+```bash
+podman exec email-triage email-triage backup now          # queue a run
+podman exec email-triage email-triage backup now --wait    # block until done
+```
+
+If the app is down, the CLI prints `FATAL: unavailable, app offline` rather
+than silently doing nothing (the backup runs *inside* the supervised app so the
+snapshot is consistent and the audit chain stays single-writer).
+
+**Each snapshot is verified before it counts.** The order is
+archive + compress → **restorability check** (cipher + full `integrity_check` +
+a schema sentinel) → seal. A snapshot that fails verification is discarded, and
+old backups are pruned only *after* a verified-good new one lands — a run of
+failures can never rotate your good backups away.
+
+**Two encryption modes:**
+
+- **`master-key`** (default) — the snapshot is sealed with a key derived from
+  this install's master key. To restore you also need the **master-key-only**
+  export (Admin → Backup → *Master key only*). Do that export **before** you
+  enable, and store it apart from the snapshots. The dashboard and the daily
+  health email show a *Last key export* reminder so a stale key export is
+  visible.
+- **`public-key`** (write-only) — each snapshot's random passphrase is sealed
+  to an X25519 **public** key you supply. The container holds only the public
+  half, so even a fully compromised container cannot **read** its own backups;
+  restore requires the matching **private** key, kept off-box. **Generate the
+  keypair on a trusted workstation, not the server:**
+
+  ```bash
+  email-triage backup gen-keypair       # prints a public + private PEM pair
+  ```
+
+  Paste only the **public** key into the config (`public_key:` or the UI
+  textarea). Keep the private key in your own key management — the server never
+  sees it. A bad/empty public key is rejected at save time, so public-key mode
+  can't silently arm against a key the runs would fail to seal to.
+
+  **Public-key mode requires `format: etbk`** (the full bundle). The off-box
+  seal is applied only to the bundle; the raw `db` snapshot has no seal layer,
+  so a `public-key` + `db` combination is refused — at save time AND at run
+  time — rather than silently writing a snapshot the on-box master key could
+  still read.
+
+**Output directory and off-box copies.** Snapshots land in `dir` (default
+`<data_dir>/backups`, a container-local volume). Getting them **off** the box
+is a host-side concern this app deliberately doesn't own: point a host job
+(rsync/Iperius/a scheduled copy) at that directory and relocate to your SMB
+share or offsite target. A fail-closed freshness check (e.g. the monitoring system watching
+the newest `_LATEST.json`) belongs on the host too.
+
+**Restoring** an automated snapshot uses the same CLI restore path as a
+hand-exported bundle:
+
+```bash
+email-triage restore <snapshot>                     # master-key mode (+ key export)
+email-triage restore <snapshot> --private-key <pem>  # public-key mode
+```
+
+### How to verify a backup
+
+A backup you have never proven you can open is not a backup. After your first
+automated run — and any time you rotate the keypair — **verify it end-to-end
+with the off-box private key, on a trusted machine.** Never copy the private key
+to the server; verification happens where the private key already lives (your
+admin workstation), not on the host.
+
+The fast, **non-destructive** check is `restore … --list`: it unwraps the
+public-key seal, decrypts the bundle, verifies the manifest hash, and prints the
+contents **without extracting anything** (no files written, no SQLCipher needed —
+so it runs fine on Windows).
+
+**Public-key mode:**
+
+1. Copy the snapshot off the host to your trusted box (the backups live on the
+   host volume, e.g. on the deploy host `/srv/email-triage/data/backups/`):
+   ```bash
+   scp you@the deploy host:/srv/email-triage/data/backups/<snapshot>.etbk .
+   ```
+2. Verify with your private key (Windows: `python -m email_triage restore …`):
+   ```bash
+   email-triage restore <snapshot>.etbk --private-key backup-private.pem --list
+   ```
+3. Confirm the output:
+   - `Public-key bundle unwrapped with the private key.` → your private key
+     opened the seal (key custody works).
+   - a manifest summary — hostname, exported-at, schema version, and the file
+     list including `triage.db` → the bundle is intact and decryptable.
+   A wrong/corrupt key or a tampered bundle fails loudly (`Public-key unwrap
+   failed` / `Decryption failed` / `Bundle integrity check failed`).
+
+**What this proves (layered validation):**
+
+- **At backup time** (on the server, with SQLCipher): the inner database was
+  extracted and integrity-checked *before* sealing — `_LATEST.json` records
+  `integrity: ok`. That proves the database is a valid, restorable SQLCipher DB.
+- **At verify time** (off-box, with your private key): the seal opens and the
+  bundle decrypts. That proves your key custody works and the backup is
+  recoverable.
+
+Together = end-to-end validated: the right key opens a known-good backup.
+
+**Master-key mode:** the same, minus the private key —
+`email-triage restore <snapshot>.etbk --list` and supply the *master-key-only*
+export passphrase when prompted.
+
+A full **extract** test (drop `--list`) writes the contents to side-by-side
+`.restore` files; **delete them afterward** — they are decrypted artifacts you
+don't want lying around.
+
 ## Startup environment variables
 
 These override the matching `email-triage.yaml` fields at boot (env
@@ -137,6 +271,10 @@ wins). Set them in the container `environment:` block.
 | `EMAIL_TRIAGE_CSRF_ENFORCE` | `true` flips CSRF from soft-launch (count-only) to hard enforcement |
 | `EMAIL_TRIAGE_AUDIT_STRICT` | `1` makes audit-write failures re-raise synchronously instead of fail-soft (debug aid) |
 | `EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE` | Integer bound for the single-writer queue (backpressure tuning) |
+| `ET_TOPIC_MATCH_CONFIDENCE_FLOOR` | Topic-digest surfacing floor — float in `[0,1]`, default `0.5`; `0` disables. Hits below it are hidden from digests, reversibly (see *Configuration → Topic Digest* in the README). Env-only (no YAML field). |
+| `ET_HEALTH_OPS_TOKEN` | Shared secret (≥16 chars) enabling a loopback-only `X-Ops-Token` bypass to fetch `/health/detail` without an admin session. Unset/blank (default) disables it. Env-only. |
+| `EMBEDDING_BITS_MANIFEST` | Path to the SHA-256-pinned embedding-bits manifest JSON (the URL+hash list that drives the lazy embedding-stack install). Default `/app/scripts/embedding-bits-manifest.json`. Env-only. |
+| `EMBEDDING_BITS_RUNTIME_DEPS` | Directory where the lazy-installed embedding ML stack (~2 GB: Torch CPU + sentence-transformers + weights) is installed/loaded. Default `/app/data/runtime-deps`; relocate to a larger/persistent volume. Env-only. |
 
 HIPAA mode itself is a YAML setting (`logging.hipaa: true`), not an env
 var. In HIPAA mode the `env` secrets backend is rejected, MFA is
@@ -203,11 +341,11 @@ sideloaded onto the target.
 ```bash
 # Stages all files + verifies hashes + packages
 ./scripts/download-embedding-bits.sh \
-    ./embedding-bits-v0.1.x.tar.zst
+    ./embedding-bits-v0.2.x.tar.zst
 
 # Outputs:
-#   ./embedding-bits-v0.1.x.tar.zst
-#   ./embedding-bits-v0.1.x.tar.zst.sha256
+#   ./embedding-bits-v0.2.x.tar.zst
+#   ./embedding-bits-v0.2.x.tar.zst.sha256
 ```
 
 Resumable — the script caches downloads under
@@ -218,11 +356,11 @@ A second run skips already-good files.
 
 ```bash
 # Copy both files to the target. Verify the sidecar:
-sha256sum -c embedding-bits-v0.1.x.tar.zst.sha256
+sha256sum -c embedding-bits-v0.2.x.tar.zst.sha256
 
 # Extract into the sideload dir (default /app/data/runtime-deps/sideload):
 mkdir -p /app/data/runtime-deps/sideload
-zstd -d embedding-bits-v0.1.x.tar.zst -c \
+zstd -d embedding-bits-v0.2.x.tar.zst -c \
     | tar -x -C /app/data/runtime-deps/sideload
 
 # Trigger the installer via the admin UI:
@@ -241,7 +379,7 @@ Alternative end-to-end via `scripts/install-embedding-bits.sh`:
 
 ```bash
 # Wraps verify + extract + sideload in one command:
-./scripts/install-embedding-bits.sh extract embedding-bits-v0.1.x.tar.zst
+./scripts/install-embedding-bits.sh extract embedding-bits-v0.2.x.tar.zst
 ./scripts/install-embedding-bits.sh sideload
 ```
 

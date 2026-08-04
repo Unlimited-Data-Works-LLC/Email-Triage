@@ -47,14 +47,17 @@ or BAA-flip note when applicable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from email_triage._envbool import parse_bool
+from email_triage.web._flash import scrub_exc  # N-179 R20_1 sub-4
 from email_triage._errfmt import fmt_exc
 from email_triage.ai_backends.registry import BACKEND_TYPES
 from email_triage.web.app import (
@@ -70,10 +73,12 @@ from email_triage.web.db import (
     update_ai_backend,
 )
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web._audit import safe_audit_write
+from email_triage.web.routers._redirect import qs
 
 # async-db: handlers route SQLite through db_call
-_log = logging.getLogger("email_triage.web.ui.ai_backends_crud")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.ui.ai_backends_crud")  # N-196b R21_4
 router = APIRouter()
 
 
@@ -81,16 +86,8 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(request: Request) -> tuple[dict | None, Any]:
-    """Standard admin gate: returns (user, error_response). When user
-    is None the caller should ``return err`` directly.
-    """
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user["role"] != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 async def _render(request: Request, name: str, ctx: dict) -> HTMLResponse:
@@ -126,28 +123,22 @@ def _audit(
     detail: str,
     outcome: str = "success",
 ) -> None:
-    """Wrap record_auth_event with the per-handler log + best-effort
-    semantic. Audit failures are logged but never poison the user
-    flow (mirrors the standing pattern in admin.py).
+    """Route record_auth_event through the best-effort audit SSOT
+    (census run17 #3). Audit failures are logged uniformly via
+    ``safe_audit_write`` (so /health's audit-failure drift check sees
+    the miss) and never poison the user flow.
     """
-    try:
-        record_auth_event(
+    safe_audit_write(
+        lambda: record_auth_event(
             db,
             event_type=event_type,
             email=user.get("email", ""),
             user_id=user.get("id"),
             outcome=outcome,
             detail=detail,
-        )
-    except Exception as exc:
-        _log.warning(
-            "ai_backend audit row failed",
-            extra={"_extra": {
-                "event": event_type,
-                "outcome": outcome,
-                "error": fmt_exc(exc),
-            }},
-        )
+        ),
+        description=f"ai_backend_audit event={event_type} outcome={outcome}",
+    )
 
 
 def _parse_form_row(form: Any) -> dict[str, Any]:
@@ -162,14 +153,21 @@ def _parse_form_row(form: Any) -> dict[str, Any]:
     type_ = (form.get("type") or "").strip().lower()
     endpoint = (form.get("endpoint") or "").strip()
     model = (form.get("model") or "").strip() or None
-    baa_certified = (form.get("baa_certified") in ("1", "on", "true"))
+    #  — ordered backup models (comma-separated from the picker;
+    # model names never contain commas).
+    backup_models_raw = (form.get("backup_models") or "").strip()
+    backup_models = [
+        m.strip() for m in backup_models_raw.split(",") if m.strip()
+    ]
+    baa_certified = parse_bool(form.get("baa_certified"))
     baa_expires_at = (form.get("baa_expires_at") or "").strip() or None
-    enabled = (form.get("enabled") in ("1", "on", "true"))
+    enabled = parse_bool(form.get("enabled"))
     return {
         "name": name,
         "type_": type_,
         "endpoint": endpoint,
         "model": model,
+        "backup_models": backup_models,
         "baa_certified": baa_certified,
         "baa_expires_at": baa_expires_at,
         "enabled": enabled,
@@ -246,6 +244,117 @@ async def ai_backends_index(request: Request):
 
 
 # ---------------------------------------------------------------------------
+#  — model picker probe (read-only, admin, metadata-only)
+# ---------------------------------------------------------------------------
+
+@router.get("/config/ai-backends/probe-models")
+async def ai_backends_probe_models(request: Request):
+    """List the models installed on a backend endpoint + their
+    capabilities, for the admin model picker.
+
+    Admin-only, read-only, METADATA-only: this issues a GET to the
+    backend's ``/api/tags`` + ``/api/show`` and returns model names /
+    sizes / capabilities. No email content (PHI) is ever involved — so
+    there is no PHI egress even when the endpoint is remote; the
+    backend's own BAA gate still governs whether an account may
+    *classify* through it.
+
+    Only Ollama backends are enumerable; other types return
+    ``ok: false`` and the picker keeps its free-text field.
+    """
+    user, err = await db_call(_require_admin, request)
+    if err:
+        return err
+
+    backend_type = (
+        request.query_params.get("backend_type") or ""
+    ).strip().lower()
+    endpoint = (request.query_params.get("endpoint") or "").strip()
+
+    if backend_type != "ollama":
+        return JSONResponse({
+            "ok": False,
+            "error": (
+                "Model listing is available for Ollama backends only — "
+                "enter the model name manually."
+            ),
+            "models": [],
+        })
+    if not endpoint:
+        return JSONResponse({
+            "ok": False,
+            "error": "Enter the endpoint URL first, then fetch models.",
+            "models": [],
+        })
+
+    config = get_config(request)
+    local_suffixes = list(
+        getattr(config.tls, "local_url_suffixes", []) or []
+    )
+    markers = list(
+        getattr(config.classifier, "embedding_name_markers", ["embed"])
+        or ["embed"]
+    )
+
+    # SSRF guard — this issues a server-side outbound GET to the
+    # submitted endpoint. RESOLVE the host, require EVERY A/AAAA record to be
+    # local/private, and PIN the probe to the validated IP so a DNS rebind
+    # between this check and the connect can't redirect it at a cloud-metadata
+    # IP (169.254.169.254) or an internal service. This replaces the prior
+    # string-prefix `is_local` gate, which trusted `.local` / allowlisted
+    # suffixes WITHOUT resolving them (the documented follow-up named in
+    # `_netloc.is_local_destination`). The BAA PHI-egress gate keeps its
+    # on-LAN suffix-trust by design — only this SSRF-sensitive probe resolves.
+    from email_triage._netloc import pin_local_endpoint
+    # getaddrinfo is BLOCKING — run it off the event loop so a crafted
+    # slow-DNS endpoint can't stall the loop (the old string gate did no DNS).
+    pinned_endpoint = await asyncio.to_thread(pin_local_endpoint, endpoint)
+    if pinned_endpoint is None:
+        return JSONResponse({
+            "ok": False,
+            "error": (
+                "Endpoint is not a local / allowlisted host — model "
+                "probing is restricted to in-install endpoints."
+            ),
+            "models": [],
+        })
+
+    from email_triage.classify.ollama import OllamaClassifier
+    probe = OllamaClassifier(
+        model="",
+        base_url=pinned_endpoint,
+        local_url_suffixes=local_suffixes,
+        embedding_name_markers=markers,
+    )
+    try:
+        models = await probe.list_models()
+    except Exception as exc:  # pragma: no cover - network failure path
+        _log.warning(
+            "probe-models failed",
+            extra={
+                "provider": endpoint,
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc),
+            },
+        )
+        return JSONResponse({
+            "ok": False,
+            "error": f"Could not reach the endpoint: {scrub_exc(exc, purpose='provider')}",
+            "models": [],
+        })
+    finally:
+        try:
+            await probe.close()
+        except Exception:
+            pass
+
+    return JSONResponse({
+        "ok": True,
+        "models": [m.to_dict() for m in models],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Add form (GET)
 # ---------------------------------------------------------------------------
 
@@ -300,17 +409,22 @@ def _ai_backends_create_db_work(
         endpoint=row["endpoint"],
         api_key_secret_ref=None,
         model=row["model"],
+        backup_models=row["backup_models"],
         baa_certified=row["baa_certified"],
         baa_expires_at=row["baa_expires_at"],
         enabled=row["enabled"],
         created_by=user.get("id"),
     )
 
-    # Plaintext key handling (the only place it sees the wire).
+    # Plaintext key handling (the only place it sees the wire). Routes
+    # through the _secret_write SSOT (never-clobber-on-blank) like every
+    # other form-derived secret write, so the AST guard's interprocedural
+    # taint sees a sanctioned write rather than a raw secrets.set. 2026-06-08.
     if api_key_plain and secrets is not None:
+        from email_triage.web.routers._secret_write import set_secret_if_changed
         secret_ref = _secret_ref_for(new_id)
         try:
-            secrets.set(secret_ref, api_key_plain)
+            set_secret_if_changed(secrets, secret_ref, api_key_plain)
             update_ai_backend(
                 db, new_id,
                 name=row["name"],
@@ -318,6 +432,7 @@ def _ai_backends_create_db_work(
                 endpoint=row["endpoint"],
                 api_key_secret_ref=secret_ref,
                 model=row["model"],
+                backup_models=row["backup_models"],
                 baa_certified=row["baa_certified"],
                 baa_expires_at=row["baa_expires_at"],
                 enabled=row["enabled"],
@@ -398,8 +513,9 @@ async def ai_backends_create(request: Request):
             ),
         })
 
+    notice = f"Backend {row['name']} added."
     return RedirectResponse(
-        f"/config/ai-backends?save_msg=Backend+{row['name']}+added.",
+        f"/config/ai-backends?{qs(save_msg=notice)}",
         status_code=303,
     )
 
@@ -490,9 +606,13 @@ def _ai_backends_update_db_work(
                     }},
                 )
     elif do_replace and api_key_plain and secrets is not None:
+        # Explicit replace-intent (the do_replace checkbox) PLUS the SSOT
+        # never-clobber-on-blank guard — routes through _secret_write like
+        # every other form-derived secret write. 2026-06-08.
+        from email_triage.web.routers._secret_write import set_secret_if_changed
         secret_ref = _secret_ref_for(backend_id)
         try:
-            secrets.set(secret_ref, api_key_plain)
+            set_secret_if_changed(secrets, secret_ref, api_key_plain)
         except Exception as exc:
             _log.error(
                 "API-key persistence failed during update",
@@ -509,6 +629,7 @@ def _ai_backends_update_db_work(
         endpoint=row["endpoint"],
         api_key_secret_ref=secret_ref,
         model=row["model"],
+        backup_models=row["backup_models"],
         baa_certified=row["baa_certified"],
         baa_expires_at=row["baa_expires_at"],
         enabled=row["enabled"],
@@ -573,8 +694,8 @@ async def ai_backends_update(request: Request, backend_id: int):
         })
 
     api_key_plain = (form.get("api_key_plain") or "").strip()
-    do_replace = (form.get("replace_key") in ("1", "on", "true"))
-    do_clear = (form.get("clear_key") in ("1", "on", "true"))
+    do_replace = parse_bool(form.get("replace_key"))
+    do_clear = parse_bool(form.get("clear_key"))
     try:
         await db_call(
             _ai_backends_update_db_work, db, secrets, user, backend_id,
@@ -605,8 +726,9 @@ async def ai_backends_update(request: Request, backend_id: int):
             ),
         })
 
+    notice = f"Backend {row['name']} updated."
     return RedirectResponse(
-        f"/config/ai-backends?save_msg=Backend+{row['name']}+updated.",
+        f"/config/ai-backends?{qs(save_msg=notice)}",
         status_code=303,
     )
 
@@ -683,11 +805,11 @@ async def ai_backends_delete(request: Request, backend_id: int):
         return HTMLResponse("Not found", status_code=404)
     name = backend["name"]
     msg = (
-        f"Backend+{name}+deleted."
-        f"+{in_use_count}+accounts+reverted+to+install+default."
-        if in_use_count else f"Backend+{name}+deleted."
+        f"Backend {name} deleted."
+        f" {in_use_count} accounts reverted to install default."
+        if in_use_count else f"Backend {name} deleted."
     )
     return RedirectResponse(
-        f"/config/ai-backends?save_msg={msg}",
+        f"/config/ai-backends?{qs(save_msg=msg)}",
         status_code=303,
     )

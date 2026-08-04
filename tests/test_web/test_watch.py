@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from .conftest import _CsrfClient  # CSRF-token-injecting client (migration #2)
+
 from email_triage.web.app import WatcherManager
 from email_triage.web.db import get_setting, set_setting
 
@@ -779,7 +781,7 @@ class TestMultiMailboxSave:
         # DB to new mailboxes and invoke the relevant logic via a
         # TestClient PUT.
         from fastapi.testclient import TestClient
-        client = TestClient(app, raise_server_exceptions=False)
+        client = _CsrfClient(app, raise_server_exceptions=False)
         token_cookies = None
         # Need an admin session for the PUT — reuse the auth fixtures
         # via create_session_token.
@@ -846,7 +848,7 @@ class TestMultiMailboxSave:
         from email_triage.web.auth import (
             SESSION_COOKIE_NAME, create_session_token,
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = _CsrfClient(app, raise_server_exceptions=False)
         cookies = {
             SESSION_COOKIE_NAME: create_session_token(
                 app.state.session_secret,
@@ -1145,3 +1147,96 @@ class TestFolderDiscoveryInEditForm:
         assert resp.status_code == 200
         # Fallback input is present (by name).
         assert 'name="mailboxes_csv"' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Loop-5 census: is_active deactivation-teardown — the funnel +
+# the WatcherManager.start() fail-closed gate (behavioural).
+# ---------------------------------------------------------------------------
+
+
+class TestApplyAccountActiveState:
+    """WatcherManager.start() must refuse an inactive account, and the
+    apply_account_active_state funnel must tear down on deactivate +
+    restart on activate — mirroring the owner-disable lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_start_refuses_inactive_account(self, app, db, admin_user):
+        """start() returns 'Account inactive' and starts nothing when the
+        account's is_active flag is 0 (fail-closed at the actuator)."""
+        from unittest.mock import AsyncMock, patch
+
+        aid = _make_imap_account(db, admin_user["id"])
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = ?", (aid,))
+        db.commit()
+        app.state.db = db
+        mgr = app.state.watcher_manager
+
+        # If the gate failed, start() would reach the IMAP push arm.
+        with patch.object(
+            mgr, "_start_imap_push", new=AsyncMock(),
+        ) as imap_mock:
+            msg = await mgr.start(aid)
+
+        assert msg == "Account inactive"
+        imap_mock.assert_not_awaited()
+        assert not mgr.is_running(aid)
+
+    @pytest.mark.asyncio
+    async def test_start_allows_active_account(self, app, db, admin_user):
+        """Control: an ACTIVE account is NOT refused by the new gate (the
+        gate must not over-fire)."""
+        from unittest.mock import AsyncMock, patch
+
+        aid = _make_imap_account(db, admin_user["id"])  # is_active=1
+        app.state.db = db
+        mgr = app.state.watcher_manager
+
+        with patch.object(
+            mgr, "_start_imap_push",
+            new=AsyncMock(return_value="Push: watching started"),
+        ) as imap_mock:
+            msg = await mgr.start(aid)
+
+        # Reached the push arm (not refused).
+        imap_mock.assert_awaited()
+        assert msg != "Account inactive"
+
+    @pytest.mark.asyncio
+    async def test_funnel_deactivate_stops_persist_false(
+        self, app, db, admin_user,
+    ):
+        """apply_account_active_state(active=False) tears down via
+        stop(persist=False) — leaving the watch preference intact so
+        re-activation restores it (owner-disable parity)."""
+        from unittest.mock import AsyncMock, patch
+
+        aid = _make_imap_account(db, admin_user["id"])
+        app.state.db = db
+        mgr = app.state.watcher_manager
+
+        with patch.object(mgr, "stop", new=AsyncMock()) as stop_mock:
+            msg = await mgr.apply_account_active_state(aid, False)
+
+        stop_mock.assert_awaited_once()
+        # persist=False is the load-bearing argument.
+        _, kwargs = stop_mock.call_args
+        assert kwargs.get("persist") is False
+        assert "inactive" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_funnel_activate_restarts(self, app, db, admin_user):
+        """apply_account_active_state(active=True) restarts via start()."""
+        from unittest.mock import AsyncMock, patch
+
+        aid = _make_imap_account(db, admin_user["id"])
+        app.state.db = db
+        mgr = app.state.watcher_manager
+
+        with patch.object(
+            mgr, "start", new=AsyncMock(return_value="Push: watching started"),
+        ) as start_mock:
+            msg = await mgr.apply_account_active_state(aid, True)
+
+        start_mock.assert_awaited_once_with(aid)
+        assert msg == "Push: watching started"

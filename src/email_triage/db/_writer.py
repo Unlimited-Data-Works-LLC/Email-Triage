@@ -66,12 +66,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+from email_triage._int_utils import parse_int_or_none  # N-219c/24 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import os
 import queue
 import threading
 from typing import Any, Callable, Protocol, runtime_checkable
 
-logger = logging.getLogger("email_triage.db._writer")
+logger = get_logger("email_triage.db._writer")  # N-196b R21_4
 
 # Default queue depth ≈ 5 min of steady-state writes at ~30/sec. Tunable
 # via env so an operator can widen it under a known burst profile.
@@ -82,17 +85,19 @@ def _resolve_queue_maxsize() -> int:
     raw = os.environ.get("EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE")
     if not raw:
         return _DEFAULT_QUEUE_MAXSIZE
-    try:
-        val = int(raw)
-        return val if val > 0 else _DEFAULT_QUEUE_MAXSIZE
-    except ValueError:
+    # N-219c/24 R23: parse_int_or_none SSOT; log a warning + fall back on
+    # non-integer input (operator-facing signal that the env-var is malformed).
+    val = parse_int_or_none(raw)
+    if val is None:
         logger.warning(
-            "Ignoring non-integer EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE=%r; "
-            "using default %d",
-            raw,
-            _DEFAULT_QUEUE_MAXSIZE,
+            "Ignoring non-integer EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE; using default",
+            extra={
+                "error_msg": str(raw),
+                "n": _DEFAULT_QUEUE_MAXSIZE,
+            },
         )
         return _DEFAULT_QUEUE_MAXSIZE
+    return val if val > 0 else _DEFAULT_QUEUE_MAXSIZE
 
 
 class WriterQueueFull(RuntimeError):

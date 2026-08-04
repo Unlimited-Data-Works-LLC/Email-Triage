@@ -16,6 +16,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from email_triage._errfmt import scrub_class_error_for_persist, scrub_error_for_persist
+from email_triage._hm_render import render_hm_for_audience  #  SSOT
 from email_triage.actions.base import Action
 from email_triage.engine.models import (
     ActionOutput,
@@ -25,9 +27,11 @@ from email_triage.engine.models import (
     FlowState,
 )
 from email_triage.providers.base import EmailProvider
-from email_triage.triage_logging import is_hipaa_mode
+from email_triage.triage_logging import account_hipaa_effective
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
 
-logger = logging.getLogger("email_triage.actions.escalate")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.escalate")  # N-196b R21_4
 
 
 def _extract_display_name(sender: str) -> str:
@@ -36,9 +40,9 @@ def _extract_display_name(sender: str) -> str:
     "Dr. Jane Smith <jane@hospital.org>" -> "Dr. Jane Smith"
     "jane@hospital.org" -> "jane"
     """
-    if "<" in sender:
-        return sender.split("<")[0].strip().strip('"')
-    return sender.split("@")[0]
+    from email_triage.mail_headers import extract_display_name
+    name = extract_display_name(sender)  # census run13  — shared <…> extraction
+    return name or sender.split("@")[0]
 
 
 def _extract_first_name(sender: str) -> str:
@@ -111,9 +115,7 @@ class EscalateAction(Action):
         notification = self._build_notification(message, classification)
 
         logger.info(
-            "Escalation: %s -> %s",
-            notification["text"],
-            notify_email,
+            "Escalation",
             extra={"flow_id": flow.flow_id},
         )
 
@@ -144,14 +146,27 @@ class EscalateAction(Action):
         # `is_hipaa_mode()`) it's first-name + timestamp only; in
         # standard mode it adds display name + subject. No body
         # content reaches this path regardless.
+        from email_triage.secrets import SecretsDecryptError, read_secret
+        # A5: read with EXPLICIT decrypt-error handling — an unreadable
+        # secret store (master-key mismatch) is NOT "no password set", and
+        # must fail closed rather than attempt a blank-password send.
+        try:
+            smtp_password = (
+                read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+            ) if secrets is not None else ""
+        except SecretsDecryptError:
+            logger.error(
+                "Escalation aborted — SMTP password unreadable (corrupt "
+                "secret row / master-key mismatch)",
+                extra={"flow_id": flow.flow_id, "notify_email": notify_email},
+            )
+            return ActionOutput(
+                result=ActionResult.FAILED,
+                error="smtp_password_unreadable",
+                data={"notify_email": notify_email, "notification": notification},
+            )
         try:
             from email_triage.web.smtp_send import send_simple_smtp_email
-            smtp_password = ""
-            if secrets is not None:
-                try:
-                    smtp_password = secrets.get("SMTP_PASSWORD") or ""
-                except Exception:
-                    smtp_password = ""
             # smtplib is blocking — run it off the event loop so an
             # escalation SMTP handshake doesn't stall the watcher /
             # push consumers sharing this loop.
@@ -181,7 +196,7 @@ class EscalateAction(Action):
             )
             return ActionOutput(
                 result=ActionResult.FAILED,
-                error=f"{type(e).__name__}: {e}",
+                error=scrub_class_error_for_persist(e),
                 data={
                     "notify_email": notify_email,
                     "notification": notification,
@@ -204,7 +219,13 @@ class EscalateAction(Action):
         message: EmailMessage,
         classification: Classification,
     ) -> dict[str, str]:
-        ts = datetime.now(timezone.utc).strftime("%H:%M")
+        #  fixed the LIVE misread (unlabeled UTC wall-clock);
+        #  (2026-07-11) routes the render through the audience-tz
+        # SSOT so a future per-recipient tz_preference threading is a
+        # 1-file change to `_hm_render.render_hm_for_audience`.
+        # ``audience_tz=None`` preserves the  fix behavior
+        # ("HH:MM UTC" wire format).
+        ts = render_hm_for_audience(datetime.now(timezone.utc))
 
         # Category tag at the front so the recipient can prioritise on
         # lock-screen preview without opening the message. Empty / None
@@ -216,7 +237,7 @@ class EscalateAction(Action):
         # Per-message HIPAA state (set at fetch time from account flag
         # OR system flag). Falls back to the global flag if the message
         # wasn't tagged — defensive for legacy call paths.
-        hipaa = getattr(message, "hipaa", False) or is_hipaa_mode()
+        hipaa = account_hipaa_effective(message=message)
         if hipaa:
             # HIPAA payload: prefix + first-name + timestamp. No
             # subject (might be PHI). No display name (might leak

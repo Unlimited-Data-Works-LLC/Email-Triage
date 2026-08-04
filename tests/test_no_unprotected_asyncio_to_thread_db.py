@@ -64,22 +64,28 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import SRC_ROOT, iter_src_files, parse_module, relpath
+
 
 # ---------------------------------------------------------------------------
 # Module discovery — every `.py` under `src/email_triage`
 # ---------------------------------------------------------------------------
+# Discovery + relpath now route through the shared pin harness (R5b) so this
+# pin cannot drift in its src-root spelling, its ``rglob`` / ``__pycache__``
+# skip, or its forward-slash relpath base. ``relpath()`` is relative to
+# ``SRC_ROOT`` → ``web/db.py`` form — IDENTICAL base to the previous
+# ``relative_to(_src_root())`` spelling, so no allow-list re-keying is needed
+# (this pin has no relpath-keyed allow-list anyway; relpath is used only for
+# parametrize ids + violation messages).
 
 def _src_root() -> Path:
-    return Path(__file__).resolve().parent.parent / "src" / "email_triage"
+    return SRC_ROOT
 
 
 def _all_modules() -> list[Path]:
     root = _src_root()
     assert root.is_dir(), f"src tree not found at {root}"
-    return sorted(
-        p for p in root.rglob("*.py")
-        if "__pycache__" not in p.parts and p.is_file()
-    )
+    return list(iter_src_files())
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +398,7 @@ class _AsyncToThreadFinder(ast.NodeVisitor):
 @pytest.mark.parametrize(
     "module_path",
     _all_modules(),
-    ids=lambda p: str(p.relative_to(_src_root())).replace("\\", "/"),
+    ids=lambda p: relpath(p),
 )
 def test_no_unprotected_asyncio_to_thread_sqlite(module_path: Path):
     """No ``asyncio.to_thread(<sync_fn>, ...)`` /
@@ -423,16 +429,24 @@ def test_no_unprotected_asyncio_to_thread_sqlite(module_path: Path):
          line.
     """
     try:
-        src = module_path.read_text(encoding="utf-8")
-        tree = ast.parse(src)
-    except (SyntaxError, UnicodeDecodeError):
-        pytest.skip(f"{module_path} did not parse")
+        source_text = module_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # Fail-CLOSED: this is the guard's OWN scanner machinery, not an
+        # optional runtime dep. A src module that won't decode is itself
+        # a defect — skipping would let it silently escape the invariant.
+        pytest.fail(f"{module_path} did not decode ({exc!r}) — a non-decoding "
+                    "src module is a defect this guard must surface, not skip")
+    tree = parse_module(module_path)
+    if tree is None:
+        # Fail-CLOSED: parse_module returns None on SyntaxError/UnicodeDecodeError.
+        pytest.fail(f"{module_path} did not parse — a non-parsing "
+                    "src module is a defect this guard must surface, not skip")
 
-    finder = _AsyncToThreadFinder(src, tree)
+    finder = _AsyncToThreadFinder(source_text, tree)
     finder.visit(tree)
 
     if finder.findings:
-        rel = str(module_path.relative_to(_src_root())).replace("\\", "/")
+        rel = relpath(module_path)
         lines = "\n".join(
             f"  {rel}:{lineno}:{col}  {sig}"
             for lineno, col, _, sig in finder.findings
@@ -618,14 +632,16 @@ class TestNoFalsePositivesInTree:
         per_module: dict[str, int] = {}
         for mod in _all_modules():
             try:
-                src = mod.read_text(encoding="utf-8")
-                tree = ast.parse(src)
-            except (SyntaxError, UnicodeDecodeError):
+                source_text = mod.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
                 continue
-            finder = _AsyncToThreadFinder(src, tree)
+            tree = parse_module(mod)
+            if tree is None:
+                continue
+            finder = _AsyncToThreadFinder(source_text, tree)
             finder.visit(tree)
             if finder.findings:
-                rel = str(mod.relative_to(_src_root())).replace("\\", "/")
+                rel = relpath(mod)
                 per_module[rel] = [
                     f"L{ln}: {sig}" for ln, _col, _, sig in finder.findings
                 ]

@@ -53,11 +53,13 @@ mechanism's investigator-workflow latency floor disappear.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime
+from email_triage._isotime import now_utc_iso
 from typing import Any
+
+from email_triage.db._helpers import load_json_col
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +255,7 @@ def verify_phi_table_against_audit_log(
         )
 
     return ReconciliationReport(
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=now_utc_iso(),
         chain_verify_passed=chain_passed,
         chain_break_reason=chain_break_reason,
         chain_length=int(chain_result["chain_length"] or 0),
@@ -339,11 +341,11 @@ def _fetch_audit_pks_from_log(
     params: list[Any] = []
     clauses: list[str] = ["row_hash != ''"]
     # Hint the planner with a LIKE on extra_json so non-flow rows don't
-    # pay the json.loads cost. ``%"flow_id"%`` is a literal-substring
-    # LIKE on the canonical JSON encoding — flow_id is always quoted as
-    # a JSON key. False positives (a row whose extra_json mentions the
-    # literal string ``flow_id`` without a value) will fall out at the
-    # json.loads + .get() step below.
+    # pay the decode cost. ``%"flow_id"%`` is a literal-substring LIKE on
+    # the canonical JSON encoding — flow_id is always quoted as a JSON
+    # key. False positives (a row whose extra_json mentions the literal
+    # string ``flow_id`` without a value) fall out at the decode + .get()
+    # step below.
     clauses.append("extra_json LIKE ?")
     params.append(f'%"{spec.extra_key}"%')
     if since_iso is not None:
@@ -356,17 +358,11 @@ def _fetch_audit_pks_from_log(
     rows = conn.execute(sql, params).fetchall()
     for r in rows:
         raw = r["extra_json"]
-        if not raw:
-            continue
-        try:
-            extras = json.loads(raw)
-        except (ValueError, TypeError):
-            # Malformed extras don't poison the walk — the chain
-            # verifier is the authoritative integrity check; reconcile
-            # is a downstream consumer.
-            continue
-        if not isinstance(extras, dict):
-            continue
+        # census  SSOT — a malformed/NULL extra_json degrades to {} →
+        # pk None → row skipped below. The chain verifier is the
+        # authoritative integrity check; reconcile is a downstream
+        # consumer, so a corrupt row doesn't poison the walk.
+        extras = load_json_col(raw, default={})
         pk = extras.get(spec.extra_key)
         if pk is None:
             continue

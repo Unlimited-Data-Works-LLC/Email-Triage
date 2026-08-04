@@ -8,7 +8,7 @@ After=network-online.target podman.socket
 # Pinned release image from GHCR. Pull the tag you want to run; the unit
 # does not build. To upgrade: change the tag and `systemctl restart
 # email-triage.service`.
-Image=ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+Image=ghcr.io/unlimited-data-works-llc/email-triage:0.2.0
 ContainerName=email-triage
 
 # Host:container port mapping. The app listens on 8080 inside the

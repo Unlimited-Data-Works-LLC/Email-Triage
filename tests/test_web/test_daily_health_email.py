@@ -156,7 +156,7 @@ class TestFromName:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, host, port):
+            def __init__(self, host, port, timeout=None):
                 captured["host"] = host
             def __enter__(self):
                 return self
@@ -169,7 +169,7 @@ class TestFromName:
             def send_message(self, msg):
                 captured["msg"] = msg
 
-        with patch.object(auth_mod.smtplib, "SMTP", _FakeSMTP):
+        with patch("email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP):
             auth_mod.send_otp_email(
                 smtp_host="h", smtp_port=25, smtp_user="u",
                 smtp_password="p", from_addr="t@x.com", to_addr="u@x.com",
@@ -187,7 +187,7 @@ class TestFromName:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, *a):
+            def __init__(self, *a, **kw):
                 pass
             def __enter__(self):
                 return self
@@ -198,7 +198,7 @@ class TestFromName:
             def send_message(self, msg):
                 captured["msg"] = msg
 
-        with patch.object(auth_mod.smtplib, "SMTP", _FakeSMTP):
+        with patch("email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP):
             auth_mod.send_otp_email(
                 smtp_host="h", smtp_port=25, smtp_user="u",
                 smtp_password="p", from_addr="t@x.com", to_addr="u@x.com",
@@ -226,8 +226,21 @@ class TestDailyHealthAssembly:
 
         # Multi-part: text + html.
         assert msg.is_multipart() or msg.get_content_type() == "multipart/alternative"
-        payloads = [p.get_payload() for p in msg.walk() if not p.is_multipart()]
-        combined = "\n".join(str(p) for p in payloads)
+        # Assert the DECODED content, not the raw MIME payload: a part flips to
+        # base64 transfer-encoding whenever the body carries non-ASCII (e.g. the
+        # "Daily health — <date>" em-dash title), which would hide plaintext
+        # in the raw payload — an order-dependent flake. Decode each part first.
+        parts = []
+        for p in msg.walk():
+            if p.is_multipart():
+                continue
+            raw = p.get_payload(decode=True)
+            parts.append(
+                raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes)
+                else str(p.get_payload())
+            )
+        combined = "\n".join(parts)
 
         assert "Daily health" in msg["Subject"]
         assert "Status" in combined
@@ -288,6 +301,231 @@ class TestDailyHealthAssembly:
         state = gather_health_state(db, cfg)
         assert is_interesting(state) is True
 
+    def test_daily_health_email_includes_n151_soft_gate_row_when_active(
+        self, db, monkeypatch,
+    ):
+        """ REDESIGNED v3 Part 3 — when the MSAL master-key SOFT-gate
+        is active, the daily health digest MUST render a dedicated
+        ``Credential store`` section as the FIRST content section
+        (above the Status chip row), flip the subject line to
+        ``⚠ Attention``, and mirror the block in the plain-text twin.
+
+        The regex-anchored order check pins the template's presentation
+        order so a future refactor can't silently push the credential
+        section below the Status block (an operator scanning from the
+        top would miss it — the very failure mode  is preventing).
+        """
+        import re
+
+        from email_triage.providers import _msal_cache_crypto as _mkc
+        from email_triage.web import db as _dbmod
+
+        # Force Part-0's predicate ACTIVE regardless of the local
+        # sqlite/keyring state — we're testing the render path.
+        # DB-SME F1 fold (2026-07-10): patch the atomic tuple SSOT
+        # ``n151_soft_gate_state`` (the only accessor
+        # ``gather_n151_soft_gate`` calls now), not the deprecated
+        # dual-call ``_active``/``_reason`` pair that torn-read on
+        # transitions.
+        monkeypatch.setattr(
+            _mkc, "n151_soft_gate_state", lambda: (True, "unavailable"),
+        )
+
+        # Seed the Part-2 primitive's settings row with a ``since`` stamp.
+        _since_iso = "2026-07-10T12:00:00+00:00"
+        _dbmod.set_setting(
+            db,
+            "admin_alert:n151_soft_gate",
+            {"since": _since_iso, "reason": "unavailable"},
+        )
+
+        cfg = _make_config()
+        state = gather_health_state(db, cfg)
+        # State snapshot carries every field the render path reads.
+        assert state["n151_soft_gate"]["active"] is True
+        assert state["n151_soft_gate"]["reason"] == "unavailable"
+        assert state["n151_soft_gate"]["since"] == _since_iso
+
+        msg = assemble_daily_health_email(state, cfg)
+
+        # Decode each MIME part — a non-ASCII em-dash flips a part to
+        # base64 which would hide the plaintext string match.
+        html_part = ""
+        text_part = ""
+        for p in msg.walk():
+            if p.is_multipart():
+                continue
+            raw = p.get_payload(decode=True)
+            body = (
+                raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else str(p.get_payload())
+            )
+            ct = p.get_content_type()
+            if ct == "text/html":
+                html_part = body
+            elif ct == "text/plain":
+                text_part = body
+
+        # Subject flips to ⚠ Attention (the SOFT-gate feeds
+        # attention_reasons via gather_health_state).
+        assert "Attention" in msg["Subject"]
+
+        # HTML: Credential store section renders BEFORE the Status chip row.
+        # The regex is anchored on the two <h3>s so an intermediate
+        # section couldn't sneak in front and pass the assertion.
+        assert "<h3>Credential store</h3>" in html_part
+        assert "<h3>Status</h3>" in html_part
+        m = re.search(
+            r"<h3>Credential store</h3>.*?<h3>Status</h3>",
+            html_part,
+            flags=re.DOTALL,
+        )
+        assert m is not None, (
+            "Credential store section must render BEFORE Status chip row "
+            "in the HTML body (order regex did not match)"
+        )
+        # Body carries the reason + since stamp so the operator has
+        # something to act on without opening the admin UI.
+        assert "unavailable" in html_part
+        assert _since_iso in html_part
+
+        # Text twin populated + also above the Status block.
+        assert "Credential store:" in text_part
+        assert "Status:" in text_part
+        assert text_part.index("Credential store:") < text_part.index("Status:")
+        assert _since_iso in text_part
+
+    @pytest.mark.parametrize(
+        "reason_raw, since_raw",
+        [
+            # HTML metachars in the reason field.
+            ("<script>alert(1)</script>", "2026-07-10T12:00:00+00:00"),
+            # HTML metachars in the since field.
+            ("unavailable", "<img src=x onerror=alert(1)>"),
+            # Both fields carrying metachars — belt + suspenders.
+            (
+                "<b>reason</b>&\"'x",
+                "2026<>07&\"10T12:00:00+00:00",
+            ),
+        ],
+    )
+    def test_daily_health_n151_row_escapes_reason_and_since(
+        self, db, monkeypatch, reason_raw, since_raw,
+    ):
+        """DA R4 CIDI-drift pin — the N-151 SOFT-gate render row in
+        ``_render_html`` MUST ``html.escape`` both the ``reason`` and
+        ``since`` fields before interpolating them into the HTML body.
+
+        The sibling render site
+        ``_assemble_n151_soft_gate_alert`` in ``web/admin_alerts.py``
+        already escapes both fields.  Any drift here re-opens a stored
+        HTML-injection surface a future ``reason`` enum expansion (or a
+        Part-2 settings-row poisoning) could exploit — Prime Directive
+        #5 requires the two mirrored render sites to converge.
+
+        Parametrized so the pin catches metachar drift on either
+        field individually AND both at once — a future refactor that
+        only escapes one field is caught the same as an
+        all-escapes-removed regression.
+        """
+        from email_triage.providers import _msal_cache_crypto as _mkc
+        from email_triage.web import db as _dbmod
+
+        # DB-SME F1 fold — patch the atomic tuple SSOT, not the two
+        # deprecated single-field accessors.  Matches the fold in
+        # ``gather_n151_soft_gate``.
+        monkeypatch.setattr(
+            _mkc, "n151_soft_gate_state", lambda: (True, reason_raw),
+        )
+
+        _dbmod.set_setting(
+            db,
+            "admin_alert:n151_soft_gate",
+            {"since": since_raw, "reason": reason_raw},
+        )
+
+        cfg = _make_config()
+        state = gather_health_state(db, cfg)
+        assert state["n151_soft_gate"]["active"] is True
+        assert state["n151_soft_gate"]["reason"] == reason_raw
+        assert state["n151_soft_gate"]["since"] == since_raw
+
+        msg = assemble_daily_health_email(state, cfg)
+
+        # Extract the HTML part.  Content-Transfer-Encoding may flip to
+        # quoted-printable / base64 for high-bit chars, so decode via
+        # ``get_payload(decode=True)`` and normalize to UTF-8 text
+        # before checking metachars (base64 would otherwise hide the
+        # raw string match either way).
+        html_part = ""
+        for p in msg.walk():
+            if p.is_multipart():
+                continue
+            if p.get_content_type() != "text/html":
+                continue
+            raw = p.get_payload(decode=True)
+            html_part = (
+                raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else str(p.get_payload())
+            )
+            break
+
+        assert html_part, "html part missing from assembled digest"
+        # The Credential store section MUST have rendered — otherwise
+        # the assertion "raw metachars absent" is trivially satisfied.
+        assert "<h3>Credential store</h3>" in html_part
+
+        # Scope the pin to the Credential store SECTION fragment (the
+        # specific render site DA R4 called out — ``_render_html``
+        # around the reason/since interpolation, L1057/L1062).  The
+        # attention-banner rendering above the section is out of scope
+        # for this pin and lives in a different render path.
+        import re as _re
+        _sec_match = _re.search(
+            r"<h3>Credential store</h3>(?P<body>.*?)(?:<h3>|</div>\s*$)",
+            html_part,
+            flags=_re.DOTALL,
+        )
+        assert _sec_match is not None, (
+            "could not slice the Credential store section from the "
+            "rendered HTML — the pin needs the fragment to run"
+        )
+        section = _sec_match.group("body")
+
+        # Grep-anchored pin: the raw metachar strings MUST NOT appear
+        # verbatim in the Credential store section.  A future refactor
+        # that drops ``html.escape`` on either field at L1057/L1062
+        # breaks this immediately.
+        for raw in (reason_raw, since_raw):
+            # Only check strings that actually carry HTML metachars —
+            # a plain ASCII string ("unavailable") is unchanged by
+            # escape() so the "raw absent" check would false-fire.
+            if any(ch in raw for ch in "<>&\"'"):
+                assert raw not in section, (
+                    "N-151 SOFT-gate Credential store section failed "
+                    "to html.escape the field before interpolation — "
+                    f"raw metachars leaked: {raw!r} present in the "
+                    "rendered section. See DA R4 CIDI-drift fold + "
+                    "sibling _assemble_n151_soft_gate_alert."
+                )
+
+        # Positive-liveness check: at least one metachar in each raw
+        # value has an escaped form present in the section — proves
+        # the escape actually ran, not just that the raw string
+        # happens to be absent for some unrelated reason.
+        _entities = {"<": "&lt;", ">": "&gt;", "&": "&amp;",
+                     '"': "&quot;", "'": "&#x27;"}
+        for raw in (reason_raw, since_raw):
+            for ch, ent in _entities.items():
+                if ch in raw:
+                    assert ent in section, (
+                        "expected escaped entity "
+                        f"{ent!r} in Credential store section (from "
+                        f"raw {raw!r}) — html.escape() did not run "
+                        "on this field"
+                    )
+                    break  # one confirmation per field is enough
+
 
 # ---------------------------------------------------------------------------
 # Send codepath
@@ -298,7 +536,7 @@ class TestSendDailyHealth:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, host, port):
+            def __init__(self, host, port, timeout=None):
                 captured["host"] = host
                 captured["port"] = port
             def __enter__(self): return self
@@ -310,7 +548,7 @@ class TestSendDailyHealth:
                 captured["msg"] = msg
 
         monkeypatch.setattr(
-            "email_triage.web.daily_health.smtplib.SMTP", _FakeSMTP,
+            "email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP,
         )
         return captured
 
@@ -435,41 +673,41 @@ class TestUpdateAvailableSection:
     * ``gather_update_available_section`` reads schema_migrations from
       the live DB connection and compares against the registered
       MIGRATIONS cap. Status drives whether the section renders.
-    * GitHub Releases fetch is mocked at ``urllib.request.urlopen``.
+    * GitHub Releases fetch is mocked at ``egress_client`` (run17 #5 — the
+      fetch routes through ``egress_client(intent=Intent.PUBLIC_FETCH)``
+      now, not a raw ``urllib.request.urlopen``).
     * Cache for the GitHub fetch is reset between tests so they don't
       contaminate each other.
     """
 
     def _patch_release_fetch(self, monkeypatch, *, payload=None, raise_exc=None):
-        """Monkeypatch the urllib.request.urlopen the gather function uses.
+        """Monkeypatch the ``egress_client`` the gather function uses.
 
         Pass ``payload`` to return that JSON dict. Pass ``raise_exc``
-        to raise that exception from urlopen (network failure path).
+        to raise that exception from the GET (network failure path).
         """
+        import json
+
+        import httpx
+
         from email_triage.web import daily_health as dh
         dh._reset_release_cache()
 
-        import io
-        import json
-        class _FakeResp:
-            def __init__(self, body: bytes):
-                self._body = body
+        class _FakeClient:
             def __enter__(self):
                 return self
             def __exit__(self, *a):
                 return False
-            def read(self):
-                return self._body
+            def get(self, url, **kw):
+                if raise_exc is not None:
+                    raise raise_exc
+                return httpx.Response(
+                    200,
+                    content=json.dumps(payload or {}).encode("utf-8"),
+                    request=httpx.Request("GET", url),
+                )
 
-        def _fake_urlopen(req, timeout=None):
-            if raise_exc is not None:
-                raise raise_exc
-            body = json.dumps(payload or {}).encode("utf-8")
-            return _FakeResp(body)
-
-        monkeypatch.setattr(
-            dh.urllib.request, "urlopen", _fake_urlopen,
-        )
+        monkeypatch.setattr(dh, "egress_client", lambda **kw: _FakeClient())
 
     def _force_target_caps(self, monkeypatch, value: int):
         """Pin the source MIGRATIONS cap so the test isn't fragile to
@@ -557,13 +795,13 @@ class TestUpdateAvailableSection:
 
     def test_section_renders_fallback_when_fetch_fails(self, db, monkeypatch):
         """Network failure -> section still renders with fallback line."""
-        import urllib.error
+        import httpx
         cfg = _make_config()
         self._set_db_schema(db, version=10)
         self._force_target_caps(monkeypatch, value=20)
         self._patch_release_fetch(
             monkeypatch,
-            raise_exc=urllib.error.URLError("simulated network down"),
+            raise_exc=httpx.ConnectError("simulated network down"),
         )
         state = gather_health_state(db, cfg)
         msg = assemble_daily_health_email(state, cfg)
@@ -579,7 +817,7 @@ class TestUpdateAvailableSection:
         cfg = _make_config()
         self._set_db_schema(db, version=20)
         self._force_target_caps(monkeypatch, value=20)
-        # No urlopen patch — gather should bail before any fetch.
+        # No egress_client patch — gather should bail before any fetch.
         state = gather_health_state(db, cfg)
         assert state["update_available"] is None
         msg = assemble_daily_health_email(state, cfg)
@@ -599,34 +837,36 @@ class TestUpdateAvailableSection:
         from email_triage.web import daily_health as dh
         dh._reset_release_cache()
 
-        def _explode(req, timeout=None):
+        def _explode(**kw):
             raise AssertionError(
-                "urlopen called even though include_update_available=False"
+                "egress_client called even though include_update_available=False"
             )
-        monkeypatch.setattr(dh.urllib.request, "urlopen", _explode)
+        monkeypatch.setattr(dh, "egress_client", _explode)
 
         state = gather_health_state(db, cfg)
         assert state["update_available"] is None
 
     def test_release_fetch_caches_within_ttl(self, db, monkeypatch):
-        """fetch_latest_release hits urlopen once per URL per TTL window."""
+        """fetch_latest_release hits egress_client once per URL per TTL window."""
         from email_triage.web import daily_health as dh
         dh._reset_release_cache()
 
+        import httpx
+
         call_count = {"n": 0}
 
-        class _Resp:
-            def __init__(self, body):
-                self._body = body
+        class _FakeClient:
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def read(self): return self._body
+            def get(self, url, **kw):
+                call_count["n"] += 1
+                return httpx.Response(
+                    200,
+                    content=b'{"tag_name": "v1", "html_url": "u", "body": "b"}',
+                    request=httpx.Request("GET", url),
+                )
 
-        def _fake_urlopen(req, timeout=None):
-            call_count["n"] += 1
-            return _Resp(b'{"tag_name": "v1", "html_url": "u", "body": "b"}')
-
-        monkeypatch.setattr(dh.urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(dh, "egress_client", lambda **kw: _FakeClient())
         url = "https://api.github.com/repos/foo/bar/releases/latest"
         first = dh.fetch_latest_release(url)
         second = dh.fetch_latest_release(url)
@@ -752,7 +992,7 @@ class TestAdminEmailRecipientResolution:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, *a): pass
+            def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def starttls(self): pass
@@ -760,7 +1000,7 @@ class TestAdminEmailRecipientResolution:
             def send_message(self, msg): captured["msg"] = msg
 
         monkeypatch.setattr(
-            "email_triage.web.daily_health.smtplib.SMTP", _FakeSMTP,
+            "email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP,
         )
         sent, _ = send_daily_health_email(
             db, cfg, secrets=None, force=True,
@@ -782,7 +1022,7 @@ class TestAdminEmailRecipientResolution:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, *a): pass
+            def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def starttls(self): pass
@@ -790,7 +1030,7 @@ class TestAdminEmailRecipientResolution:
             def send_message(self, msg): captured["msg"] = msg
 
         monkeypatch.setattr(
-            "email_triage.web.daily_health.smtplib.SMTP", _FakeSMTP,
+            "email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP,
         )
         sent, _ = send_daily_health_email(
             db, cfg, secrets=None, force=True,
@@ -832,7 +1072,7 @@ class TestUpdateFailedEmail:
         captured: dict = {}
 
         class _FakeSMTP:
-            def __init__(self, host, port):
+            def __init__(self, host, port, timeout=None):
                 captured["host"] = host
                 captured["port"] = port
             def __enter__(self): return self
@@ -842,7 +1082,7 @@ class TestUpdateFailedEmail:
             def send_message(self, msg): captured["msg"] = msg
 
         monkeypatch.setattr(
-            "email_triage.web.daily_health.smtplib.SMTP", _FakeSMTP,
+            "email_triage.web.smtp_send.smtplib.SMTP", _FakeSMTP,
         )
         return captured
 
@@ -965,7 +1205,7 @@ class TestUpdateFailedEmail:
         cfg.admin_email.recipients = ["ops@example.com"]
 
         class _BoomSMTP:
-            def __init__(self, *a): pass
+            def __init__(self, *a, **kw): pass
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def starttls(self): pass
@@ -974,7 +1214,7 @@ class TestUpdateFailedEmail:
                 raise OSError("smtp connection refused")
 
         monkeypatch.setattr(
-            "email_triage.web.daily_health.smtplib.SMTP", _BoomSMTP,
+            "email_triage.web.smtp_send.smtplib.SMTP", _BoomSMTP,
         )
         sent, reason = send_update_failed_email(
             db, cfg, secrets=None,

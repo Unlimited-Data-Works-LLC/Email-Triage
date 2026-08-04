@@ -57,7 +57,8 @@ def _make_db_full() -> sqlite3.Connection:
     """Bring up the full schema via init_db so every helper this
     module pokes at has the columns / settings rows it needs."""
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -185,7 +186,7 @@ def _make_classification() -> Classification:
 
 class TestBackendAllowlists:
     """The two allowlists are the privacy-critical constants for M-4
-    and M-5. Future commits that reach for OpenAI / Gemini / Anthropic
+    and M-5. Future commits that reach for OpenAI / Gemini / AI provider
     embeddings should land on a pre-failed test, not a green merge.
     """
 
@@ -216,7 +217,7 @@ class TestBackendAllowlists:
         # Defence in depth: explicit denylist of names a future
         # contributor might reach for.
         for forbidden in (
-            "openai", "anthropic", "gemini", "groq",
+            "openai", "AI provider", "gemini", "groq",
             "mistral", "cohere", "voyage",
         ):
             assert forbidden not in _LOCAL_BACKENDS
@@ -227,7 +228,7 @@ class TestBackendAllowlists:
         sent-mail-index constant."""
         assert _ALLOWED_EMBEDDING_BACKENDS == self._PINNED_LOCAL_BACKENDS
         for forbidden in (
-            "openai", "anthropic", "gemini", "groq",
+            "openai", "AI provider", "gemini", "groq",
             "mistral", "cohere", "voyage",
         ):
             assert forbidden not in _ALLOWED_EMBEDDING_BACKENDS
@@ -628,11 +629,11 @@ class TestHipaaDraftReply:
 class TestNonLocalBackendRejection:
     """SentMailIndex.__init__ must refuse non-local backends. The
     sibling ``test_sent_mail_index.py`` covers the openai / gemini /
-    anthropic cases; this module pins the contract a second time so a
+    AI provider cases; this module pins the contract a second time so a
     future test-file deletion doesn't silently strip the guard."""
 
     @pytest.mark.parametrize("forbidden", [
-        "openai", "anthropic", "gemini", "groq", "mistral", "cohere",
+        "openai", "AI provider", "gemini", "groq", "mistral", "cohere",
     ])
     def test_construction_rejects_non_local(self, forbidden):
         conn = _make_db_full()
@@ -659,7 +660,7 @@ class TestEmbeddingBackendFactoryAllowlist:
     here so the factory drift can't slip past the live test suite."""
 
     @pytest.mark.parametrize("forbidden", [
-        "openai", "anthropic", "gemini", "groq", "mistral", "cohere",
+        "openai", "AI provider", "gemini", "groq", "mistral", "cohere",
     ])
     def test_factory_rejects_non_local(self, forbidden):
         cfg = SimpleNamespace(
@@ -692,7 +693,7 @@ class TestEmbeddingBackendFactoryAllowlist:
 #     / M-7 — they stay hard-off (the opt-in is scoped to operator self-
 #     disclosure, not derivative-of-PHI surfaces).
 #
-# Companion drawer: internal documentation walks the per-layer
+# Companion drawer: docs/hipaa-audit.md walks the per-layer
 # audit; internal documentation carries the sign-off log entry.
 # ---------------------------------------------------------------------------
 

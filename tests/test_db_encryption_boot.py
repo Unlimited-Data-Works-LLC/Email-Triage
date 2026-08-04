@@ -25,6 +25,7 @@ What IS exercised on dev:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 import types
@@ -94,15 +95,23 @@ def test_resolve_env_unrecognized_defers_to_yaml(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_contract_plain_when_flag_off_non_hipaa(monkeypatch):
-    """Flag off + non-HIPAA = plaintext, no raise (the common case)."""
+def test_contract_plain_when_flag_off_non_hipaa(monkeypatch, caplog):
+    """Flag off + non-HIPAA = plaintext, no raise (the common case) — but a loud
+    general PLAINTEXT advisory now fires (operator 2026-06-11: "the default
+    should be encrypted anyway; warn on NOT encrypted"). Not fatal."""
     monkeypatch.delenv(_ENV_VAR, raising=False)
     _triage_logging._hipaa_mode = False  # autouse fixture restores
-    assert (
-        enforce_db_encryption_boot_contract(
+    with caplog.at_level("WARNING"):
+        result = enforce_db_encryption_boot_contract(
             _cfg(encryption_enabled=False), master_key_available=True
         )
-        is False
+    assert result is False
+    assert any(
+        "opening in PLAINTEXT" in r.message for r in caplog.records
+    ), "expected the general plaintext advisory on a non-HIPAA plaintext boot"
+    # ...and NOT the HIPAA-specific advisory (this isn't HIPAA mode).
+    assert not any(
+        "HIPAA mode is ON" in r.message for r in caplog.records
     )
 
 
@@ -311,7 +320,7 @@ def test_init_db_plaintext_still_works(tmp_path):
     from email_triage.web.db import init_db
 
     db_file = tmp_path / "plain.db"
-    conn = init_db(str(db_file))
+    conn = track(init_db(str(db_file)))
     try:
         # WAL + foreign_keys set by _bootstrap_schema.
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -336,7 +345,7 @@ def test_init_db_memory_default_unchanged():
     """init_db() with no args still opens an in-memory DB + bootstraps."""
     from email_triage.web.db import init_db
 
-    conn = init_db()
+    conn = track(init_db())
     try:
         names = {
             r[0]

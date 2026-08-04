@@ -17,6 +17,7 @@ adds:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timedelta, timezone
 
@@ -50,7 +51,7 @@ from email_triage.web.mfa import (
 @pytest.fixture
 def db():
     """Fresh in-memory DB + seeded test user. HIPAA mode default OFF."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES (?, ?, ?, ?)",
@@ -283,7 +284,7 @@ class TestMfaRequiredPredicate:
         codes = issue_recovery_codes(db, user_id=user["id"], count=2)
         consume_recovery_code(db, user_id=user["id"], code=codes[0])
         consume_recovery_code(db, user_id=user["id"], code=codes[1])
-        # No active hardware key + zero unused codes → first-login
+        # No active passkey + zero unused codes → first-login
         # path. Operator should re-issue codes if user is in this
         # state without a passkey.
         assert is_mfa_required_for(db, user) is False

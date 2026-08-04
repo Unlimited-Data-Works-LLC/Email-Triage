@@ -44,11 +44,16 @@ Exempt paths:
 """
 
 from __future__ import annotations
+from email_triage._secret_keys import SESSION_SECRET_KEY  # N-231 R22 stored-secret-key SSOT
 
 import hashlib
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import os
 import re
+import threading
+from collections import Counter
 from typing import Iterable
 from urllib.parse import parse_qs
 
@@ -57,7 +62,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 
-_log = logging.getLogger("email_triage.web.csrf")
+_log = get_logger("email_triage.web.csrf")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +96,64 @@ _EXEMPT_PREFIXES: tuple[str, ...] = (
 # Methods that DO require a token. Everything else (GET / HEAD /
 # OPTIONS) is RFC 7231 safe and skipped.
 _GUARDED_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+# ---------------------------------------------------------------------------
+# CSRF reject tracker — a PROCESS-GLOBAL "what still needs a token" log.
+#
+# The per-app ``app.state.csrf_rejects`` counter resets with each app instance
+# (i.e. every test), so it can't give a cross-test view. This module-level tally
+# survives the whole PROCESS, keyed by a NORMALIZED route shape (numeric path
+# segments → ``:id``), so it is BOUNDED (a finite set of route shapes), PHI-SAFE
+# (no body, no query, numeric ids redacted), and groups by FORM. Its purpose is
+# the CSRF-test-enforcement migration: run the suite, read
+# :func:`csrf_reject_report` (a pytest session hook prints it) to see which
+# forms POST without a token under soft-launch = the migration to-do; the set
+# shrinks as tests adopt the token-injecting client. CAVEATS: (1) this is
+# MIGRATION PROGRESS, not csrf COVERAGE — a route already token-injecting or
+# with no csrf test at all never appears; (2) under ``pytest-xdist`` it is
+# PER-WORKER (each worker is its own process), not a unified suite-wide tally;
+# (3) the ``:id`` redaction is numeric-only (fine for this app's integer-id
+# routes — a future non-numeric PHI-bearing path segment would NOT be redacted).
+# In production (enforce=ON) it doubles as a by-route view of actual CSRF
+# rejections.
+# ---------------------------------------------------------------------------
+
+_CSRF_REJECT_TRACKER: "Counter[str]" = Counter()
+_CSRF_TRACKER_LOCK = threading.Lock()
+_ROUTE_ID_RE = re.compile(r"/\d+(?=/|$)")
+
+
+def _normalize_route(method: str, path: str) -> str:
+    """``(POST, /accounts/5/save)`` → ``POST /accounts/:id/save`` — a bounded,
+    PHI-safe route SHAPE (numeric segments redacted, no query/body)."""
+    return f"{method} {_ROUTE_ID_RE.sub('/:id', path)}"
+
+
+def record_csrf_reject(method: str, path: str, *, enforced: bool) -> None:
+    """Accumulate one CSRF reject / would-reject into the process-global tally,
+    keyed by ``<outcome> <route-shape>`` (outcome = ``rejected`` when enforced,
+    ``would-reject`` under soft-launch)."""
+    key = (
+        ("rejected " if enforced else "would-reject ")
+        + _normalize_route(method, path)
+    )
+    with _CSRF_TRACKER_LOCK:
+        _CSRF_REJECT_TRACKER[key] += 1
+
+
+def csrf_reject_report() -> dict[str, int]:
+    """The process-global CSRF reject / would-reject tally by route shape — the
+    'what still needs a token' view for the test-enforcement migration (and a
+    by-route CSRF-rejection view in production)."""
+    with _CSRF_TRACKER_LOCK:
+        return dict(_CSRF_REJECT_TRACKER)
+
+
+def reset_csrf_reject_tracker() -> None:
+    """Clear the process-global tally (test isolation / a fresh migration run)."""
+    with _CSRF_TRACKER_LOCK:
+        _CSRF_REJECT_TRACKER.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +219,7 @@ def attach_csrf_cookie(
         token,
         max_age=max_age,
         httponly=False,    # JS reads it; HttpOnly would defeat the purpose
-        secure=secure,     # set False in dev/HTTP listener; True in prod
+        secure=secure,     # set False in dev/HTTP listener; True in prod  # n200-secure-ssot-allowed: attach_csrf_cookie is the CSRF SSOT; `secure` param is the seam; every caller (api.py) passes an is_request_https()-derived value per N-200
         samesite="strict",
         path="/",
     )
@@ -373,7 +436,7 @@ class CsrfMiddleware:
                     await response(scope, receive, send)
                     return
 
-        secret_key = getattr(scope["app"].state, "session_secret", "")
+        secret_key = getattr(scope["app"].state, SESSION_SECRET_KEY, "")
         valid = bool(secret_key) and verify_csrf_token(
             secret_key, token, session_token,
         )
@@ -386,10 +449,13 @@ class CsrfMiddleware:
             # attribute (e.g. test fixture skipping lifespan) reflects
             # the production posture, not the legacy soft-launch one.
             enforce = bool(getattr(state, "csrf_enforce", True))
+            # Process-global by-route tally (the migration "what needs a token"
+            # log — survives the whole test run, unlike the per-app counter).
+            record_csrf_reject(method, path, enforced=enforce)
             _log.warning(
-                "CSRF token %s",
-                "rejected" if enforce else "would-reject (soft-launch)",
+                "CSRF token evaluated",
                 extra={"_extra": {
+                    "outcome": "rejected" if enforce else "would-reject (soft-launch)",
                     "path": path,
                     "method": method,
                     "enforce": enforce,
@@ -403,6 +469,7 @@ class CsrfMiddleware:
             # counter?" without grepping log_entries. Outcome name
             # distinguishes soft-launch (would-have-rejected; the
             # request still proceeded) from enforce (actually 403'd).
+            from email_triage.web._audit import safe_audit_write_async
             from email_triage.web.db import record_access_event
             from email_triage.web.db_threadpool import db_call
             #  — record_access_event is @db_write; calling it
@@ -415,8 +482,8 @@ class CsrfMiddleware:
             # swallow it (same policy as safe_audit_write).
             db = getattr(state, "db", None)
             if db is not None:
-                try:
-                    await db_call(
+                await safe_audit_write_async(
+                    lambda: db_call(
                         record_access_event,
                         db,
                         actor_user_id=None,
@@ -434,15 +501,9 @@ class CsrfMiddleware:
                             f"body_buffered={buffered_body is not None} "
                             f"body_too_large={body_too_large}"
                         ),
-                    )
-                except Exception as exc:
-                    _log.warning(
-                        "audit_write_failed",
-                        extra={"_extra": {
-                            "audit": "csrf_rejection",
-                            "error": str(exc),
-                        }},
-                    )
+                    ),
+                    description="csrf_rejection",
+                )
             if enforce:
                 response = JSONResponse(
                     {"error": "csrf_token_invalid"},
@@ -527,7 +588,7 @@ def csrf_input(request) -> object:
     try:
         from email_triage.web.auth import SESSION_COOKIE_NAME
         session_token = request.cookies.get(SESSION_COOKIE_NAME, "") or ""
-        secret_key = getattr(request.app.state, "session_secret", "") or ""
+        secret_key = getattr(request.app.state, SESSION_SECRET_KEY, "") or ""
     except Exception:
         # Templates render in many contexts; never raise.
         session_token = ""

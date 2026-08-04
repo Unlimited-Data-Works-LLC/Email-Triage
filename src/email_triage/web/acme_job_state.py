@@ -34,6 +34,8 @@ the recent-history surface ( calls for the last-10 list on
 
 from __future__ import annotations
 
+from email_triage.db._helpers import dump_json_col, load_json_col
+
 import json
 import secrets as _secrets
 import sqlite3
@@ -42,7 +44,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from email_triage._isotime import parse_iso
+from email_triage._isotime import now_utc_iso, parse_iso
 from email_triage.db._helpers import apply_compatible_row_factory
 
 
@@ -240,7 +242,9 @@ class _JobState:
     ) -> str:
         with self._lock:
             self._reset_unlocked()
-            self.job_id = "acme_" + _secrets.token_hex(6)
+            # N-244 R24: SSOT — `_ids.new_short_id`. Byte-identical shape.
+            from email_triage._ids import new_short_id
+            self.job_id = new_short_id("acme")
             self.phase = "starting"
             self.started_at = time.time()
             self.attempt = 0
@@ -289,7 +293,17 @@ class _JobState:
             # automatic-failed.
             self.phase = "cancelled" if kind == "cancelled" else "failed"
             self.finished_at = time.time()
-            self.last_error = str(error)
+            #  tail — ACME job errors are displayed in the ACME
+            # status UI (`last_error` is read by the operator-facing
+            # status endpoint). Route through scrub_exc so provider
+            # errors (DNS challenge failures, TSIG key issues) cannot
+            # echo secret fragments to the operator UI. Log sinks
+            # upstream preserve full traceback for privileged debug.
+            from email_triage.web._flash import scrub_exc
+            if isinstance(error, BaseException):
+                self.last_error = scrub_exc(error, purpose="form")
+            else:
+                self.last_error = scrub_exc(str(error), purpose="form")
             self.last_error_kind = kind
 
     def reset(self) -> None:
@@ -318,7 +332,7 @@ _STATE = _JobState()
 # ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_iso()
 
 
 def _row_to_snapshot(row: sqlite3.Row | dict | None) -> dict[str, Any] | None:
@@ -333,12 +347,12 @@ def _row_to_snapshot(row: sqlite3.Row | dict | None) -> dict[str, Any] | None:
         d = dict(row)
     domains = []
     try:
-        domains = json.loads(d.get("domains_json") or "[]")
+        domains = load_json_col(d.get("domains_json"), default=[])
     except (TypeError, ValueError):
         domains = []
     visibility = {}
     try:
-        visibility = json.loads(d.get("visibility_json") or "{}")
+        visibility = load_json_col(d.get("visibility_json"), default={})
     except (TypeError, ValueError):
         visibility = {}
     started_at = d.get("started_at")
@@ -408,12 +422,12 @@ def _db_insert_row(state_snapshot: dict[str, Any], actor_user_id: int | None) ->
                 (
                     state_snapshot["job_id"],
                     actor_user_id,
-                    json.dumps(state_snapshot["domains"]),
+                    dump_json_col(state_snapshot["domains"]),
                     state_snapshot["directory_url"],
                     state_snapshot["phase"],
                     state_snapshot["attempt"],
                     state_snapshot["max_attempts"],
-                    json.dumps(state_snapshot["visibility"]),
+                    dump_json_col(state_snapshot["visibility"]),
                     1 if state_snapshot["cancel_requested"] else 0,
                     started_iso,
                     now,
@@ -436,6 +450,16 @@ def _db_update_row(job_id: str | None, fields: dict[str, Any]) -> None:
         return
     if not fields:
         return
+    # census #6/#8 — scrub the persisted last_error at the single write
+    # boundary (covers phase/finish_failure/cancel). The ACME path carries
+    # TSIG HMAC keys + ACME/EAB creds (secret leg) AND a mail/DNS exception can
+    # echo a recipient address or mailbox path (PHI leg); last_error renders in
+    # the admin UI, so a raw exception leaks either. Route through the persist
+    # SSOT (BOTH legs) — census run13 #8 closed the PHI leg that the
+    # secret-only scrub left open here.
+    if fields.get("last_error"):
+        from email_triage._errfmt import scrub_error_for_persist
+        fields = {**fields, "last_error": scrub_error_for_persist(fields["last_error"])}
     cols = ", ".join(f"{k} = ?" for k in fields.keys())
     vals = list(fields.values()) + [job_id]
     # SW-1: serialize with the main writer under  (see _db_insert_row).
@@ -559,7 +583,7 @@ def visibility(domain: str, **flags: Any) -> None:
     _STATE.visibility_set(domain, **flags)
     snap = _STATE.snapshot()
     _db_update_row(snap["job_id"], {
-        "visibility_json": json.dumps(snap["visibility"]),
+        "visibility_json": dump_json_col(snap["visibility"]),
         "last_progress_at": _now_iso(),
     })
 

@@ -83,7 +83,8 @@ class TestDbSecrets:
     @pytest.fixture
     def db(self):
         from email_triage.web.db import init_db
-        return init_db(":memory:")
+        from _db_tracking import track
+        return track(init_db(":memory:"))
 
     @pytest.fixture
     def master_key(self):
@@ -323,14 +324,15 @@ class TestDbSecrets:
         import threading
         from email_triage.secrets import DbSecrets
         from email_triage.web.db import init_db
+        from _db_tracking import track
 
         db_path = tmp_path / "rotate-lock.db"
-        init_db(str(db_path))
+        track(init_db(str(db_path)))
 
         def _open() -> sqlite3.Connection:
-            c = sqlite3.connect(
+            c = track(sqlite3.connect(
                 str(db_path), check_same_thread=False, timeout=10.0,
-            )
+            ))
             c.row_factory = sqlite3.Row
             return c
 
@@ -418,7 +420,8 @@ class TestDbSecretsWriteLock:
     @pytest.fixture
     def db(self):
         from email_triage.web.db import init_db
-        return init_db(":memory:")
+        from _db_tracking import track
+        return track(init_db(":memory:"))
 
     @pytest.fixture
     def master_key(self):

@@ -54,7 +54,7 @@ from .admin import router as _admin_router
 from .ai_backends_crud import router as _ai_backends_crud_router
 from .embedding_install import router as _embedding_install_router
 from .triage_classify import router as _triage_classify_router
-from .openclaw import router as _openclaw_router
+from .webhook import router as _webhook_router
 from .labels import router as _labels_router
 from .retry_queue import router as _retry_queue_router
 
@@ -84,7 +84,7 @@ for _r in (
     _embedding_install_router,
     _ai_backends_crud_router,
     _triage_classify_router,
-    _openclaw_router,
+    _webhook_router,
     _labels_router,
     _retry_queue_router,
 ):
@@ -108,7 +108,7 @@ _CONCERN_MODULES = (
     ".ai_backends_crud",
     ".embedding_install",
     ".triage_classify",
-    ".openclaw",
+    ".webhook",
     ".labels",
     ".retry_queue",
 )

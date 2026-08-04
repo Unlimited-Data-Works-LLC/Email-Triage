@@ -42,6 +42,8 @@ from typing import Any
 
 import httpx
 
+from email_triage._egress import Intent, egress_async_client
+
 
 class LazyHttpClient:
     """Holds a lazily-constructed :class:`httpx.AsyncClient` with a
@@ -51,7 +53,7 @@ class LazyHttpClient:
 
         class OllamaClassifier:
             def __init__(self, ..., timeout: float = 120.0):
-                self._http = LazyHttpClient(timeout=timeout)
+                self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
 
             async def classify(self, ...):
                 client = await self._http.get()
@@ -64,12 +66,20 @@ class LazyHttpClient:
     safe to instantiate before an event loop exists (matches the
     reasoning in :func:`providers._oauth_http.refresh_lock_for`).
 
-    Constructor kwargs are forwarded verbatim to
-    :class:`httpx.AsyncClient` -- ``base_url``, ``timeout``,
-    ``headers``, etc. all pass through.
+    The client is built through :func:`email_triage._egress.egress_async_client`
+    so every holder declares an :class:`Intent` and inherits the egress funnel's
+    fail-closed policy (this is the ONE seam that routes all ~12 LazyHttpClient
+    callers through the funnel). Remaining constructor kwargs forward verbatim to
+    the underlying :class:`httpx.AsyncClient` -- ``base_url``, ``timeout``,
+    ``headers``, etc. ``extra_local_suffixes`` (from ``config.tls.local_url_suffixes``)
+    widens what counts as a local destination for the locality intents.
     """
 
-    def __init__(self, **client_kwargs: Any) -> None:
+    def __init__(self, *, intent: Intent,
+                 extra_local_suffixes: tuple[str, ...] = (),
+                 **client_kwargs: Any) -> None:
+        self._intent = intent
+        self._extra_local_suffixes = tuple(extra_local_suffixes)
         self._client_kwargs = client_kwargs
         self._client: httpx.AsyncClient | None = None
         self._lock: asyncio.Lock | None = None
@@ -91,7 +101,11 @@ class LazyHttpClient:
             return self._client
         async with self._get_lock():
             if self._client is None:
-                self._client = httpx.AsyncClient(**self._client_kwargs)
+                self._client = egress_async_client(
+                    intent=self._intent,
+                    extra_local_suffixes=self._extra_local_suffixes,
+                    **self._client_kwargs,
+                )
             return self._client
 
     async def aclose(self) -> None:
@@ -104,4 +118,4 @@ class LazyHttpClient:
                 self._client = None
 
 
-__all__ = ["LazyHttpClient"]
+__all__ = ["Intent", "LazyHttpClient"]

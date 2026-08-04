@@ -234,6 +234,105 @@ class TestFullBundle:
         # msal_cache included whenever present (no toggle).
         assert "data/msal_cache.json" in result.files
 
+    def test_per_account_msal_caches_included(self, tmp_path):
+        """N-177 / R20_2 — the census identified backup silently omitted per-
+        account MSAL token caches. This asserts every `data/msal_cache*.json`
+        on disk is in the bundle (bijection). The legacy singleton path is a
+        subset of the glob and stays covered."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        # Two per-account caches + the legacy singleton (the old backup path
+        # only collected the singleton — the two per-account files leaked out).
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy": true}')
+        (data_dir / "msal_cache_3.json").write_bytes(b'{"acct":3}')
+        (data_dir / "msal_cache_7.json").write_bytes(b'{"acct":7}')
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost", schema_version=42,
+            )
+        finally:
+            conn.close()
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        # All 3 files bijectively present under data/.
+        want = {"data/msal_cache.json", "data/msal_cache_3.json", "data/msal_cache_7.json"}
+        got = {p for p in result.files if p.startswith("data/msal_cache")}
+        assert got == want, (
+            f"per-account MSAL bijection broken: on disk {want}, in bundle {got}"
+        )
+
+    def test_per_account_msal_caches_round_trip_restore(self, tmp_path):
+        """DA/hipaa-sme must-fix — restore writes ALL msal_cache_*.json back
+        with 0o600 (bijection round-trip). Backup-side glob is worthless if
+        restore drops files."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy":true}')
+        (data_dir / "msal_cache_11.json").write_bytes(b'{"acct":11}')
+        (data_dir / "msal_cache_22.json").write_bytes(b'{"acct":22}')
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost", schema_version=42,
+            )
+        finally:
+            conn.close()
+        from email_triage.backup import write_unbundled_to_dir
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        restore_dir = tmp_path / "restore"
+        written = write_unbundled_to_dir(result, restore_dir)
+        for name in ("msal_cache.json", "msal_cache_11.json", "msal_cache_22.json"):
+            p = restore_dir / "data" / name
+            assert p.is_file(), f"restore lost {name}"
+            assert p.read_bytes() == (data_dir / name).read_bytes()
+
+    def test_torn_write_msal_cache_omitted(self, tmp_path):
+        """DA must-fix — a torn/truncated JSON cache mid-backup must NOT be
+        bundled (poisoning restore is worse than missing). Skip+continue."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy":true}')
+        (data_dir / "msal_cache_9.json").write_bytes(b'{"truncated":')  # invalid JSON
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost", schema_version=42,
+            )
+        finally:
+            conn.close()
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        assert "data/msal_cache.json" in result.files
+        assert "data/msal_cache_9.json" not in result.files, (
+            "torn-write cache poisoned the bundle"
+        )
+
     def test_include_master_key_adds_file(self, tmp_path):
         bundle = self._build(tmp_path, include_master_key=True)
         result = unbundle(bundle, passphrase=self.PASSPHRASE)

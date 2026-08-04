@@ -315,3 +315,101 @@ def find_free_slots(
         day += timedelta(days=1)
 
     return out
+
+
+def check_availability_conflict(
+    invite_start: datetime,
+    invite_end: datetime,
+    events: Iterable[CalendarEvent],
+    *,
+    working_hours: WorkingHours | None = None,
+    business_hours_start: str = "09:00",
+    business_hours_end: str = "17:00",
+    skip_weekends: bool = True,
+    timezone_name: str = "UTC",
+) -> dict:
+    """N-291 R30 (row 67 seam) — decide whether an incoming .ics invite
+    conflicts with the user's declared availability + existing calendar.
+
+    Returns a decision dict with:
+      - ``conflict``: bool — True iff the invite range overlaps any
+        existing event OR falls fully outside the user's business/
+        working-hours windows.
+      - ``reason``: str — one of ``"event_overlap"``, ``"outside_hours"``,
+        ``"weekend"``, ``"clear"``. Enables the calling policy layer
+        to pick ``accept`` / ``decline`` / ``tentative``.
+      - ``overlapping_events``: list of (start, end) tuples for events
+        that overlap the invite. Empty if the conflict is
+        hours-based, not event-based.
+
+    Pure function — no I/O. Feed it a fetched events list from the
+    calling site (the invite-response action supplies it from
+    `provider.list_events(...)`).
+
+    THIS IS A SEAM — the punch  auto-response policy (accept /
+    decline / tentative selection) is a separate policy knob that
+    consumes this decision. Kept out of scope here so the policy
+    can iterate without touching the pure-conflict math.
+    """
+    inv_s = _to_aware_utc(invite_start)
+    inv_e = _to_aware_utc(invite_end)
+
+    # Pass 1 — event overlap.
+    overlapping: list[tuple[datetime, datetime]] = []
+    for ev in events or []:
+        if ev.start is None or ev.end is None:
+            continue
+        es = _to_aware_utc(ev.start)
+        ee = _to_aware_utc(ev.end)
+        # Half-open interval overlap: [inv_s, inv_e) ∩ [es, ee) non-empty.
+        if es < inv_e and inv_s < ee:
+            overlapping.append((es, ee))
+    if overlapping:
+        return {
+            "conflict": True,
+            "reason": "event_overlap",
+            "overlapping_events": overlapping,
+        }
+
+    # Pass 2 — availability-window check. The invite must fall INSIDE
+    # at least one of the user's declared windows on both endpoints.
+    tz = ZoneInfo(timezone_name) if timezone_name else timezone.utc
+    day_start_local = inv_s.astimezone(tz).date()
+    day_end_local = inv_e.astimezone(tz).date()
+    day = day_start_local
+    invite_wholly_inside_hours = False
+    while day <= day_end_local:
+        windows = _day_windows(
+            day, tz,
+            working_hours=working_hours,
+            business_hours_start=business_hours_start,
+            business_hours_end=business_hours_end,
+            skip_weekends=skip_weekends,
+        )
+        for ws, we in windows:
+            if ws <= inv_s and inv_e <= we:
+                invite_wholly_inside_hours = True
+                break
+        if invite_wholly_inside_hours:
+            break
+        day += timedelta(days=1)
+    if not invite_wholly_inside_hours:
+        # Weekend day with skip_weekends returns []; distinguish for
+        # a nicer decline reason.
+        if skip_weekends and inv_s.astimezone(tz).date().weekday() >= 5:
+            return {
+                "conflict": True,
+                "reason": "weekend",
+                "overlapping_events": [],
+            }
+        return {
+            "conflict": True,
+            "reason": "outside_hours",
+            "overlapping_events": [],
+        }
+
+    return {
+        "conflict": False,
+        "reason": "clear",
+        "overlapping_events": [],
+    }

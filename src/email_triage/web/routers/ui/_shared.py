@@ -31,9 +31,15 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from email_triage._isotime import parse_iso
-from email_triage.engine.models import Classification, EmailMessage, UserRole
+from email_triage._isotime import now_utc_iso, parse_iso, parse_iso_aware, to_utc_iso  # N-357b R31
+from email_triage._hm_render import render_hm_for_audience  #  SSOT
+from email_triage.engine.models import (
+    Classification, EmailMessage, UserRole, WEB_ALLOWED_RULE_TYPES,
+)
 from email_triage.web.db import can_manage_account
+from email_triage.db._helpers import dump_json_col, load_json_col
+from email_triage.secrets import read_secret
+from email_triage.web._list_authz import is_list_deletable_by, is_list_writable_by
 from email_triage.web import settings_keys as _S
 from email_triage.web.app import get_config, get_db, get_secrets, get_templates
 from email_triage.web.auth import (
@@ -53,11 +59,17 @@ from email_triage.web.dependencies import (
     OwnedGmailApiAccount,
     get_current_user,
     get_session_secret,
+    is_admin as _is_admin,  # N-222f R22 SSOT — local var `is_admin` shadows the callable, so import under alias
     require_auth,
     require_role,
 )
+import threading
+
+from email_triage._atomicio import atomic_write_text
+from email_triage._envbool import parse_bool, parse_bool_tristate
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import bounded_int, parse_int_or_none  # N-219c R23
 
 _log = get_logger("web.ui")
 
@@ -82,13 +94,31 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _safe_int(raw: object, default: int = 0) -> int:
+def is_htmx(request) -> bool:
+    """True when the request was issued by HTMX (the ``HX-Request`` header).
+
+    SSOT for HTMX detection. The value is matched
+    CASE-INSENSITIVELY: HTMX itself sends ``"true"``, but an intermediary proxy
+    can mangle the case, so the bare ``== "true"`` inline checks that were
+    scattered across the ui concern files were fragile. ``test_is_htmx_ssot_pin``
+    enforces that every HX-Request read routes through here.
+    """
+    return request.headers.get("HX-Request", "").lower() == "true"
+
+
+def _safe_int(raw: object, default: "int | None" = 0) -> "int | None":
     """Parse request-supplied input to int, never raising.
 
     ``int(form.get("x"))`` raises ``ValueError`` on a non-numeric value
     (a tampered form field, ``?offset=abc``) — uncaught, that escapes
     the handler as a 500. This coerces a missing / blank / non-numeric
     value to ``default`` instead.
+
+    N-282 R29: signature widened to allow `default=None` so callers
+    that distinguish "absent/invalid → None" from "0" can route
+    through this SSOT (the R29 census  finding was the walrus-
+    inside-IfExp shape at `integrations.py:436` re-implementing this
+    with an `.isdigit()` gate).
     """
     try:
         return int(raw)  # type: ignore[arg-type]
@@ -136,27 +166,6 @@ def _get_categories_from_db(db, user_id: int | None = None) -> dict[str, str]:
     system categories (user override wins on collision)."""
     from email_triage.web.db import get_categories_dict
     return get_categories_dict(db, user_id=user_id)
-
-
-def _tag_message_hipaa(message, account: dict):
-    """Stamp message.hipaa based on the owning account's resolved state.
-
-    Providers don't know about accounts (they only know their own
-    config), so every call site that fetches a message for a specific
-    account must tag the result here. Downstream actions read
-    ``message.hipaa`` instead of calling ``is_hipaa_mode()`` so the
-    right per-account decision is made rather than a global one.
-    """
-    if message is None or account is None:
-        return message
-    from email_triage.triage_logging import is_account_hipaa
-    try:
-        message.hipaa = is_account_hipaa(account)
-    except AttributeError:
-        # EmailMessage is a frozen dataclass in some configurations;
-        # fall back to replace() semantics if direct assignment fails.
-        pass
-    return message
 
 
 async def _render(templates, request, name, context=None):
@@ -226,7 +235,6 @@ async def _render(templates, request, name, context=None):
     needs_baa = "baa_banner" not in ctx
     needs_retry = "retry_queue_banner" not in ctx
     if needs_baa or needs_retry:
-        from email_triage.web.db_threadpool import db_call
         user_for_banners = ctx.get("user")
 
         def _both_banners():
@@ -267,11 +275,10 @@ def _inject_retry_queue_banner_ctx(
     """
     if user is None:
         try:
-            from email_triage.web.dependencies import get_current_user
             user = get_current_user(request)
         except Exception:
             user = None
-    if user is None or user.get("role") != "admin":
+    if not _is_admin(user):  # N-222f R22
         return None
     db = getattr(request.app.state, "db", None)
     if db is None:
@@ -325,11 +332,10 @@ def _inject_baa_banner_ctx(
         # ctx but some (login pages, public help) don't. We can still
         # render the banner if the request carries a session.
         try:
-            from email_triage.web.dependencies import get_current_user
             user = get_current_user(request)
         except Exception:
             user = None
-    if user is None or user.get("role") != "admin":
+    if not _is_admin(user):  # N-222f R22
         return None
 
     # HIPAA-disabled install gate. Only render the banner when at least
@@ -447,19 +453,24 @@ def _dashboard_health_chips(request: Request, db) -> dict:
 
             providers: dict[str, dict] = {}
             alerts: list[dict] = []
+            paused: list[dict] = []
             for s in acct_states:
                 p = s.get("provider", "unknown")
                 b = providers.setdefault(p, {
                     "total": 0, "push": 0, "poll": 0,
-                    "uncovered": 0, "push_plus_poll": 0,
+                    "uncovered": 0, "watching_off": 0, "push_plus_poll": 0,
                     "accounts": [],
                 })
                 b["total"] += 1
                 primary = s.get("primary", "none")
+                watching_off = bool(s.get("watching_off"))
                 if primary == "push":
                     b["push"] += 1
                 elif primary == "poll":
                     b["poll"] += 1
+                elif watching_off:
+                    # Deliberately not watched — neutral, not "uncovered ⚠".
+                    b["watching_off"] += 1
                 else:
                     b["uncovered"] += 1
                 if s.get("mode") == "push+poll":
@@ -489,6 +500,14 @@ def _dashboard_health_chips(request: Request, db) -> dict:
                         "owner":        s["owner"],
                         "alert":        s["alert"],
                     })
+                elif watching_off:
+                    # Surfaced neutrally ("watching off (by choice)") with a
+                    # re-enable link — NOT an alert, doesn't flip the chip.
+                    paused.append({
+                        "account_id":   s["account_id"],
+                        "account_name": s["account_name"],
+                        "owner":        s["owner"],
+                    })
 
             # Process-level (not per-account).
             try:
@@ -501,9 +520,13 @@ def _dashboard_health_chips(request: Request, db) -> dict:
                 poll_reg, poll_fresh = 0, 0
 
             chips["watchers"] = {
+                # Paused-by-choice accounts do NOT flip the chip to ⚠ — only a
+                # real alert does ( follow-up: disabling a watcher is not an
+                # error).
                 "ok": not alerts,
                 "providers":    providers,
                 "alerts":       alerts,
+                "paused":       paused,
                 # Process-level counters surfaced separately so the
                 # template can show "5/5 folders watching" without
                 # walking every account.
@@ -521,9 +544,19 @@ def _dashboard_health_chips(request: Request, db) -> dict:
         mx = row["mx"] if row else None
         if mx:
             try:
-                dt = datetime.fromisoformat(mx)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
+                # N-269d R28: parse_iso handles Z-form natively.
+                # N-319 R30 (task  fix): the pre-fix inline
+                # `from ... import parse_iso` here (and at :792)
+                # shadowed the module-level import at :34 →
+                # function-local variable → any code path that hit
+                # the try/except at :605 BEFORE reaching this line
+                # would UnboundLocalError. Same defect class as
+                # N-269b. Removed; module-level import at :34 is
+                # authoritative.
+                # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+                dt = parse_iso_aware(mx)
+                if dt is None:
+                    raise ValueError("bad iso")
                 age = datetime.now(timezone.utc) - dt
                 age_s = age.total_seconds()
                 if age_s < 120:
@@ -546,7 +579,7 @@ def _dashboard_health_chips(request: Request, db) -> dict:
 
     # ---- Errors (24h) -----------------------------------------------
     try:
-        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        since = to_utc_iso(datetime.now(timezone.utc) - timedelta(hours=24))
         row = db.execute(
             "SELECT COUNT(*) AS cnt FROM log_entries "
             "WHERE level = 'ERROR' AND ts >= ?",
@@ -610,8 +643,33 @@ def _dashboard_health_chips(request: Request, db) -> dict:
                     else "📡 Push active"
                 ),
             }
-    except Exception:
-        pass
+    except Exception as _n319_e:
+        # N-319 R30 (task  fix — root-cause per
+        # `feedback_fix_flaky_tests_dont_dismiss` + N-294 silent-
+        # swallow rule): the pre-fix `except Exception: pass` here
+        # made the O365 chip block silently return `total=0` on ANY
+        # error inside the block, defeating `TestDashboardO365Chip`
+        # assertions. Route to `.debug` per N-294 pattern so a real
+        # error is at least logged; the chip still degrades to `Push
+        # off` (initial state at :411) so the dashboard remains
+        # rendered.
+        # N-330 R30 (CI-red fix-forward on N-319 — N-242 R24 ratchet):
+        # aliased-import `logging as _n319_log` was an SSOT-bypass
+        # (same shape N-242 forbids). Route through the module-level
+        # `get_logger` from `triage_logging` — the PHI-safe structured
+        # logging SSOT (NOTE: this is the log-emitter SSOT, not the
+        # log_entries HMAC audit chain; those are Prime Directives 3
+        # + 12, distinct SSOTs — the N-330 commit-message misworded
+        # this as "HMAC chain," corrected here).
+        # N-332 R30 fix-forward on N-330: was `.debug(..., exc_info=e)`,
+        # but `TriageLogger.debug/info/warning` do NOT thread `exc_info`
+        # — it sinks silently into `**extra`. Escalate to `.error()`,
+        # which does thread `exc_info` (triage_logging.py:447). The
+        # block errored, so `.error()` is the correct severity anyway.
+        get_logger("email_triage.web.routers.ui").error(
+            "_dashboard_health_chips: office365_push block errored",
+            exc_info=_n319_e,
+        )
 
     return chips
 
@@ -677,20 +735,72 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
     )
 
     db = get_db(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
 
+    #  — the Recent-activity widget shows the 5 newest runs. Fetch
+    # one extra (limit+1 sentinel) so the card can honestly say "5 most
+    # recent — older runs not shown" instead of letting the operator
+    # read 5 rows as their entire history. Cheaper than a COUNT(*) on a
+    # potentially large triage_runs table, and a teaser widget only
+    # needs the boolean "is there more", not the exact total.
+    _DASH_RUNS_SHOWN = 5
+    _recent_runs = get_recent_triage_runs_for_user(
+        db, user["id"], limit=_DASH_RUNS_SHOWN + 1,
+    )
     ctx: dict = {
         "user": user,
         "is_admin": is_admin,
         "getting_started": get_dashboard_getting_started(db, user),
-        "recent_runs": get_recent_triage_runs_for_user(db, user["id"], limit=5),
+        "recent_runs": _recent_runs[:_DASH_RUNS_SHOWN],
+        "recent_runs_has_more": len(_recent_runs) > _DASH_RUNS_SHOWN,
         "quiet_hours": _current_user_quiet_hours(db, user),
     }
 
     if is_admin:
         ctx["health_chips"] = _dashboard_health_chips(request, db)
+        #  — restore-key freshness reminder (the automated backups can't be
+        # restored without the operator's key-only export). Productized here +
+        # in the health email instead of a repeated verbal nag.
+        try:
+            from pathlib import Path as _P
+
+            from email_triage import backup as _bk
+
+            _cfg = request.app.state.config
+            _dbp = getattr(getattr(_cfg, "persistence", None), "db_path", "")
+            _ddir = _P(_dbp).parent if _dbp else _P("./data")
+            _km = _bk.read_key_export_marker(_ddir)
+            ctx["last_key_export"] = _km.get("ts") if _km else None
+        except Exception:
+            ctx["last_key_export"] = None
+        #  Part 4 — N-151 SOFT-gate surface on the admin Dashboard Health
+        # block. When the MSAL master key is unavailable, silent-refresh for
+        # the encrypted OAuth cache is degraded; surface a prominent single-
+        # line row at the TOP of the Health card so an admin sees the gate
+        # without having to open the detailed health page. Portable text
+        # (no the monitoring system/ops-tokens/admin-only-path leaks in user copy) — the
+        # reason enum is the same one exposed by ``/health/detail``.
+        # Fail-open UX: any accessor failure → gate NOT rendered (never 500
+        # the dashboard). Part 0 accessor lives in the crypto module; the
+        # accessors return (bool, str) so a template ``if`` gate suffices.
+        try:
+            from email_triage.providers._msal_cache_crypto import (
+                n151_soft_gate_state as _n151_state,
+            )
+            _active, _reason = _n151_state()
+            if _active:
+                ctx["n151_soft_gate"] = {
+                    "active": True,
+                    "reason": _reason,
+                }
+            else:
+                ctx["n151_soft_gate"] = {"active": False, "reason": "available"}
+        except Exception:
+            ctx["n151_soft_gate"] = {"active": False, "reason": "available"}
     else:
         ctx["health_chips"] = None
+        ctx["last_key_export"] = None
+        ctx["n151_soft_gate"] = {"active": False, "reason": "available"}
 
     # Watcher banner: show when any owned account's watcher has been
     # disconnected > 15 min. Admins see any account's banner.
@@ -721,9 +831,15 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
                 bad_since: datetime | None = None
                 if started_at:
                     try:
-                        bad_since = datetime.fromisoformat(started_at)
-                        if bad_since.tzinfo is None:
-                            bad_since = bad_since.replace(tzinfo=timezone.utc)
+                        # N-269d R28: parse_iso handles Z-form natively.
+                        # N-319 R30: inline-import removed for the
+                        # same UnboundLocalError-shadow reason as the
+                        # sibling at :548 — module-level import at
+                        # :34 covers all uses in this file.
+                        # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+                        bad_since = parse_iso_aware(started_at)
+                        if bad_since is None:
+                            raise ValueError("bad iso")
                     except Exception:
                         bad_since = None
                 if bad_since is None or bad_since < cutoff:
@@ -738,6 +854,31 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
     except Exception:
         banner = None
     ctx["watcher_banner"] = banner
+
+    #  — bounded-backfill saturation banner. Surface a cursor-expiry
+    # gap on the dashboard (the landing page) so an owner who never opens
+    # the Accounts list still sees that older mail may be un-triaged. One
+    # get_setting per owned account (settings cache-backed); the account-
+    # row chip on /accounts carries the same signal + the dismiss.
+    backfill_capped_accounts: list[dict] = []
+    try:
+        from email_triage.web._backfill_chip import get_backfill_capped
+        if is_admin:
+            _bf_accts = list_email_accounts(db)
+        else:
+            _bf_accts = list_email_accounts(db, user_id=user["id"])
+        for a in _bf_accts:
+            chip = get_backfill_capped(db, a["id"])
+            if chip:
+                backfill_capped_accounts.append({
+                    "account_id": a["id"],
+                    "account_name": a.get("name", ""),
+                    "window": chip.get("window", ""),
+                    "at": chip.get("at", ""),
+                })
+    except Exception:
+        backfill_capped_accounts = []
+    ctx["backfill_capped_accounts"] = backfill_capped_accounts
 
     #  — LLM-backend health banner. End-user visible. Shows
     # whichever of three states applies:
@@ -788,8 +929,14 @@ def _build_dashboard_context(request: Request, user: dict) -> dict:
                 "maintenance_window": (
                     {
                         "host": active.window.host,
-                        "ends_at_local_hm": active.ends_at.strftime(
-                            "%H:%M UTC"
+                        #  fixed the key-vs-value misnaming
+                        # (key was `ends_at_local_hm`, value was UTC);
+                        #  (2026-07-11) routes the render through
+                        # the `render_hm_for_audience` SSOT for future
+                        # audience-tz threading. audience_tz=None
+                        # preserves the "HH:MM UTC" wire format.
+                        "ends_at_utc_hm": render_hm_for_audience(
+                            active.ends_at
                         ),
                     } if active is not None else None
                 ),
@@ -830,21 +977,21 @@ def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
         window = "24h"
 
     now = datetime.now(timezone.utc)
-    since_iso = (now - delta).isoformat()
+    since_iso = to_utc_iso(now - delta)
 
     volume = {
         "window": count_triage_messages_in_window(db, since_iso=since_iso),
         "hour": count_triage_messages_in_window(
-            db, since_iso=(now - timedelta(hours=1)).isoformat(),
+            db, since_iso=to_utc_iso(now - timedelta(hours=1)),
         ),
         "day": count_triage_messages_in_window(
-            db, since_iso=(now - timedelta(hours=24)).isoformat(),
+            db, since_iso=to_utc_iso(now - timedelta(hours=24)),
         ),
         "week": count_triage_messages_in_window(
-            db, since_iso=(now - timedelta(days=7)).isoformat(),
+            db, since_iso=to_utc_iso(now - timedelta(days=7)),
         ),
         "month": count_triage_messages_in_window(
-            db, since_iso=(now - timedelta(days=30)).isoformat(),
+            db, since_iso=to_utc_iso(now - timedelta(days=30)),
         ),
     }
 
@@ -853,46 +1000,31 @@ def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
     accounts_breakdown = triage_account_breakdown(db, since_iso=since_iso)
     err_rate = triage_error_rate(db, since_iso=since_iso)
 
-    watcher_states: list[dict] = []
-    try:
-        wm = getattr(request.app.state, "watcher_manager", None)
-        if wm is not None:
-            accounts_by_id = {
-                a["id"]: a for a in list_email_accounts(db)
-            }
-            for acct_id, s in wm.all_statuses().items():
-                acct = accounts_by_id.get(acct_id, {})
-                watcher_states.append({
-                    "account_id": acct_id,
-                    "account_name": acct.get("name", ""),
-                    "status": s.get("status", "unknown"),
-                    "processed": s.get("processed", 0),
-                    "errors": s.get("errors", 0),
-                    "started_at": s.get("started_at"),
-                })
-    except Exception:
-        pass
-
-    pubsub_configured = False
-    try:
-        pubsub_configured = bool(
-            request.app.state.config.push.gmail_topic_name
-        )
-    except Exception:
-        pass
-
     #  — Push-delivery rollup. Reads the persisted per-(account,
     # provider, day) counter table that the Gmail + O365 webhooks
     # write into on every successful queue.put_nowait. Empty list
     # when the table is empty / unreachable; template renders an
     # "awaiting deliveries" line in that case.
+    # Order-load-bearing: MUST run before the `watcher_states` fold
+    # below — the Gmail-API + O365 branch of that fold reads
+    # `push_deliveries` for the per-account count union (IMAP counts
+    # come from `_mb_state`; Gmail/O365 have no per-mailbox state).
+    # The prior ordering (fetch AFTER the fold) NameError'd on every
+    # request, was swallowed by a bare `except`, and rendered
+    # "No watchers tracked" while watchers were healthy. The bare
+    # `except` below is now a structured log — future NameErrors of
+    # this class surface loud instead of silent.
     push_deliveries: list[dict] = []
     push_deliveries_by_day: dict[str, dict[str, int]] = {}
     push_deliveries_days: list[str] = []
     try:
         from email_triage.web.db import get_push_deliveries_window
         push_deliveries = get_push_deliveries_window(db, days=14)
-    except Exception:
+    except Exception as _pd_e:
+        _log.error(
+            "_admin_stats_snapshot: push_deliveries fetch failed",
+            exc_info=_pd_e,
+        )
         push_deliveries = []
     # Re-shape for the template into a per-day rollup:
     #   { "YYYY-MM-DD": {"gmail": N, "office365": M, "total": N+M} }
@@ -910,6 +1042,109 @@ def _admin_stats_snapshot(db, request: Request, window: str) -> dict:
     push_deliveries_days = sorted(
         push_deliveries_by_day.keys(), reverse=True,
     )
+
+    # N-411 (2026-07-13) — /admin/stats "Watcher state (current snapshot)"
+    # folds over `WatcherManager.account_states(db)` per its docstring SSOT
+    # contract (watcher.py:268-278). Pre-fix this loop iterated
+    # `all_statuses()` (IMAP `_mb_state` only), so every Gmail-API +
+    # Office-365 account rendered as `status=stopped` + `Started="-"` even
+    # while its Pub/Sub / Graph subscription was healthy (operator screenshot
+    # 2026-07-12 21:19 EDT). Fix routes through `account_states` — the
+    # cross-provider SSOT unifying IMAP `_mb_state` + `gmail_watches` rows +
+    # `office365_subscriptions` rows. Pinned by
+    # `tests/test_account_status_ssot_pin.py`.
+    watcher_states: list[dict] = []
+    try:
+        wm = getattr(request.app.state, "watcher_manager", None)
+        if wm is not None:
+            # IMAP mailbox-level counts + started_at come from the private
+            # `all_statuses()` view (IMAP is the only provider with a per-
+            # mailbox count). Gmail-API + O365 don't populate `_mb_state`,
+            # so their counters come from `get_push_deliveries_window`
+            # loaded above (`push_deliveries`).
+            imap_status_by_id: dict[int, dict] = wm.all_statuses()
+            gmail_o365_processed_by_id: dict[int, int] = {}
+            for r in push_deliveries:
+                # push_deliveries rows carry account_id (see the schema
+                # at `get_push_deliveries_window`); sum per account
+                # across the 14-day window.
+                gmail_o365_processed_by_id[r["account_id"]] = (
+                    gmail_o365_processed_by_id.get(r["account_id"], 0)
+                    + int(r.get("count", 0) or 0)
+                )
+            # SSOT — matches health.py:478 + _shared.py:448 + daily_health.py:538
+            # sync-direct invocation shape (playbook §3 "Per-account watcher-
+            # status SSOT" row, N-411). Do NOT introduce a `db_call` wrap
+            # unless the other 3 consumers are migrated together.
+            for row in wm.account_states(db):
+                aid = row["account_id"]
+                provider = row.get("provider", "")
+                push = row.get("push") or {}
+                # Status rendering — human-readable, per-provider aware.
+                # IMAP: reuse the per-mailbox aggregate status ("watching",
+                # "starting", "reconnecting", "error", "stopped").
+                # Gmail-API + O365: derive from `push.active` /
+                # `push.transient` / `poll.enrolled` since they have no
+                # per-mailbox IDLE state.
+                if provider == "imap":
+                    s = imap_status_by_id.get(aid, {})
+                    status = s.get("status", "stopped")
+                    processed = int(s.get("processed", 0) or 0)
+                    errors = int(s.get("errors", 0) or 0)
+                    started_at = s.get("started_at")
+                    # N-411 anti-irony fold-in (DA GO-WITH-FIXES): the count
+                    # semantics differ per-provider — IMAP is lifetime (per-
+                    # mailbox `_mb_state` counter, cleared on watcher restart
+                    # via `_mark_recovered`), Gmail/O365 come from the
+                    # `push_deliveries` 14-day rolling window. Surface the
+                    # window per-row so an operator comparing accounts
+                    # side-by-side can't draw a false conclusion (e.g. "Gmail
+                    # is 100× quieter than IMAP") — exactly the operator-
+                    # facing accuracy defect class N-411 exists to prevent.
+                    count_window = "lifetime"
+                else:
+                    if push.get("active"):
+                        status = "watching"
+                    elif push.get("transient"):
+                        status = "starting"
+                    elif (row.get("poll") or {}).get("enrolled"):
+                        status = "polling"
+                    else:
+                        status = "stopped"
+                    processed = gmail_o365_processed_by_id.get(aid, 0)
+                    errors = 0  # push-delivery table doesn't count errors
+                    started_at = push.get("detail")
+                    count_window = "14d"
+                watcher_states.append({
+                    "account_id": aid,
+                    "account_name": row.get("account_name", ""),
+                    "status": status,
+                    "processed": processed,
+                    "errors": errors,
+                    "started_at": started_at,
+                    "count_window": count_window,
+                })
+    except Exception as _ws_e:
+        # Root-cause discipline (feedback_root_cause_scope,
+        # feedback_just_be_honest): a bare `except: pass` here hid a
+        # NameError for hours — `push_deliveries` was fetched AFTER
+        # this block, so every request tripped the swallow and
+        # `watcher_states` stayed empty. The template rendered
+        # "No watchers tracked" while watchers were healthy. Keeping
+        # the guard (best-effort hydration must never 500 the page)
+        # but logging so the NEXT class of hydration bug is loud.
+        _log.error(
+            "_admin_stats_snapshot: watcher_states hydration failed",
+            exc_info=_ws_e,
+        )
+
+    pubsub_configured = False
+    try:
+        pubsub_configured = bool(
+            request.app.state.config.push.gmail_topic_name
+        )
+    except Exception:
+        pass
 
     return {
         "window": window,
@@ -959,24 +1194,35 @@ def _logs_page_snapshot(
     return {"entries": entries, "rows": rows, "accounts_by_id": accounts_by_id}
 
 
-def _compliance_page_snapshot(db, app_state) -> dict:
+def _compliance_page_snapshot(db, app_state, offsets: dict | None = None) -> dict:
     """ phase 2 — every read for /compliance in one threadpool hop.
 
     The page joins seven different tables to assemble the audit view;
     the prior loop fired off a fresh DB hit for every account in the
     boundary lookup. With the GROUP-BY query plus this wrap
     we get a single hop that finishes the whole snapshot.
+
+     reachability — ``offsets`` maps a table key (``access_events`` /
+    ``api_key_events`` / ``discover_runs`` / ``generic_access_events`` /
+    ``recent_events``) to its raw ``offset`` query-param value. Each
+    audit table is paged INDEPENDENTLY so the full §164.312(b) trail is
+    reachable, not just the newest page. Returns a ``PageWindow`` per
+    table under ``audit_pages`` for the shared pager macro.
     """
     from email_triage.web.db import (
         list_email_accounts, list_hipaa_boundary_events, latest_hipaa_boundary,
         latest_hipaa_boundaries_for_accounts,
         list_hipaa_access_events, list_api_key_events, list_discover_runs,
-        list_access_events, verify_log_chain,
+        list_access_events, verify_log_chain, verify_all_audit_chains,
+        count_hipaa_access_events, count_api_key_events, count_discover_runs,
+        count_access_events, count_hipaa_boundary_events,
     )
+    from email_triage.web._pagination import page_window, clamp_offset
     from email_triage.triage_logging import (
         is_hipaa_mode, is_account_hipaa, is_account_hipaa_locked,
     )
-    import json as _json_decode
+
+    offsets = offsets or {}
 
     accounts = list_email_accounts(db)
     boundaries_by_scope = latest_hipaa_boundaries_for_accounts(db)
@@ -991,16 +1237,50 @@ def _compliance_page_snapshot(db, app_state) -> dict:
             "last_event": last_event,
         })
 
-    recent_events = list_hipaa_boundary_events(db, limit=50)
+    #  — each audit table renders with a hard page cap. Page it via
+    # the shared offset pager so the full trail is REACHABLE (not just
+    # counted). ``_paged`` returns (rows, PageWindow) and keeps the
+    # COUNT(*) off the common path: on the first page (no offset) it only
+    # counts when the page filled (shown == cap, so an older page MIGHT
+    # exist); once the operator pages (offset > 0) the count is needed to
+    # clamp + show the range. The COUNT is an unindexed full scan on the
+    # audit tables, so skipping it for a small first page matters.
+    BOUNDARY_CAP, AUDIT_CAP = 50, 100
+
+    def _paged(list_fn, count_fn, cap, raw_offset):
+        raw = bounded_int(raw_offset, default=0)  # N-219c/16 R23: SSOT
+        if raw <= 0:
+            page = list_fn(db, limit=cap, offset=0)
+            total = count_fn(db) if len(page) >= cap else len(page)
+            win = page_window(
+                total=total, offset=0, limit=cap, shown=len(page))
+            return page, win
+        total = count_fn(db)
+        off = clamp_offset(raw, cap, total)
+        page = list_fn(db, limit=cap, offset=off)
+        win = page_window(total=total, offset=off, limit=cap, shown=len(page))
+        return page, win
+
+    recent_events, _be_win = _paged(
+        list_hipaa_boundary_events, count_hipaa_boundary_events,
+        BOUNDARY_CAP, offsets.get("recent_events"))
     system_last = latest_hipaa_boundary(db, "system")
-    access_events = list_hipaa_access_events(db, limit=100)
-    api_key_events = list_api_key_events(db, limit=100)
-    discover_runs_rows = list_discover_runs(db, limit=100)
+    access_events, _ae_win = _paged(
+        list_hipaa_access_events, count_hipaa_access_events,
+        AUDIT_CAP, offsets.get("access_events"))
+    api_key_events, _ak_win = _paged(
+        list_api_key_events, count_api_key_events,
+        AUDIT_CAP, offsets.get("api_key_events"))
+    discover_runs_rows, _dr_win = _paged(
+        list_discover_runs, count_discover_runs,
+        AUDIT_CAP, offsets.get("discover_runs"))
     for r in discover_runs_rows:
-        try:
-            r["folders_list"] = _json_decode.loads(r.get("folders") or "[]")
-        except (ValueError, TypeError):
-            r["folders_list"] = []
+        # load_json_col SSOT (census #16b): the discover_runs.folders JSON
+        # column degrades to [] on NULL/corrupt/wrong-shape, replacing the
+        # prior _json_decode.loads + ValueError/TypeError guard.
+        r["folders_list"] = load_json_col(
+            r.get("folders"), default=[], label="discover_runs.folders",
+        )
 
     stats = {
         "total": len(rows),
@@ -1008,8 +1288,26 @@ def _compliance_page_snapshot(db, app_state) -> dict:
         "effective_on": sum(1 for r in rows if r["effective_hipaa"]),
     }
 
-    generic_access_events = list_access_events(db, limit=100)
+    generic_access_events, _ga_win = _paged(
+        list_access_events, count_access_events,
+        AUDIT_CAP, offsets.get("generic_access_events"))
     log_chain = verify_log_chain(db, app_state=app_state)
+    #  — verify every chained audit-event table's HMAC chain so an operator
+    # can SEE tamper-evidence status (intact / first break) on /compliance, the
+    # same way log_chain is surfaced. Read-only; count-agnostic over the chained
+    # table registry.
+    audit_chains = verify_all_audit_chains(db)
+
+    # PageWindow per table — keyed by the template's table name. The
+    # shared pager macro renders "showing N–M of T" + newer/older links
+    # off these. (``.total/.shown/.limit`` cover the old audit_totals.)
+    audit_pages = {
+        "access_events": _ae_win,
+        "api_key_events": _ak_win,
+        "discover_runs": _dr_win,
+        "generic_access_events": _ga_win,
+        "recent_events": _be_win,
+    }
 
     return {
         "system_hipaa": system_on,
@@ -1021,7 +1319,9 @@ def _compliance_page_snapshot(db, app_state) -> dict:
         "discover_runs": discover_runs_rows,
         "generic_access_events": generic_access_events,
         "log_chain": log_chain,
+        "audit_chains": audit_chains,
         "stats": stats,
+        "audit_pages": audit_pages,
     }
 
 
@@ -1085,19 +1385,10 @@ def _get_lists_for_user(db, user) -> tuple[list[dict], list[dict]]:
             for r in rules:
                 r_dict = dict(r)
                 raw = r_dict.get("adds_labels")
-                if raw:
-                    try:
-                        parsed = _json.loads(raw)
-                        if isinstance(parsed, list):
-                            r_dict["adds_labels_list"] = [
-                                str(s) for s in parsed
-                            ]
-                        else:
-                            r_dict["adds_labels_list"] = []
-                    except Exception:
-                        r_dict["adds_labels_list"] = []
-                else:
-                    r_dict["adds_labels_list"] = []
+                # census  SSOT — corrupt/NULL adds_labels degrades to [].
+                r_dict["adds_labels_list"] = [
+                    str(s) for s in load_json_col(raw, default=[])
+                ]
                 #  — provider_labels parsed to the same shape the
                 # edit-form snapshot delivers (entries carry a
                 # pre-computed _key for the picker checkbox).
@@ -1148,7 +1439,9 @@ def _load_meeting_prefs_with_default_tz(db, user_id):
     return prefs
 
 
-_PROFILE_TABS = ("notifications", "categories", "meeting", "writing")
+_PROFILE_TABS = (
+    "notifications", "categories", "meeting", "writing", "topic-digest",
+)
 
 
 def _resolve_profile_tab(
@@ -1262,6 +1555,16 @@ def _profile_page_snapshot(db, user) -> dict:
 _ESCALATION_TEST_RL_KEY = "escalation_test_last_send"
 _ESCALATION_TEST_RL_WINDOW_SEC = 60
 
+#  Internet-Search cooldown: each operator-pressed "Look up" can fan out
+# to clinicaltrials.gov / SearXNG / the local LLM (the summary). A short
+# per-user min-interval caps rapid-fire (double-clicks, scripted abuse)
+# without hampering iterative refinement — the button is also hx-disabled
+# during the (multi-second) request, so the practical floor on the summary
+# path is already the request duration; this protects the FAST paths
+# (registry-only / not-configured / no-results) from hammering the egress.
+_TOPIC_SEARCH_RL_KEY = "topic_search_last"
+_TOPIC_SEARCH_RL_WINDOW_SEC = 3.0
+
 
 def _test_send_chip_html(
     *,
@@ -1293,7 +1596,9 @@ def _test_send_chip_html(
     # already lives in the audit row's detail blob.
     err_short = error.strip()
     if len(err_short) > 80:
-        err_short = err_short[:77] + "..."
+        # N-254 R25: route through truncate SSOT.
+        from email_triage._textfmt import truncate
+        err_short = truncate(err_short, 80, ellipsis="...")
 
     if state == "ok":
         return (
@@ -1344,10 +1649,12 @@ def _resolve_managed_accounts(db, user: dict) -> list[dict]:
     administrative path that does not exist in this UI yet (a future
     /admin/users/<id>/style-data lives outside the user-facing
     /profile namespace).
+
+    Routes through the self-scoped manageable-set SSOT (``account_scope``,
+    census run12 #1) — the same owner+delegate, no-admin-bypass computation.
     """
-    from email_triage.web.db import list_email_accounts
-    rows = list_email_accounts(db, user_id=user["id"])
-    return rows
+    from email_triage.web.account_scope import manageable_accounts
+    return manageable_accounts(db, user)
 
 
 def _build_style_data_entry(
@@ -1358,6 +1665,7 @@ def _build_style_data_entry(
     is_admin_view: bool = False,
 ) -> dict:
     """Assemble the per-account dict the template renders."""
+    from email_triage.triage_logging import is_account_hipaa as _iah_sde
     from email_triage.web.db import (
         get_style_profile,
         get_sent_mail_index_summary,
@@ -1423,7 +1731,8 @@ def _build_style_data_entry(
 
     # Sample subjects display: under HIPAA, redact in the on-screen
     # view (the export endpoint redacts on its own path).
-    if acct.get("hipaa"):
+    # N-81: route through is_account_hipaa (folds system flag).
+    if _iah_sde(acct):
         sample_display: list[str] = []
     else:
         sample_display = list(index_summary.get("sample_subjects") or [])
@@ -1438,7 +1747,9 @@ def _build_style_data_entry(
         is_style_knobs_hipaa_allow,
         is_rag_sent_index_enabled,
     )
-    is_hipaa_acct = bool(acct.get("hipaa"))
+    # N-81: is_account_hipaa folds the system flag (acct["hipaa"]=0 on a
+    # system-HIPAA install still resolves True → Mine/RAG buttons disabled).
+    is_hipaa_acct = _iah_sde(acct)
     m1m2_hipaa_allow = (
         is_style_knobs_hipaa_allow(db, acct["id"])
         if is_hipaa_acct else False
@@ -1485,10 +1796,9 @@ def _build_style_data_entry(
     if _raw_override is None or _raw_override == "":
         mine_limit_override_value = ""
     else:
-        try:
-            mine_limit_override_value = int(_raw_override)
-        except (TypeError, ValueError):
-            mine_limit_override_value = ""
+        # N-219c/16 R23: parse_int_or_none SSOT + '' sentinel on failure.
+        _iv = parse_int_or_none(_raw_override)
+        mine_limit_override_value = _iv if _iv is not None else ""
     mine_limit_install_default = get_style_learning_mine_limit_default(db)
     mine_limit_resolved = resolve_account_mine_limit(db, acct)
 
@@ -1662,9 +1972,13 @@ def _record_style_data_audit(
     Audit failure is degrade-not-deny: log a warning and keep going.
     Mirrors the discover-run + hipaa-access-event policy in this file.
     """
-    try:
-        from email_triage.web.db import record_auth_event
-        record_auth_event(
+    # census run17 #3 — the EMIT routes through the safe_audit_write SSOT so its
+    # failure is logged via the ONE audit-failure funnel /health's drift check
+    # watches (was a hand-rolled try/except WARNING that hid the failure).
+    from email_triage.web.db import record_auth_event
+    from email_triage.web._audit import safe_audit_write
+    safe_audit_write(
+        lambda: record_auth_event(
             db,
             event_type=event_type,
             email=actor_email or "",
@@ -1674,52 +1988,79 @@ def _record_style_data_audit(
                 f"account_id={account_id}"
                 + (f"; {detail}" if detail else "")
             ),
-        )
-    except Exception as e:
-        _log.warning(
-            "M-8 style-data audit row failed",
-            event_type=event_type,
-            account_id=account_id,
-            error=fmt_exc(e),
-        )
+        ),
+        description=f"style-data audit {event_type} account_id={account_id} outcome={outcome}",
+    )
 
 
-def _record_style_data_hipaa_access(
+def audit_phi_access(
     db,
     *,
-    actor_user_id: int,
+    actor_user_id: int | None,
     account: dict,
     operation: str,
     outcome: str = "ok",
+    detail: str | None = None,
 ) -> None:
-    """Write a hipaa_access_events row when actor != owner on a HIPAA acct.
+    """THE SSOT for the actor-not-owner PHI-read audit bookend (PD#14).
 
-    Per feedback_hipaa_actor_owner_gate.md — the gate fires only when:
+    Writes a hipaa_access_events row when the gate conditions are met:
 
-      account.hipaa is True
-      AND actor_user_id != account.user_id
+      is_account_hipaa(account) is True
+      AND actor_user_id != account["user_id"]
 
-    Owner-self-access is a §164.502(a) self-disclosure carve-out and
-    is NOT recorded in hipaa_access_events (the auth_events row above
-    captures user-initiated actions for the operator audit lens).
+    Gate semantics per PD#14 + feedback_hipaa_actor_owner_gate.md:
+
+    - Owner self-access (actor_user_id == account["user_id"]) is a
+      §164.502(a) self-disclosure carve-out and is NOT recorded here
+      (the auth_events row above captures it for the operator audit lens).
+    - A system-initiated read (actor_user_id=None) STILL EMITS: None !=
+      owner_id, so a None actor is NOT the owner and is NOT exempt.
+      Do NOT add an ``actor_user_id is not None`` guard — that was the
+      N-72 bug. System actors are "null principal" PHI reads and must be
+      audited.
+    - Non-HIPAA accounts: no emit regardless of actor.
+
+    All hand-rolled actor-not-owner bookends in web/routers/ui/ must route
+    through here. Shape-B (config/system, no actor-not-owner gate) and
+    Shape-C (start/finalize bracket) are allow-listed in
+    tests/test_audit_phi_access_pin.py and MUST NOT be collapsed here.
+
+    Behavior: best-effort — a write failure logs a WARNING and returns;
+    the calling access proceeds. The failure is always visible in logs.
     """
+    # census run17 #3 — the gate check stays best-effort (a gate failure logs +
+    # returns), but the EMIT routes through the safe_audit_write SSOT so its
+    # failure is logged via the ONE audit-failure funnel /health's drift check
+    # watches (was a hand-rolled try/except WARNING — and this is the PD#14
+    # actor≠owner PHI-read bookend SSOT itself, the highest-leverage convert).
     try:
         from email_triage.triage_logging import is_account_hipaa
-        if not is_account_hipaa(account):
-            return
-        if account.get("user_id") == actor_user_id:
-            return
-        from email_triage.web.db import record_hipaa_access_event
-        record_hipaa_access_event(
-            db, actor_user_id, account["id"], operation, outcome=outcome,
+        from email_triage.db.audit import phi_access_audit_required
+        required = phi_access_audit_required(
+            account_hipaa=is_account_hipaa(account),
+            actor_user_id=actor_user_id,
+            owner_id=account.get("user_id"),
         )
     except Exception as e:
         _log.warning(
-            "M-8 HIPAA access audit row failed",
+            "audit_phi_access: gate check failed",
             account_id=account.get("id"),
             operation=operation,
             error=fmt_exc(e),
         )
+        return
+    if not required:
+        return
+    from email_triage.web.db import record_hipaa_access_event
+    from email_triage.web._audit import safe_audit_write
+    safe_audit_write(
+        lambda: record_hipaa_access_event(
+            db, actor_user_id, account["id"], operation,
+            outcome=outcome, detail=detail,
+        ),
+        description=f"audit_phi_access {operation} account_id={account.get('id')}",
+    )
 
 
 def _resolve_style_data_account(
@@ -1765,13 +2106,14 @@ def _profile_style_data_snapshot(db, user) -> dict:
         get_style_learning_mine_limit_default,
         STYLE_LEARNING_INLINE_LIMIT_CEILING,
     )
+    from email_triage.web.account_scope import is_account_owner
     accounts_raw = _resolve_managed_accounts(db, user)
     entries = [
         _build_style_data_entry(
             db, a, actor_user_id=user["id"],
             is_admin_view=(
-                user.get("role") == "admin"
-                and a.get("user_id") != user["id"]
+                _is_admin(user)  # N-222f R22
+                and not is_account_owner(a, user["id"])
             ),
         )
         for a in accounts_raw
@@ -1961,7 +2303,7 @@ def _create_list_snapshot(
     empty list writes NULL.
     """
     import json as _json
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     db.execute(
         "INSERT INTO classification_lists (name, category, owner_id, is_global, created_at) VALUES (?, ?, ?, ?, ?)",
         (name, category, owner_id, int(is_global), now),
@@ -1972,21 +2314,21 @@ def _create_list_snapshot(
     pattern_clean = (pattern or "").strip()
     if pattern_clean:
         rt = rule_type if rule_type in (
-            "sender", "sender_domain", "subject"
+            WEB_ALLOWED_RULE_TYPES
         ) else "sender"
         labels_json = (
-            _json.dumps(list(adds_labels))
+            dump_json_col(list(adds_labels))
             if adds_labels else None
         )
         provider_labels_json = (
-            _json.dumps(list(provider_labels))
+            dump_json_col(list(provider_labels))
             if provider_labels else None
         )
         db.execute(
             "INSERT INTO list_rules (list_id, rule_type, pattern, skip_ai, "
             "adds_labels, provider_labels, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (new_list_id, rt, pattern_clean, int(skip_ai == "1"),
+            (new_list_id, rt, pattern_clean, int(parse_bool(skip_ai)),
              labels_json, provider_labels_json, now),
         )
     db.commit()
@@ -2004,7 +2346,9 @@ def _delete_list_snapshot(
     ).fetchone()
     if row is None:
         return "not_found", False
-    if row["owner_id"] != user_id and user_role != "admin":
+    # Delete-LIST gate via the is_list_deletable_by SSOT (census run15 #2 — owner
+    # or admin only; was an inline owner/admin gate that slipped the rule-authz pin).
+    if not is_list_deletable_by(row, user_id=user_id, role=user_role):
         return "forbidden", False
     db.execute(
         "DELETE FROM classification_lists WHERE id = ?", (list_id,),
@@ -2046,22 +2390,24 @@ def _add_rule_snapshot(
     ).fetchone()
     if row is None:
         return "not_found", False
-    if row["owner_id"] != user_id and user_role not in ("admin", "power_user"):
+    # N-60 (Loop-5 census) — power_user writes rules ONLY on a GLOBAL list,
+    # never another user's personal one; owner/admin always (SSOT).
+    if not is_list_writable_by(row, user_id=user_id, role=user_role):
         return "forbidden", False
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     labels_json = (
-        _json.dumps(list(adds_labels))
+        dump_json_col(list(adds_labels))
         if adds_labels else None
     )
     provider_labels_json = (
-        _json.dumps(list(provider_labels))
+        dump_json_col(list(provider_labels))
         if provider_labels else None
     )
     db.execute(
         "INSERT INTO list_rules (list_id, rule_type, pattern, skip_ai, "
         "adds_labels, provider_labels, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (list_id, rule_type, pattern_clean, int(skip_ai == "1"),
+        (list_id, rule_type, pattern_clean, int(parse_bool(skip_ai)),
          labels_json, provider_labels_json, now),
     )
     db.commit()
@@ -2078,7 +2424,8 @@ def _delete_rule_snapshot(
     ).fetchone()
     if row is None:
         return "not_found", False
-    if row["owner_id"] != user_id and user_role not in ("admin", "power_user"):
+    # N-60 — power_user only on GLOBAL lists; owner/admin always (SSOT).
+    if not is_list_writable_by(row, user_id=user_id, role=user_role):
         return "forbidden", False
     db.execute(
         "DELETE FROM list_rules WHERE id = ? AND list_id = ?",
@@ -2109,7 +2456,8 @@ def _get_rule_snapshot(
     ).fetchone()
     if list_row is None:
         return "not_found", None, None
-    if list_row["owner_id"] != user_id and user_role not in ("admin", "power_user"):
+    # N-60 — power_user reads/edits rules only on a GLOBAL list (SSOT).
+    if not is_list_writable_by(list_row, user_id=user_id, role=user_role):
         return "forbidden", None, None
     # SELECT * is cheap here and tolerates pre-v22 schemas (the column
     # access is wrapped in a presence check below).
@@ -2121,12 +2469,8 @@ def _get_rule_snapshot(
         return "not_found", None, None
     rule = dict(rule_row)
     raw = rule.pop("adds_labels", None)
-    try:
-        rule["adds_labels_list"] = (
-            _json.loads(raw) if raw else []
-        )
-    except Exception:
-        rule["adds_labels_list"] = []
+    # census  SSOT — corrupt/NULL adds_labels degrades to [].
+    rule["adds_labels_list"] = load_json_col(raw, default=[])
     raw_pl = rule.pop("provider_labels", None)
     rule["provider_labels_list"] = _parse_provider_labels(raw_pl)
     return "ok", rule, dict(list_row)
@@ -2145,15 +2489,8 @@ def _parse_provider_labels(raw) -> list[dict]:
     Malformed entries (missing keys, wrong types) are silently dropped
     so a half-written column doesn't crash the page render.
     """
-    import json as _json
-    if not raw:
-        return []
-    try:
-        parsed = _json.loads(raw)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(parsed, list):
-        return []
+    # census  SSOT — corrupt/NULL provider_labels degrades to [].
+    parsed = load_json_col(raw, default=[])
     out: list[dict] = []
     for entry in parsed:
         if not isinstance(entry, dict):
@@ -2201,7 +2538,8 @@ def _save_rule_snapshot(
     ).fetchone()
     if list_row is None:
         return "not_found", None, None
-    if list_row["owner_id"] != user_id and user_role not in ("admin", "power_user"):
+    # N-60 — power_user edits rules only on a GLOBAL list (SSOT).
+    if not is_list_writable_by(list_row, user_id=user_id, role=user_role):
         return "forbidden", None, None
     rule_row = db.execute(
         "SELECT id FROM list_rules WHERE id = ? AND list_id = ?",
@@ -2210,21 +2548,21 @@ def _save_rule_snapshot(
     if rule_row is None:
         return "not_found", None, None
     rt = rule_type if rule_type in (
-        "sender", "sender_domain", "subject"
+        WEB_ALLOWED_RULE_TYPES
     ) else "sender"
     labels_json = (
-        _json.dumps(list(adds_labels))
+        dump_json_col(list(adds_labels))
         if adds_labels else None
     )
     provider_labels_json = (
-        _json.dumps(list(provider_labels))
+        dump_json_col(list(provider_labels))
         if provider_labels else None
     )
     db.execute(
         "UPDATE list_rules SET rule_type = ?, pattern = ?, "
         "skip_ai = ?, adds_labels = ?, provider_labels = ? "
         "WHERE id = ? AND list_id = ?",
-        (rt, pattern_clean, int(skip_ai == "1"),
+        (rt, pattern_clean, int(parse_bool(skip_ai)),
          labels_json, provider_labels_json, rule_id, list_id),
     )
     db.commit()
@@ -2235,25 +2573,16 @@ def _save_rule_snapshot(
     ).fetchone()
     rule = dict(updated)
     raw = rule.pop("adds_labels", None)
-    try:
-        rule["adds_labels_list"] = (
-            _json.loads(raw) if raw else []
-        )
-    except Exception:
-        rule["adds_labels_list"] = []
+    # census  SSOT — corrupt/NULL adds_labels degrades to [].
+    rule["adds_labels_list"] = load_json_col(raw, default=[])
     raw_pl = rule.pop("provider_labels", None)
     rule["provider_labels_list"] = _parse_provider_labels(raw_pl)
     return "ok", rule, dict(list_row)
 
 
-def _require_admin_user(request: Request):
-    """Return user dict or raise redirect/403."""
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user["role"] != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin_user
+from email_triage._secret_keys import SESSION_SECRET_KEY  # N-231 R22 stored-secret-key SSOT
 
 
 def _build_categories_page_snapshot(db, scope: str) -> dict:
@@ -2319,7 +2648,11 @@ def _personal_category_create_snapshot(
     try:
         create_category(db, slug, description, user_id=user_id)
     except ValueError as e:
-        error = str(e)
+        #  tail — user-visible error from create_category. ValueError
+        # message may echo raw slug/description content the user typed;
+        # route through scrub_exc for defense-in-depth.
+        from email_triage.web._flash import scrub_exc
+        error = scrub_exc(e, purpose="form")
     except Exception:
         error = f"Category '{slug}' already exists for your account."
     personal_categories = list_categories(
@@ -2336,8 +2669,11 @@ def _personal_category_delete_snapshot(
     from email_triage.web.db import (
         get_category, delete_category, list_categories,
     )
+    from email_triage.web._resource_authz import can_modify_owned_resource
     cat = get_category(db, cat_id)
-    if cat is None or cat.get("user_id") != user_id:
+    if cat is None or not can_modify_owned_resource(
+        cat.get("user_id"), requester_id=user_id, admin_bypass=False,
+    ):
         return "forbidden", []
     delete_category(db, cat_id)
     personal_categories = list_categories(
@@ -2378,10 +2714,19 @@ def _secret_key_for_account(account_id: int, provider_type: str) -> str | None:
 
 
 def _enrich_account(acct: dict, secrets) -> dict:
-    """Add has_password / has_secret flags without exposing actual values."""
+    """Add has_password / has_secret flags without exposing actual values.
+
+    Also sets a unified ``has_credentials`` bool (True iff a credential is
+    present) — but ONLY when ``secrets`` is actually readable. When secrets
+    can't be checked (lifespan-off / test), the key is left UNSET so the row
+    template can't emit a false "credentials removed" signal (N-108: it
+    distinguishes a Removed account, whose creds are purged, from an
+    Edit-paused one, whose creds are intact — both render is_active=0).
+    """
     sk = _secret_key_for_account(acct["id"], acct["provider_type"])
     if sk and secrets:
-        val = secrets.get(sk)
+        val = read_secret(secrets, sk)
+        acct["has_credentials"] = bool(val)
         if acct["provider_type"] == "imap":
             acct["has_password"] = bool(val)
         elif acct["provider_type"] == "office365":
@@ -2400,7 +2745,7 @@ def _build_accounts_page_snapshot(request: Request, user: dict) -> dict:
     """
     db = get_db(request)
     secrets = get_secrets(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
 
     from email_triage.web.app import get_request_accounts, get_watcher_manager
 
@@ -2445,8 +2790,14 @@ def _build_accounts_page_snapshot(request: Request, user: dict) -> dict:
             config=request.app.state.config,
         )
 
-    flash_success = request.query_params.get("success") or ""
-    flash_error = request.query_params.get("error") or ""
+    # N-253b R25: route through the flash SSOT `read_flash` which
+    # decodes `msg`/`err` (the wire-shape written by `msg_qs`/`err_qs`).
+    # Backwards-compat: also honour the legacy `success`/`error` params
+    # in case a stale link still points at the old shape.
+    from email_triage.web.routers._redirect import read_flash
+    _msg, _err = read_flash(request)
+    flash_success = _msg or request.query_params.get("success") or ""
+    flash_error = _err or request.query_params.get("error") or ""
 
     return {
         "user": user,
@@ -2464,7 +2815,7 @@ def _build_accounts_page_snapshot(request: Request, user: dict) -> dict:
 def _api_keys_page_snapshot(db, user: dict) -> dict:
     """ phase 2 — keys + users in one threadpool hop."""
     from email_triage.web.auth import list_api_keys
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
     if is_admin:
         keys = list_api_keys(db)
         all_users = db.execute(
@@ -2475,6 +2826,62 @@ def _api_keys_page_snapshot(db, user: dict) -> dict:
         keys = list_api_keys(db, user_id=user["id"])
         all_users = []
     return {"keys": keys, "all_users": all_users, "is_admin": is_admin}
+
+
+def _hardware_keys_page_snapshot(db, user: dict, raw_filter: str = "") -> dict:
+    """Hardware-key listing for the Security tab, in one threadpool hop.
+
+    Regular user: their own keys only (no owner filter). Admin: their
+    own keys by default, with a "Filter by owner" dropdown (each owner
+    / All users) so they can review any user's keys from one page —
+    same pattern as /accounts. Logic lifted verbatim from the old
+    /profile/hardware-keys handler when that page folded into the
+    consolidated Security tab (2026-06-07).
+    """
+    from email_triage.web.db_auth_helpers import list_hardware_keys
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
+    raw_filter = (raw_filter or "").strip()
+    if not is_admin:
+        keys = list_hardware_keys(db, user["id"], include_revoked=True)
+        return {
+            "keys": keys, "visible_owners": [],
+            "owner_filter": user["id"], "is_admin": is_admin,
+        }
+    all_keys = list_hardware_keys(db, None, include_revoked=True)
+    # Build owner list across all keys (admins see everyone). Style
+    # matches /accounts: "name (email)" if name present, else email,
+    # else "User #N". No "Me" alias.
+    seen_owners: dict[int, dict] = {}
+    for k in all_keys:
+        oid = k.get("user_id")
+        if oid is None or oid in seen_owners:
+            continue
+        email = k.get("owner_email") or ""
+        name = k.get("owner_name") or ""
+        label = f"{name} ({email})" if (name and email) else (
+            name or email or f"User #{oid}"
+        )
+        seen_owners[oid] = {"id": oid, "label": label}
+    visible_owners = sorted(
+        seen_owners.values(), key=lambda x: x["label"].lower(),
+    )
+    if raw_filter == "all":
+        owner_filter_value: int | str = "all"
+        keys = all_keys
+    else:
+        try:
+            candidate = int(raw_filter) if raw_filter else user["id"]
+        except (TypeError, ValueError):
+            candidate = user["id"]
+        valid = {o["id"] for o in visible_owners}
+        if candidate not in valid:
+            candidate = user["id"]
+        owner_filter_value = candidate
+        keys = [k for k in all_keys if k.get("user_id") == candidate]
+    return {
+        "keys": keys, "visible_owners": visible_owners,
+        "owner_filter": owner_filter_value, "is_admin": is_admin,
+    }
 
 
 def _extract_provider_config(
@@ -2573,10 +2980,11 @@ def _extract_provider_config(
         # the loop is the authority on which mode the account is in.
         override_raw = (form.get("poll_interval_override") or "").strip()
         if override_raw:
-            try:
-                config["poll_interval_override"] = int(override_raw)
-            except ValueError:
-                pass  # Silently drop malformed; UI shows blank.
+            # N-219c/7 R23: parse_int_or_none SSOT; silently drop malformed
+            # (UI shows blank).
+            _val = parse_int_or_none(override_raw)
+            if _val is not None:
+                config["poll_interval_override"] = _val
     elif ptype == "office365":
         config["is_personal_msa"] = "is_personal_msa" in form
         config["calendar_opted_in"] = "calendar_opted_in" in form
@@ -2731,12 +3139,32 @@ def _save_provider_secret(form, ptype: str, account_id: int, secrets) -> None:
     the OAuth callback, not a form submission.
     """
     from email_triage.providers.traits import get_traits
+    from email_triage.web.routers._secret_write import set_secret_if_changed
     traits = get_traits(ptype)
     if traits is None or not traits.secret_form_field:
         return
-    val = form.get(traits.secret_form_field, "")
-    if val:
-        secrets.set(_secret_key_for_account(account_id, ptype), val)
+    # Blank submit PRESERVES the stored provider secret. The account editor
+    # keeps every tab-pane in the DOM, so a Save from any tab re-POSTs the
+    # (possibly password-manager-autofilled) password field; never-clobber-
+    # on-blank + the readonly-until-focus field stop that from wiping the
+    # app-password. See the 2026-06-08 save-clobber incident.
+    set_secret_if_changed(
+        secrets,
+        _secret_key_for_account(account_id, ptype),
+        form.get(traits.secret_form_field),
+    )
+    # N-348 R31 (2026-07-04, census DISCOVERED MED-HIGH): bust the
+    # provider_labels cache when credentials change so a re-auth /
+    # password rotation shows fresh labels for the account within
+    # the operator's next tick (not the 5-min TTL). Fires
+    # unconditionally on every _save_provider_secret call — the
+    # cache-miss cost of a no-change save is trivial vs the
+    # stale-labels-after-OAuth-rotation UX defect. Lazy import to
+    # avoid an import-graph cycle from web/routers → providers.
+    from email_triage.providers.provider_labels import (
+        invalidate_cache_for_account,
+    )
+    invalidate_cache_for_account(account_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2817,10 +3245,10 @@ def _wizard_resume_step(db, account_id: int) -> int | None:
     if not raw:
         return None
     if isinstance(raw, dict):
-        try:
-            n = int(raw.get("step", 0))
-        except (TypeError, ValueError):
-            return None
+        # N-216 R23 (2026-07-02): route through _safe_int SSOT — returns
+        # 0 (out of 1..5) on invalid → falls through the range check to
+        # `return None`, matching the pre-migration try/except semantics.
+        n = _safe_int(raw.get("step"), 0)
         if 1 <= n <= 5:
             return n
     return None
@@ -2883,7 +3311,10 @@ def _should_skip_step4(db, user, account_id: int) -> bool:
     # copy-from radios are meaningful — don't skip.
     from email_triage.web.db import list_email_accounts
     try:
-        for a in list_email_accounts(db):
+        # N-109: mirror the copy-from picker (wizard step 4), which is
+        # active_only — a deactivated account won't appear there, so the
+        # auto-skip heuristic must not count it either.
+        for a in list_email_accounts(db, active_only=True):
             if a["id"] == account_id:
                 continue
             if not can_manage_account(db, user, a):
@@ -2965,7 +3396,7 @@ def _accounts_edit_pre_provider(
     from email_triage.actions.digest_configs import list_digest_configs
     from email_triage.triage_logging import is_account_hipaa
 
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
     account_id = acct["id"]
 
     _enrich_account(acct, secrets)
@@ -3073,19 +3504,25 @@ def _extract_digest_config_from_form(
         custom_start_iso=(form.get("window_custom_start") or "").strip(),
         custom_end_iso=(form.get("window_custom_end") or "").strip(),
     )
-    has_att_raw = (form.get("has_attachment") or "").strip()
-    has_att: bool | None = None
-    if has_att_raw == "yes":
-        has_att = True
-    elif has_att_raw == "no":
-        has_att = False
+    # A9 (census 2026-06-09): yes/no/unset tristate via the SSOT.
+    has_att: bool | None = parse_bool_tristate(form.get("has_attachment"))
+    #  — labels can arrive from the discovered-label multi-select
+    # (``tags_select[]``) AND/OR the free-text override (``tags_csv``).
+    # Union them, dedup preserving order, so the operator can pick known
+    # provider labels AND type arbitrary ones (the filter is multi-value
+    # AND, so a single-value datalist would be wrong — see combo_input).
+    _tags: list[str] = list(_csv_split(form.get("tags_csv")))
+    for _t in form.getlist("tags_select"):
+        _t = (_t or "").strip()
+        if _t and _t not in _tags:
+            _tags.append(_t)
     cfg.filter = DigestFilter(
         read_state=(form.get("read_state") or "any").strip(),
         folders=form.getlist("folders") or _csv_split(
             form.get("folders_csv"),
         ),
         categories=form.getlist("categories"),
-        tags=_csv_split(form.get("tags_csv")),
+        tags=_tags,
         from_addr=(form.get("from_addr") or "").strip(),
         subject=(form.get("subject") or "").strip(),
         list_id=(form.get("list_id") or "").strip(),
@@ -3165,11 +3602,23 @@ def _extract_digest_config_from_form(
     return cfg
 
 
-def _digest_editor_context(db, request, account_id: int, dcfg=None):
+def _digest_editor_context(
+    db, request, account_id: int, dcfg=None, provider_labels=None,
+):
     """Common context bundle for rendering the digest editor.
 
     ``dcfg`` is the config under edit — None means brand-new
     digest the operator hasn't named yet (form blank).
+
+    ``provider_labels`` is the discovered Gmail-label / IMAP-
+    keyword set for the label-filter multi-select, fetched async by the
+    caller (sync context builder can't await the provider round-trip).
+    None / [] → the template falls back to the free-text override only.
+    Access scoping is by the requester's MANAGEABLE-account set (the
+    caller resolves the account via OwnedAccountOrLogin), NOT the HIPAA
+    flag — there is no is_account_hipaa gate (removed 2026-06-06 per the
+    §160.103 use-vs-disclosure SME ruling; an account's own labels shown
+    to its authorized manager is an intra-entity use, not a disclosure).
     """
     from email_triage.actions.digest_configs import (
         ACTION_KEYS, CADENCES, COLUMN_KEYS, GROUP_BYS, READ_STATES,
@@ -3214,6 +3663,7 @@ def _digest_editor_context(db, request, account_id: int, dcfg=None):
         "acct": acct,
         "dcfg": dcfg,
         "folder_options": folder_options,
+        "provider_labels_for_account": provider_labels or [],
         "categories": categories,
         "enums": {
             "cadences": CADENCES,
@@ -3259,7 +3709,7 @@ _MANUAL_REDIRECT_URI = "http://127.0.0.1:1/"
 def _oauth_state_serializer(request: Request):
     """Sign / verify the OAuth state token using the session secret."""
     from itsdangerous import URLSafeTimedSerializer
-    secret = getattr(request.app.state, "session_secret", "") or "dev-secret"
+    secret = getattr(request.app.state, SESSION_SECRET_KEY, "") or "dev-secret"
     return URLSafeTimedSerializer(secret, salt="oauth-state-v1")
 
 
@@ -3287,15 +3737,17 @@ def _public_callback_url(request: Request) -> str:
 
 def _render_gmail_push_status_label(watch: dict | None) -> str:
     """Display-only push status for the Accounts row (no buttons)."""
-    if watch is None:
+    # N-263d R28 SSOT — synthetic poll-mode rows (empty topic, epoch
+    # expiry) return live=False. gmail_watch_expiry parses the same
+    # expires_at so the label helper does ONE parse (routed through
+    # the SSOT).
+    from email_triage.web.gmail_watch_status import (
+        gmail_watch_expiry,
+        is_gmail_watch_live,
+    )
+    if not is_gmail_watch_live(watch):
         return '<span style="color:var(--pico-muted-color);white-space:nowrap;">Push off</span>'
-    # B3: poll-mode accounts have a synthetic watch row (empty topic,
-    # epoch expires_at) to hold the history cursor. These are not
-    # "push on".
-    topic = (watch.get("topic_name") or "").strip()
-    expires = parse_iso(watch.get("expires_at", ""))
-    if not topic or (expires is not None and expires <= datetime.now(timezone.utc)):
-        return '<span style="color:var(--pico-muted-color);white-space:nowrap;">Push off</span>'
+    expires = gmail_watch_expiry(watch)
     remaining = expires - datetime.now(timezone.utc)
     days = max(0, remaining.days)
     sub = f' <small style="color:var(--pico-muted-color);">(expires in {days}d)</small>'
@@ -3329,17 +3781,15 @@ def _render_cadence_status_label(acct: dict, watch: dict | None, ingestion) -> s
 
     # For Gmail: distinguish "push configured but expired" so the chip
     # can show a warning state rather than a clean "push on".
+    # N-263d R28 SSOT — is_gmail_watch_live carries the topic-non-empty
+    # + assume-UTC-on-naive + future-check predicate. The "configured
+    # but expired" warning arm remains open here (push_on + not live).
+    from email_triage.web.gmail_watch_status import is_gmail_watch_live
     push_healthy = push_on
     if push_on and watch is not None:
         topic = (watch.get("topic_name") or "").strip()
-        exp = parse_iso(watch.get("expires_at", ""))
-        if exp is not None:
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            if topic and exp > datetime.now(timezone.utc):
-                push_healthy = True
-            elif topic:
-                push_healthy = False  # configured but expired
+        if topic:
+            push_healthy = is_gmail_watch_live(watch)
 
     if not push_on and not poll_on:
         return (
@@ -3371,21 +3821,26 @@ def _render_cadence_status_label(acct: dict, watch: dict | None, ingestion) -> s
     )
 
 
-def _render_openclaw_status_label(db, account_id: int) -> str:
-    """Display-only OpenClaw status (no buttons)."""
-    from email_triage.web.events import get_openclaw_quiet_settings
-    s = get_openclaw_quiet_settings(db, account_id)
+def _render_webhook_status_label(db, account_id: int) -> str:
+    """Display-only outbound-webhook status (no buttons)."""
+    from email_triage.web.events import get_webhook_quiet_settings
+    s = get_webhook_quiet_settings(db, account_id)
     if s["paused"]:
-        return '<span style="color:var(--pico-color-amber-500);white-space:nowrap;">⏸ OpenClaw paused</span>'
+        return '<span style="color:var(--pico-color-amber-500);white-space:nowrap;">⏸ Webhook paused</span>'
     if not s["enabled"]:
-        return '<span style="color:var(--pico-muted-color);white-space:nowrap;">OpenClaw off</span>'
+        return '<span style="color:var(--pico-muted-color);white-space:nowrap;">Webhook off</span>'
     if s["start_utc"] and s["end_utc"]:
+        # N-83: start_utc/end_utc are stored raw from a form (no HH:MM
+        # validation — a crafted POST bypasses the <input type=time> widget),
+        # so escape before HTML interpolation (reflected-XSS class).
+        import html as _html
         return (
-            f'<span style="color:var(--pico-ins-color);white-space:nowrap;">📡 OpenClaw on</span>'
+            f'<span style="color:var(--pico-ins-color);white-space:nowrap;">📡 Webhook on</span>'
             f' <small style="color:var(--pico-muted-color);white-space:nowrap;">'
-            f'(quiet {s["start_utc"]}–{s["end_utc"]} UTC)</small>'
+            f'(quiet {_html.escape(str(s["start_utc"]))}–'
+            f'{_html.escape(str(s["end_utc"]))} UTC)</small>'
         )
-    return '<span style="color:var(--pico-ins-color);white-space:nowrap;">📡 OpenClaw on</span>'
+    return '<span style="color:var(--pico-ins-color);white-space:nowrap;">📡 Webhook on</span>'
 
 
 def _render_calendar_status_label(db, acct: dict) -> str:
@@ -3454,13 +3909,11 @@ def _enrich_account_chips(
     watch = None
     if acct["provider_type"] == "gmail_api":
         watch = get_gmail_watch(db, acct["id"])
-        # Synthetic poll-mode watch rows (empty topic, epoch expiry)
-        # should not surface a "push chip" in the edit panel — treat
-        # them as no-watch for UI purposes.
-        topic = (watch.get("topic_name") if watch else "") or ""
-        exp = parse_iso((watch or {}).get("expires_at", ""))
-        is_active_push = bool(watch and topic.strip()
-                              and exp is not None and exp > datetime.now(timezone.utc))
+        # N-263d R28 SSOT — synthetic poll-mode watch rows (empty topic,
+        # epoch expiry) should not surface a "push chip" in the edit
+        # panel; is_gmail_watch_live carries that gate.
+        from email_triage.web.gmail_watch_status import is_gmail_watch_live
+        is_active_push = is_gmail_watch_live(watch)
         # Prereqs for the user-facing Start Push button:
         #
         # 1. The account completed the Web-app ("Primary -- push-enabled")
@@ -3521,8 +3974,8 @@ def _enrich_account_chips(
     acct["cadence_status"] = _render_cadence_status_label(
         acct, watch, _get_install_ingestion_config(),
     )
-    acct["openclaw_chip"] = _render_openclaw_chip(db, acct["id"])
-    acct["openclaw_status"] = _render_openclaw_status_label(db, acct["id"])
+    acct["webhook_chip"] = _render_webhook_chip(db, acct["id"])
+    acct["webhook_status"] = _render_webhook_status_label(db, acct["id"])
     acct["calendar_chip"] = _render_calendar_chip(db, acct)
     acct["calendar_status"] = _render_calendar_status_label(db, acct)
     # Pre-rendered calendar-selection table — uses the
@@ -3559,6 +4012,16 @@ def _enrich_account_chips(
     except Exception:
         acct["auth_stale"] = None
 
+    #  — bounded-backfill saturation chip. Set when a Gmail
+    # history-expired / O365 delta-resync recovery hit the cap, so
+    # older mail in the gap may be un-triaged. The row template
+    # surfaces a "recovery capped — backfill" chip with a dismiss.
+    try:
+        from email_triage.web._backfill_chip import get_backfill_capped
+        acct["backfill_capped"] = get_backfill_capped(db, acct["id"])
+    except Exception:
+        acct["backfill_capped"] = None
+
 
 def _render_gmail_watch_chip(watch: dict | None) -> str:
     """Return the HTMX fragment shown in the row's push-status cell."""
@@ -3569,12 +4032,11 @@ def _render_gmail_watch_chip(watch: dict | None) -> str:
         return (
             '<span style="color:var(--pico-muted-color);">Push off</span>'
         )
-    expires = parse_iso(watch.get("expires_at"))
+    # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+    expires = parse_iso_aware(watch.get("expires_at"))
     if expires is None:
         sub = ''
     else:
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
         remaining = expires - datetime.now(timezone.utc)
         days = max(0, remaining.days)
         sub = f'expires in {days}d'
@@ -3670,10 +4132,9 @@ def _render_o365_push_chip(sub: dict | None, account_id: int) -> str:
     sub_id = (sub.get("subscription_id") or "").strip()
     expires_iso = sub.get("expiration_at") or ""
     sub_text = ""
-    exp = parse_iso(expires_iso)
+    # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+    exp = parse_iso_aware(expires_iso)
     if exp is not None:
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         remaining = exp - now
         if remaining.total_seconds() <= 0:
@@ -3690,7 +4151,11 @@ def _render_o365_push_chip(sub: dict | None, account_id: int) -> str:
                     f' <small style="color:var(--pico-muted-color);">'
                     f'expires in {max(hours, 0)}h</small>'
                 )
-    safe_sub = sub_id[:36] if sub_id else "(unknown)"
+    # N-83: sub_id is a Microsoft Graph subscription_id (provider-supplied,
+    # DB-stored); escape before HTML interpolation. (The prior ``safe_`` name
+    # only meant "truncated", not escaped — defense-in-depth fix.)
+    import html as _html
+    safe_sub = _html.escape(sub_id[:36] if sub_id else "(unknown)")
     return (
         f'<span style="color:var(--pico-ins-color);">🔔 Push: ON</span>'
         f'{sub_text}'
@@ -3742,15 +4207,23 @@ def _o365_subscription_create_args(request: Request, account_id: int) -> tuple[s
     base = base.rstrip("/")
     webhook_url = f"{base}/webhooks/office365" if base else ""
     client_state = ""
+    from email_triage.secrets import SecretsDecryptError, read_secret
     try:
-        per_acct = secrets.get(_S.office365_clientstate(account_id))
+        per_acct = read_secret(secrets, _S.office365_clientstate(account_id))
         if per_acct:
             client_state = str(per_acct)
         else:
-            install = secrets.get("office365_clientstate")
+            install = read_secret(secrets, "office365_clientstate")
             if install:
                 client_state = str(install)
-    except Exception:
+    except SecretsDecryptError:
+        # A5 — surface the true cause; an unreadable clientState
+        # (master-key mismatch) shouldn't silently regenerate a new one
+        # as if none existed without a trace.
+        _log.error(
+            "office365 clientState unreadable — corrupt secret row or "
+            "master-key mismatch", account_id=account_id,
+        )
         client_state = ""
     if not client_state:
         # Auto-generate. 32 random URL-safe bytes ≈ 43 ASCII chars,
@@ -3813,6 +4286,22 @@ _AADSTS_TRANSLATIONS: dict[str, str] = {
     ),
 }
 
+_OAUTH_CHIP_LINE_CAP = 280
+
+
+def _clip_oauth_line(error_text: str) -> str:
+    """First line of an OAuth error, clipped to keep the chip compact.
+
+     — append an ellipsis when the message was actually cut (the
+    first line exceeded the cap, OR there were further lines we
+    dropped) so the operator knows the chip is a preview, not the whole
+    error."""
+    lines = error_text.strip().splitlines()
+    first = lines[0] if lines else ""
+    clipped = first[:_OAUTH_CHIP_LINE_CAP]
+    cut = len(first) > _OAUTH_CHIP_LINE_CAP or len(lines) > 1
+    return clipped + ("…" if cut else "")
+
 
 def _aadsts_translate(error_text: str) -> tuple[str | None, str]:
     """Translate an AADSTS-prefixed error into an English one-liner.
@@ -3838,14 +4327,14 @@ def _aadsts_translate(error_text: str) -> tuple[str | None, str]:
     match = _re.search(r"AADSTS\d+", error_text)
     if not match:
         # Trim verbatim error to keep the chip compact.
-        verbatim = error_text.strip().splitlines()[0][:280]
+        verbatim = _clip_oauth_line(error_text)
         return None, verbatim
     code = match.group(0)
     if code in _AADSTS_TRANSLATIONS:
         return code, _AADSTS_TRANSLATIONS[code]
     # Unknown AADSTS code — fall back to the verbatim message but
     # keep the code visible.
-    verbatim = error_text.strip().splitlines()[0][:280]
+    verbatim = _clip_oauth_line(error_text)
     return code, verbatim
 
 
@@ -4043,7 +4532,7 @@ def _create_calendar_provider_from_account(
     if ptype == "gmail_api":
         from email_triage.providers.gmail_calendar import GoogleCalendarProvider
         sk = _secret_key_for_account(acct["id"], "gmail_api")
-        refresh_token = secrets.get(sk) if sk else ""
+        refresh_token = read_secret(secrets, sk) if sk else ""
         go = _resolve_google_oauth(google_oauth)
         client_id = go.web_client_id if go else ""
         client_secret = go.web_client_secret if go else ""
@@ -4069,13 +4558,16 @@ def _create_calendar_provider_from_account(
         is_personal = bool(cfg.get("is_personal_msa", False))
         tenant_id = "common" if is_personal else (install.tenant_id if install else "")
         #  — per-account MSAL token-cache file, keyed by account id,
-        # matching the mail factory (factory.py:office365 branch). Mail
-        # + calendar for the same account intentionally share one cache
-        # file (same Microsoft account); two *different* accounts must
-        # not. An explicit ``token_cache_path`` in cfg still wins.
-        token_cache_path = cfg.get("token_cache_path") or (
-            f"./data/msal_cache_{acct['id']}.json"
-        )
+        # UNCONDITIONALLY (matching the mail factory factory.py:office365
+        # branch, which ignores any cfg override). Mail + calendar for the
+        # same account intentionally share one cache file (same Microsoft
+        # account); two *different* accounts must not. run18 #1: a prior
+        # ``cfg.get("token_cache_path") or`` override here let the calendar
+        # writer escape the per-account path that purge_account_local_state
+        # unlinks (a writer↔purge DIVERGENCE — the token survived account
+        # delete) AND broke the share-one-file invariant; dropped so the
+        # disposal SSOT covers this writer too. (DA catch, N-150.)
+        token_cache_path = str(msal_cache_path_for_account(acct["id"]))
         return Office365CalendarProvider(
             client_id=client_id,
             tenant_id=tenant_id or "common",
@@ -4132,12 +4624,17 @@ def _render_calendar_surrogate_picker(db, acct: dict) -> str:
             "</div>"
         )
 
+    from email_triage.web.account_scope import same_owner
     user_id = acct.get("user_id")
     account_id = acct["id"]
     candidates: list[dict] = []
     try:
-        for c in list_email_accounts(db) or []:
-            if c.get("user_id") != user_id:
+        # N-109: surrogate-target picker — active_only hides deactivated
+        # (creds-purged) accounts that could never serve as a calendar surrogate.
+        for c in list_email_accounts(db, active_only=True) or []:
+            # owner-to-owner: only the SOURCE account's owner's OTHER accounts can
+            # be a surrogate (NOT a requester gate — same_owner, not is_account_owner).
+            if not same_owner(acct, c):
                 continue
             if c.get("id") == account_id:
                 continue  # can't surrogate to self
@@ -4158,7 +4655,9 @@ def _render_calendar_surrogate_picker(db, acct: dict) -> str:
     # which account they're configuring without scrolling — the
     # dropdown row is otherwise context-free.
     self_name = acct.get("name") or ""
-    self_addr = acct.get("email_address") or ""
+    # census run17  — account_email SSOT, not the open-coded key.
+    from email_triage.db.accounts import account_email
+    self_addr = account_email(acct)
     self_label = self_name + (
         f" <{self_addr}>" if self_addr else ""
     )
@@ -4179,7 +4678,7 @@ def _render_calendar_surrogate_picker(db, acct: dict) -> str:
     for c in candidates:
         cid = c.get("id")
         name = c.get("name") or f"#{cid}"
-        addr = c.get("email_address") or ""
+        addr = account_email(c)
         label = f"{name}" + (f" <{addr}>" if addr else "")
         sel = " selected" if cid == current_sid else ""
         options.append(
@@ -4472,45 +4971,53 @@ def _render_calendars_table(
     )
 
 
-def _render_openclaw_chip(db, account_id: int) -> str:
-    """Inline chip describing the OpenClaw webhook gate for an account."""
-    from email_triage.web.events import get_openclaw_quiet_settings
-    s = get_openclaw_quiet_settings(db, account_id)
+def _render_webhook_chip(db, account_id: int) -> str:
+    """Inline chip describing the outbound-webhook gate for an account."""
+    from email_triage.web.events import get_webhook_quiet_settings
+    s = get_webhook_quiet_settings(db, account_id)
     if s["paused"]:
-        label = '<span style="color:var(--pico-color-amber-500);">⏸ OpenClaw paused</span>'
+        label = '<span style="color:var(--pico-color-amber-500);">⏸ Webhook paused</span>'
     elif not s["enabled"]:
-        label = '<span style="color:var(--pico-muted-color);">OpenClaw off</span>'
+        label = '<span style="color:var(--pico-muted-color);">Webhook off</span>'
     elif s["start_utc"] and s["end_utc"]:
+        # N-83: start_utc/end_utc are stored raw from a form (no HH:MM
+        # validation); escape before HTML interpolation (reflected-XSS class).
+        import html as _html
         label = (
-            f'<span style="color:var(--pico-ins-color);">📡 OpenClaw on</span>'
+            f'<span style="color:var(--pico-ins-color);">📡 Webhook on</span>'
             f' <small style="color:var(--pico-muted-color);">'
-            f'(quiet {s["start_utc"]}–{s["end_utc"]} UTC)</small>'
+            f'(quiet {_html.escape(str(s["start_utc"]))}–'
+            f'{_html.escape(str(s["end_utc"]))} UTC)</small>'
         )
     else:
-        label = '<span style="color:var(--pico-ins-color);">📡 OpenClaw on</span>'
+        label = '<span style="color:var(--pico-ins-color);">📡 Webhook on</span>'
     return (
         f'{label}'
         f' <button type="button" class="outline secondary"'
         f' style="padding:0.1rem 0.4rem;margin-left:0.4rem;font-size:0.8rem;"'
-        f' hx-get="/accounts/{account_id}/openclaw/editor"'
-        f' hx-target="#openclaw-cell-{account_id}"'
+        f' hx-get="/accounts/{account_id}/webhook/editor"'
+        f' hx-target="#webhook-cell-{account_id}"'
         f' hx-swap="innerHTML">Edit</button>'
     )
 
 
-def _openclaw_quiet_save_snapshot(
+def _webhook_quiet_save_snapshot(
     db, account_id: int, form_dict: dict,
 ) -> str:
     """ phase 2 — read existing settings, apply form patch, write
     back, render chip — all in one threadpool hop."""
-    from email_triage.web.db import get_setting, set_setting
-    current = get_setting(db, _S.openclaw_quiet(account_id)) or {}
+    from email_triage.web.db import set_setting
+    from email_triage.web.events import read_webhook_quiet_raw
+    # Read-both back-compat via the read_webhook_quiet_raw SSOT: merge onto the
+    # new webhook_quiet:<id> key, or the legacy openclaw_quiet:<id> key on a
+    # pre-rename install. WRITE always goes to the new key.
+    current = read_webhook_quiet_raw(db, account_id)
     current["enabled"] = bool(form_dict.get("enabled"))
     current["paused"] = bool(form_dict.get("paused"))
     current["start_utc"] = (form_dict.get("start_utc") or "").strip()
     current["end_utc"] = (form_dict.get("end_utc") or "").strip()
-    set_setting(db, _S.openclaw_quiet(account_id), current)
-    return _render_openclaw_chip(db, account_id)
+    set_setting(db, _S.webhook_quiet(account_id), current)
+    return _render_webhook_chip(db, account_id)
 
 
 def _parse_watch_form(form, default_account_id: int | None = None):
@@ -4529,11 +5036,15 @@ def _parse_watch_form(form, default_account_id: int | None = None):
     """
     from email_triage.web.email_watches import (
         EmailWatch, WatchActions, WatchFilter,
-        EscalateAction, WebhookAction,
+        EscalateAction, WebhookAction, AutoRetireAction,
     )
     # Belt-and-braces: drop the legacy all_accounts field if a stale
     # browser cache POSTs it. The multi-select is the source of truth.
     _ = form.get("all_accounts")
+    #  — auto-retire after N matches. Blank / 0 / non-numeric -> off.
+    _retire_n = bounded_int(  # N-219c/16 R23: SSOT
+        (form.get("auto_retire_after") or "0").strip() or "0", default=0,
+    )
     return EmailWatch(
         watch_id="",
         name=(form.get("name") or "").strip(),
@@ -4556,6 +5067,13 @@ def _parse_watch_form(form, default_account_id: int | None = None):
             webhook=WebhookAction(
                 enabled=("webhook_enabled" in form),
                 url=(form.get("webhook_url") or "").strip(),
+            ),
+            auto_retire=AutoRetireAction(
+                after_n=max(0, _retire_n),
+                action=(
+                    (form.get("auto_retire_action") or "disable").strip()
+                    or "disable"
+                ),
             ),
         ),
     )
@@ -4587,12 +5105,15 @@ def _parse_raw_email(raw_text: str) -> EmailMessage:
     """Parse a raw email string (with headers) into an EmailMessage."""
     msg = email_mod.message_from_string(raw_text, policy=email_mod.policy.default)
 
-    # Extract sender.
+    # Extract sender. A7 (census 2026-06-09): the single-address
+    # extraction goes through the bare-address SSOT. (The To/Cc
+    # ``getaddresses`` below is a DIFFERENT op — a multi-address list —
+    # and legitimately stays.)
     sender = ""
     from_hdr = msg.get("From", "")
     if from_hdr:
-        _name, addr = email.utils.parseaddr(str(from_hdr))
-        sender = addr or str(from_hdr)
+        from email_triage.mail_headers import extract_bare_address
+        sender = extract_bare_address(str(from_hdr)) or str(from_hdr)
 
     # Extract recipients.
     recipients: list[str] = []
@@ -4623,14 +5144,19 @@ def _parse_raw_email(raw_text: str) -> EmailMessage:
                 if isinstance(payload, str):
                     body_text = payload
                     break
-        # Fallback to HTML if no plain text.
+        # Fallback to HTML if no plain text. Route through the html_to_text
+        # SSOT (census /): dumping raw HTML into body_text leaked
+        # <script>/<style> content into the classifier LLM on the paste path.
         if not body_text:
             for part in msg.walk():
                 ct = part.get_content_type()
                 if ct == "text/html":
                     payload = part.get_content()
                     if isinstance(payload, str):
-                        body_text = payload
+                        from email_triage.engine.html_text import (
+                            html_to_text_with_links,
+                        )
+                        body_text = html_to_text_with_links(payload)
                         break
     else:
         payload = msg.get_content()
@@ -4642,8 +5168,12 @@ def _parse_raw_email(raw_text: str) -> EmailMessage:
     for key in msg.keys():
         headers[key] = str(msg[key])
 
-    # Generate a message ID.
-    message_id = str(msg.get("Message-ID", "")) or f"classify-test-{int(time.time())}"
+    # Generate a message ID. A6 (census 2026-06-09): route the header read
+    # through the casing SSOT (works on a stdlib email.message.Message —
+    # it exposes .get/.items). The stdlib .get is already case-insensitive
+    # here, but routing keeps the extractor count-agnostic-pinnable.
+    from email_triage.mail_headers import get_rfc_message_id
+    message_id = get_rfc_message_id(msg) or f"classify-test-{int(time.time())}"
 
     return EmailMessage(
         message_id=message_id,
@@ -4697,6 +5227,7 @@ from email_triage.providers.factory import (  # noqa: E402
     set_install_ingestion_config,
     _resolve_google_oauth,
     _resolve_office365_oauth,
+    msal_cache_path_for_account,
     build_provider as _create_provider_from_account,
 )
 from email_triage.providers import factory as _provider_factory  # noqa: E402
@@ -4812,6 +5343,53 @@ def _routes_post_provider_snapshot(
     return {"folders": folders, "excluded_count": excluded_count}
 
 
+# The route actions OFFERED in the routes editor. SSOT — the UI renders these
+# and the completeness pin (test_available_actions_in_live_registry) asserts
+# EVERY one is registered in build_default_registry (the live ingestion
+# registry), so an offered-but-unregistered action can't ship dead-in-prod
+# (incident_2026-06-11). Order is preserved (the editor renders in this order).
+_AVAILABLE_ROUTE_ACTIONS: tuple[str, ...] = (
+    "move", "label", "notify", "draft_reply",
+    "suggest_meeting_times", "add-label", "clock",
+    # Feature-report eval fold (2026-07-17): 5 actions were REGISTERED in
+    # the live web ingestion registry (build_default_registry) but ABSENT
+    # from the UI-offer tuple, so the operator could never wire them via
+    # /accounts routes editor. escalate additionally landed in the web
+    # registry (was CLI-only pre-fix). accept_invite / decline_invite /
+    # tentative_invite / self_sent_event were fully wired in code — just
+    # not offered. Report site was claiming these are usable via routes.
+    "escalate",
+    "accept_invite", "decline_invite", "tentative_invite",
+    "self_sent_event",
+    # 2026-07-17 — MuteAction: post-classification marker. Semantically composes
+    # with other actions (tick mute alongside label/move; tick mute alone to
+    # silence downstream fan-out). See actions/mute.py for HIPAA-safety.
+    "mute",
+)
+
+
+def _regulatory_clock_templates(conn) -> list[dict]:
+    """ — the seeded, ENABLED regulatory-clock templates (base defs) for the
+    ``clock`` route-action picker: ``code`` + human ``title``, regime-ordered.
+    Queried (not hardcoded) so it reflects what's actually enabled. Sync — the
+    caller dispatches it off-loop via ``db_call``."""
+    try:
+        rows = conn.execute(
+            "SELECT code, title FROM regulatory_clock_def "
+            "WHERE enabled = 1 AND config_owner_account_id IS NULL "
+            "ORDER BY regime, title"
+        ).fetchall()
+    except Exception:
+        return []  # table absent (pre-#34 schema) → no picker, fail-soft
+    return [
+        {
+            "code": (r["code"] if hasattr(r, "keys") else r[0]),
+            "title": (r["title"] if hasattr(r, "keys") else r[1]),
+        }
+        for r in rows
+    ]
+
+
 async def _build_routes_context(
     request: Request,
     db,
@@ -4918,18 +5496,14 @@ async def _build_routes_context(
         # checkboxes in this order. Append ``add-label`` rather than
         # interleaving so saved routes from before this change keep
         # the same visual layout for the existing actions.
-        "available_actions": [
-            # 2026-05-13 — ``suggest_meeting_times`` added so operators
-            # can explicitly route meeting-request → calendar-aware
-            # draft. ALSO fires automatically (see
-            # actions/suggest_meeting_times.py:inject_meeting_intercept)
-            # when calendar + meeting prefs are wired, so most
-            # operators never need to pick it; the explicit option is
-            # for installs that want it on a different category or
-            # alongside other actions (move, label, notify).
-            "move", "label", "notify", "draft_reply",
-            "suggest_meeting_times", "add-label",
-        ],
+        "available_actions": list(_AVAILABLE_ROUTE_ACTIONS),
+        #  — the seeded regulatory-clock TEMPLATES (code + title) for the
+        # "clock" route-action's picker. Queried (not hardcoded) so it reflects
+        # the actual enabled base defs; empty list → the row renders a
+        # "no templates" note instead of an empty select.
+        "regulatory_clock_templates": await db_call(
+            _regulatory_clock_templates, db
+        ),
         "all_labels": all_labels,
         "folder_msg": folder_msg,
         "provider_labels_for_account": provider_labels_for_account,
@@ -5090,17 +5664,18 @@ def _gmail_api_watch_start_status(
     # Determine mode exactly like _render_cadence_status_label.
     mode = "poll"
     days_remaining = 0
-    if watch:
-        topic = (watch.get("topic_name") or "").strip()
-        try:
-            exp = datetime.fromisoformat(
-                str(watch.get("expires_at", "")).replace("Z", "+00:00")
-            )
-            if topic and exp > datetime.now(timezone.utc):
-                mode = "push"
-                days_remaining = max(0, (exp - datetime.now(timezone.utc)).days)
-        except Exception:
-            pass
+    # N-263d R28 SSOT — is_gmail_watch_live carries the topic + expiry
+    # gate; gmail_watch_expiry returns the parsed aware datetime for
+    # days_remaining (single-parse via the SSOT).
+    from email_triage.web.gmail_watch_status import (
+        gmail_watch_expiry,
+        is_gmail_watch_live,
+    )
+    if is_gmail_watch_live(watch):
+        mode = "push"
+        exp = gmail_watch_expiry(watch)
+        if exp is not None:
+            days_remaining = max(0, (exp - datetime.now(timezone.utc)).days)
 
     # Resolve poll interval (mins) the same way the B3 loop does.
     ingestion = _get_install_ingestion_config()
@@ -5147,28 +5722,40 @@ def _triage_page_snapshot(
     threadpool hop. The owner-filter logic is pure (no DB), so we keep
     it inside the hop to land a single coherent ctx dict."""
     from email_triage.web.db import (
-        list_email_accounts, list_triage_jobs, list_labels,
+        list_email_accounts, list_triage_jobs, count_triage_jobs,
+        list_labels,
     )
 
-    is_admin = user["role"] == "admin"
+    # N-109: bulk-triage account <select> — a human picks a mailbox to run
+    # triage on; a deactivated (creds-purged) account can't be triaged, so
+    # active_only hides it (and the owner-filter derived from it).
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
     if is_admin:
-        all_accounts = list_email_accounts(db)
+        all_accounts = list_email_accounts(db, active_only=True)
     else:
-        all_accounts = list_email_accounts(db, user_id=user["id"])
+        all_accounts = list_email_accounts(
+            db, user_id=user["id"], active_only=True,
+        )
 
     visible_owners = _build_visible_owners(all_accounts, user)
     owner_filter, accounts = _apply_owner_filter(
         all_accounts, owner_filter_q, user["id"], visible_owners,
     )
 
+    #  — scope the recent-jobs widget INSIDE the query so the
+    # limit=10 applies AFTER the visibility filter. The old code
+    # fetched the global newest-10 then client-filtered to the visible
+    # set, so a user whose jobs were outnumbered by other users' newer
+    # jobs saw an empty widget despite having runs. count gives the
+    # true total for the "newest 10 of M" notice.
+    RECENT_JOBS_CAP = 10
     visible_account_ids = {a["id"] for a in accounts}
-    recent_jobs_all = (
-        list_triage_jobs(db, limit=10) if visible_account_ids else []
+    recent_jobs = list_triage_jobs(
+        db, account_ids=visible_account_ids, limit=RECENT_JOBS_CAP,
     )
-    recent_jobs = [
-        j for j in recent_jobs_all
-        if j["account_id"] in visible_account_ids
-    ]
+    recent_jobs_total = count_triage_jobs(
+        db, account_ids=visible_account_ids,
+    )
     accounts_by_id = {a["id"]: a for a in accounts}
 
     #  — labels surface as a filter on the Triage form. Carry the
@@ -5182,6 +5769,8 @@ def _triage_page_snapshot(
         "visible_owners": visible_owners,
         "owner_filter": owner_filter,
         "recent_jobs": recent_jobs,
+        "recent_jobs_total": recent_jobs_total,
+        "recent_jobs_cap": RECENT_JOBS_CAP,
         "accounts_by_id": accounts_by_id,
         "all_labels": all_labels,
     }
@@ -5255,14 +5844,11 @@ def _job_eta_secs(job: dict) -> int | None:
     processed = int(job.get("total_processed") or 0)
     if seen <= processed or processed == 0:
         return None
-    from datetime import datetime, timezone
-    try:
-        started = datetime.fromisoformat(job["started_at"])
-    except Exception:
+    # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+    started = parse_iso_aware(job["started_at"])
+    if started is None:
         return None
     now = datetime.now(timezone.utc)
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
     elapsed = (now - started).total_seconds()
     if elapsed <= 0:
         return None
@@ -5279,11 +5865,15 @@ def _discover_page_snapshot(
     """ phase 2 — accounts list + visible-owners filter in one
     threadpool hop."""
     from email_triage.web.db import list_email_accounts
-    is_admin = user["role"] == "admin"
+    # N-109: discover-page account <select> — same picker shape as bulk-triage;
+    # hide deactivated (creds-purged) accounts a human can't act on.
+    is_admin = _is_admin(user)  # N-222f R22 (was: user["role"] == "admin")
     if is_admin:
-        all_accounts = list_email_accounts(db)
+        all_accounts = list_email_accounts(db, active_only=True)
     else:
-        all_accounts = list_email_accounts(db, user_id=user["id"])
+        all_accounts = list_email_accounts(
+            db, user_id=user["id"], active_only=True,
+        )
 
     visible_owners = _build_visible_owners(all_accounts, user)
     owner_filter, accounts = _apply_owner_filter(
@@ -5343,6 +5933,15 @@ def _build_classifier_from_config(config):
             base_url=config.classifier.ollama_url,
             prefer_loaded=config.classifier.prefer_loaded,
             local_url_suffixes=local_suffixes,
+            prefer_loaded_skip_embeddings=(
+                config.classifier.prefer_loaded_skip_embeddings
+            ),
+            embedding_name_markers=config.classifier.embedding_name_markers,
+            backup_models=config.classifier.backup_models,
+            num_ctx=config.classifier.num_ctx,
+            ollama_think=config.classifier.ollama_think,
+            ollama_no_think_marker=config.classifier.ollama_no_think_marker,
+            ollama_keep_alive=config.classifier.ollama_keep_alive,
         )
     elif backend == "openai":
         from email_triage.classify.openai_compat import OpenAICompatClassifier
@@ -5595,8 +6194,8 @@ def _admin_security_snapshot(db, config) -> dict:
 
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
-    cutoff_24h = (now - timedelta(hours=24)).isoformat()
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
+    cutoff_24h = to_utc_iso(now - timedelta(hours=24))
+    cutoff_7d = to_utc_iso(now - timedelta(days=7))
     rejects_24h = 0
     rejects_7d = 0
     try:
@@ -5650,8 +6249,23 @@ def _admin_security_snapshot(db, config) -> dict:
     }
 
 
+_CONFIG_WRITE_LOCK = threading.Lock()
+
+
 def _write_config_yaml(config) -> None:
-    """Write the current config back to the YAML file it was loaded from."""
+    """Write the current config back to the YAML file (A11, census 2026-06-09).
+
+    Serialized (a process-wide lock) so two concurrent admin saves can't
+    interleave their read-modify-write and lose an edit, and written
+    ATOMICALLY (sibling temp + ``os.replace`` via ``atomic_write_text``) so
+    a crash mid-write can never leave a truncated/corrupt config YAML that
+    the next boot fails to parse."""
+    with _CONFIG_WRITE_LOCK:
+        _write_config_yaml_locked(config)
+
+
+def _write_config_yaml_locked(config) -> None:
+    """Build + atomically write the config YAML. Hold ``_CONFIG_WRITE_LOCK``."""
     import yaml
     from pathlib import Path
 
@@ -5688,6 +6302,75 @@ def _write_config_yaml(config) -> None:
         "model": config.classifier.model,
         "ollama_url": config.classifier.ollama_url,
     }
+    #  — persist the ordered backup models so failover survives a
+    # restart (the read path parses it; without this write the list is
+    # silently lost on every reload). Conditional-emit like the fields
+    # below — only when set.
+    if config.classifier.backup_models:
+        data["classifier"]["backup_models"] = list(
+            config.classifier.backup_models
+        )
+    #  — persist the pinned context window. Conditional-emit (None = inherit)
+    # so a Save doesn't silently drop it — the classifier block is a FULL
+    # REBUILD (D-A1, same trap as backup_models above).
+    if config.classifier.num_ctx is not None:
+        data["classifier"]["num_ctx"] = int(config.classifier.num_ctx)
+    # N-378 — persist the Ollama `think` payload knob (tri-state: None =
+    # model default, True/False = explicit). Conditional-emit on non-None
+    # so a Save with the operator's blank-select choice doesn't write a
+    # confusing `ollama_think: null` line every time. Same D-A1 FULL
+    # REBUILD trap as num_ctx above: unwritten = reverts to dataclass
+    # default on next load. Same class as `test_writer_references_every_
+    # config_field` catches — new ClassifierConfig fields MUST round-trip.
+    if config.classifier.ollama_think is not None:
+        data["classifier"]["ollama_think"] = bool(
+            config.classifier.ollama_think
+        )
+    # N-378 belt-and-braces marker knob. Conditional-emit on True (dataclass
+    # default is False, so no need to write the default).
+    if config.classifier.ollama_no_think_marker:
+        data["classifier"]["ollama_no_think_marker"] = True
+    # N-431 (2026-07-19) — Ollama ``keep_alive`` payload option. Always-emit
+    # so an operator-tuned value survives a full-rebuild writer pass (same
+    # rationale as the timeout knobs below). Cast to str defensively; the
+    # dataclass accepts str|int but YAML round-trips str most cleanly and
+    # the wire field accepts both forms.
+    data["classifier"]["ollama_keep_alive"] = str(
+        config.classifier.ollama_keep_alive
+    )
+    # -a/-c: Ollama probe/admin timeouts + ReDoS regex safety budget.
+    # Always-emit so an operator-tuned value survives admin-form Save
+    # (full-rebuild writer would otherwise drop the field). Same rationale
+    # as the encryption_enabled always-emit below.
+    data["classifier"]["ollama_probe_timeout_secs"] = float(
+        config.classifier.ollama_probe_timeout_secs
+    )
+    data["classifier"]["ollama_admin_timeout_secs"] = float(
+        config.classifier.ollama_admin_timeout_secs
+    )
+    data["classifier"]["hint_regex_timeout_secs"] = float(
+        config.classifier.hint_regex_timeout_secs
+    )
+    data["classifier"]["embed_timeout_secs"] = float(
+        config.classifier.embed_timeout_secs
+    )
+    data["classifier"]["st_probe_timeout_secs"] = float(
+        config.classifier.st_probe_timeout_secs
+    )
+    #  — persist the prefer_loaded embedding-skip tuning. The classifier
+    # block is a FULL REBUILD, so any field not emitted here is silently
+    # dropped on Save and reverts to its dataclass default on reload — which
+    # re-breaks the  embedding-skip for an operator who extended the
+    # markers (e.g. [embed, bge, gte, e5]). Conditional-emit on non-default.
+    # (D-A1, 2am audit 2026-06-07; same class as  backup_models trap.)
+    if not config.classifier.prefer_loaded:
+        data["classifier"]["prefer_loaded"] = False
+    if not config.classifier.prefer_loaded_skip_embeddings:
+        data["classifier"]["prefer_loaded_skip_embeddings"] = False
+    if list(config.classifier.embedding_name_markers or []) != ["embed"]:
+        data["classifier"]["embedding_name_markers"] = list(
+            config.classifier.embedding_name_markers or []
+        )
     if config.classifier.openai_base_url:
         data["classifier"]["openai_base_url"] = config.classifier.openai_base_url
     if config.classifier.openai_model:
@@ -5709,6 +6392,14 @@ def _write_config_yaml(config) -> None:
         "from_addr": config.smtp.from_addr,
         "from_name": config.smtp.from_name,
         "use_tls": config.smtp.use_tls,
+    }
+
+    # N-324 R30 (CI-red fix-forward on N-321 — config-roundtrip pin).
+    # `AuditConfig.trusted_proxies` is operator-user-facing config
+    # (each install populates for its deploy topology), so it must
+    # round-trip through YAML — not exempt via `_NON_ROUNDTRIP_FIELDS`.
+    data["audit"] = {
+        "trusted_proxies": list(config.audit.trusted_proxies),
     }
 
     # Health email + summary signature.
@@ -5753,6 +6444,18 @@ def _write_config_yaml(config) -> None:
     # Logging — emit every dataclass field so a future change to
     # retention / hipaa / etc. round-trips through Save without
     # silently reverting on next reload.
+    #
+    # NB ``hipaa`` here is the config-FILE BOOT SEED, NOT the live
+    # runtime value: setup_logging() seeds is_hipaa_mode() from it at
+    # boot, then web/app.py's lifespan OVERRIDES it from the DB
+    # (runtime_settings.hipaa — the admin Security toggle) when that row
+    # exists. The toggle never writes YAML, so this is NOT a divergent
+    # second writer (census 2026-06-09 #4 / run13 #6, verify-don't-accept
+    # REFUTED the "stale dual-write" framing; see cli.py:658). DO NOT
+    # "drop the stale field" — emitting it is precisely what keeps an
+    # admin Save from silently reverting the boot seed (which on an
+    # install whose runtime_settings row doesn't exist yet is a
+    # HIPAA-turns-OFF safety regression).
     data["logging"] = {
         "level": config.logging.level,
         "format": config.logging.format,
@@ -5769,15 +6472,44 @@ def _write_config_yaml(config) -> None:
     if config.logging.file:
         data["logging"]["file"] = config.logging.file
 
-    # Secrets — preserve from existing.
+    # Secrets bootstrap config. ALL four fields round-trip: the loader
+    # reads master_key_name + external (config.py _parse_raw), and the
+    # full-rebuild writer previously dropped them — so a hand-set custom
+    # master key name OR an external-provider (Vault/KeePass) config block
+    # was silently lost on the next admin Save, bricking the secrets store
+    # on the following boot (default key name not found / provider
+    # unconfigured). These are key-NAME pointers + connection config,
+    # already YAML-resident by design — NOT managed secret VALUES (those
+    # live in the encrypted DB column), so emitting them adds no plaintext
+    # exposure. #8-FULL round-trip gap, census 2026-06-10.
     data["secrets"] = {
         "backend": config.secrets.backend,
         "keyfile_path": config.secrets.keyfile_path,
+        "master_key_name": config.secrets.master_key_name,
     }
+    if getattr(config.secrets, "external", None):
+        data["secrets"]["external"] = dict(config.secrets.external)
 
-    # Persistence
+    # Persistence. ``encryption_enabled`` is the §164.312(a)(2)(iv)
+    # SQLCipher encryption-at-rest gate — ALWAYS emit it so an admin Save
+    # of any unrelated setting can't silently drop an operator's
+    # ``encryption_enabled: true`` from YAML (full-rebuild writer ⇒ any
+    # unemitted field reverts to its dataclass default on next boot;
+    # here that default is plaintext-OFF, the worst direction for a HIPAA
+    # control). #8-FULL round-trip gap, census 2026-06-10.
     data["persistence"] = {
         "db_path": config.persistence.db_path,
+        "encryption_enabled": bool(config.persistence.encryption_enabled),
+        # -b: sqlite lock-wait budgets. Always-emit so an operator-
+        # tuned value survives admin-form Save (full-rebuild writer would
+        # otherwise drop the field and silently revert to the 30.0/5.0
+        # defaults on the next boot).
+        "sqlite_busy_wait_secs": float(
+            config.persistence.sqlite_busy_wait_secs
+        ),
+        "sqlite_probe_timeout_secs": float(
+            config.persistence.sqlite_probe_timeout_secs
+        ),
     }
 
     # Ingestion cadence. Bounds are class-level constants (never need
@@ -5788,6 +6520,21 @@ def _write_config_yaml(config) -> None:
         "default_poll_interval_minutes": config.ingestion.default_poll_interval_minutes,
         "push_poll_interval_min": config.ingestion.push_poll_interval_min,
         "poll_poll_interval_min": config.ingestion.poll_poll_interval_min,
+        # -d: HTTP-client + IDLE-drain timeouts. Always-emit so an
+        # operator-tuned value survives admin-form Save.
+        "idle_task_drain_timeout_secs": float(
+            config.ingestion.idle_task_drain_timeout_secs
+        ),
+        "office365_http_timeout_secs": float(
+            config.ingestion.office365_http_timeout_secs
+        ),
+        "watcher_shutdown_grace_secs": float(
+            config.ingestion.watcher_shutdown_grace_secs
+        ),
+        # DA-F4: IMAP LOGOUT shutdown wait budget.
+        "imap_logout_timeout_secs": float(
+            getattr(config.ingestion, "imap_logout_timeout_secs", 2.0),
+        ),
     }
 
     # TLS + ACME. Round-trip the cert_dir + acme block so the
@@ -5816,10 +6563,25 @@ def _write_config_yaml(config) -> None:
     if suffixes:
         tls_block["local_url_suffixes"] = suffixes
     a = config.tls.acme
-    if a.enabled or a.account_email or a.domains or a.rfc2136.nameserver:
+    # DA NTH-3 fold: include http01 sub-config sentinels in the emit-gate
+    # so an operator who configures http01 BEFORE flipping enabled/domains
+    # does not silently lose those fields on the next config re-save
+    # (lossless round-trip, symmetric with the auth block).
+    _h = a.http01
+    _http01_touched = (
+        _h.mode != "standalone"
+        or _h.bind_host != "0.0.0.0"
+        or int(_h.bind_port) != 80
+        or bool(_h.webroot_path)
+    )
+    if (
+        a.enabled or a.account_email or a.domains
+        or a.rfc2136.nameserver or _http01_touched
+    ):
         acme_block: dict[str, Any] = {
             "enabled": a.enabled,
             "directory_url": a.directory_url,
+            "staging_directory_url": a.staging_directory_url,  # N-230b R23 config-roundtrip
             "account_email": a.account_email,
             "domains": list(a.domains),
             "challenge": a.challenge,
@@ -5831,6 +6593,12 @@ def _write_config_yaml(config) -> None:
             "validation_retry_backoff": a.validation_retry_backoff,
             "caa_enforce": a.caa_enforce,
             "dns_provider": a.dns_provider,
+            # -d: RFC-2136 DNS UPDATE query timeout budget.
+            "dns_query_timeout_secs": float(a.dns_query_timeout_secs),
+            # DA-F1: udp probe budget (12 dns.query.udp sites).
+            "dns_probe_timeout_secs": float(
+                getattr(a, "dns_probe_timeout_secs", 5.0),
+            ),
         }
         rfc = a.rfc2136
         if (rfc.nameserver or rfc.tsig_key_name or rfc.update_zone):
@@ -5848,6 +6616,14 @@ def _write_config_yaml(config) -> None:
                     rfc, "public_propagation_split_horizon_wait_secs", 600,
                 ),
             }
+        h = a.http01
+        acme_block["http01"] = {
+            "mode": h.mode,
+            "bind_host": h.bind_host,
+            "bind_port": int(h.bind_port),
+            "webroot_path": h.webroot_path,
+            "self_check_timeout_secs": int(h.self_check_timeout_secs),
+        }
         tls_block["acme"] = acme_block
     if tls_block:
         data["tls"] = tls_block
@@ -5897,7 +6673,7 @@ def _write_config_yaml(config) -> None:
                 w.require_user_verification_for_admin,
         }
 
-    # Push (Gmail Pub/Sub + OpenClaw API). Always emit the four Gmail
+    # Push (Gmail Pub/Sub + outbound-webhook API). Always emit the four Gmail
     # Pub/Sub knobs so the /admin/integrations save round-trips through
     # YAML losslessly. Emitting unconditionally avoids the silent-revert
     # surprise where a save of empty strings disappears on next reload
@@ -5911,16 +6687,32 @@ def _write_config_yaml(config) -> None:
         "gmail_subscription_sa_email": p.gmail_subscription_sa_email,
         "gmail_audience": p.gmail_audience,
     }
-    # OpenClaw / bulk knobs — preserve only when set away from default to
-    # keep the YAML diff readable.
-    if not getattr(p, "openclaw_webhook_enabled", True):
-        push_block["openclaw_webhook_enabled"] = False
-    rl = int(getattr(p, "openclaw_rate_limit_per_minute", 60))
+    # Outbound-webhook / bulk knobs — preserve only when set away from default
+    # to keep the YAML diff readable. Written under the neutral webhook_* keys;
+    # the config loader still reads the legacy openclaw_* keys (back-compat), so
+    # an old YAML is transparently rewritten to the new keys on the next save.
+    if not getattr(p, "webhook_enabled", True):
+        push_block["webhook_enabled"] = False
+    rl = int(getattr(p, "webhook_rate_limit_per_minute", 60))
     if rl != 60:
-        push_block["openclaw_rate_limit_per_minute"] = rl
+        push_block["webhook_rate_limit_per_minute"] = rl
     bs = int(getattr(p, "bulk_max_batch_size", 100))
     if bs != 100:
         push_block["bulk_max_batch_size"] = bs
+    # Office 365 / Graph subscription renewal window — loader reads it
+    # (defaults 24); always emit so an operator who shrank it for a shaky
+    # Graph link doesn't lose the value on the next Save. #8-FULL gap.
+    push_block["office365_subscription_renewal_window_hours"] = int(
+        getattr(p, "office365_subscription_renewal_window_hours", 24),
+    )
+    # -d: HTTP-client timeouts. Always-emit so an operator-tuned
+    # value survives admin-form Save.
+    push_block["webhook_timeout_secs"] = float(
+        getattr(p, "webhook_timeout_secs", 10.0),
+    )
+    push_block["gmail_cert_timeout_secs"] = float(
+        getattr(p, "gmail_cert_timeout_secs", 10.0),
+    )
     data["push"] = push_block
 
     #  — Classification cache. Only emit when the operator has
@@ -5968,8 +6760,124 @@ def _write_config_yaml(config) -> None:
             emb_block["fallback"] = fb_block
         data["embedding"] = emb_block
 
-    with open(target, "w") as f:
-        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    # Webhooks. Operator-configured outbound targets — the loader
+    # reads these (``_parse_webhooks``); without this emit an admin Save
+    # WIPED the configured list. ``secret_key`` is a key-NAME reference
+    # into the secrets store, NOT the secret value, so it is safe to YAML.
+    # Conditional-emit: an empty list is the canonical "no webhooks"
+    # default and stays absent to keep the YAML minimal. #8-FULL gap.
+    webhooks = list(getattr(config, "webhooks", []) or [])
+    if webhooks:
+        def _dump_target(wt):
+            row = {
+                "url": wt.url,
+                "events": list(wt.events or []),
+                "secret_key": wt.secret_key,
+            }
+            # Per-target-templating fields (N-419 §4.35). Conditional-
+            # emit so a plain ``custom`` target with no template stays
+            # backward-compatible in the YAML (no new keys on existing
+            # configs); a typed target OR an operator-set template
+            # writes the fields explicitly.
+            tt = getattr(wt, "target_type", "custom") or "custom"
+            if tt != "custom":
+                row["target_type"] = tt
+            bt = getattr(wt, "body_template", None)
+            if bt:
+                row["body_template"] = bt
+            # DA-F3b fix — per-account targeting. None = wildcard
+            # (backward-compat, key absent from YAML).
+            aid = getattr(wt, "account_id", None)
+            if aid:
+                row["account_id"] = aid
+            return row
+
+        data["webhooks"] = [_dump_target(wt) for wt in webhooks]
+    #  deny-by-default external-webhook guard. The admin form sets it +
+    # the dispatch path consumes it, but it was neither written nor read,
+    # so the UI toggle silently reverted to deny on restart. Emit only when
+    # the operator has explicitly allowed external (its presence in YAML IS
+    # the "allowed" signal; absence = the safe deny default). The loader's
+    # companion read is in ``config._parse_raw``. #8-FULL gap.
+    if getattr(config, "webhooks_allow_external", False):
+        data["webhooks_allow_external"] = True
+
+    #  regulatory-clock section. Loader-read (``config._parse_raw``'s
+    # ``if "regulatory_clock" in raw``), but the FULL-REBUILD writer never
+    # emitted it — so an admin Save of any tab silently DROPPED
+    # ``detection_enabled`` AND the per-install working-day / holiday calendar.
+    # That is worse than cosmetic: a wrong working-day set miscomputes a
+    # regulatory deadline → a false ``breached`` chained into the IMMUTABLE
+    # audit log. Conditional-emit on any non-default. #8-FULL data-loss class.
+    rc_clock = getattr(config, "regulatory_clock", None)
+    if rc_clock is not None:
+        _default_week = [0, 1, 2, 3, 4]
+        if (
+            rc_clock.detection_enabled
+            or rc_clock.working_day_holidays
+            or list(rc_clock.working_week) != _default_week
+        ):
+            data["regulatory_clock"] = {
+                "detection_enabled": bool(rc_clock.detection_enabled),
+                "working_day_holidays": list(rc_clock.working_day_holidays),
+                "working_week": list(rc_clock.working_week),
+            }
+
+    #  — automated DB backup section. FULL-REBUILD writer ⇒ if this isn't
+    # emitted, an admin Save of ANY other tab silently DROPS the operator's
+    # ``backup:`` block, reverting backups to disabled (the worst direction for
+    # a disaster-recovery control — same class as the persistence
+    # ``encryption_enabled`` round-trip note above). The loader's companion read
+    # is ``config._parse_raw``'s ``if "backup" in raw``. ``public_key`` is an
+    # X25519 PUBLIC key (write-only seal target), NOT a secret value, so it is
+    # safe to YAML. Conditional-emit: a fresh disabled default stays absent to
+    # keep new configs minimal; any operator change to the block round-trips.
+    bk = getattr(config, "backup", None)
+    if bk is not None:
+        from email_triage.config import BackupConfig as _BackupConfig
+        _bk_default = _BackupConfig()
+        if (
+            bk.enabled
+            or bk.cadence != _bk_default.cadence
+            or bk.format != _bk_default.format
+            or str(bk.retention) != _bk_default.retention
+            or bk.dir
+            or bk.encryption != _bk_default.encryption
+            or bk.public_key
+        ):
+            backup_block: dict[str, Any] = {
+                "enabled": bool(bk.enabled),
+                "cadence": bk.cadence,
+                "format": bk.format,
+                "retention": str(bk.retention),
+                "encryption": bk.encryption,
+            }
+            if bk.dir:
+                backup_block["dir"] = bk.dir
+            if bk.public_key:
+                backup_block["public_key"] = bk.public_key
+            data["backup"] = backup_block
+
+    # LLM maintenance windows. Loader reads them (keeping
+    # only windows with cron+backend+duration>0); without this emit the
+    # operator's windows vanished on the next Save. Conditional-emit on
+    # non-empty. #8-FULL gap.
+    windows = list(getattr(config, "llm_maintenance_windows", []) or [])
+    if windows:
+        data["llm_maintenance_windows"] = [
+            {
+                "host": w.host,
+                "cron": w.cron,
+                "duration_minutes": int(w.duration_minutes),
+                "backend": w.backend,
+            }
+            for w in windows
+        ]
+
+    atomic_write_text(
+        target,
+        yaml.dump(data, default_flow_style=False, sort_keys=False),
+    )
 
 
 # ---------------------------------------------------------------------------

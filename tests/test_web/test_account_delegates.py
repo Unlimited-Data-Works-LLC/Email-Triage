@@ -4,6 +4,7 @@ import pytest
 
 from email_triage.web.db import (
     add_account_delegate,
+    can_administer_account,
     can_manage_account,
     create_email_account,
     is_account_delegate,
@@ -115,6 +116,52 @@ class TestCanManageAccount:
         assert can_manage_account(db, regular_user, None) is False
 
 
+class TestCanAdministerAccount:
+    """can_administer_account is STRICTLY STRONGER than can_manage_account:
+    admin/owner YES, but a DELEGATE is NOT an administrator (the no-delegate
+    sensitive-op gate — divergence census 2026-06-11, batch 4). The contrast
+    with TestCanManageAccount::test_delegate_yes is the whole point."""
+
+    def test_admin_yes(self, db, admin_user, regular_user):
+        a = create_email_account(
+            db, regular_user["id"], "ACCT", "imap", {"host": "x"},
+        )
+        acct = {"id": a, "user_id": regular_user["id"]}
+        assert can_administer_account(db, admin_user, acct) is True
+
+    def test_owner_yes(self, db, regular_user):
+        a = create_email_account(
+            db, regular_user["id"], "ACCT", "imap", {"host": "x"},
+        )
+        acct = {"id": a, "user_id": regular_user["id"]}
+        assert can_administer_account(db, regular_user, acct) is True
+
+    def test_delegate_NO(self, db, regular_user, admin_user):
+        """The security-critical case: a delegate CAN manage but CANNOT
+        administer — so the SAME (account, delegate) pair that is True for
+        can_manage_account is False here."""
+        a = create_email_account(
+            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        acct = {"id": a, "user_id": admin_user["id"]}
+        assert can_manage_account(db, regular_user, acct) is True   # contrast
+        assert can_administer_account(db, regular_user, acct) is False
+
+    def test_stranger_no(self, db, regular_user, admin_user):
+        a = create_email_account(
+            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+        )
+        acct = {"id": a, "user_id": admin_user["id"]}
+        assert can_administer_account(db, regular_user, acct) is False
+
+    def test_none_user_no(self, db):
+        assert can_administer_account(db, None, {"id": 1, "user_id": 1}) is False
+
+    def test_none_acct_no(self, db, regular_user):
+        assert can_administer_account(db, regular_user, None) is False
+
+
 class TestListAccountsIncludesDelegated:
     def test_owned_only_when_no_delegations(self, db, regular_user):
         a = create_email_account(
@@ -193,6 +240,62 @@ class TestRouteAuthz:
             f"/accounts/{a}", cookies=user_cookies,
         )
         assert resp.status_code == 403
+
+    def test_delegate_cannot_revoke_delegate(
+        self, client, user_cookies, db, regular_user, admin_user,
+    ):
+        """batch-4 edge: a delegate must NOT revoke delegation (the revoke
+        route is owner-or-admin only — can_administer_account). A delegate
+        trying to revoke even their OWN delegate row gets 403 and the row
+        survives. (Complements the existing test_delegate_cannot_grant_further;
+        delete is covered by test_delegate_cannot_delete.)"""
+        a = create_email_account(
+            db, admin_user["id"], "DELEGATED", "imap", {"host": "x"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        resp = client.delete(
+            f"/accounts/{a}/delegates/{regular_user['id']}",
+            cookies=user_cookies,
+        )
+        assert resp.status_code == 403
+        assert is_account_delegate(db, a, regular_user["id"]) is True
+
+    def test_delegate_cannot_flip_hipaa_via_edit_form(
+        self, client, user_cookies, db, regular_user, admin_user,
+    ):
+        """batch-4 edge — the highest-stakes op AND the most fragile: the
+        HIPAA-flag flip is a 200-returning SUB-BLOCK of the edit save (not a
+        dedicated 403 route), so its delegate-denial has no 403 to assert.
+        A delegate FORGING ``hipaa_submitted`` in the PUT must NOT flip the
+        flag — the save still applies for fields a delegate may edit (200),
+        but can_administer_account gates the flag itself. (N-57: the
+        structural reference pin needs this behavioural edge test.)"""
+        from email_triage.web.db import get_email_account
+        a = create_email_account(
+            db, admin_user["id"], "DELEGATED", "imap",
+            {"host": "old.com", "username": "u@old.com", "mailbox": "INBOX"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        assert bool(get_email_account(db, a)["hipaa"]) is False  # starts OFF
+
+        resp = client.put(f"/accounts/{a}", data={
+            "name": "DELEGATED",
+            "provider_type": "imap",
+            "host": "old.com",
+            "port": "993",
+            "username": "u@old.com",
+            "mailbox": "INBOX",
+            "use_ssl": "1",
+            "is_active": "1",
+            "hipaa_submitted": "1",
+            "hipaa": "1",          # delegate tries to flip the flag ON
+        }, cookies=user_cookies)
+
+        assert resp.status_code == 200
+        assert bool(get_email_account(db, a)["hipaa"]) is False, (
+            "a delegate must NOT be able to flip the HIPAA flag via the edit "
+            "form (can_administer_account is the no-delegate gate)"
+        )
 
 
 class TestDelegateGrantUI:

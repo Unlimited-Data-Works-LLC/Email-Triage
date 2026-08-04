@@ -69,6 +69,50 @@ class BackendDisabledError(BackendError):
     """
 
 
+class BackendBAARequiredError(BackendError):
+    """Raised by :func:`load_backend` when ``require_baa_certified=True``
+    (a HIPAA account's PHI-egress path) but the backend row is not
+    BAA-certified, has no BAA expiry, or its BAA has expired.
+
+    Fail-closed: a HIPAA account's PHI must not reach a non-BAA
+    subprocessor (§164.502(a)(1) impermissible disclosure /
+    §164.308(b)(1) BAA-required). The account-setup selector already
+    refuses such a backend at selection time; this is the reciprocal
+    RUNTIME gate so a backend whose BAA lapsed (or was de-certified)
+    AFTER selection can't silently egress PHI on the style-learning
+    distill path. Loop-6 census N-63.
+    """
+
+
+def meter_chat_complete(fn):
+    """N-194b R21_9: decorator that wraps a `chat_complete` implementation
+    in `metrics.timer("et_llm_chat_seconds", backend=self.backend_type)`.
+
+    Every adapter's `chat_complete` gets this — one seam for all LLM
+    round-trips outside the classify hot path (which has its own
+    `et_llm_classify_seconds` metric at classify/base.py:642). Pinned by
+    `tests/test_n194_llm_chat_metrics_pin.py`.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    async def _wrapped(self, *args, **kwargs):
+        # N-384 (2026-07-10 wf_69674c7e-c67, HIGH): emit the outcome-counter
+        # twin — the timer records latency but was blind to the failure edge.
+        from email_triage import metrics as _metrics
+        backend_label = getattr(self, "backend_type", "unknown") or "unknown"
+        outcome = "transport_error"
+        try:
+            with _metrics.timer("et_llm_chat_seconds", backend=backend_label):
+                result = await fn(self, *args, **kwargs)
+            outcome = "success"
+            return result
+        finally:
+            _metrics.emit_llm_outcome("chat", backend_label, outcome)
+
+    return _wrapped
+
+
 class BackendAdapter(ABC):
     """A single LLM backend instance, ready to receive chat-completion
     requests.

@@ -42,7 +42,8 @@ from email_triage.web.db import (
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -132,7 +133,11 @@ class _MockBackend:
 
 def _install_mock_backend(monkeypatch, backend: _MockBackend) -> None:
     """Monkeypatch ``load_backend`` to return our mock."""
-    def fake_loader(backend_id, *, db_conn, secrets=None, config=None):
+    def fake_loader(backend_id, *, db_conn, secrets=None, config=None,
+                    require_baa_certified=False):
+        # Mirror the real load_backend signature (census N-63 added the
+        # require_baa_certified chokepoint kwarg) so this boundary mock can't
+        # drift from the seam it stands in for.
         return backend
     monkeypatch.setattr(distill_mod, "load_backend", fake_loader)
 
@@ -496,3 +501,139 @@ class TestCadence:
         )
         assert result.status == "success"
         assert len(backend.calls) == 2
+
+
+@pytest.mark.asyncio
+class TestRuntimeBAAGate:
+    """Census N-63 — the SEAM test: drive the REAL load_backend (no mock)
+    so the distill path's runtime BAA refusal is proven end-to-end. The
+    mocked-backend tests above bypass load_backend entirely and so can't
+    catch a regression that drops the require_baa_certified flag — this one
+    does (mock-the-boundary lesson)."""
+
+    @staticmethod
+    def _point_account_at_uncertified_backend(db, account_id) -> int:
+        bid = int(db.execute(
+            "INSERT INTO ai_backends "
+            "(name, type, endpoint, api_key_secret_ref, model, "
+            " baa_certified, baa_expires_at, enabled) "
+            "VALUES ('Uncertified Cloud','openai',"
+            "'https://api.openai.com/v1',NULL,NULL,0,NULL,1)"
+        ).lastrowid)
+        db.execute(
+            "UPDATE email_accounts SET style_learning_backend_id = ? "
+            "WHERE id = ?", (bid, account_id),
+        )
+        db.commit()
+        return bid
+
+    async def test_hipaa_distill_refuses_uncertified_backend(self, db):
+        """A HIPAA account pointed at a non-BAA backend → outcome=baa_required,
+        no LLM call, audited, no retry enqueued — PHI never egresses."""
+        uid = _seed_user(db)
+        aid = _seed_account(db, user_id=uid, hipaa=True)
+        set_hipaa_style_distill_enabled(db, True)
+        set_style_knobs_hipaa_allow(db, aid, enabled=True)
+        self._point_account_at_uncertified_backend(db, aid)
+
+        # NOTE: NO _install_mock_backend — the real load_backend runs and must
+        # refuse at the chokepoint BEFORE instantiating any adapter.
+        result = await distill_hipaa_account(
+            aid, db_conn=db, messages=_make_messages(),
+            actor_user_id=uid, skip_ner=True,
+        )
+
+        assert result.status == distill_mod.OUTCOME_BAA_REQUIRED
+        # No style descriptor persisted (PHI never reached an LLM).
+        assert get_hipaa_style_descriptor(db, aid) is None
+        # The refusal is audited with the BAA cause.
+        events = list_style_distill_events(db, account_id=aid)
+        assert events and events[-1]["outcome"] == "baa_required"
+        # A lapsed BAA won't self-heal → the queue entry is PARKED (paused),
+        # not left worker-selectable. A parked entry is created so the
+        # operator sees a BAA-blocked account to re-certify.
+        entry = get_style_distill_queue_entry(db, account_id=aid)
+        assert entry is not None and entry["paused"]
+
+    async def test_baa_refusal_pauses_a_preexisting_due_retry_row(self, db):
+        """db-sme PD#18 regression: an earlier backend_fail leaves a DUE retry
+        row (paused=0, next_retry_at in the past); the BAA then lapses. When
+        the retry worker drives the distill, the refusal must PAUSE that row so
+        the worker can't re-select + re-fire it every poll (a tight loop)."""
+        uid = _seed_user(db)
+        aid = _seed_account(db, user_id=uid, hipaa=True)
+        set_hipaa_style_distill_enabled(db, True)
+        set_style_knobs_hipaa_allow(db, aid, enabled=True)
+        self._point_account_at_uncertified_backend(db, aid)
+        # Seed a DUE retry row, then force it past-due + worker-selectable.
+        enqueue_style_distill_retry(db, account_id=aid, last_error="net")
+        db.execute(
+            "UPDATE style_distill_queue "
+            "SET paused = 0, next_retry_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE account_id = ?", (aid,),
+        )
+        db.commit()
+        assert get_style_distill_queue_entry(db, account_id=aid)["paused"] == 0
+
+        result = await distill_hipaa_account(
+            aid, db_conn=db, messages=_make_messages(),
+            actor_user_id=uid, skip_ner=True,
+        )
+
+        assert result.status == distill_mod.OUTCOME_BAA_REQUIRED
+        # The previously-due row is now paused → the worker (WHERE paused=0)
+        # can no longer re-select it. No infinite re-fire loop.
+        assert get_style_distill_queue_entry(db, account_id=aid)["paused"] == 1
+
+    async def test_install_default_nonlocal_endpoint_refused_for_hipaa(self, db):
+        """DA install-default hole: a HIPAA account with a NULL backend FK and
+        an operator-set REMOTE config.classifier.ollama_url must NOT egress PHI
+        to the install default without a BAA — the gate fires even on the
+        backend_id=None path (the install default is config.classifier)."""
+        from email_triage.ai_backends import BackendBAARequiredError, load_backend
+
+        class _Cls:
+            backend = "ollama"
+            ollama_url = "https://ollama.cloud.example.com"  # NON-local
+            model = "x"
+        class _Tls:
+            local_url_suffixes: list[str] = []
+        class _Cfg:
+            classifier = _Cls()
+            tls = _Tls()
+
+        with pytest.raises(BackendBAARequiredError):
+            load_backend(None, db_conn=db, secrets=None, config=_Cfg(),
+                         require_baa_certified=True)
+
+    async def test_hipaa_distill_does_not_refuse_certified_backend(self, db):
+        """Control (mock-free): a BAA-certified, non-expired backend passes the
+        runtime gate. The real loader is used, so we assert the outcome is NOT
+        baa_required — the distill proceeds past the gate (and then fails later
+        at the real network call with no key → backend_fail, which is fine; the
+        point is the BAA gate did not refuse it). Proves the gate isn't a
+        blanket ban on the ai_backends path."""
+        uid = _seed_user(db)
+        aid = _seed_account(db, user_id=uid, hipaa=True)
+        set_hipaa_style_distill_enabled(db, True)
+        set_style_knobs_hipaa_allow(db, aid, enabled=True)
+        bid = int(db.execute(
+            "INSERT INTO ai_backends "
+            "(name, type, endpoint, api_key_secret_ref, model, "
+            " baa_certified, baa_expires_at, enabled) "
+            "VALUES ('Certified Cloud','openai',"
+            "'https://api.openai.com/v1',NULL,NULL,1,'2099-01-01',1)"
+        ).lastrowid)
+        db.execute(
+            "UPDATE email_accounts SET style_learning_backend_id = ? "
+            "WHERE id = ?", (bid, aid),
+        )
+        db.commit()
+
+        result = await distill_hipaa_account(
+            aid, db_conn=db, messages=_make_messages(),
+            actor_user_id=uid, skip_ner=True,
+        )
+        # The BAA gate let it through — whatever happens next (a real-network
+        # backend_fail here), it is NOT a BAA refusal.
+        assert result.status != distill_mod.OUTCOME_BAA_REQUIRED

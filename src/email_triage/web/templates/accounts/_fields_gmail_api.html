@@ -55,11 +55,13 @@
     {% set default_iv = ingestion.push_poll_interval_min if mode == 'push' else ingestion.poll_poll_interval_min %}
     <label style="margin-top:0.5rem;display:block;">
         Poll interval override (min){{ m.help("How often email-triage checks Gmail for new mail when push is unavailable. Blank uses the install default. Example: enter 5 to check every 5 minutes for an account where push hasn't been enabled yet, or leave blank to follow the default.") }}
-        <input type="number" name="poll_interval_override"
-               value="{{ acct.config.get('poll_interval_override', '') if acct is defined else '' }}"
-               min="{{ ingestion.POLL_MIN }}" max="{{ ingestion.POLL_MAX }}" step="{{ ingestion.STEP }}"
-               placeholder="{{ default_iv }}"
-               style="width:8rem;">
+        {{ m.combo_input(
+            "poll_interval_override",
+            acct.config.get('poll_interval_override', '') if acct is defined else '',
+            ["5", "10", "15", "30", "60"],
+            type="number",
+            placeholder=default_iv,
+            attrs="min=" ~ ingestion.POLL_MIN ~ " max=" ~ ingestion.POLL_MAX ~ " step=" ~ ingestion.STEP ~ " style='width:8rem;'") }}
         <small style="color:var(--pico-muted-color);">
             Blank = server default ({{ default_iv }} min for current
             <strong>{{ mode }}</strong> mode). Override is reset automatically when

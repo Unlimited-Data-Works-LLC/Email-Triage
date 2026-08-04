@@ -22,6 +22,14 @@
     live progress page.
 </p>
 
+{# #58 — rolled-up cross-account mail-search-index update progress. Loads once
+   on page-load; the fragment self-polls while a reindex wave is active and
+   renders empty (stops polling) when it's done. #}
+<div id="reindex-agg"
+     hx-get="/triage/jobs/reindex-progress"
+     hx-trigger="load"
+     hx-swap="innerHTML"></div>
+
 {% if active_jobs %}
 <section style="margin-top:1.5rem;">
     <h3 style="margin-bottom:0.5rem;">Active</h3>
@@ -76,10 +84,7 @@
                     {% endif %}
                 </td>
                 <td>
-                    <small class="local-datetime"
-                           data-utc="{{ j.created_at }}">
-                        {{ j.created_at }}
-                    </small>
+                    <small><time datetime="{{ j.created_at }}" data-us-datetime>{{ j.created_at | us_datetime }}</time></small>
                 </td>
                 <td>
                     <a href="/triage/jobs/{{ j.job_id }}" role="button"
@@ -157,10 +162,8 @@
                        timestamp). The agent that built this page
                        initially named it ``finished_at`` which
                        silently rendered empty. #}
-                    <small class="local-datetime"
-                           data-utc="{{ j.ended_at or j.created_at }}">
-                        {{ j.ended_at or j.created_at }}
-                    </small>
+                    {% set _ts = j.ended_at or j.created_at %}
+                    <small><time datetime="{{ _ts }}" data-us-datetime>{{ _ts | us_datetime }}</time></small>
                 </td>
                 <td>
                     <a href="/triage/jobs/{{ j.job_id }}" role="button"
@@ -178,20 +181,11 @@
         No recent background runs.
     </p>
     {% endif %}
+    {# #300/#301 — the page caps active+recent AFTER scoping to your #}
+    {# accounts; the pager makes the full history reachable.         #}
+    {% from "_pager.html" import pager %}
+    {% if jobs_win %}
+    {{ pager(jobs_win, "offset", request, "background runs across your accounts") }}
+    {% endif %}
 </section>
-
-<script>
-document.querySelectorAll('.local-datetime').forEach(function(el) {
-    var utc = el.getAttribute('data-utc');
-    if (!utc) return;
-    try {
-        var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
-        var d = new Date(hastz ? utc : utc + 'Z');
-        el.textContent = d.toLocaleString(undefined, {
-            month: 'short', day: 'numeric',
-            hour: 'numeric', minute: '2-digit',
-        });
-    } catch (e) { /* leave UTC string */ }
-});
-</script>
 {% endblock %}

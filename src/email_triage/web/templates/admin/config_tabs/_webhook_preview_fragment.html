@@ -1,0 +1,71 @@
+{# Outbound-webhook body-template LIVE PREVIEW fragment (task #56).
+
+   Consumed by `admin_integrations_webhook_preview` (HTMX inner-swap
+   target `#outbound-body-preview` in
+   `admin/config_tabs/integrations.html`). Renders TWO `<pre>` blocks:
+
+   * Normal — the exact bytes email-triage would POST for the selected
+     target-type + effective template (operator override or built-in
+     default) against the canned sample envelope.
+   * HIPAA-locked — the minimal metadata shape the receiver gets when
+     the target's account is HIPAA-flagged (operator template IGNORED
+     at fire time — defense-in-depth atop `_FORBIDDEN_KEYS`).
+
+   The preview reuses `render_for_target` — bytes here are byte-
+   identical to production emit for the same input (Task #55 decision
+   memo: server-side render via HTMX avoids the Mustache/Handlebars
+   client divergence trap). #}
+
+{% if template_error %}
+<article style="border-left:3px solid var(--pico-del-color);background:var(--pico-card-background-color);padding:0.4rem 0.6rem;margin:0 0 0.4rem;">
+    <small><strong>&#9888; Template rejected.</strong> {{ template_error }}</small>
+</article>
+{% endif %}
+
+<div style="font-size:0.8rem;color:var(--pico-muted-color);margin-bottom:0.3rem;">
+    <strong>Preview</strong> — target <code>{{ target_type }}</code>,
+    sample event <code>{{ sample_event }}</code>{%
+        if not template_used %} (using target-type default){% endif %}.
+    Rendered by the same
+    <code>render_for_target</code> SSOT that fires production emit.
+</div>
+
+<div style="margin:0.25rem 0 0.5rem;">
+    <div style="font-size:0.8rem;font-weight:600;margin-bottom:0.15rem;">
+        Normal (non-HIPAA) wire body
+    </div>
+    {% if normal_error %}
+    <article style="border-left:3px solid var(--pico-del-color);background:var(--pico-card-background-color);padding:0.4rem 0.6rem;margin:0;">
+        <small><strong>&#9888; Delivery would be refused.</strong>
+        {{ normal_error }}</small>
+    </article>
+    {% else %}
+    <pre style="background:var(--pico-code-background-color);padding:0.4rem 0.5rem;margin:0;font-size:0.8rem;overflow-x:auto;white-space:pre-wrap;word-break:break-all;">{{ normal_body }}</pre>
+    {% endif %}
+    {% if unreferenced_required %}
+    {# SME-panel 2026-07-15 DA PD-N-operator-mistake fold — surface the
+       operator template's missing required_fields inline. Preview
+       renders successfully against the canned envelope, but a prod
+       fire against a real envelope missing the same field would
+       RequiredFieldMissing-refuse. #}
+    <article style="border-left:3px solid var(--pico-mark-background-color);background:var(--pico-card-background-color);padding:0.4rem 0.6rem;margin:0.35rem 0 0;">
+        <small><strong>&#9432; Operator template omits required fields:</strong>
+        {% for field in unreferenced_required %}<code>data.{{ field }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+        Preview renders fine against the sample envelope (which carries the field), but a prod fire whose envelope is missing this field will
+        <code>RequiredFieldMissing</code>-refuse the delivery. Add
+        <code>{% raw %}{{{% endraw %}data.{{ unreferenced_required[0] }}{% raw %}}}{% endraw %}</code> to the template, or fall back to the
+        target-type's default template (leave the box blank).</small>
+    </article>
+    {% endif %}
+</div>
+
+<div>
+    <div style="font-size:0.8rem;font-weight:600;margin-bottom:0.15rem;">
+        HIPAA-locked wire body
+        <small style="color:var(--pico-muted-color);font-weight:normal;">
+            (what a HIPAA-flagged account receives — operator template
+            ignored)
+        </small>
+    </div>
+    <pre style="background:var(--pico-code-background-color);padding:0.4rem 0.5rem;margin:0;font-size:0.8rem;overflow-x:auto;white-space:pre-wrap;word-break:break-all;">{{ hipaa_body }}</pre>
+</div>

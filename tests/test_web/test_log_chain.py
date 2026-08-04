@@ -83,6 +83,68 @@ class TestEmitChain:
         assert extras.get("error") == "boom"
         assert "_extra" not in extras
 
+    def test_emit_redacts_phi_extra_from_raw_getlogger_in_hipaa_mode(self, db):
+        """run17 #1 — a RAW ``logging.getLogger`` (bypassing TriageLogger.
+        ``_sanitise``) that passes a PHI-shaped ``extra`` must NOT persist the
+        PHI value into the un-expungeable HMAC ``log_entries`` table. The sink
+        ALLOWLIST (``redact_persisted_extra``) strips it BEFORE the hash preimage
+        is built, so the row still verifies (hash == store) and carries no PHI.
+        This is the load-bearing behavioural pin for the 3-SME-reviewed fix.
+        """
+        import json as _json
+
+        from email_triage import triage_logging
+
+        handler = SQLiteLogHandler(db, flush_interval=1)
+        # RAW stdlib logger — the exact bypass path that leaked at HEAD.
+        log = logging.getLogger("test.run17_phi_sink")
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        prior = triage_logging._hipaa_mode
+        triage_logging._hipaa_mode = True
+        try:
+            log.info(
+                "triage failed",
+                extra={"subject": "Dx PATIENT_PHI_SENTINEL",
+                       "reason": "PHI_REASON_SENTINEL",
+                       "flow_id": "f-42", "account_id": 7},
+            )
+        finally:
+            triage_logging._hipaa_mode = prior
+            log.removeHandler(handler)
+
+        row = db.execute(
+            "SELECT ts, level, logger, message, extra_json, prev_hash, "
+            "row_hash, master_key_version FROM log_entries "
+            "WHERE logger = 'test.run17_phi_sink' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        extras = _json.loads(row["extra_json"])
+        # PHI-shaped keys → placeholder; operator/plumbing keys survive.
+        assert extras.get("subject") == "[redacted]"
+        assert extras.get("reason") == "[redacted]"
+        assert extras.get("flow_id") == "f-42"
+        # emit() stringifies every value via redact_exc(str(v)) before the
+        # allowlist runs, so the surviving int persists as its str form.
+        assert extras.get("account_id") == "7"
+        # No PHI sentinel anywhere in the PERSISTED (== hashed) extra_json.
+        assert "PATIENT_PHI_SENTINEL" not in row["extra_json"]
+        assert "PHI_REASON_SENTINEL" not in row["extra_json"]
+        # hash preimage == store: recompute the row hash from the STORED
+        # (redacted) extra_json — it must equal the stored row_hash. If the
+        # strip had landed AFTER hashing (PHI in the preimage), this would
+        # mismatch and verify_log_chain would flag a desync.
+        recomputed = compute_log_row_hash(
+            row["prev_hash"], row["ts"], row["level"], row["logger"],
+            row["message"], row["extra_json"],
+            hash_alg="hmac-sha256-v1",
+            master_key_version=row["master_key_version"],
+        )
+        assert recomputed == row["row_hash"], (
+            "hash preimage != stored extra_json — the PHI strip landed AFTER "
+            "the hash compute (chain desync) instead of before it"
+        )
+
     def test_emit_chains_rows(self, db):
         handler = SQLiteLogHandler(db, flush_interval=1)
         log = logging.getLogger("test.log_chain")
