@@ -118,7 +118,7 @@ jobs:
     # mirror, which has no self-hosted runners.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Latest committed census must be recent (enforced on v* tags)
         run: |
           if [[ "${{ github.ref }}" != refs/tags/v* ]]; then
@@ -192,7 +192,7 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Stamp commit SHA into COMMIT
         # The Containerfile COPYs ``COMMIT`` into ``/app/VERSION``;
@@ -220,15 +220,15 @@ jobs:
       #). MUST precede setup-buildx so buildx picks up the binfmt
       # handlers.
       - name: Set up QEMU (multi-arch emulation)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -242,7 +242,7 @@ jobs:
         # only fires on semver tags, never on a main push, and we
         # add `:stable` as an explicit alias for the most-recent
         # semver tag.
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -278,7 +278,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Containerfile
@@ -338,7 +338,7 @@ jobs:
       - name: Log in to GHCR
         # cosign needs to push the signature + attestation artifacts
         # into the registry alongside the image manifest.
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -373,7 +373,7 @@ jobs:
       # and is the gate HIPAA installs actually enforce.
       - name: SLSA-3 build provenance
         if: github.event.repository.visibility == 'public'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ needs.build-and-push.outputs.image-digest }}
@@ -431,13 +431,13 @@ jobs:
           swap-storage: true
 
       - name: Checkout (for CHANGELOG)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -566,7 +566,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
