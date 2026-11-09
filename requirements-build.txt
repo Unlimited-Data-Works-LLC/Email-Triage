@@ -1,0 +1,21 @@
+# The Containerfile builder stage's build toolchain, hash-pinned (punch 775).
+# The builder source-builds sqlcipher3 with `pip install --no-build-isolation`, so the build backend runs from
+# THIS install, not from an isolated PyPI fetch. Before 775 that was `pip install setuptools wheel`: unpinned
+# and unhashed in the one stage that compiles the encryption-at-rest binding. `source_built.py verify` binds the
+# source and amalgamation sha, never the toolchain; these hashes bind the toolchain.
+# Installed by `pip install --require-hashes --only-binary :all: --no-deps -r requirements-build.txt`.
+# Versions and hashes: setuptools 84.2.1 and packaging 26.3 are the entries already locked in
+# requirements-ci-tools.lock / requirements.lock; wheel 0.48.0 (requires packaging>=24.0) digests are the
+# PyPI JSON values read 2026-11-02, the setuptools wheel digest checked against the same JSON.
+# One hand-kept pin, not a pip-compile lock, and named outside requirements*.lock on purpose, exactly like
+# requirements-pip.txt: the requirements*.lock glob pins (reachable-from-pyproject, floors, N-545 image
+# description, privacy closure walk) read every .lock as a compiled lock reachable from pyproject, and a build
+# toolchain is neither. tests/test_punch775_builder_toolchain_hashed_pin.py holds this file hashed and the
+# Containerfile's use of it.
+setuptools==84.2.1 \
+    --hash=sha256:ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2
+wheel==0.48.0 \
+    --hash=sha256:3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab
+packaging==26.3 \
+    --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c

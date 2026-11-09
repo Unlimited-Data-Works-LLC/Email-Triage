@@ -48,7 +48,7 @@ def test_dashboard_banner_calm_copy_inside_maintenance_window(
     # in-test ``now``.
     app.state.config.llm_maintenance_windows = [
         LLMMaintenanceWindow(
-            host="llm-host", cron="* * * * *",
+            host="llm-host.invalid", cron="* * * * *",
             duration_minutes=30, backend="ollama",
         ),
     ]

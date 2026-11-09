@@ -85,7 +85,14 @@ def db():
             status_code   INTEGER NOT NULL,
             outcome       TEXT NOT NULL,
             detail        TEXT,
-            request_id    TEXT
+            request_id    TEXT,
+            -- #26: record_access_event now HMAC-chains the row (migration v43).
+            -- This hand-rolled fixture must carry the chain columns or
+            -- _chain_insert's INSERT fails ("no such column: prev_hash").
+            prev_hash          TEXT NOT NULL DEFAULT '',
+            row_hash           TEXT NOT NULL DEFAULT '',
+            hash_alg           TEXT,
+            master_key_version INTEGER
         );
     """)
     c.commit()
@@ -249,16 +256,49 @@ def test_new_request_context_resets_to_outer_value():
 # Audit fail-fast (no silent swallow)
 # ---------------------------------------------------------------------------
 
-def test_audit_failure_increments_counter(monkeypatch, db):
+async def _get_and_drain(app, path):
+    """GET ``path`` via an in-process ASGI client and drain the fire-and-forget
+    audit-write task ON THE SAME event loop; return the httpx Response.
+
+    Same-loop fix (census run15 testinfra — the test_audit_strict_mode class):
+    the access-audit middleware fire-and-forgets the audit write via
+    ``asyncio.create_task`` on the loop the request runs on (tracked on
+    ``app.state._audit_pending``; the ``audit_failures`` bump AND the
+    ``access_log`` INSERT both happen INSIDE that task). The OLD drain created a
+    SECOND ``asyncio.new_event_loop()`` and ``gather``ed those tasks — a
+    cross-loop await that cannot drive a task bound to another loop, so under CI
+    load the side-effect hadn't happened when asserted (counter 0 / row missing).
+    With ``httpx.ASGITransport`` the request, the ``create_task``'d
+    ``_audit_write``, and the drain ``gather`` all share the pytest-asyncio loop
+    (``asyncio_mode = "auto"``), so the drain deterministically completes it.
+    """
+    import asyncio
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test.invalid",
+    ) as client:
+        resp = await client.get(path)
+    pending = list(getattr(app.state, "_audit_pending", None) or [])
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return resp
+
+
+@pytest.mark.audit_failure_expected(
+    match='access_log GET route=/classify/test status=200',
+    count=1,
+)
+async def test_audit_failure_increments_counter(monkeypatch, db):
     """If record_access_event raises, dispatch logs + bumps the
     counter on app.state. Response is still returned (we don't poison
     the user's request) but the failure is auditable.
 
-    .2: post-E-refactor the audit write is fire-and-forget on a
-    task tracked by ``app.state._audit_pending``. Patch the
-    module-cached reference (access_audit imported the helper at
-    module load) and drain the pending set before asserting."""
-    import asyncio
+    .2: the audit write is fire-and-forget on a task tracked by
+    ``app.state._audit_pending``. Patch the module-cached reference
+    (access_audit imported the helper at module load) and drain the pending
+    set ON THE SAME LOOP before asserting (census run15 testinfra)."""
     from email_triage.web import access_audit
 
     def boom(*args, **kwargs):
@@ -270,22 +310,18 @@ def test_audit_failure_increments_counter(monkeypatch, db):
     monkeypatch.setattr(access_audit, "_record_access_event", boom)
 
     app = _build_app(db=db)
-    client = TestClient(app)
-    r = client.get("/classify/test")
-    assert r.status_code == 200  # request still served
-
-    # Drain pending audit-write tasks before reading the counter.
-    pending = getattr(app.state, "_audit_pending", None)
-    if pending:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        finally:
-            loop.close()
-
+    resp = await _get_and_drain(app, "/classify/test")
+    assert resp.status_code == 200  # request still served
     assert getattr(app.state, "audit_failures", 0) == 1
 
 
+@pytest.mark.audit_failure_expected(
+    match=(
+        'access_audit:_audit_write',
+        'access_audit:dispatch',
+    ),
+    count=2,
+)
 def test_audit_failure_strict_mode_reraises(monkeypatch, db):
     """In strict-audit mode, audit failure re-raises so the bug is
     visible.
@@ -310,14 +346,18 @@ def test_audit_failure_strict_mode_reraises(monkeypatch, db):
         client.get("/classify/test")
 
 
-def test_access_log_row_carries_request_id(db):
+async def test_access_log_row_carries_request_id(db):
     """A real audit row written under a request scope must have
-    the same request_id we minted on the way in."""
+    the same request_id we minted on the way in.
+
+    .2: the access_log write is FIRE-AND-FORGET (app.state._audit_pending);
+    querying immediately RACES it. Same-loop drain via _get_and_drain (the old
+    new-event-loop gather raced under CI load — census run15 testinfra), so the
+    fire-and-forget SUCCESS path is tested deterministically."""
     app = _build_app(db=db)
-    client = TestClient(app)
-    r = client.get("/classify/test")
-    assert r.status_code == 200
-    minted = r.headers["X-Request-ID"]
+    resp = await _get_and_drain(app, "/classify/test")
+    assert resp.status_code == 200
+    minted = resp.headers["X-Request-ID"]
     rows = db.execute(
         "SELECT request_id FROM access_log ORDER BY id DESC LIMIT 1"
     ).fetchall()

@@ -151,14 +151,28 @@ def histogram(name: str, help_text: str = "") -> _Histogram:
 
 @contextmanager
 def timer(histogram_name: str, **labels: str) -> Iterator[None]:
-    """Context manager that records elapsed wall-time into a
-    histogram cell."""
-    h = histogram(histogram_name)
+    """Context manager that records elapsed wall-time into a histogram cell.
+
+    Telemetry is a non-decisional side-effect (project PD#8): recording must
+    NEVER break the wrapped body. Both the get-or-create and the observe are
+    best-effort — any registry error is swallowed (fail-open) — so a metrics
+    fault can't take down a hot path that wraps its work in a ``timer`` (the
+    LLM classify call, run17 #9). The happy path is unchanged: the elapsed
+    observation still lands on every normal call.
+    """
     t0 = time.perf_counter()
+    try:
+        h: _Histogram | None = histogram(histogram_name)
+    except Exception:  # pragma: no cover — get-or-create is lock + dict
+        h = None
     try:
         yield
     finally:
-        h.observe(time.perf_counter() - t0, **labels)
+        if h is not None:
+            try:
+                h.observe(time.perf_counter() - t0, **labels)
+            except Exception:  # pragma: no cover — observe is lock + deque
+                pass
 
 
 def reset_all() -> None:
@@ -168,6 +182,179 @@ def reset_all() -> None:
             c.reset()
         for h in _histograms.values():
             h.reset()
+
+
+# ---------------------------------------------------------------------------
+# LLM outcome counter twin funnel (N-384 — divergence census 2026-07-10,
+# wf_69674c7e-c67, HIGH)
+# ---------------------------------------------------------------------------
+#
+# The ~7 ``metrics.timer('et_llm_*_seconds', backend=...)`` wrappers across
+# ``classify/base.py``, ``ai_backends/base.py``, ``engine/embedding_backend.py``
+# and ``cli.py`` recorded latency but NEVER a paired outcome counter — so
+# ``/metrics`` scrapes saw p50/p95/p99 for the LLM hot path but no failure-
+# rate signal. A slow degradation (JSON parse rate falling from 99% to 90%,
+# transport_error trickling in) was invisible to Prometheus / Grafana that
+# ``metrics.py``'s own docstring courts.
+#
+# ``emit_llm_outcome`` is the funnel every timer body routes both its success
+# edge and every failure edge through. Sibling of the ``record_login_success``/
+# ``record_login_failure`` funnels in ``web/login_guard.py`` — Prime Directive
+# 18 (SET/CLEAR through ONE funnel; the pin's interprocedural AST walk keeps
+# hand-rolled counter calls from creeping back onto the timer sites).
+#
+# The interprocedural structural pin lives at
+# ``tests/test_llm_timer_outcome_counter_pin.py``.
+_LLM_OUTCOMES: frozenset[str] = frozenset({
+    "success",           # LLM call returned parseable, on-taxonomy
+    "parse_retry",       # first attempt unparseable, retry produced a parse
+                         #   (call-level: represents a whole call that
+                         #   recovered via retry — not a first-attempt outcome)
+    "parse_failed",      # call ended without a parse (a single-attempt path
+                         #   whose one attempt was unparseable, OR the retry
+                         #   path whose retry ALSO failed) — verdict dropped
+    "off_taxonomy",      # parseable JSON but the label was rejected by
+                         #   downstream validation (raise ValueError etc.)
+    "transport_error",   # HTTP / network / timeout / circuit breaker — the
+                         #   LLM call itself failed before parsing
+})
+_LLM_OPS: frozenset[str] = frozenset({"classify", "chat", "embed"})
+
+
+def emit_llm_outcome(op: str, backend: str, outcome: str) -> None:
+    """Bump the outcome-counter twin for an ``et_llm_<op>_seconds`` timer.
+
+    ``op`` — one of :data:`_LLM_OPS`, matching the timer's histogram suffix.
+    ``backend`` — the model backend the timer wrapped (``"ollama"``, an
+    ``OpenAIBackend`` name, etc.), same value used for the timer's
+    ``backend=`` label so the two metrics join.
+    ``outcome`` — one of :data:`_LLM_OUTCOMES`. An unknown value coerces to
+    ``"transport_error"`` (fail-safe classification: never lose a signal by
+    silently dropping it).
+
+    Semantics — **PER-WHOLE-CALL**. Exactly one emit per full LLM call at
+    the call's terminal outcome. Call sites that retry internally
+    (``classify_with_topics``) collapse the retry sequence into a single
+    call-level outcome:
+
+      * first attempt parse OK → ``"success"``
+      * first attempt parse fail then retry parse OK → ``"parse_retry"``
+      * every attempt unparseable → ``"parse_failed"``
+      * parseable but off-taxonomy → ``"off_taxonomy"``
+      * transport fault at any attempt → ``"transport_error"``
+
+    This keeps ``sum(rate(et_llm_<op>_total))`` equal to the per-call rate.
+    The paired histogram (``et_llm_<op>_seconds``) records **per-attempt**
+    latency samples (one observation per timer opening), so a retry
+    contributes 2 histogram samples but 1 counter emit — dashboards
+    computing ``rate(<outcome>) / rate(<total>)`` operate on per-call
+    ratios, and ``histogram_count / counter_total`` yields the
+    average-attempts-per-call.
+
+    Fail-open per the same discipline as :func:`timer`: any registry hiccup
+    is swallowed so a metrics fault can't take down a hot classify / embed
+    path. The happy path is one dict get + one int increment.
+
+    Callers MUST route BOTH the success edge (``outcome="success"``) and every
+    failure edge (``parse_retry`` / ``parse_failed`` / ``off_taxonomy`` /
+    ``transport_error``) through this funnel. The pin
+    ``test_llm_timer_outcome_counter_pin.py`` walks the AST for
+    ``with metrics.timer('et_llm_*_seconds', ...):`` blocks and refuses a body
+    that does not reach ``emit_llm_outcome(...)`` on every terminal path.
+    """
+    if outcome not in _LLM_OUTCOMES:
+        outcome = "transport_error"
+    if op not in _LLM_OPS:
+        # An unknown op is a caller bug, not a metric to invent — return
+        # silently so the LLM call proceeds; the pin catches the typo at CI.
+        return
+    try:
+        counter(
+            f"et_llm_{op}_total",
+            "LLM outcomes by backend and outcome (twin of "
+            f"et_llm_{op}_seconds histogram).",
+        ).inc(backend=str(backend), outcome=outcome)
+    except Exception:  # pragma: no cover — get-or-create is lock + dict
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Counter-registry SSOT funnels (N-385 — divergence census 2026-07-10,
+# wf_69674c7e-c67, HIGH)
+# ---------------------------------------------------------------------------
+#
+# Before this change, the codebase carried FOUR independent counter registries
+# for one intent ("per-event tally, labels-as-kwargs enum") and each callsite
+# picked arbitrarily:
+#
+#   * ``email_triage.metrics`` singleton (→ ``/metrics``, Prometheus text
+#     — the DOCUMENTED external-scrape surface),
+#   * ``app.state.metrics`` dict (→ ``/health/detail``, admin/stats.html),
+#   * ``persistent_counters`` Redis backend (→ install-lifetime totals),
+#   * ``get_topic_match_counters`` (→ ``/health/detail`` topic block).
+#
+# An operator watching ``/metrics`` saw LLM latency but no webhook rate,
+# no topic-match failure rate, no triage-runner throughput. The picked
+# canonical is ``email_triage.metrics`` (Prometheus text = external
+# operator-visible surface). The auxiliary registries STAY (they own
+# distinct render surfaces — /health/detail JSON, install-lifetime totals)
+# but every callsite that bumps one of them now ALSO mirrors to the
+# singleton through a thin funnel:
+#
+#   * ``emit_webhook_event(kind)``   — the ``_inc_counter`` funnel in
+#     ``web/routers/webhooks.py`` calls this on every webhook receipt.
+#     Bumps ``et_webhook_events_total{kind=…}``.
+#   * ``emit_topic_match_outcome(outcome)`` — the ``_TopicMatchCounters``
+#     instance in ``classify/base.py`` calls this on every ``incr(...)``.
+#     Bumps ``et_topic_match_outcomes_total{outcome=…}``.
+#   * ``et_triage_runs_total{trigger, outcome}`` — the ``run_triage`` wrapper
+#     in ``web/triage_runner.py`` bumps this DIRECTLY at the terminal (the
+#     hot-path was carrying zero counters before — the "invisible triage
+#     runner" the census called out).
+#
+# The interprocedural structural pin lives at
+# ``tests/test_counter_registry_ssot_pin.py``.
+
+def emit_webhook_event(kind: str) -> None:
+    """Bump ``et_webhook_events_total{kind=<kind>}`` on the Prometheus SSOT.
+
+    Called from ``web/routers/webhooks.py::_inc_counter`` — the single funnel
+    every webhook counter caller already routes through — so all ~N sites get
+    the singleton mirror without a per-site edit and the divergence pin has
+    ONE interprocedural anchor to check.
+
+    Fail-open per the same discipline as :func:`timer` — a metrics fault
+    cannot take down the webhook receive path.
+    """
+    try:
+        counter(
+            "et_webhook_events_total",
+            "Webhook events by kind (Prometheus mirror of "
+            "app.state.metrics + persistent_counters['webhooks']).",
+        ).inc(kind=str(kind))
+    except Exception:  # pragma: no cover — get-or-create is lock + dict
+        pass
+
+
+def emit_topic_match_outcome(outcome: str) -> None:
+    """Bump ``et_topic_match_outcomes_total{outcome=<outcome>}`` on the Prometheus SSOT.
+
+    Called from ``classify/base.py::_TopicMatchCounters.incr`` — the single
+    funnel every topic-match counter caller already routes through — so
+    ``salvage_recovered`` / ``parse_retried`` / ``retry_recovered`` /
+    ``retry_failed_dropped`` (and any future outcome) each get their singleton
+    mirror without a per-site edit.
+
+    Fail-open — a metrics fault cannot take down a topic-match parse path.
+    """
+    try:
+        counter(
+            "et_topic_match_outcomes_total",
+            "Topic-match parse outcomes (Prometheus mirror of the in-memory "
+            "get_topic_match_counters() dict rendered on /health/detail).",
+        ).inc(outcome=str(outcome))
+    except Exception:  # pragma: no cover — get-or-create is lock + dict
+        pass
 
 
 # ---------------------------------------------------------------------------

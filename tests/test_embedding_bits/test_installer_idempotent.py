@@ -105,7 +105,7 @@ async def test_fast_path_actually_runs_pip(
     assert result1.status == "installed"
 
     # Wipe the marker the pip stub wrote so we can detect the rerun.
-    marker = target / ".pip-installed-marker"
+    marker = target / "wheels" / ".pip-installed-marker"
     assert marker.exists(), "first call should have written marker"
     marker.unlink()
 

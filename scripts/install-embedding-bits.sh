@@ -29,7 +29,8 @@
 
 set -euo pipefail
 
-SIDELOAD_DIR="${EMBEDDING_BITS_SIDELOAD_DIR:-/app/data/runtime-deps/sideload}"
+# Punch 547: fixed, not an env override (the same prefix the app verifies).
+SIDELOAD_DIR="/app/data/runtime-deps/sideload"
 
 usage() {
     cat <<EOF
@@ -41,9 +42,7 @@ Commands:
   install             Run the auto-download installer
   status              Print the install_state row
 
-Environment:
-  EMBEDDING_BITS_SIDELOAD_DIR   override sideload extract path
-                                (default: ${SIDELOAD_DIR})
+Sideload extract path: ${SIDELOAD_DIR} (fixed; punch 547)
 
 EOF
     exit 1

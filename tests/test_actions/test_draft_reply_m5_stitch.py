@@ -48,7 +48,8 @@ def _make_db() -> sqlite3.Connection:
     flag), and ``sent_mail_index`` (M-4 retrieval target).
     """
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -561,7 +562,7 @@ class TestEmptyRetrieval:
 
 class TestEmbeddingBackendAllowlist:
     def test_non_ollama_backend_raises_value_error(self):
-        """Operator points ``embedding.backend`` at openai / anthropic
+        """Operator points ``embedding.backend`` at openai / AI provider
         / etc -> the factory raises ValueError naming the rejected
         value AND the allowlist."""
         cfg = SimpleNamespace(
@@ -579,7 +580,7 @@ class TestEmbeddingBackendAllowlist:
         assert "local-only" in msg
 
     def test_anthropic_backend_rejected_on_top_of_allowlist(self):
-        """Belt-and-braces: project-wide no-Anthropic rule rides on top
+        """Belt-and-braces: project-wide no-AI provider rule rides on top
         of the allowlist."""
         cfg = SimpleNamespace(
             embedding=SimpleNamespace(
@@ -590,7 +591,16 @@ class TestEmbeddingBackendAllowlist:
         )
         with pytest.raises(ValueError) as excinfo:
             build_embedding_backend(cfg)
-        assert "anthropic" in str(excinfo.value)
+        # Compare case-insensitively AND derive the needle from the config
+        # rather than repeating a literal: `build_embedding_backend` lowercases
+        # the backend before formatting the message, and the publish pipeline
+        # rewrites this vendor token (publish-sanitize-map.txt) to a
+        # MIXED-CASE replacement. A hardcoded literal needle therefore passed
+        # here and failed in the curated public tree — the replacement's
+        # capital survived in the assertion but not in the lowercased message.
+        msg = str(excinfo.value).lower()
+        assert cfg.embedding.backend.lower() in msg
+        assert "local-only allowlist" in msg
 
     def test_empty_backend_returns_none(self):
         """Operator left ``embedding:`` out of YAML -> factory returns

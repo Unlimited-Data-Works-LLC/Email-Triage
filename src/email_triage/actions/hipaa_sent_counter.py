@@ -69,12 +69,24 @@ Re-scanning the same Sent-folder snapshot is a no-op on the
 counters — the ``hipaa_sent_dedup`` PK on
 ``(account_id, msgid_hash)`` short-circuits already-seen messages
 inside :func:`record_hipaa_sent_message_if_new`. Each unique
-outbound message increments the counters exactly once across the
-install's lifetime (or until the operator runs
+outbound message increments the counters exactly once per
+*stable-identity era* (or until the operator runs
 :func:`reset_hipaa_send_counter` after a manual M-3 distill).
+
+A6 (census 2026-06-09) routed the RFC Message-ID resolution through
+``mail_headers.get_message_rfc_id`` (one casing authority). For an
+IMAP ``Message-Id``-cased message that was already counted under the
+provider-native id, the dedup key (``msgid_hash``) changes once at
+the A6 deploy boundary — a single benign +1 re-count if it is still
+inside the recent-scan window, self-stabilizing on the next sweep.
+The counters are the M-3/M-7 style-distill threshold trigger
+(N=20), not a §164.502(e) disclosure-accounting record, so a
+one-cycle early re-distill is the only effect.
 """
 
 from __future__ import annotations
+
+from email_triage.db._helpers import load_json_col
 
 import sqlite3
 from typing import Any
@@ -119,12 +131,26 @@ class HipaaSentCounterLoop:
         # operator can fan the scan across Sent + Sent Items +
         # Drafts-That-Were-Sent + etc. Empty/None falls through to
         # the provider default ("in:sent" against the default folder).
-        cleaned: list[str] = []
-        if sent_folders:
-            for f in sent_folders:
-                if isinstance(f, str) and f.strip():
-                    cleaned.append(f.strip())
-        self._sent_folders: tuple[str, ...] = tuple(cleaned)
+        # run18  (PD#5): route the coercion through the
+        # normalize_sent_folder_override SSOT instead of an inline
+        # strip, so the contract (strip, drop blanks, tolerate the
+        # legacy scalar-string shape) lives in ONE place. A future
+        # caller that does NOT pre-normalize stays safe — the old
+        # inline loop iterated a bare str into its characters.
+        from email_triage.providers.sent_folder import (
+            normalize_sent_folder_override,
+        )
+        self._sent_folders: tuple[str, ...] = tuple(
+            normalize_sent_folder_override(sent_folders)
+        )
+        # the backlog  (2026-07-12): memoize the N-402 auto-detected
+        # IMAP Sent folder across scans within THIS loop instance's
+        # lifetime. Saves one `LIST "" "*"` round-trip per sweep tick on
+        # IMAP-no-`sent_folders` accounts. Persists ONLY across the loop
+        # instance (a new loop instance re-detects); no cross-process
+        # state, no invalidation logic needed. Set once on first
+        # successful auto-detect; None means "not yet auto-detected".
+        self._auto_detected_sent_folder: str | None = None
 
     # -- account-state helpers ---------------------------------------------
 
@@ -156,7 +182,7 @@ class HipaaSentCounterLoop:
         # is_style_learning_account_enabled expects).
         import json
         try:
-            d["config"] = json.loads(d.get("config_json") or "{}")
+            d["config"] = load_json_col(d.get("config_json"), default={})
         except (ValueError, TypeError):
             d["config"] = {}
         return d
@@ -247,18 +273,64 @@ class HipaaSentCounterLoop:
         # Provider-agnostic folder switch via MailFilter — same pattern
         # as SentMailCaptureLoop (2026-05-13 UIDs-are-mailbox-scoped
         # fix; pair each id with its source folder).
+        # N-82 (Defect A) — import the auth-revoked classifier so the
+        # per-folder and fallback search exception handlers can distinguish
+        # a dead-token failure (re-raise → reaches the sweeper's SET edge)
+        # from a genuinely transient error (swallow → return 0 as before).
+        # Using is_auth_revoked_exc rather than is_auth_revoked keeps the
+        # call-site free of the (class_name, str) decomposition and keeps
+        # the needle SSOT as the single source.
+        from email_triage.web._auth_revoked import is_auth_revoked_exc
+
         seen: set[str] = set()
         merged_pairs: list[tuple[str, str]] = []  # (folder, uid)
         try:
-            if self._sent_folders:
+            # the backlog  (2026-07-12): sibling fix to
+            # ``sent_mail_capture.py`` — auto-detect Sent folder on IMAP
+            # via find_sent_folder SSOT so operator-config-populate becomes
+            # optional. HIPAA-relevance: this counter is HIPAA-scoped
+            # (per-account compliance reporting), so N-390's warn+return_0
+            # posture UNDER-REPORTED sent-mail compliance counts on any
+            # IMAP account without explicit `sent_folders`. Auto-detect
+            # CLOSES that under-report gap — the count now reflects real
+            # activity on the auto-detected Sent folder instead of always
+            # being zero. Falls back to the per-folder warn+continue net
+            # if the detected folder doesn't exist (no worse than N-390).
+            # See internal documentation §4.19 (N-390 skip class)
+            # + the follow-up register row for the auto-detect landing.
+            folders_to_walk: tuple[str, ...] = self._sent_folders
+            if not folders_to_walk:
+                from email_triage.providers.imap import ImapProvider
+
+                if isinstance(self._provider, ImapProvider):
+                    if self._auto_detected_sent_folder is None:
+                        from email_triage.providers.sent_folder import (
+                            find_sent_folder,
+                        )
+                        self._auto_detected_sent_folder = (
+                            await find_sent_folder(self._provider)
+                        )
+                        log.info(
+                            "hipaa_sent_counter: auto-detected IMAP Sent folder",
+                            account_id=self._account_id,
+                            folder=self._auto_detected_sent_folder,
+                        )
+                    folders_to_walk = (self._auto_detected_sent_folder,)
+
+            if folders_to_walk:
                 from email_triage.engine.models import MailFilter
-                for folder in self._sent_folders:
+                for folder in folders_to_walk:
                     try:
                         part = await self._provider.search(
                             "in:sent", limit,
                             filter=MailFilter(folder=folder),
                         )
                     except Exception as exc:
+                        # N-82 — auth-revoked: propagate so the sweeper's
+                        # except-scan_err branch SETs the auth_stale chip.
+                        # Transient errors are swallowed (continue) as before.
+                        if is_auth_revoked_exc(exc):
+                            raise
                         log.warning(
                             "hipaa_sent_counter: provider search failed "
                             "(continuing with other folders)",
@@ -272,11 +344,21 @@ class HipaaSentCounterLoop:
                             seen.add(mid)
                             merged_pairs.append((folder, mid))
             else:
+                # Non-IMAP fallback (Gmail-API / O365): `"in:sent"` is
+                # honored natively (Gmail via X-GM-RAW; Graph via
+                # well-known folder scoping). Translator-SSOT reject in
+                # `translate_imap_query_to_imap` (N-390) is the peer
+                # defense-in-depth control.
                 fallback_ids = await self._provider.search("in:sent", limit)
                 merged_pairs = [
                     ("", mid) for mid in (fallback_ids or [])
                 ]
         except Exception as exc:
+            # N-82 — auth-revoked escapes the inner try (via re-raise above
+            # or from the fallback search): propagate so the sweeper SETs the
+            # chip. Transient errors are still swallowed → return 0.
+            if is_auth_revoked_exc(exc):
+                raise
             log.warning(
                 "hipaa_sent_counter: provider search failed",
                 account_id=self._account_id,
@@ -294,6 +376,14 @@ class HipaaSentCounterLoop:
                 else:
                     msg = await self._provider.fetch_message(mid)
             except Exception as exc:
+                # #1 (census run16) — auth-revoked on the FETCH leg must
+                # propagate like the SEARCH leg already does (N-82), so the
+                # sweeper SETs the auth_stale chip instead of swallowing the
+                # dead-token error and letting the success path CLEAR it (masks
+                # re-auth on the very HIPAA accounts that most need the cue).
+                # Transient errors are still swallowed (continue) as before.
+                if is_auth_revoked_exc(exc):
+                    raise
                 log.warning(
                     "hipaa_sent_counter: fetch failed; continuing",
                     message_id=mid,
@@ -327,20 +417,13 @@ class HipaaSentCounterLoop:
         )
         from email_triage.web.db import record_hipaa_sent_message_if_new
 
-        # Pull RFC Message-ID with the same fallback pattern that
-        # SentMailIndex uses (some providers lowercase the header key).
-        headers = message.headers or {}
-        rfc_id = (
-            headers.get("Message-ID")
-            or headers.get("message-id")
-            or ""
-        ).strip()
-        if not rfc_id:
-            # Some IMAP servers strip the header; fall back to the
-            # provider-native id so we still dedup per provider scope.
-            # Not as portable across providers but better than
-            # double-counting on every scan.
-            rfc_id = (getattr(message, "message_id", "") or "").strip()
+        # A6 (census 2026-06-09): the message-level SSOT resolves the RFC
+        # Message-ID in ANY header casing (was Message-ID/message-id only —
+        # missing the IMAP ``Message-Id``), then falls back to the
+        # provider-native id. One casing authority across all sent-mail
+        # sites; no per-scan double-count from a missed casing.
+        from email_triage.mail_headers import get_message_rfc_id
+        rfc_id = get_message_rfc_id(message)
         if not rfc_id:
             log.info(
                 "hipaa_sent_counter: message lacks any usable id, skipping",

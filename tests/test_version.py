@@ -11,7 +11,7 @@ Covers ``compute_version_status`` exhaustively across:
 
 Also smokes the live introspection wrappers
 (``read_target_schema_caps``, ``read_db_schema_version``,
-``read_previous_schema_caps``) so a regression in the env-var hook or
+``parse_previous_schema_caps``) so a regression in the CLI-arg parse or
 the read-only DB open path surfaces in CI.
 """
 
@@ -35,7 +35,7 @@ from email_triage.version import (
     describe_status,
     gather_version_status,
     read_db_schema_version,
-    read_previous_schema_caps,
+    parse_previous_schema_caps,
     read_target_schema_caps,
 )
 
@@ -254,28 +254,32 @@ class TestReadDbSchemaVersion:
         assert read_db_schema_version(p) == 14
 
 
-class TestReadPreviousSchemaCaps:
-    def test_unset_env_returns_none(self, monkeypatch):
-        monkeypatch.delenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", raising=False)
-        assert read_previous_schema_caps() is None
+class TestParsePreviousSchemaCaps:
+    """Punch 547: the value is an explicit ``version-check`` argument now,
+    never an env var (an unset/inflated env value silently opened the
+    deploy's rollback gate)."""
 
-    def test_blank_string_returns_none(self, monkeypatch):
-        monkeypatch.setenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", "")
-        assert read_previous_schema_caps() is None
+    def test_none_returns_none(self):
+        assert parse_previous_schema_caps(None) is None
 
-    def test_zero_string_returns_none(self, monkeypatch):
+    def test_blank_string_returns_none(self):
+        assert parse_previous_schema_caps("") is None
+
+    def test_zero_string_returns_none(self):
         # "0" is ambiguous (could mean "no previous image" or "version
         # 0"). Treat as "no info available".
-        monkeypatch.setenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", "0")
-        assert read_previous_schema_caps() is None
+        assert parse_previous_schema_caps("0") is None
 
-    def test_garbage_returns_none(self, monkeypatch):
-        monkeypatch.setenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", "not-a-number")
-        assert read_previous_schema_caps() is None
+    def test_garbage_returns_none(self):
+        assert parse_previous_schema_caps("not-a-number") is None
 
-    def test_positive_int_returned(self, monkeypatch):
-        monkeypatch.setenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", "13")
-        assert read_previous_schema_caps() == 13
+    def test_positive_int_returned(self):
+        assert parse_previous_schema_caps(" 13 ") == 13
+
+    def test_the_environment_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS", "999")
+        s = gather_version_status(None)
+        assert s.previous_schema_caps is None
 
 
 class TestGatherVersionStatus:
@@ -307,3 +311,56 @@ class TestGatherVersionStatus:
         s = gather_version_status(p)
         assert s.status == STATUS_UP_TO_DATE
         assert s.db_schema_version == target
+
+
+class TestReadDbSchemaVersionStrict:
+    """2026-10-18: the deploy's version-check read an unopenable live DB as
+    schema 0. ``strict=True`` (the version-check caller) raises
+    ``DbSchemaUnreadableError`` instead; the default stays 0 for the banner
+    renders (R14's one allowed fail-open, a non-decisional render)."""
+
+    def test_strict_raises_when_the_open_fails(self, tmp_path, monkeypatch):
+        import email_triage.db._engine as engine
+        from email_triage.version import DbSchemaUnreadableError
+
+        p = tmp_path / "live.db"
+        sqlite3.connect(str(p)).close()
+
+        def _opener(_path):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(engine, "open_dedicated_conn_readish", _opener)
+        with pytest.raises(DbSchemaUnreadableError, match="unable to open database file"):
+            read_db_schema_version(p, strict=True)
+        # The banner default is unchanged.
+        assert read_db_schema_version(p) == 0
+
+    def test_strict_raises_for_a_missing_file(self, tmp_path):
+        from email_triage.version import DbSchemaUnreadableError
+
+        with pytest.raises(DbSchemaUnreadableError):
+            read_db_schema_version(tmp_path / "no-such.db", strict=True)
+
+    def test_strict_still_reads_zero_for_a_db_without_the_table(self, tmp_path):
+        p = tmp_path / "fresh.db"
+        conn = sqlite3.connect(str(p))
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+        conn.close()
+        assert read_db_schema_version(p, strict=True) == 0
+
+    def test_strict_reads_the_max_version(self, tmp_path):
+        p = tmp_path / "live.db"
+        conn = sqlite3.connect(str(p))
+        conn.execute(
+            "CREATE TABLE schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT, "
+            "applied_at TEXT, checksum TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+            [(3, "a", "ts", "x"), (9, "b", "ts", "x")],
+        )
+        conn.commit()
+        conn.close()
+        assert read_db_schema_version(p, strict=True) == 9

@@ -135,10 +135,15 @@ class TestDiscoverRunEndpointRecords:
         hipaa_rows = list_hipaa_access_events(db, account_id=acct_id)
         assert hipaa_rows == []
 
-    def test_discover_records_actor_for_hipaa_account(
+    def test_discover_owner_self_hipaa_account_no_access_event(
         self, client, db, admin_cookies, admin_user
     ):
-        """HIPAA-flagged account: BOTH discover_runs AND hipaa_access_events rows."""
+        """N-80: OWNER discovering their OWN HIPAA account — discover_runs
+        records (universal), but NO hipaa_access_events row (§164.502(a)
+        owner-self carve-out, via phi_access_audit_required). actor≠owner
+        recording is pinned at the predicate level (test_audit_phi_access_pin
+        truth-table)."""
+        # admin_user owns the account AND is the actor → owner-self.
         acct_id = _make_account(
             db, admin_user["id"], hipaa=True, name="PHI Inbox"
         )
@@ -154,18 +159,23 @@ class TestDiscoverRunEndpointRecords:
             cookies=admin_cookies,
         )
 
-        # Universal discover_runs row.
+        # Universal discover_runs row (records regardless of owner).
         runs = list_discover_runs(db, account_id=acct_id)
         assert len(runs) == 1
         assert runs[0]["actor_user_id"] == admin_user["id"]
         assert runs[0]["account_name"] == "PHI Inbox"
 
-        # Parallel hipaa_access_events row — independent trail, not replaced.
+        # N-80: owner-self access is EXEMPT — no hipaa_access_events row.
         hipaa_rows = list_hipaa_access_events(db, account_id=acct_id)
-        assert len(hipaa_rows) == 1
-        assert hipaa_rows[0]["operation"] == "discover"
-        assert hipaa_rows[0]["actor_user_id"] == admin_user["id"]
+        assert len(hipaa_rows) == 0, (
+            "owner-self discover must NOT write a hipaa_access_events row "
+            "(§164.502(a) self-disclosure carve-out, N-80)"
+        )
 
+    @pytest.mark.audit_failure_expected(
+        match='discover_run account=1 scanned=0 errors=1',
+        count=1,
+    )
     def test_discover_run_audit_insert_failure_does_not_break_response(
         self, client, db, admin_cookies, admin_user
     ):

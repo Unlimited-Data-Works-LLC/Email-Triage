@@ -16,6 +16,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import logging
@@ -39,7 +40,7 @@ from email_triage.web.db import (
 @pytest.fixture
 def conn():
     """Fresh in-memory DB + a clean settings cache."""
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     invalidate_setting_cache()
     yield c
     invalidate_setting_cache()

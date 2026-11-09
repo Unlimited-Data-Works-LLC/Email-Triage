@@ -212,21 +212,36 @@ class TestQueryTranslation:
 
 
 class TestStripHtml:
+    """O365 body extraction routes HTML through the html_to_text SSOT
+    (census /) — the old private _strip_html (bare re.sub) left
+    <script>/<style> CONTENT intact, which reached the classifier LLM."""
+
     def test_basic_strip(self):
-        from email_triage.providers.office365 import Office365Provider
-        html = "<p>Hello</p><br/><p>World</p>"
-        text = Office365Provider._strip_html(html)
+        from email_triage.engine.html_text import html_to_text_with_links
+        text = html_to_text_with_links("<p>Hello</p><br/><p>World</p>")
         assert "Hello" in text
         assert "World" in text
         assert "<" not in text
 
     def test_complex_html(self):
-        from email_triage.providers.office365 import Office365Provider
-        html = '<div style="color:red"><a href="url">Link</a> text</div>'
-        text = Office365Provider._strip_html(html)
+        from email_triage.engine.html_text import html_to_text_with_links
+        text = html_to_text_with_links(
+            '<div style="color:red"><a href="url">Link</a> text</div>'
+        )
         assert "Link" in text
         assert "text" in text
         assert "<" not in text
+
+    def test_script_style_content_dropped(self):
+        """The fix: a <style>/<script> block's CONTENT must NOT survive into
+        the body text the classifier sees."""
+        from email_triage.engine.html_text import html_to_text_with_links
+        text = html_to_text_with_links(
+            "<style>.a{color:red}</style><script>steal()</script>"
+            "<p>real body</p>"
+        )
+        assert "real body" in text
+        assert "steal" not in text and "color:red" not in text
 
 
 class TestGraphAPI:
@@ -334,6 +349,44 @@ class TestGraphAPI:
         assert "alice@test.com" in msg.sender
         assert msg.subject == "Test"
         assert msg.body_text == "Hello"
+        # Default (full) path is unchanged: selects body + expands attachments.
+        params = provider._http.get.call_args.kwargs.get("params") or {}
+        assert "body" in params["$select"]
+        assert params.get("$expand") == "attachments"
+
+    async def test_fetch_message_headers_only_selects_no_body(self, provider):
+        # run17 #8 / §164.502(b): a headers_only fetch must NOT pull the PHI
+        # body or attachment bytes — header-only $select (no body/bodyPreview),
+        # no $expand=attachments. Graph response carries only metadata fields.
+        msg_data = {
+            "id": "msg-2",
+            "subject": "Meta only",
+            "from": {"emailAddress": {"name": "Alice", "address": "alice@test.com"}},
+            "toRecipients": [{"emailAddress": {"address": "bob@test.com"}}],
+            "receivedDateTime": "2026-04-14T10:00:00Z",
+            "categories": ["X"],
+            "conversationId": "conv-2",
+            "hasAttachments": True,
+        }
+        provider._http.get = AsyncMock(return_value=_mock_graph_response(msg_data))
+
+        msg = await provider.fetch_message("msg-2", headers_only=True)
+        params = provider._http.get.call_args.kwargs.get("params") or {}
+        # The minimum-necessary narrowing: no body fields, no attachment expand.
+        assert "body" not in params["$select"]
+        assert "bodyPreview" not in params["$select"]
+        assert "$expand" not in params
+        # Metadata fields the caller needs still parse through EmailMessage...
+        assert msg.message_id == "msg-2"
+        assert "alice@test.com" in msg.sender
+        assert msg.recipients == ["bob@test.com"]
+        assert msg.subject == "Meta only"
+        assert msg.thread_id == "conv-2"
+        assert msg.labels == ["X"]
+        # ...while the PHI body / attachments are empty (none requested).
+        assert msg.body_text == ""
+        assert msg.body_html == ""
+        assert msg.attachments == []
 
     async def test_create_draft(self, provider):
         provider._http.post = AsyncMock(return_value=_mock_graph_response(
@@ -442,7 +495,7 @@ class TestGraphAPI:
     async def test_list_folders_pagination(self, provider):
         """Graph's @odata.nextLink is followed; absolute URL routed verbatim."""
         next_url = (
-            "https://graph.microsoft.com/v1.0/me/mailFolders"
+            "https://graph.microsoft.invalid/v1.0/me/mailFolders"
             "?$skiptoken=abc123"
         )
         responses = [
@@ -569,14 +622,14 @@ class TestSubscriptions:
         }))
 
         result = await provider.create_subscription(
-            webhook_url="https://host.tailnet.ts.net/webhooks/graph",
+            webhook_url="https://host.tailnet.ts.invalid/webhooks/graph",
             client_state="secret123",
         )
         assert result["id"] == "sub-1"
 
         call_args = provider._http.post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json", {})
-        assert payload["notificationUrl"] == "https://host.tailnet.ts.net/webhooks/graph"
+        assert payload["notificationUrl"] == "https://host.tailnet.ts.invalid/webhooks/graph"
         assert payload["clientState"] == "secret123"
         assert payload["resource"] == "me/mailFolders('Inbox')/messages"
         assert payload["changeType"] == "created"
@@ -710,7 +763,7 @@ class TestAuth:
         mock_app.get_accounts.return_value = []
         mock_app.initiate_device_flow.return_value = {
             "user_code": "ABCD1234",
-            "verification_uri": "https://login.microsoftonline.com/common/oauth2/deviceauth",
+            "verification_uri": "https://login.microsoftonline.invalid/common/oauth2/deviceauth",
             "message": "Go to https://... and enter code ABCD1234",
         }
         mock_app.acquire_token_by_device_flow.return_value = {

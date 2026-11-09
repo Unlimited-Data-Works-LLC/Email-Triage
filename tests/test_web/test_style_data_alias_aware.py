@@ -72,7 +72,7 @@ def _make_acct(
     """
     aid = create_email_account(
         db, owner_id, name, "imap",
-        {"host": "mail.example.com", "account": primary},
+        {"host": "mail.example.invalid", "account": primary},
     )
     if aliases:
         update_email_account_aliases(db, aid, aliases)
@@ -635,45 +635,6 @@ class TestDbHelpersRoundtrip:
         n = delete_account_style_per_alias(db, a)
         assert n == 2
         assert list_account_style_per_alias(db, a) == []
-
-
-# ---------------------------------------------------------------------------
-# 10. Privacy invariant pin
-# ---------------------------------------------------------------------------
-
-class TestPrivacyInvariantPin:
-    def test_privacy_invariant_no_operator_identifiers_in_alias_module(self):
-        """The new alias-aware code paths (and the migration body)
-        must not embed any operator identifier — only generic
-        placeholders (example.com / your-domain.example / etc.).
-        Mirrors the install-wide privacy invariant test."""
-        import inspect
-
-        from email_triage.web.db import (
-            normalise_from_address as _norm,
-            is_alias_mode_enabled_for_account as _check,
-            list_account_style_per_alias as _list,
-            set_account_style_per_alias as _set,
-        )
-        from email_triage.actions.style_profile import (
-            extract_style_profiles_per_alias as _epa,
-            resolve_alias_profile as _rap,
-        )
-
-        forbidden = (
-            "bob", "Doe", "exampleuser", "exampleuser",
-            "examplerealm", "the gateway host", "the deploy host", "the filter host",
-        )
-        sources = [
-            inspect.getsource(fn)
-            for fn in (_norm, _check, _list, _set, _epa, _rap)
-        ]
-        text = "\n".join(sources).lower()
-        for needle in forbidden:
-            assert needle not in text, (
-                f"Operator identifier {needle!r} leaked into alias-aware "
-                "code path; replace with a generic placeholder."
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,78 @@
+# source-built.pins — the components this image builds FROM SOURCE.
+#
+# WHY THIS FILE EXISTS (cve-arc task , punch 538, 2026-09-29)
+# ==============================================================
+# `sqlcipher3` and the SQLCipher C library are built from upstream git inside
+# the Containerfile, so they appear in NEITHER `pyproject.toml` NOR
+# `requirements.lock`. A dependency scanner reading only those two manifests
+# cannot see the encryption-at-rest mechanism at all — 15 coleifer
+# release-watch rows kept alerting for fixes the running build already has,
+# and the C half (where the memory-safety CVEs are filed) was invisible.
+#
+# This file is that missing manifest, and it is the BUILD'S INPUT, not a
+# description of it: the Containerfile sources `scripts/source_built.py shell`
+# for every sha, version and tag it uses. There is no second copy — no `ARG`,
+# no `ENV`, no literal — so the file cannot say one thing while the build does
+# another. `tests/test_source_built_declaration_pin.py` enforces that.
+#
+# NAME/EXTENSION ARE DELIBERATE: no `requirements` in the name and not `.txt`
+# or `.in`, so Dependabot's requirements-file fetcher does not ingest it and
+# pip tooling does not try to install it.
+#
+# GRAMMAR
+# =======
+#   * A line is a COMMENT if its first non-space character is `#`; blank lines
+#     are ignored. There are NO trailing comments — a `#` after the sixth
+#     column is a seventh token and the parser REJECTS the line.
+#   * A data line is EXACTLY six whitespace-separated columns:
+#
+#         <kind> <name> <version> <owner>/<repo> <40-hex commit sha> <tag>
+#
+#   * `kind` is `pypi` (a Python distribution, installed and reported by
+#     `importlib.metadata`) or `c` (a C library compiled into the extension).
+#     The column exists so a consumer never mistakes a C library for a PyPI
+#     project name: there is no PyPI project called `sqlcipher`, and reading
+#     one as if there were would query an unrelated (squattable) namespace.
+#   * `version` is the upstream release string, without a leading `v`.
+#   * the sha is ALWAYS the peeled COMMIT sha, never an annotated-tag object
+#     sha. `v4.20.0` is an annotated tag (object 52252487); the commit it peels
+#     to is what is recorded here.
+#   * `tag` is the upstream tag spelling, which differs per project
+#     (coleifer: `0.6.5`; sqlcipher: `v4.20.0`). The build fetches that exact
+#     tag and asserts it peels to the declared sha, which is what binds the
+#     VERSION string to the commit. It is a version binding, not an
+#     authenticity check: the v4.20.0 tag signature is unverified upstream
+#     (unknown_key), so provenance rests on the sha pins plus the
+#     amalgamation sha256 pin in `vendor/sqlite3.expected.sha256`.
+#   * Names are unique. A line is EMBEDDED when its `name` differs from the
+#     repository's own name (`sqlite` in `sqlcipher/sqlcipher`): it has no
+#     clone of its own, and its `<owner>/<repo>` and sha MUST equal those of
+#     a non-embedded line. Every non-embedded line gets exactly one
+#     `git clone` in the Containerfile, and the pin asserts that bijection.
+#
+# WHAT THE BUILD PROVES, FAIL-CLOSED, ON EVERY BUILD
+# ==================================================
+#   builder: each clone's `rev-parse HEAD` == the declared sha; the declared
+#            tag peels to that sha; the generated amalgamation's
+#            `#define SQLITE_VERSION` is exactly the declared sqlite version;
+#            then `source_built.py verify`.
+#   runtime: `source_built.py verify` again, on the image that actually ships —
+#            `importlib.metadata.version("sqlcipher3")`, the first token of
+#            `PRAGMA cipher_version`, and `sqlcipher3.dbapi2.sqlite_version`.
+#
+# WHAT IT DOES NOT COVER (do not read the `c` lines as CVE coverage)
+# ==================================================================
+#   * No feed matches the `c` lines yet. Recording a version is not detecting a
+#     vulnerability in it; matching needs an NVD-CPE reader that does not exist
+#     (cve-arc's own task, register row N-522).
+#   * The AES implementation is Debian's libcrypto (`libssl3`), linked
+#     dynamically, and is declared NOWHERE. OpenSSL CVEs reach a scanner only
+#     by scanning the image's OS packages.
+#
+# BUMPING A COMPONENT: edit the line here, and update
+# `vendor/sqlite3.expected.sha256` in the same change if the amalgamation
+# moves. Nothing else in the build needs touching.
+
+pypi  sqlcipher3  0.6.5   coleifer/sqlcipher3  38a57201a6a96b6c2b752246cc293b16a649da04  0.6.5
+c     sqlcipher   4.20.0  sqlcipher/sqlcipher  355d4db92d3404e71faa8088d071a71d767807f4  v4.20.0
+c     sqlite      3.54.1  sqlcipher/sqlcipher  355d4db92d3404e71faa8088d071a71d767807f4  v4.20.0

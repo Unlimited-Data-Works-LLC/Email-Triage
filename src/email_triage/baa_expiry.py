@@ -66,10 +66,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
+from email_triage._isotime import now_utc_iso
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from typing import Any
 
-logger = logging.getLogger("email_triage.baa_expiry")
+logger = get_logger("email_triage.baa_expiry")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -95,17 +97,12 @@ class BackendBucketRow:
 
 
 def _parse_expiry(date_str: str | None) -> date | None:
-    if not date_str:
-        return None
-    try:
-        # Accept either ``YYYY-MM-DD`` (the canonical form documented
-        # in the v26 migration) or full ISO datetimes.
-        return datetime.fromisoformat(str(date_str)).date()
-    except (TypeError, ValueError):
-        try:
-            return date.fromisoformat(str(date_str)[:10])
-        except (TypeError, ValueError):
-            return None
+    # N-263b R31 fromisoformat sweep — route through `_isotime.parse_iso_date`
+    # SSOT. Handles YMD (v26 migration canonical form) + full-ISO datetime
+    # via the SSOT's YMD-first-then-full-ISO fallback (behavior-preserving
+    # over the prior nested try/except pair).
+    from email_triage._isotime import parse_iso_date
+    return parse_iso_date(date_str)
 
 
 def classify_bucket(
@@ -149,6 +146,47 @@ def classify_bucket(
     if days <= SOON_DAYS:
         return ("expiring_soon", days)
     return ("fresh", days)
+
+
+def is_backend_baa_valid_for_phi(
+    *,
+    baa_certified: Any,
+    baa_expires_at: str | None,
+    today: date | None = None,
+) -> bool:
+    """SSOT predicate: may a HIPAA account's PHI be sent to this ai_backends
+    row right now?
+
+    True iff the backend is BAA-certified AND carries a parseable BAA expiry
+    AND that expiry has not passed. ``enabled`` is intentionally NOT part of
+    this predicate — the loader + the selector check it separately with their
+    own typed error/feedback; this predicate owns ONLY the BAA-validity
+    question. Pure — no DB access.
+
+    This is the single rule behind BOTH the account-setup selector gate
+    (``web/routers/ui/accounts.py``) AND the runtime ``load_backend``
+    chokepoint (``ai_backends/loader.py``). Before Loop-6 the rule was
+    hand-inlined at selection time only, so the runtime style-learning
+    distill path egressed PHI to an uncertified/expired backend with no check
+    (census N-63, §164.502(a)(1) / §164.308(b)(1)).
+
+    Boundary (fail-closed): a BAA is treated as INVALID on and after its
+    expiry calendar date — i.e. valid only while ``today < expiry`` — mirroring
+    the existing account-setup selector's ``expires_at <= today`` refusal so
+    routing this gate onto the SSOT is behaviour-PRESERVING there. NOTE: the
+    auto-disable sweep (:func:`classify_bucket`) uses a looser ``days < 0``
+    edge (valid THROUGH the expiry day); that 1-day micro-divergence at the
+    boundary is pre-existing and is flagged for the hipaa-sme — this predicate
+    deliberately takes the stricter (fail-closed) side.
+    """
+    if not baa_certified:
+        return False
+    expiry = _parse_expiry(baa_expires_at)
+    if expiry is None:
+        # No / unparseable expiry on a "certified" row → fail closed.
+        return False
+    today = today or date.today()
+    return today < expiry
 
 
 def compute_expiry_buckets(
@@ -233,10 +271,12 @@ def auto_disable_expired_for_hipaa_accounts(
     helper so the BAA-driven downgrade lives in the same audit trail
     as the §164.312(b) PHI-access path.
     """
-    from email_triage.web.db import (
-        record_hipaa_access_event,
-        set_account_style_learning_backend,
+    from email_triage.db.audit import (
+        record_hipaa_access_event_txn,
+        record_witnessed_state_change,
     )
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.db import set_account_style_learning_backend_txn
 
     buckets = compute_expiry_buckets(conn, today=today)
     expired_ids = {r.id: r for r in buckets["expired"]}
@@ -262,11 +302,10 @@ def auto_disable_expired_for_hipaa_accounts(
 
     disabled: list[dict[str, Any]] = []
     # The HIPAA-mode check is the system-wide flag; per-account is the
-    # row's own column. ``is_account_hipaa`` does both — we want any
+    # row's own column. ``account_hipaa_effective`` does both — we want any
     # account on a system that's in HIPAA mode to fall under the BAA
     # gate even if the per-account flag happens to be 0.
-    from email_triage.triage_logging import is_hipaa_mode
-    system_hipaa = is_hipaa_mode()
+    from email_triage.triage_logging import account_hipaa_effective
     for row in rows:
         row_d = dict(row) if hasattr(row, "keys") else None
         if row_d is None:
@@ -274,14 +313,43 @@ def auto_disable_expired_for_hipaa_accounts(
         backend_id = int(row_d["backend_id"])
         if backend_id not in expired_ids:
             continue
-        is_hipaa = bool(row_d.get("hipaa")) or system_hipaa
+        is_hipaa = account_hipaa_effective(account=row_d)
         if not is_hipaa:
             continue
-        # Clear the FK + record an audit row.
+        # Clear the FK + record an audit row, in ONE transaction (N-520
+        # step 2): a failed witness rolls this account's clear back and
+        # raises, so no account is downgraded without its §164.312(b) row.
+        # S-N1 (s2 panel): each account is isolated through the
+        # safe_audit_write SSOT. A failed witness on one account leaves that
+        # account as it was (logged + /health drift counter) and the loop
+        # goes on to the rest; the state_txn returns True so a None result
+        # means "this account was refused", never "nothing happened".
         expired = expired_ids[backend_id]
-        set_account_style_learning_backend(
-            conn, int(row_d["account_id"]), None,
-        )
+        _aid = int(row_d["account_id"])
+        _ok = safe_audit_write(lambda _aid=_aid, _bid=backend_id, _e=expired: record_witnessed_state_change(
+            conn, operation="style_learning_backend_baa_expired",
+            state_txn=lambda c, _aid=_aid: (
+                set_account_style_learning_backend_txn(c, _aid, None),
+                True,
+            )[1],
+            witness_txn=lambda c, _r, _aid=_aid, _bid=backend_id, _e=expired: (
+                record_hipaa_access_event_txn(
+                    c,
+                    actor_user_id=actor_user_id,
+                    account_id=_aid,
+                    operation="style_learning_backend_baa_expired",
+                    outcome="auto_disabled",
+                    detail=(
+                        f"backend_id={_bid} "
+                        f"name={_e.name!r} "
+                        f"expired_at={_e.baa_expires_at}"
+                    ),
+                )
+            ),
+        ), description="baa_expiry auto-disable", table="hipaa_access_events",
+            emitter="record_hipaa_access_event_txn")
+        if _ok is None:
+            continue
         disabled.append({
             "account_id": int(row_d["account_id"]),
             "account_name": row_d["account_name"],
@@ -290,28 +358,6 @@ def auto_disable_expired_for_hipaa_accounts(
             "backend_name": expired.name,
             "expired_at": expired.baa_expires_at,
         })
-        try:
-            record_hipaa_access_event(
-                conn,
-                actor_user_id=actor_user_id,
-                account_id=int(row_d["account_id"]),
-                operation="style_learning_backend_baa_expired",
-                outcome="auto_disabled",
-                detail=(
-                    f"backend_id={backend_id} "
-                    f"name={expired.name!r} "
-                    f"expired_at={expired.baa_expires_at}"
-                ),
-            )
-        except Exception as exc:
-            logger.warning(
-                "BAA-expiry audit row failed: %s",
-                exc,
-                extra={"_extra": {
-                    "account_id": row_d["account_id"],
-                    "backend_id": backend_id,
-                }},
-            )
     if disabled:
         logger.warning(
             "BAA-expired backends auto-disabled on HIPAA accounts",
@@ -353,7 +399,7 @@ def baa_expiry_daily_sweep(
         "expired": len(buckets["expired"]),
         "auto_disabled": disabled,
         "buckets": buckets,
-        "swept_at": datetime.now(timezone.utc).isoformat(),
+        "swept_at": now_utc_iso(),
     }
 
 

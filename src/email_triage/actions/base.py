@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from typing import Any
 
 from email_triage.engine.models import (
@@ -58,6 +58,9 @@ from email_triage.engine.models import (
     FlowState,
 )
 from email_triage.providers.base import EmailProvider
+from email_triage.triage_logging import get_logger
+
+log = get_logger("email_triage.actions.base")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +203,7 @@ async def record_idempotent_done(
     db = bag.get("db")
     account_id = bag.get("account_id")
     rfc_id = _message_rfc_id(message)
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     if db is not None and account_id is not None and rfc_id:
         # Durable path.
         from email_triage.web.db_threadpool import db_call
@@ -220,10 +223,14 @@ async def record_idempotent_done(
         try:
             await db_call(_idempotency_upsert)
             return
-        except Exception:
+        except Exception as exc:
             # Durable write failed — fall through to the state_bag
             # record so the in-flow retry path still skips.
-            pass
+            log.error(
+                "action idempotency durable write failed; using state_bag fallback",
+                action_name=action_name,
+                exc_info=exc,
+            )
 
     # Legacy fallback — per-flow state_bag.
     if flow.state_bag is None:
@@ -289,7 +296,14 @@ def build_action_log_extras(
         extras["account_name"] = sb["account_name"]
     if sb.get("account_id"):
         extras["account_id"] = sb["account_id"]
-    if not getattr(message, "hipaa", False):
+    # N-77: gate the PHI fields through the per-account-HIPAA SSOT, not a bare
+    # ``message.hipaa`` read. message.hipaa is stamped at fetch, but routing
+    # through account_hipaa_effective restores the install-wide (system-flag)
+    # axis as a backstop — so a HIPAA install still redacts here even if a
+    # message ever reached this sink unstamped (most-restrictive-wins, PD#8;
+    # consistent with the notify/escalate action gates).
+    from email_triage.triage_logging import account_hipaa_effective
+    if not account_hipaa_effective(message=message):
         if message.sender:
             extras["sender"] = message.sender
         if message.subject:
@@ -299,7 +313,43 @@ def build_action_log_extras(
 
 
 class Action(ABC):
-    """Execute a single triage action against a classified email."""
+    """Execute a single triage action against a classified email.
+
+    Idempotency contract (invariant test lives in
+    ``tests/test_actions/test_action_idempotency_invariant.py``):
+
+    * The invariant test AST-walks each subclass's ``execute()`` body
+      looking for calls to the retry-safety helpers
+      ``check_idempotent_already_done()`` and
+      ``record_idempotent_done()``. Any subclass that calls BOTH
+      directly in ``execute()`` passes automatically — that's the
+      preferred shape.
+
+    * A subclass that delegates the retry-safety work via
+      ``return await self._do_idempotent_work(...)`` (where the
+      helpers are called inside the private method) is INVISIBLE to
+      the AST walk. Such subclasses MUST opt into the natural-
+      idempotent path by declaring two class attributes:
+
+      .. code-block:: python
+
+         class MyAction(Action):
+             _naturally_idempotent: bool = True
+             _idempotency_rationale: str = (
+                 "Provider API is idempotent: labeling an already-"
+                 "labeled thread is a no-op."
+             )
+
+      The rationale field is required and is logged in the invariant
+      test output so future readers can audit the claim (see
+      ``add_label.py``, ``label.py`` for reference implementations).
+
+    * The invariant test fails LOUD on any subclass that neither
+      calls the helpers directly in ``execute()`` nor sets
+      ``_naturally_idempotent = True``. This is intentional —
+      "silently maybe-idempotent" is the exact class of bug the
+      test exists to catch.
+    """
 
     @property
     @abstractmethod

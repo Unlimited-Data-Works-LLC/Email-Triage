@@ -166,23 +166,42 @@ class TestLabelAction:
         assert r.sender == "shipment-tracking@amazon.com"
         assert "Shipped" in r.subject
 
-    async def test_failure_log_redacts_sender_subject_on_hipaa(self, caplog):
+    async def test_hipaa_mode_skips_provider_label_egress(self, caplog):
+        """§164.502(e) egress gate (divergence census 2026-06-09 #5):
+        in HIPAA mode LabelAction must NOT push the category up to the
+        provider mailbox. The apply is skipped (no egress), the outcome
+        is SKIPPED(hipaa_mode), and the skip log still redacts
+        sender/subject (message_id stays — not PHI).
+
+        Before the fix this action applied the label even in HIPAA mode
+        and only redacted the *failure* log — i.e. a *successful* apply
+        still leaked the category to Gmail/O365. The gate (which
+        AddLabelAction always had) closes that egress."""
         import logging as _log
         provider = _make_provider()
-        provider.apply_label.side_effect = RuntimeError("nope")
         action = LabelAction()
         msg = _make_message(
             sender="patient@example.com", subject="lab results",
         )
         msg.hipaa = True
-        with caplog.at_level(_log.ERROR, logger="email_triage.actions.label"):
-            await action.execute(
+        with caplog.at_level(_log.INFO, logger="email_triage.actions.label"):
+            result = await action.execute(
                 _make_flow(), msg, _make_classification(), provider,
             )
-        r = [r for r in caplog.records if r.levelname == "ERROR"][0]
-        assert not hasattr(r, "sender") or r.sender is None
-        assert not hasattr(r, "subject") or r.subject is None
-        # message_id still present — not PHI.
+        # The egress gate: nothing was written upstream.
+        provider.apply_label.assert_not_called()
+        assert result.result == ActionResult.SKIPPED
+        assert result.data.get("reason") == "hipaa_mode"
+        # The skip log still redacts PHI (sender/subject); message_id
+        # is retained (not PHI).
+        recs = [
+            r for r in caplog.records
+            if "skipped (HIPAA mode)" in r.getMessage()
+        ]
+        assert recs, "expected a HIPAA-skip log line from LabelAction"
+        r = recs[0]
+        assert not getattr(r, "sender", None)
+        assert not getattr(r, "subject", None)
         assert r.message_id is not None
 
 

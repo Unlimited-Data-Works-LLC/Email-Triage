@@ -64,6 +64,14 @@ class TestRedisCacheSectionRender:
         assert "On-LAN only" in body
         # The HIPAA defence-in-depth note is present.
         assert "HIPAA-flagged" in body
+        # The Flush button must RENDER — not merely exist in template
+        # source. The config-tabs refactor (1cbfe6e) once dropped this
+        # form, orphaning the still-live /cache/flush route from the UI;
+        # only a render assertion (the route-behaviour tests below POST
+        # directly and don't prove reachability) catches that class of
+        # regression. .
+        assert 'action="/admin/integrations/cache/flush"' in body
+        assert "Flush cached classifications" in body
 
 
 class TestRedisCacheSave:
@@ -76,7 +84,7 @@ class TestRedisCacheSave:
         resp = client.post(
             "/admin/integrations/save",
             data={
-                "redis_cache_url": "redis://example.lan:6379/2",
+                "redis_cache_url": "redis://example.invalid:6379/2",
                 "redis_cache_ttl_secs": "86400",
             },
             follow_redirects=False,
@@ -84,7 +92,7 @@ class TestRedisCacheSave:
         assert resp.status_code == 303
         # In-memory config mutated.
         cfg = client.app.state.config
-        assert cfg.redis_cache.url == "redis://example.lan:6379/2"
+        assert cfg.redis_cache.url == "redis://example.invalid:6379/2"
         assert cfg.redis_cache.ttl_secs == 86400
         # Install singleton swapped.
         cache = get_install_classification_cache()
@@ -93,7 +101,7 @@ class TestRedisCacheSave:
         # YAML round-trip preserved.
         text = yaml_in_tmpdir.read_text()
         assert "redis_cache" in text
-        assert "redis://example.lan:6379/2" in text
+        assert "redis://example.invalid:6379/2" in text
         assert "86400" in text
 
     def test_save_empty_url_disables_cache(
@@ -101,7 +109,7 @@ class TestRedisCacheSave:
     ):
         # Seed an enabled cache first.
         client.app.state.config.redis_cache = RedisCacheConfig(
-            url="redis://example.lan:6379/2", ttl_secs=86400,
+            url="redis://example.invalid:6379/2", ttl_secs=86400,
         )
         client.cookies.set(
             SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME],
@@ -131,7 +139,7 @@ class TestRedisCacheSave:
         resp = client.post(
             "/admin/integrations/save",
             data={
-                "redis_cache_url": "redis://example.lan:6379/2",
+                "redis_cache_url": "redis://example.invalid:6379/2",
                 "redis_cache_ttl_secs": "not-a-number",
             },
             follow_redirects=False,
@@ -157,7 +165,7 @@ class TestRedisCacheSave:
         resp = client.post(
             "/admin/integrations/save",
             data={
-                "redis_cache_url": "redis://example.lan:6379/2",
+                "redis_cache_url": "redis://example.invalid:6379/2",
                 "redis_cache_ttl_secs": "5",  # below the 3600 s floor
             },
             follow_redirects=False,
@@ -177,7 +185,7 @@ class TestRedisCacheSave:
         resp = client.post(
             "/admin/integrations/save",
             data={
-                "redis_cache_url": "redis://example.lan:6379/2",
+                "redis_cache_url": "redis://example.invalid:6379/2",
                 "redis_cache_ttl_secs": str(10 ** 10),  # 317 years
             },
             follow_redirects=False,
@@ -222,7 +230,7 @@ class TestRedisCacheAuth:
     def test_anonymous_cannot_save_redis_cache(self, client, yaml_in_tmpdir):
         resp = client.post(
             "/admin/integrations/save",
-            data={"redis_cache_url": "redis://attacker.lan:6379/0"},
+            data={"redis_cache_url": "redis://attacker.invalid:6379/0"},
             follow_redirects=False,
         )
         # Redirect to login OR 403; never 303 to ?saved=1.

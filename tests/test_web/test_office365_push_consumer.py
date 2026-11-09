@@ -142,6 +142,16 @@ def _fake_message(mid="msg-fixture-1", *, hipaa=False, headers=None):
     )
 
 
+def _resync_pages(provider, *pages):
+    """Fake ``search_iter`` for the resync probe (punch 854): yields each page
+    with a nextLink on every page but the last. Returns the recording mock."""
+    async def _walk(query, *, batch_size=500, **_kw):
+        for i, page in enumerate(pages):
+            yield list(page), (f"https://graph/next-{i}" if i < len(pages) - 1 else None)
+    provider.search_iter = MagicMock(side_effect=_walk)
+    return provider.search_iter
+
+
 # ---------------------------------------------------------------------------
 # _process_office365_push_item — happy path + cursor advance
 # ---------------------------------------------------------------------------
@@ -183,6 +193,43 @@ class TestProcessOffice365PushItem:
         assert row["delta_link"] == "https://graph/new-cursor"
 
     @pytest.mark.asyncio
+    async def test_inactive_account_is_skipped_cursor_not_advanced(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Loop-5 census: a DEACTIVATED account's push delivery is NOT
+        classified/acted, and (mirroring the O365 owner-disabled branch)
+        the delta cursor is NOT advanced — O365 re-walks the delta fresh
+        each webhook, and the dedup table catches anything already
+        processed, so leaving the cursor put means re-activation
+        re-discovers the backlog cleanly. This is the deliberate
+        ASYMMETRY with the Gmail consumer (which DOES advance)."""
+        _make_account(db)
+        _seed_subscription(db, delta_link="https://graph/old-cursor")
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = 1")
+        db.commit()
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_office365_push_item(
+                push_app,
+                {"account_id": 1, "subscription_id": "subscription-fixture-1"},
+            )
+
+        # No live ingestion: no delta walk, no fetch, no classify.
+        fake_provider.poll_delta.assert_not_awaited()
+        fake_provider.fetch_message.assert_not_awaited()
+        fake_classifier.classify.assert_not_awaited()
+        # Cursor UNCHANGED (O365 owner-disabled parity).
+        assert get_o365_subscription(db, 1)["delta_link"] == (
+            "https://graph/old-cursor"
+        )
+
+    @pytest.mark.asyncio
     async def test_first_walk_passes_none_cursor(
         self, push_app, db, fake_provider, fake_classifier,
     ):
@@ -215,7 +262,7 @@ class TestProcessOffice365PushItem:
     async def test_resync_required_falls_back_to_search(
         self, push_app, db, fake_provider, fake_classifier,
     ):
-        """410 / resyncRequired → bounded backfill via search() +
+        """410 / resyncRequired → bounded backfill via the resync probe +
         seed a fresh cursor for next time."""
         from email_triage.providers.office365 import (
             GraphDeltaResyncRequiredError,
@@ -232,7 +279,7 @@ class TestProcessOffice365PushItem:
             ),
             ([], "https://graph/fresh-cursor"),
         ]
-        fake_provider.search.return_value = ["msg-recent-1"]
+        walk = _resync_pages(fake_provider, ["msg-recent-1"])
         fake_provider.fetch_message.return_value = _fake_message(
             "msg-recent-1",
         )
@@ -248,12 +295,156 @@ class TestProcessOffice365PushItem:
                 push_app, {"account_id": 1, "subscription_id": "subscription-fixture-1"},
             )
 
-        fake_provider.search.assert_awaited_once()
+        walk.assert_called_once()
+        fake_provider.search.assert_not_awaited()
         # The recent message reached the classifier.
         assert fake_classifier.classify.await_count == 1
         # Cursor advanced to the fresh seed.
         row = get_o365_subscription(db, 1)
         assert row["delta_link"] == "https://graph/fresh-cursor"
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_resync_clears_a_stored_inbox_chip(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Punch 854 — a non-saturated ``search("ALL")`` walk enumerated the
+        whole mailbox, so it covers an earlier gap and the INBOX chip clears
+        (``walk_kind="o365_resync"`` is in FULL_WALK_KINDS)."""
+        from email_triage.providers.office365 import (
+            GraphDeltaResyncRequiredError,
+        )
+        from email_triage.web._backfill_chip import (
+            BACKFILL_CAP, get_backfill_capped, mark_backfill_capped,
+        )
+
+        _make_account(db)
+        _seed_subscription(db, delta_link="https://graph/dead-cursor")
+        mark_backfill_capped(
+            db, 1, kind="o365_resync", window="most recent",
+            recovered=BACKFILL_CAP, source_mailbox="INBOX",
+        )
+        fake_provider.poll_delta.side_effect = [
+            GraphDeltaResyncRequiredError(
+                410, {"error": {"message": "resyncRequired"}}, "/delta",
+            ),
+            ([], "https://graph/fresh-cursor"),
+        ]
+        walk = _resync_pages(fake_provider, ["msg-recent-1"])
+        fake_provider.fetch_message.return_value = _fake_message(
+            "msg-recent-1",
+        )
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_office365_push_item(
+                push_app, {"account_id": 1, "subscription_id": "subscription-fixture-1"},
+            )
+
+        walk.assert_called_once()
+        fake_provider.search.assert_not_awaited()
+        assert get_backfill_capped(db, 1) is None
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_resync_keeps_the_chip_when_a_failure_is_not_queued(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Punch 854 (DA MISSED-2) — the walk covers the gap only once its
+        messages were processed. A message that failed and could not be
+        queued for retry is not covered, so the chip stays."""
+        from email_triage.providers.office365 import (
+            GraphDeltaResyncRequiredError,
+        )
+        from email_triage.web._backfill_chip import (
+            BACKFILL_CAP, get_backfill_capped, mark_backfill_capped,
+        )
+
+        _make_account(db)
+        _seed_subscription(db, delta_link="https://graph/dead-cursor")
+        mark_backfill_capped(
+            db, 1, kind="o365_resync", window="most recent",
+            recovered=BACKFILL_CAP, source_mailbox="INBOX",
+        )
+        fake_provider.poll_delta.side_effect = [
+            GraphDeltaResyncRequiredError(
+                410, {"error": {"message": "resyncRequired"}}, "/delta",
+            ),
+            ([], "https://graph/fresh-cursor"),
+        ]
+        walk = _resync_pages(fake_provider, ["msg-recent-1"])
+        fake_provider.fetch_message.side_effect = RuntimeError("fetch failed")
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ), patch(
+            "email_triage.web.watcher_retry.enqueue_watcher_retry",
+            side_effect=RuntimeError("retry queue unavailable"),
+        ):
+            await _process_office365_push_item(
+                push_app, {"account_id": 1, "subscription_id": "subscription-fixture-1"},
+            )
+
+        walk.assert_called_once()
+        fake_provider.search.assert_not_awaited()
+        chip = get_backfill_capped(db, 1)
+        assert chip is not None
+        assert chip["source_mailbox"] == "INBOX"
+
+    @pytest.mark.asyncio
+    async def test_short_page_with_more_pending_is_saturated(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Punch 854 (db-sme S1) — Graph can return a short page with a
+        nextLink. The probe follows it, so a mailbox larger than the cap
+        reads as saturated and the stored chip is re-marked, not cleared."""
+        from email_triage.providers.office365 import (
+            GraphDeltaResyncRequiredError,
+        )
+        from email_triage.web._backfill_chip import (
+            get_backfill_capped, mark_backfill_capped,
+        )
+
+        _make_account(db)
+        _seed_subscription(db, delta_link="https://graph/dead-cursor")
+        mark_backfill_capped(
+            db, 1, kind="o365_resync", window="most recent",
+            recovered=3, source_mailbox="INBOX",
+        )
+        fake_provider.poll_delta.side_effect = [
+            GraphDeltaResyncRequiredError(
+                410, {"error": {"message": "resyncRequired"}}, "/delta",
+            ),
+            ([], "https://graph/fresh-cursor"),
+        ]
+        walk = _resync_pages(fake_provider, ["m1", "m2"], ["m3", "m4"])
+        fake_provider.fetch_message.side_effect = lambda mid: _fake_message(mid)
+
+        with patch(
+            "email_triage.web._backfill_chip.BACKFILL_CAP", 3,
+        ), patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_office365_push_item(
+                push_app, {"account_id": 1, "subscription_id": "subscription-fixture-1"},
+            )
+
+        walk.assert_called_once()
+        assert fake_provider.fetch_message.await_count == 3
+        chip = get_backfill_capped(db, 1)
+        assert chip is not None
+        assert chip["recovered"] == 3
 
     @pytest.mark.asyncio
     async def test_per_message_error_does_not_halt_delta(

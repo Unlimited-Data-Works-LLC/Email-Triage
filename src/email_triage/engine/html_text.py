@@ -28,12 +28,16 @@ class _TextWithLinksParser(HTMLParser):
     """Streaming HTML parser that emits inline text with ``(url)`` after
     anchor text and collects all ``(text, href)`` pairs seen."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, inline_links: bool = True) -> None:
         super().__init__(convert_charrefs=True)
         self._chunks: list[str] = []
         self._anchor_stack: list[tuple[str, list[str]]] = []
         self._skip_depth = 0
         self.links: list[tuple[str, str]] = []
+        # When False, anchor text is emitted WITHOUT the trailing ``(href)``
+        # (the text-only render used by html_to_text). ``self.links`` is still
+        # collected either way.
+        self.inline_links = inline_links
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
         t = tag.lower()
@@ -63,10 +67,13 @@ class _TextWithLinksParser(HTMLParser):
             if href:
                 if anchor_text:
                     self.links.append((anchor_text, href))
-                    self._emit(f"{anchor_text} ({href})")
+                    self._emit(
+                        f"{anchor_text} ({href})" if self.inline_links
+                        else anchor_text
+                    )
                 else:
                     self.links.append(("", href))
-                    self._emit(f"({href})")
+                    self._emit(f"({href})" if self.inline_links else "")
             else:
                 self._emit(anchor_text)
         if t in _BLOCK_TAGS:
@@ -100,14 +107,17 @@ class _TextWithLinksParser(HTMLParser):
                         self._anchor_stack[-1][1] if self._anchor_stack
                         else self._chunks
                     )
-                    target.append(f"{anchor_text} ({href})")
+                    target.append(
+                        f"{anchor_text} ({href})" if self.inline_links
+                        else anchor_text
+                    )
                 else:
                     self.links.append(("", href))
                     target = (
                         self._anchor_stack[-1][1] if self._anchor_stack
                         else self._chunks
                     )
-                    target.append(f"({href})")
+                    target.append(f"({href})" if self.inline_links else "")
             else:
                 target = (
                     self._anchor_stack[-1][1] if self._anchor_stack
@@ -141,6 +151,34 @@ def html_to_text_with_links(html_str: str) -> str:
     return parser.get_text()
 
 
+def html_to_text(html_str: str) -> str:
+    """Render HTML as plain text WITHOUT inlining anchor URLs — the text-only
+    sibling of :func:`html_to_text_with_links`. Same robustness + the same
+    ``<script>``/``<style>``-content drop, but emits anchor TEXT only (no
+    ``(href)``). The SSOT for "give me readable text from an HTML body" where
+    inline link URLs aren't wanted — incoming-message ``body_text`` and the
+    multipart/alternative plain-text fallback of outbound mail."""
+    if not html_str:
+        return ""
+    parser = _TextWithLinksParser(inline_links=False)
+    try:
+        parser.feed(html_str)
+        parser.close()
+    except Exception:
+        return _regex_fallback(html_str)
+    return parser.get_text()
+
+
+def strip_tags(text: str) -> str:
+    """Strip HTML tags from a SHORT string (e.g. an operator error banner) down
+    to a single whitespace-collapsed line, dropping ``<script>``/``<style>``
+    content. NOT a body renderer — use :func:`html_to_text` for message bodies;
+    this is the SSOT for the cheap "remove tags from a one-liner" case."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", _regex_fallback(text)).strip()
+
+
 def extract_links(html_str: str) -> list[tuple[str, str]]:
     """Return ``[(anchor_text, href), ...]`` in document order."""
     if not html_str:
@@ -157,8 +195,26 @@ def extract_links(html_str: str) -> list[tuple[str, str]]:
 
 def _regex_fallback(html_str: str) -> str:
     """Last-ditch tag stripper — used when the HTMLParser raises."""
+    # Drop <script>/<style> blocks ENTIRELY (their CONTENT too) before
+    # stripping tags — the parser path does this via _skip_depth, and the
+    # fallback (which fires on malformed HTML, exactly when a crafted email
+    # is most likely) must match, else JS/CSS bleeds into the classifier
+    # input (census /).
+    without_blocks = re.sub(
+        r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", html_str,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # ...and an UNCLOSED <script>/<style> (no end tag): drop from the open
+    # tag to EOF rather than leak the JS/CSS tail. Mirrors the parser path's
+    # _skip_depth (which never decrements on an unclosed tag) so the fallback
+    # is no weaker than the primary on a crafted/malformed body (census
+    # /; db-sme + DA hardening).
+    without_blocks = re.sub(
+        r"<(script|style)\b[^>]*>.*", " ", without_blocks,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     with_breaks = re.sub(
-        r"</?(?:p|div|br|li|tr|h[1-6]|ul|ol|hr)[^>]*>", "\n", html_str,
+        r"</?(?:p|div|br|li|tr|h[1-6]|ul|ol|hr)[^>]*>", "\n", without_blocks,
         flags=re.IGNORECASE,
     )
     no_tags = re.sub(r"<[^>]+>", "", with_breaks)

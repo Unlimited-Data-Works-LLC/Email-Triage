@@ -16,6 +16,54 @@ from typing import Any
 
 import yaml
 
+from email_triage._int_utils import bounded_int  # N-219c/21 R23
+from email_triage.update_check import (  # punch 553 off-switch SSOT
+    DEFAULT_RELEASE_CHECK_URL, parse_release_check_url,
+)
+
+
+# N-378 (2026-07-08): lazy TriageLogger accessor for defensive-parse
+# warnings — the wider `email_triage.triage_logging.get_logger` SSOT is
+# used (N-196 R20_9 + N-242 R24 ratchets forbid stdlib `logging.getLogger`
+# here). Lazy import inside the function keeps config.py's module-level
+# import graph free of triage_logging — a cycle isn't possible today
+# (triage_logging doesn't import config at top-level) but the deferred
+# import is cheap AND the warning-emit path is rare (only fires on a YAML
+# typo). Caller: `_log_config_warn(...)` at parse-time.
+def _log_config_warn(msg: str, *args: Any) -> None:
+    from email_triage.triage_logging import get_logger
+    get_logger(__name__).warning(msg, *args)
+
+
+def _warn_embedding_fallback_ignored(embedding_raw: Any) -> bool:
+    """Name a leftover ``embedding.fallback`` section instead of obeying it.
+
+    Punch 552 / N-555 removed the embedding fallback chain: on the deploy host it pointed
+    at a chat model, so a refused local embedder silently became wrong-model
+    vectors that score zero against the index. The loader reads named keys
+    only, so a stale section would otherwise be dropped without a word, which
+    is the silent failure the removal exists to end. Not a boot refusal: an
+    optional feature's dead key must not take down the app. Returns True when
+    it warned (the test seam).
+    """
+    if not isinstance(embedding_raw, dict):
+        return False
+    fb = embedding_raw.get("fallback")
+    if not isinstance(fb, dict):
+        return False
+    backend = str(fb.get("backend", "") or "").strip()
+    model = str(fb.get("model_name", "") or "").strip()
+    if not backend and not model:
+        return False
+    _log_config_warn(
+        "embedding.fallback is configured but no longer supported, and is "
+        "IGNORED (punch 552 / N-555): a failed embed now fails visibly "
+        "instead of being re-embedded by another model whose vectors do not "
+        f"match the index. Configured fallback: backend={backend!r} "
+        f"model_name={model!r}. Remove the embedding.fallback section."
+    )
+    return True
+
 
 # ---------------------------------------------------------------------------
 # Config data structures
@@ -51,6 +99,120 @@ class ClassifierConfig:
     # already warm — and sidesteps version drift (qwen3.5 → qwen3.6)
     # without requiring a config chase. Cached for 30 s per process.
     prefer_loaded: bool = True
+    #  — when ``prefer_loaded`` selects a resident model, skip any
+    # embedding-only model (it 400s on /api/chat). Detected by a
+    # case-insensitive substring match of the model name against
+    # ``embedding_name_markers`` (/api/ps carries no capabilities
+    # field, so the name is the only in-band signal). Default on;
+    # extend the markers to cover non-"embed"-named embedders
+    # (e.g. bge, gte, e5, minilm, arctic-embed) without a code change.
+    prefer_loaded_skip_embeddings: bool = True
+    embedding_name_markers: list[str] = field(
+        default_factory=lambda: ["embed"],
+    )
+    #  — ordered capability/resource fallback models, tried after
+    # ``model`` when it can't serve a classification (won't load /
+    # embedding-only). Same backend + endpoint as ``model`` (no BAA
+    # boundary crossed). Empty = no fallback (today's behaviour).
+    backup_models: list[str] = field(default_factory=list)
+    #  — pin the Ollama context-window size (``num_ctx``). None = inherit the
+    # model's loaded default (today's behaviour). When set, it is injected into
+    # the options dict of EVERY classify / topic-match call, so the two 
+    # topic-match stages read the SAME value and the §4.2.3 byte-identical-
+    # options prefix-cache invariant is preserved. A divergent value forces a
+    # one-time model reload on the first call. Ollama-only.
+    num_ctx: int | None = None
+    # N-378 (2026-07-08) — Ollama ``think`` payload option as a CONFIG KNOB
+    # (never hardcoded). Story: N-372 (2026-07-05) REMOVED ``think: False``
+    # because Ollama bug #15260 broke grammar-mask application when
+    # ``think=false`` was combined with ``format=<json-schema>`` — the format
+    # mask deferred until an end-of-thinking token that never arrived, so the
+    # schema was silently dropped. That bug was CLOSED via Ollama PRs #15678
+    # and #15392 (merged 2026-04-21, shipped in Ollama 0.31.1, released
+    # 2026-06-30). llm-host runs 0.31.1. But leaving ``think`` unset means
+    # reasoning models (qwen3.6:35b) burn the full ``num_predict`` budget on
+    # hidden reasoning tokens before emitting the JSON — production
+    # 2026-07-07/08 showed recurring ``finish_reason=length, raw_len=0`` empty
+    # responses on the topic-match path (silent quality-loss: the digest
+    # falls open to zero verdicts). The operator's environment-specific
+    # decision (thinking disabled for this deployment) belongs in the config,
+    # NOT baked as a design flake in code.
+    #
+    #   None (default) — omit the ``think`` payload option; the model's
+    #                    stock template applies (Qwen3 emits
+    #                    ``<think>…</think>`` blocks).
+    #   False          — send ``"think": false`` in the payload (disables
+    #                    thinking mode; ~4-6× faster; requires Ollama
+    #                    ≥ 0.31.1 for grammar-mask correctness alongside
+    #                    ``format=<json-schema>``).
+    #   True           — send ``"think": true`` (explicit thinking-on).
+    #
+    # Applied uniformly to every Ollama /api/chat payload the classifier
+    # emits (SSOT — one knob covers classify + topic-match + safety +
+    # style-learning completion). The prefix-cache invariant is unaffected
+    # because ``think`` is a top-level payload option, not inside
+    # ``options`` (whose byte-identical shape governs the KV-prefix reuse).
+    ollama_think: bool | None = None
+    # N-378 belt-and-braces companion. Qwen3-family models honour a
+    # ``/no_think`` marker at the end of the user message as a per-call
+    # thinking-off directive — independent of the ``think`` payload option
+    # (some Qwen3 tokenizer templates recognize it even when ``think`` is
+    # unset). Set True to append it to every classify / topic-match / safety
+    # / completion prompt the classifier sends. Only useful with
+    # Qwen3-family models; a no-op on other reasoning models.
+    ollama_no_think_marker: bool = False
+    # Punch 547 / N-372: opt-in classify parse-failure diagnostic. When True,
+    # a parse failure adds ONE warning carrying a scrubbed 400-char head of
+    # the raw LLM response. A troubleshooting mode: never refused, HIPAA mode
+    # included (operator ruling A4, 2026-10-21); while on it is loud (a
+    # "DEBUG CAPTURE ON" WARNING at start and on each capture, and an admin
+    # banner), because the head is model prose about the mail and the scrub is
+    # not a Safe-Harbor de-identifier. Replaces the retired
+    # ET_CLASSIFY_DEBUG_CAPTURE env var. Applied by classify/ollama.py
+    # ``configure_debug_capture``.
+    debug_capture_raw_head: bool = False
+    # -a (2026-07-11): connect + handshake timeout budgets for the
+    # Ollama HTTP probes, per feedback_dynamic_over_hardcoding — was 4
+    # hardcoded float literals across /api/ps + /api/show (5s) + /api/tags
+    # (10s). Two knobs because the paths have DIFFERENT sanity budgets:
+    # ``probe`` covers the hot-path resolve check (/api/ps every call,
+    # cached 30s; and /api/show, cached forever) — the shorter budget
+    # keeps the classification path from stalling behind an unresponsive
+    # daemon; ``admin`` covers /api/tags (admin picker fetches installed
+    # set), where a 5s probe budget is too tight for a full model
+    # enumeration on a busy Ollama.
+    ollama_probe_timeout_secs: float = 5.0
+    ollama_admin_timeout_secs: float = 10.0
+    # N-431 (2026-07-19) — Ollama ``keep_alive`` payload option as a
+    # CONFIG KNOB, threaded through every /api/chat + /api/embeddings
+    # call the classifier + embedding backend + CLI embed shim emits
+    # (SSOT: :mod:`email_triage._ollama_reuse`). Absent this field the
+    # Ollama daemon applies its built-in default ``"5m"`` per call,
+    # silently overriding any operator TTL pin (including a Forever
+    # ``-1`` pin). See ``feedback_always_set_ollama_keep_alive_
+    # explicitly`` — SSOT is the wire field, not the operator's
+    # forever-pin cron. Accepted forms: ``"10m"`` / ``"1h"`` / ``"-1"``
+    # (string, converted to int at wire time) / ``0`` (unload
+    # immediately). Bounded generous default here — a per-deployment
+    # operator YAML override is expected.
+    ollama_keep_alive: str = "10m"
+    # -c (2026-07-11) — ReDoS safety budget for the operator-
+    # authored SUBJECT rule-match site (classify/hints.py); NOT a
+    # network timeout — a per-match compute-bound safety timeout that
+    # aborts pathological regex backtracking. 1.0 s preserves prior
+    # behavior. Raising it accommodates slow / complex operator
+    # patterns at the cost of a longer worker stall on an evil regex.
+    hint_regex_timeout_secs: float = 1.0
+    # -d (2026-07-11) — LLM_PHI embed timeout on the M-4 sent-mail-
+    # index CLI path (was hardcoded ``timeout=60.0`` at cli.py:3269).
+    # Longer than the /api/tags admin budget because /api/embeddings can
+    # legitimately take tens of seconds on cold model load.
+    embed_timeout_secs: float = 60.0
+    # -e (2026-07-11) — sentence_transformers subprocess-probe
+    # budget on the M-4 embedding-bits import check (was hardcoded
+    # ``timeout=60`` at embedding_bits/__init__.py:329). Compute-bound
+    # Python-interpreter import probe (not network).
+    st_probe_timeout_secs: float = 60.0
     openai_base_url: str = ""
     openai_model: str = ""
     gemini_model: str = ""
@@ -96,6 +258,12 @@ class SecretsConfig:
     Use ``backend: "external:<name>"`` to delegate to a plugin-registered
     provider (KeePass, Vault, etc.) — see ``register_external_provider``
     in ``email_triage.secrets``.
+
+    The ``external`` dict holds the provider's CONNECTION config (URL, mount,
+    path) and round-trips through ``config.yaml`` — so it is operator-readable
+    plaintext at rest. Put a *reference* (a key name / file path the provider
+    resolves), NOT a literal secret value (token/password), in ``external``;
+    secret material belongs in the encrypted secrets store, not config.yaml.
 
     The default ``"auto"`` is deployment-aware: it resolves to
     ``container`` when the master key is present as a container secret
@@ -177,17 +345,102 @@ class PersistenceConfig:
     # (``sqlcipher3-binary``) installed AND a reachable master key.
     #
     # Operator opts in via YAML ``persistence: { encryption_enabled: true }``
-    # or by exporting ``EMAIL_TRIAGE_DB_ENCRYPTION=1`` for a one-shot run
-    # (mirrors the ``tls.csrf_enforce`` / ``EMAIL_TRIAGE_CSRF_ENFORCE``
-    # YAML-plus-env idiom). The env var, when set to a recognized value,
-    # OVERRIDES the YAML field at boot.
+    # — the ONE store (punch 547 removed the EMAIL_TRIAGE_DB_ENCRYPTION env
+    # override: config is loaded before the DB is opened, so the field can
+    # always decide, and an env var that can turn encryption off is a bypass).
     #
     # FAIL-CLOSED in HIPAA mode (per ``docs/v0.1.2-single-file-encryption-
     # plan.md`` §4.3): once the flag resolves ON, a missing
     # ``sqlcipher3`` import or an unavailable master key raises a boot
     # ``RuntimeError`` — NEVER a silent plaintext fallback. Resolution +
     # enforcement live in ``email_triage.db._engine.resolve_db_encryption``.
-    encryption_enabled: bool = False
+    #
+    # DEFAULT IS ENCRYPTED (operator directive 2026-08-18, N-459). This literal
+    # is what a boot with NO config file at all resolves to, and it used to be
+    # False — so a container started without a mounted config silently created a
+    # PLAINTEXT store while every shipped scaffold
+    # (``config/example-homelab.yaml``, ``config/example-medical.yaml``, the
+    # ``cli.py`` init template) said ``true``. The literal now agrees with the
+    # scaffolds: reaching plaintext requires setting the flag false on purpose,
+    # which is exactly the "you have to go out of your way, and it SCREAMS into
+    # the log" posture the product always intended.
+    encryption_enabled: bool = True
+
+    # -b (2026-07-11): sqlite3 lock-wait budgets, per
+    # feedback_dynamic_over_hardcoding — was ~10 hardcoded literals
+    # (``timeout=30.0`` / ``busy_timeout=30000`` / ``timeout=5.0``)
+    # scattered across db/_engine.py + db/_migrate.py + web/db.py.
+    #
+    # ``sqlite_busy_wait_secs`` — the STANDARD-opener lock-wait budget.
+    # Wired through the ``sqlite3.connect(timeout=...)`` kwarg on every
+    # opener AND the ``PRAGMA busy_timeout`` value (in ms) applied by
+    # ``_apply_standard_pragmas``. Same knob covers both so a tuning
+    # change stays coherent between the DBAPI busy loop and the SQL-
+    # layer busy loop. Under WAL, this is how long a writer waits for a
+    # RESERVED/EXCLUSIVE lock before EBUSY.
+    #
+    # ``sqlite_probe_timeout_secs`` — the SHORT-probe budget used by
+    # boot-time / migration integrity + plaintext-detection probes that
+    # should fail fast when the DB is held by another process
+    # (``_is_plaintext_sqlite`` gate). NOT the standard-opener budget.
+    sqlite_busy_wait_secs: float = 30.0
+    sqlite_probe_timeout_secs: float = 5.0
+
+
+@dataclass
+class RegulatoryClockConfig:
+    """ — Regulatory clock awareness (clinical-trial safety-reporting deadline
+    engine).
+
+    DETECTION (the Stage-A keyword recall gate → Stage-B local-Ollama confirm
+    that auto-creates candidate clocks) is FLAG-GATED and DEFAULT OFF until the
+    operator validates recall on real sponsor/IRB mail. A false negative on a
+    safety-reporting deadline is the high-cost error, so the detector ships dark
+    and is enabled deliberately, per-install, after calibration.
+
+    The clock tables / state machine / HMAC audit chain are ALWAYS present
+    (additive migrations, inert until a clock is created); only the automatic
+    detection that creates candidates is gated here. Manual/admin clock creation
+    and disposition work regardless of this flag.
+
+    Operator opts in via YAML ``regulatory_clock: { detection_enabled: true }``.
+
+    ``working_day_holidays`` + ``working_week`` configure the per-install
+    working-day calendar (LOCKED operator decision #3 — institutional IRB
+    timelines are institution-specific, and a wrong holiday set chains a false
+    ``breached`` into the immutable log). ``working_day_holidays`` is a list of
+    ISO dates (``"2026-07-03"``) that are NOT working days; ``working_week`` is
+    the working weekday numbers (0=Mon … 6=Sun, default Mon–Fri). Only the IRB/
+    INTERNAL ``working_day`` clocks use these; calendar_day clocks ignore them.
+    """
+    detection_enabled: bool = False
+    working_day_holidays: list[str] = field(default_factory=list)
+    working_week: list[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
+
+
+#: Public recursive resolvers used when ``tls.acme.rfc2136.public_resolvers``
+#: is unset. One copy: the dataclass default, the YAML parse and the admin-form
+#: save all read it (punch 589; it used to be restated in three places).
+DEFAULT_PUBLIC_RESOLVERS: tuple[str, ...] = ("8.8.8.8", "1.1.1.1", "9.9.9.9")
+
+#: Resolver IP -> the DNS-over-HTTPS JSON endpoint the ACME CNAME pre-flight
+#: queries for it. The pre-flight speaks the Google/Cloudflare JSON API
+#: (``?name=&type=`` + ``Accept: application/dns-json``) over httpx's default
+#: HTTP/1.1. An IP that is not here is SKIPPED by the pre-flight, by name, and
+#: never sent to another provider in its place (punch 589: unlisted IPs used to
+#: go to dns.google while the diagnostics named the configured IP).
+#:
+#: Quad9 (9.9.9.9 / 149.112.112.112) is deliberately absent. It retired HTTP/1.1
+#: for DoH on 2025-12-15 and answers this request with HTTP 505 (measured
+#: 2026-10-10), and ``h2`` is not in the lock. Quad9 stays a valid
+#: ``public_resolvers`` entry: the UDP:53 checks (CAA, the public-propagation
+#: poll, the NS seed) use every listed IP, and only this one HTTPS check skips it.
+DOH_JSON_ENDPOINTS: dict[str, str] = {
+    "8.8.8.8": "https://dns.google/resolve",
+    "8.8.4.4": "https://dns.google/resolve",
+    "1.1.1.1": "https://cloudflare-dns.com/dns-query",
+    "1.0.0.1": "https://cloudflare-dns.com/dns-query",
+}
 
 
 @dataclass
@@ -227,7 +480,7 @@ class Rfc2136Config:
     # only consider the gate cleared when ALL configured
     # resolvers see the record.
     public_resolvers: list[str] = field(
-        default_factory=lambda: ["8.8.8.8", "1.1.1.1", "9.9.9.9"]
+        default_factory=lambda: list(DEFAULT_PUBLIC_RESOLVERS)
     )
     public_propagation_timeout_secs: int = 1800  # 30 min
     public_propagation_interval_secs: int = 15
@@ -242,6 +495,52 @@ class Rfc2136Config:
     # directly. Default 10 min covers the common 5-min cron plus a
     # buffer for recursor cache refresh on LE side.
     public_propagation_split_horizon_wait_secs: int = 600
+
+
+@dataclass
+class Http01Config:
+    """HTTP-01 ACME challenge solver settings.
+
+    Two operator-selectable modes:
+
+    - ``mode="standalone"`` — the renewer starts a small, scoped
+      stdlib HTTP listener on ``bind_host:bind_port`` (default
+      ``0.0.0.0:80``) that answers **only**
+      ``GET /.well-known/acme-challenge/{token}`` from an in-memory
+      token store; every other path returns 404. The listener is
+      short-lived (started on-demand around each ``issue_now`` call
+      and torn down after cert issued). This matches the standard
+      ``certbot --standalone`` shape. The main FastAPI app never
+      speaks cleartext HTTP; this listener is a separate scoped
+      socket that never touches PHI. Requires the host firewall /
+      container quadlet to publish port 80 to the outside world so
+      Let's Encrypt can reach it.
+
+    - ``mode="webroot"`` — the renewer writes the challenge token
+      as a file at ``{webroot_path}/{token}`` and expects the
+      operator's existing reverse proxy / webserver
+      (nginx / caddy / apache / traefik) to serve
+      ``/.well-known/acme-challenge/*`` from that directory. The
+      app never binds port 80. Matches ``certbot --webroot``. The
+      operator wires the location block once; the renewer just
+      drops files. Preferred for installs that already terminate
+      HTTP at the edge.
+
+    Both modes are HIPAA-defensible: the tokens are ephemeral
+    LE-provided base64url random values (~32 chars), not PHI; the
+    scoped listener (standalone) 404s everything but the challenge
+    path; the webroot dir (webroot) contains only challenge tokens.
+    """
+    mode: str = "standalone"  # "standalone" | "webroot"
+    bind_host: str = "0.0.0.0"
+    bind_port: int = 80
+    webroot_path: str = ""
+    # Self-check timeout: after publish, the renewer polls its OWN
+    # listener (standalone) or the webroot dir (webroot) to confirm
+    # the token is retrievable BEFORE handing off to LE. Guards
+    # against a listener that failed to bind, a webroot dir that
+    # the proxy can't read, etc. Fail-closed on timeout.
+    self_check_timeout_secs: int = 10
 
 
 @dataclass
@@ -265,6 +564,14 @@ class AcmeConfig:
     # rate limit while iterating:
     #   https://acme-staging-v02.api.letsencrypt.org/directory
     directory_url: str = "https://acme-v02.api.letsencrypt.org/directory"
+    # N-230 R22 — LE staging endpoint (default). Previously in-lined at
+    # `auth_keys.py:1806` as a literal fallback when the operator picked
+    # the "staging" directory from the /auth/keys ACME UI — a fork that
+    # points at a different staging endpoint had to code-patch the
+    # router. Now overridable via YAML `tls.acme.staging_directory_url`.
+    staging_directory_url: str = (
+        "https://acme-staging-v02.api.letsencrypt.org/directory"
+    )
     account_email: str = ""
     domains: list[str] = field(default_factory=list)
     challenge: str = "dns-01"  # "dns-01" | "http-01"
@@ -272,6 +579,10 @@ class AcmeConfig:
     check_interval_hours: int = 24
     dns_provider: str = "rfc2136"  # "rfc2136" | future: "cloudflare", "route53"
     rfc2136: Rfc2136Config = field(default_factory=Rfc2136Config)
+    # HTTP-01 challenge solver config. Consulted only when
+    # ``challenge=="http-01"``; default shape is standalone :80
+    # listener, switchable to webroot mode. See ``Http01Config``.
+    http01: Http01Config = field(default_factory=Http01Config)
     # Resilience knobs for the LE-side validation step. After our
     # public-resolver gate passes, the LE directory still queries
     # the record from its own recursive chain — negative caches and
@@ -298,6 +609,18 @@ class AcmeConfig:
     # (True) or only warns (False, default = report-only first week
     # so operators see what would have happened before opting in).
     caa_enforce: bool = False
+    # -d (2026-07-11) — RFC-2136 DNS UPDATE query timeout budget.
+    # Pre-fix hardcoded ``timeout=10`` at 3 dns.query.tcp sites in
+    # web/acme_renewer.py. See _ACME_DNS_QUERY_TIMEOUT_SECS + setter
+    # in that module.
+    dns_query_timeout_secs: float = 10.0
+    # DA-F1 (2026-07-11) — udp probe budget for the 12 dns.query.udp
+    # sites (CAA lookup, NS resolution, propagation-verify, resolver
+    # iteration). Separate from the tcp UPDATE budget because probes
+    # are inherently faster / cheaper — was hardcoded ``timeout=5``
+    # across all 12 sites. See ``_ACME_DNS_PROBE_TIMEOUT_SECS`` in
+    # web/acme_renewer.py.
+    dns_probe_timeout_secs: float = 5.0
 
 
 @dataclass
@@ -309,9 +632,12 @@ class TLSConfig:
     1. **Built-in ACME automation** (``acme.enabled=true``). The app
        speaks ACME directly to the configured directory (default LE
        prod), publishes challenges via DNS-01 (RFC-2136 against the
-       operator's BIND) or HTTP-01, writes cert + key atomically into
-       ``cert_dir``, and renews automatically on a 24-hour timer.
-       Zero ongoing operator overhead.
+       operator's BIND) or HTTP-01 (standalone listener bound at
+       ``http01.bind_host:http01.bind_port`` OR webroot files at
+       ``http01.webroot_path`` for an operator-supplied proxy),
+       writes cert + key atomically into ``cert_dir``, and renews
+       automatically on a 24-hour timer. Zero ongoing operator
+       overhead.
     2. **External ACME pipeline** (operator-side acme.sh / lego /
        certbot with DNS-01). Point ``cert_dir`` at the directory the
        external tool writes ``server.crt`` + ``server.key`` to. App
@@ -324,7 +650,7 @@ class TLSConfig:
        ``email-triage tls bootstrap`` generates a cert if ``cert_dir``
        is empty. Browser shows the usual warning. WebAuthn won't
        work cross-host with self-signed; use one of the above for
-       any auth-surface work that needs hardware keys.
+       any auth-surface work that needs passkeys.
 
     ``cert_dir`` defaults to ``<data_dir>/certs/``. Override here
     when the external ACME tool writes elsewhere on the host.
@@ -388,7 +714,7 @@ class TLSConfig:
     ``memory/project_medical_researcher.md`` matches shape (a) or (b)
     in practice; the homelab reference install on the deploy host matches shape
     (b) — Tailscale-only ingress with cleartext loopback to the
-    container's exposed port. (See ``CLAUDE.md`` "Container deployment"
+    container's exposed port. (See ``the AI assistant.md`` "Container deployment"
     + ``memory/deployment-notes.md`` for the deploy host-specific deployment
     record.)
 
@@ -601,8 +927,10 @@ class TLSConfig:
     Periodic-review cadence: per ``internal documentation``
     §6.1 (release-aligned + quarterly-minimum), this EM's continued
     adequacy is re-verified at every release-cut. As a durable
-    Addressable EM (no sunset milestone — unlike EQM-05's v0.2.0/v0.3.0
-    legacy-SHA-256 sunset), the periodic-review cadence IS the
+    Addressable EM (no sunset milestone — unlike EQM-05's legacy-SHA-256
+    sunset, whose removal timeline is pending explicit operator directive
+    per the 2026-07-06 correction; see `db/audit.py`), the periodic-review
+    cadence IS the
     §164.316(b)(2)(iii) "review documentation periodically" surface for
     EQM-03. Triggers for re-verification:
       - Any change to the four-posture TLS support architecture above
@@ -635,7 +963,7 @@ class TLSConfig:
     # Default OFF so existing deployments don't flip to HTTPS-only on
     # upgrade and surprise an external the monitoring system check / monitor that
     # was hard-coded to HTTP. Operator opts in via YAML
-    # ``tls: { enabled: true }``. See docs/deploy-the deploy host.md for the
+    # ``tls: { enabled: true }``. See internal documentation for the
     # rollout sequence (update monitors first, then enable here).
     enabled: bool = False
     acme: AcmeConfig = field(default_factory=AcmeConfig)
@@ -644,8 +972,9 @@ class TLSConfig:
     # rejects stay flat at zero across normal traffic + the 
     # oversize-body fix landed). Violations now return HTTP 403.
     # Operator can opt out by setting ``tls: { csrf_enforce: false }``
-    # in YAML, or by exporting ``EMAIL_TRIAGE_CSRF_ENFORCE=0`` for a
-    # one-shot debug session. Soft-launch logging is still wired —
+    # in YAML or via the live toggle at /admin/security. This field is
+    # the SOLE store: the ``EMAIL_TRIAGE_CSRF_ENFORCE`` env override was
+    # removed 2026-09-12. Soft-launch logging is still wired —
     # ``app.state.csrf_rejects`` and the access_log audit row both
     # fire regardless of enforce mode (outcome flips between
     # ``csrf_rejected`` (403'd) and ``csrf_would_reject`` (logged
@@ -691,11 +1020,13 @@ class PushConfig:
     gmail_topic_name: str = ""
     gmail_subscription_sa_email: str = ""
     gmail_audience: str = ""
-    # OpenClaw bearer-token API. Webhook emit + rate limit
-    # share the push config block because they're operator-facing
-    # surface, not a per-account knob.
-    openclaw_webhook_enabled: bool = True
-    openclaw_rate_limit_per_minute: int = 60
+    # Outbound-webhook (bearer-token API) emit + rate limit share the push
+    # config block because they're operator-facing surface, not a per-account
+    # knob. Generic by design: the webhook can target any service (OpenClaw,
+    # Slack, an in-house automation, ...). Legacy openclaw_* config keys are
+    # still read at load time (see _from_dict) for back-compat.
+    webhook_enabled: bool = True
+    webhook_rate_limit_per_minute: int = 60
     # Cap on bulk-endpoint batch size. 0 = unlimited (callers know
     # what they're doing). Default 100 prevents runaway batches.
     bulk_max_batch_size: int = 100
@@ -708,6 +1039,16 @@ class PushConfig:
     # should shrink it (subscription dies if a renew round-trip
     # fails on the very last attempt before expiry).
     office365_subscription_renewal_window_hours: int = 24
+    # -d (2026-07-11) — module-level HTTP-client timeouts per
+    # feedback_dynamic_over_hardcoding. Pre-fix each was a hardcoded
+    # float literal at module import time. See the module SSOTs +
+    # setters in the respective modules.
+    #   webhook_timeout_secs      — web/watch_runner._WEBHOOK_TIMEOUT_SECS
+    #                              (outbound webhook fan-out client)
+    #   gmail_cert_timeout_secs   — web/gmail_push_auth._GMAIL_CERT_TIMEOUT_SECS
+    #                              (JWKS cert fetch on the Gmail push path)
+    webhook_timeout_secs: float = 10.0
+    gmail_cert_timeout_secs: float = 10.0
 
 
 @dataclass
@@ -718,7 +1059,60 @@ class SmtpConfig:
     from_addr: str = ""              # Envelope sender
     from_name: str = ""              # Optional display name: "Name" <addr>
     use_tls: bool = True
+    #  (2026-07-11): connect + handshake timeout (seconds). Bounded
+    # so the smtplib.SMTP() connect can't block forever on an
+    # unresponsive relay (llm-host audit `wf_80d5be60-ae1` finding). 30s
+    # is a sane default for connect + STARTTLS; operators facing slow
+    # relays raise it, operators wanting fail-fast lower it.
+    # feedback_dynamic_over_hardcoding: derived-at-runtime.
+    timeout_secs: float = 30.0
+    # Punch 595: with no ``host``, email-OTP login is REFUSED (the code has no
+    # way to reach the user). A dev / first-boot install may set this to have
+    # the code written to the process's stderr instead: never to the logging
+    # tree, so never to ``log_entries`` (HMAC-chained, kept 6 years). Refused
+    # in HIPAA mode: at load when ``logging.hipaa`` is set, and at every login
+    # request against the live HIPAA flag, which can be turned on at runtime.
+    dev_console_otp: bool = False
+    # Operator certificate modes (2026-10-21): the SMTP relay's override of
+    # outbound_tls.cert_check / cert_enforce. None inherits the global setting.
+    cert_check: bool | None = None
+    cert_enforce: bool | None = None
     # Password is NOT here — it comes from the secrets store as SMTP_PASSWORD.
+
+
+@dataclass
+class OutboundTLSConfig:
+    """Outbound TLS: what the app does with a server's certificate when IT is
+    the client (IMAP, SMTP, HTTPS egress), and how HTTPS egress finds its proxy
+    and CA bundle. Operator modes, 2026-10-21 (reverses the no-opt-out of
+    punch 645/651). Applied by ``email_triage.tls`` (bound at start; the admin
+    save edits it in place). None of these settings refuses a boot, a save or a
+    deploy, or changes ``/health``: a malformed value logs and falls back.
+
+    * ``cert_check`` off: connect without validating (setup / troubleshooting).
+    * ``cert_check`` on, ``cert_enforce`` off: validate; on a failure log one
+      ``tls_cert_check_failed`` WARNING and connect anyway.
+    * ``cert_check`` on, ``cert_enforce`` on: validate and refuse on failure.
+
+    Defaults (panel M H6, 2026-10-22): check on, enforce on (validate and
+    refuse), for new installs and on upgrade. An install turns ``cert_enforce``
+    (or ``cert_check``) off for setup or troubleshooting; every mode is kept.
+
+    IMAP accounts override per account (``cert_check`` / ``cert_enforce`` in the
+    account config, ``inherit`` by default); SMTP overrides in ``smtp``.
+
+    HTTPS egress honours the well-known environment variables (``HTTPS_PROXY``,
+    ``HTTP_PROXY``, ``ALL_PROXY``, ``NO_PROXY``, ``SSL_CERT_FILE``,
+    ``SSL_CERT_DIR``, ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE``) unless
+    ``ignore_env`` is set; ``proxy_url`` / ``no_proxy`` / ``ca_bundle`` here
+    override them.
+    """
+    cert_check: bool = True
+    cert_enforce: bool = True
+    proxy_url: str = ""
+    no_proxy: str = ""
+    ca_bundle: str = ""
+    ignore_env: bool = False
 
 
 @dataclass
@@ -783,16 +1177,16 @@ class AdminEmailConfig:
     as a read-fallback shim for a deprecation cycle; new edits write
     here.
 
-    ``release_check_url`` is the GitHub Releases API endpoint the
-    daily-health "update available" section queries to pick up release
-    notes. Operator-configurable so an install pointing at a fork or a
-    private mirror can override. Empty / missing falls back to the
-    public mirror default below.
+    ``release_check_url`` is the GitHub Releases API endpoint the hourly
+    update check (punch 553) and the daily-health "update available"
+    section query. Operator-configurable so an install pointing at a fork
+    or a private mirror can override. It is also the update check's ONE
+    off-switch: key missing -> the public default (on by default, operator
+    decision 553-1); blank / null -> OFF, no request made. Parsed only by
+    :func:`email_triage.update_check.parse_release_check_url`.
     """
     recipients: list[str] = field(default_factory=list)
-    release_check_url: str = (
-        "https://api.github.com/repos/unlimited-data-works-llc/email-triage/releases/latest"
-    )
+    release_check_url: str = DEFAULT_RELEASE_CHECK_URL
 
 
 @dataclass
@@ -810,6 +1204,26 @@ class WebhookTarget:
     url: str = ""
     events: list[str] = field(default_factory=list)
     secret_key: str = ""  # key name in secrets store, NOT the actual secret
+    # Per-target body templating (v0.2.0 release-blocking feature).
+    # ``target_type`` picks a built-in receiver shape from
+    # ``web/_webhook_target_types.py::TARGET_TYPES`` (custom / slack /
+    # pagerduty / opsgenie / discord / teams); ``body_template`` is an
+    # optional operator override rendered by
+    # ``web/_webhook_template.py::render_for_target``. Both default to
+    # backward-compatible envelope-verbatim behavior.
+    target_type: str = "custom"
+    body_template: str | None = None
+    # SME-panel 2026-07-15 DA-F3b fix — per-account targeting. When
+    # ``None`` (default) this target fires on EVERY account's events
+    # (wildcard, backward-compatible with pre-fix installs). When set
+    # to an account id string, ``EventDispatcher._matching_targets``
+    # filters this target OUT of any fire whose context account_id
+    # doesn't match. Closes the cross-account fanning class in a
+    # multi-account HIPAA-mix deployment: a Slack target scoped to
+    # ``account_id="admin-ops"`` no longer receives fires from an
+    # unrelated HIPAA account (the HIPAA-lock still fires per-call as
+    # defense-in-depth; the account_id filter is the primary gate).
+    account_id: str | None = None
 
 
 @dataclass
@@ -886,6 +1300,26 @@ class IngestionConfig:
     PUSH_MAX: int = 60
     STEP: int = 5
 
+    # -d (2026-07-11) — per feedback_dynamic_over_hardcoding.
+    #   idle_task_drain_timeout_secs — post-IDLE cleanup wait for the
+    #      aioimaplib idle task in ImapProvider.watch(). Was hardcoded
+    #      ``timeout=10`` at providers/imap.py:2092. Compute-bound
+    #      in-process wait, NOT a network timeout.
+    #   office365_http_timeout_secs — Microsoft Graph API httpx client
+    #      timeout. Was hardcoded ``timeout=30.0`` at
+    #      providers/office365.py:507.
+    idle_task_drain_timeout_secs: float = 10.0
+    office365_http_timeout_secs: float = 30.0
+    # -e (2026-07-11) — per-watcher shutdown grace at the shared-
+    # loop teardown (2 asyncio.wait_for sites at web/watcher.py:933/971).
+    # See _WATCHER_SHUTDOWN_GRACE_SECS in that module.
+    watcher_shutdown_grace_secs: float = 3.0
+    # DA-F4 (2026-07-11) — IMAP LOGOUT shutdown wait budget (was
+    # hardcoded 2.0s at providers/imap.py:2200). Some Dovecot deployments
+    # reliably TimeoutError here on mid-IDLE close; the transport-level
+    # close is the fallback. See ``_IMAP_LOGOUT_TIMEOUT_SECS``.
+    imap_logout_timeout_secs: float = 2.0
+
 
 @dataclass
 class WebAuthnConfig:
@@ -893,7 +1327,7 @@ class WebAuthnConfig:
 
     ``rp_id`` is the Relying Party ID — the browser binds every
     registered credential to this string permanently. Changing it
-    invalidates every registered hardware key (operator + every user
+    invalidates every registered passkey (operator + every user
     must re-register). Pick a hostname (or registrable suffix) that
     matches the install's canonical URL.
 
@@ -909,8 +1343,10 @@ class WebAuthnConfig:
     rp_id: str = ""        # e.g. "auth.example.com"
     rp_name: str = "Email Triage"
     origin: str = ""       # e.g. "https://auth.example.com"
-    # Future: enforce userVerification=required for admin role
-    # (PIN/biometric on touch). the backlog .
+    # When True, an admin's hardware-key registration and login ask the
+    # authenticator for user verification (PIN / biometric) AND the server
+    # enforces it at the finish step (punch ; the requirement is stored
+    # with the challenge). Passkey login always requires it.
     require_user_verification_for_admin: bool = False
 
 
@@ -1057,20 +1493,6 @@ class RedisCacheConfig:
 
 
 @dataclass
-class EmbeddingFallbackConfig:
-    """Optional secondary embedding backend (#m4-fallback).
-
-    Only consulted when the primary embedder raises (network blip,
-    model still loading, container restart in-flight). Same shape as
-    the primary block — must individually pass the local-only
-    allowlist at construction time.
-    """
-    backend: str = ""               # "ollama" / "sentence_transformers" / ""
-    model_name: str = ""
-    ollama_url: str = ""            # blank inherits primary's URL
-
-
-@dataclass
 class EmbeddingConfig:
     """Configuration for the local embedding backend (M-4 / M-5).
 
@@ -1086,17 +1508,78 @@ class EmbeddingConfig:
     (with a one-time INFO log) when no embedding backend is
     configured. Fail-closed by design.
 
-    Optional ``fallback`` sub-section configures a second backend
-    that runs when the primary raises. Used 2026-05-13 to chain a
-    fast CPU embedder (``sentence_transformers``) in front of an
-    overflowing-GPU Ollama instance as the safety net.
+    There is no ``fallback`` sub-section any more (punch 552 / N-555):
+    a backup embedder is a different model, so its vectors never match
+    the index, and the chain hid a broken primary. A YAML that still
+    carries one gets a load-time WARNING (``_warn_embedding_fallback_ignored``).
     """
     backend: str = ""               # "ollama" / "sentence_transformers" / ""
     model_name: str = ""            # e.g. "all-MiniLM-L6-v2"
     ollama_url: str = "http://localhost:11434"
-    fallback: EmbeddingFallbackConfig = field(
-        default_factory=EmbeddingFallbackConfig,
-    )
+    # Operator decision 2026-10-25: a stale or refused embedding runtime is
+    # replaced by the app itself (boot + sweeper), through the same stage /
+    # verify / swap / rollback funnel as the admin's click. False returns a
+    # site under formal change control to the punch-569 click.
+    auto_update: bool = True
+
+
+@dataclass
+class BackupConfig:
+    """ automated DB backup — the ``backup:`` YAML section.
+
+    Configured in the CONFIG FILE, not env vars (per feedback_no_env_vars_for_
+    paths: env vars to toggle features / set paths are invisible + scattered +
+    silently break). ``enabled`` is the master switch (default OFF — the operator
+    flips it on only AFTER the key-only export). ``cadence`` ∈ {manual
+    (CLI/cron-driven, no in-app timer), daily, weekly}; ``format`` ∈ {etbk (full
+    bundle: DB + config + certs), db (raw SQLCipher snapshot)}; ``retention`` is a
+    spec (``14`` = keep-count | ``14d`` = days | ``2w`` = weeks); ``dir`` empty →
+    self-locates to ``<data_dir>/backups``."""
+    enabled: bool = False
+    cadence: str = "manual"
+    format: str = "etbk"
+    retention: str = "14"
+    dir: str = ""
+    # ``encryption``: ``master-key`` (HKDF-from-master-key passphrase; restore
+    # needs only the key-only export) | ``public-key`` (write-only: the bundle's
+    # random passphrase is sealed to an X25519 PUBLIC key held on-box; only the
+    # off-box PRIVATE key restores — survives container compromise). For
+    # ``public-key``, ``public_key`` is the X25519 public-key PEM text or a path.
+    encryption: str = "master-key"
+    public_key: str = ""
+
+
+@dataclass
+class AuditConfig:
+    """N-321 R30 (task  tranche  DA follow-up — operator-approved
+    delivery model 2026-07-03: empty-list default + docs example).
+
+    §164.312(b) audit-trail identity: behind ANY reverse proxy
+    (the deploy host's podman NAT, nginx, HAProxy) `request.client.host` is the
+    PROXY's IP, NOT the actual client. Every audit row today records
+    the proxy IP → zero identity trail on the chain.
+
+    `trusted_proxies` is a list of CIDR strings. When the direct-
+    connect peer's IP matches one of these CIDRs, the SSOT
+    `request_forwarded_for(...)` walks the rightmost `X-Forwarded-For`
+    entry (or falls back to the direct peer). When the direct peer
+    is NOT in a trusted CIDR, XFF is IGNORED (a client-controllable
+    header must never invent identity).
+
+    **Empty-list default** = ignore XFF, preserve current behavior on
+    every install. Each operator populates for their own deploy
+    topology. Example (the deploy host-typical):
+
+        audit:
+          trusted_proxies:
+            - 127.0.0.1/32       # loopback
+            - 10.88.0.0/16       # podman default bridge
+
+    Migration of the ~14 audit callers to
+    `request_forwarded_for(request, config.audit.trusted_proxies)` is
+    a follow-up sweep — this dataclass ships the primitive.
+    """
+    trusted_proxies: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1108,9 +1591,14 @@ class TriageConfig:
     secrets: SecretsConfig = field(default_factory=SecretsConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    regulatory_clock: RegulatoryClockConfig = field(
+        default_factory=RegulatoryClockConfig
+    )
     tls: TLSConfig = field(default_factory=TLSConfig)
     smtp: SmtpConfig = field(default_factory=SmtpConfig)
+    outbound_tls: OutboundTLSConfig = field(default_factory=OutboundTLSConfig)
     push: PushConfig = field(default_factory=PushConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
     webhooks: list[WebhookTarget] = field(default_factory=list)
     #  — outbound webhook URLs default to local-only. Operators
     # must set webhooks_allow_external: true in YAML to ship events
@@ -1123,6 +1611,11 @@ class TriageConfig:
     ingestion: IngestionConfig = field(default_factory=IngestionConfig)
     webauthn: WebAuthnConfig = field(default_factory=WebAuthnConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
+    # N-321 R30 (task  tranche  DA follow-up): audit-identity
+    # config. Empty `trusted_proxies` default = ignore XFF (current
+    # behavior on every install). See `AuditConfig` for the SSOT
+    # semantics + migration path.
+    audit: AuditConfig = field(default_factory=AuditConfig)
     health_email: HealthEmailConfig = field(default_factory=HealthEmailConfig)
     # CR-2c — canonical admin-notification destination. Daily health
     # digest, update-failed alerts, and future admin-targeted channels
@@ -1164,12 +1657,123 @@ def _parse_classifier(raw: dict[str, Any]) -> ClassifierConfig:
     cfg.backend = raw.get("backend", cfg.backend)
     cfg.model = raw.get("model", cfg.model)
     cfg.ollama_url = raw.get("ollama_url", cfg.ollama_url)
-    cfg.prefer_loaded = bool(raw.get("prefer_loaded", cfg.prefer_loaded))
+    cfg.prefer_loaded = _cfg_bool(
+        raw, "prefer_loaded", default=cfg.prefer_loaded, section="classifier",
+    )
+    cfg.prefer_loaded_skip_embeddings = _cfg_bool(
+        raw, "prefer_loaded_skip_embeddings",
+        default=cfg.prefer_loaded_skip_embeddings, section="classifier",
+    )
+    _markers = raw.get("embedding_name_markers")
+    if isinstance(_markers, list):
+        cfg.embedding_name_markers = [str(m) for m in _markers]
+    _backups = raw.get("backup_models")
+    if isinstance(_backups, list):
+        cfg.backup_models = [
+            str(m).strip() for m in _backups if str(m).strip()
+        ]
+    #  — pinned Ollama context window (reject bool / non-positive; None = inherit).
+    _num_ctx = raw.get("num_ctx")
+    if isinstance(_num_ctx, int) and not isinstance(_num_ctx, bool) and _num_ctx > 0:
+        cfg.num_ctx = _num_ctx
+    # N-378 — Ollama `think` payload knob. Tri-state; loader accepts
+    # (a) missing key → keep default (None), (b) explicit True/False → set,
+    # (c) explicit YAML null / None → set to None. Any non-bool non-None
+    # value (accidental "false" string, an int) is rejected + warned so a
+    # typo can't silently downgrade thinking control. SME panel 2026-07-08
+    # MUST-FIX F1 (hipaa-sme + devils-advocate consensus): the sibling
+    # marker knob below MUST carry the same defensive shape so a stray
+    # YAML `"false"` string can't sneak through `bool(...)` coercion (any
+    # non-empty string is truthy). Emit a boot-time warning on unexpected
+    # values so the operator can grep for the typo.
+    if "ollama_think" in raw:
+        _think = raw.get("ollama_think")
+        if _think is None or isinstance(_think, bool):
+            cfg.ollama_think = _think
+        else:
+            _log_config_warn(
+                "config.classifier.ollama_think: expected True / False / "
+                "null, got %r (type=%s) — silently ignored; the classifier "
+                "keeps ollama_think=%r. Fix the YAML to remove the typo.",
+                _think, type(_think).__name__, cfg.ollama_think,
+            )
+    # N-378 F1 — SME MUST-FIX: mirror the tri-state defensive shape on
+    # the marker knob (was `bool(raw.get(...))` which silently coerced a
+    # stray `"false"` string to True). Only explicit True/False is
+    # accepted; anything else is rejected + warned.
+    if "ollama_no_think_marker" in raw:
+        _marker = raw.get("ollama_no_think_marker")
+        if isinstance(_marker, bool):
+            cfg.ollama_no_think_marker = _marker
+        else:
+            _log_config_warn(
+                "config.classifier.ollama_no_think_marker: expected True "
+                "/ False, got %r (type=%s) — silently ignored; the "
+                "classifier keeps ollama_no_think_marker=%r. Fix the YAML "
+                "to remove the typo.",
+                _marker, type(_marker).__name__,
+                cfg.ollama_no_think_marker,
+            )
+    if "debug_capture_raw_head" in raw:
+        _dc = raw.get("debug_capture_raw_head")
+        if isinstance(_dc, bool):
+            cfg.debug_capture_raw_head = _dc
+        else:
+            _log_config_warn(
+                "config.classifier.debug_capture_raw_head: expected True / "
+                "False, got %r (type=%s) — ignored; the capture stays %r.",
+                _dc, type(_dc).__name__, cfg.debug_capture_raw_head,
+            )
     cfg.openai_base_url = raw.get("openai_base_url", cfg.openai_base_url)
     cfg.openai_model = raw.get("openai_model", cfg.openai_model)
     cfg.gemini_model = raw.get("gemini_model", cfg.gemini_model)
     if "categories" in raw:
         cfg.categories = raw["categories"]
+    # -a/c/d — timeout knobs.
+    cfg.ollama_probe_timeout_secs = float(
+        raw.get("ollama_probe_timeout_secs", cfg.ollama_probe_timeout_secs),
+    )
+    cfg.ollama_admin_timeout_secs = float(
+        raw.get("ollama_admin_timeout_secs", cfg.ollama_admin_timeout_secs),
+    )
+    cfg.hint_regex_timeout_secs = float(
+        raw.get("hint_regex_timeout_secs", cfg.hint_regex_timeout_secs),
+    )
+    cfg.embed_timeout_secs = float(
+        raw.get("embed_timeout_secs", cfg.embed_timeout_secs),
+    )
+    cfg.st_probe_timeout_secs = float(
+        raw.get("st_probe_timeout_secs", cfg.st_probe_timeout_secs),
+    )
+    # N-431 (2026-07-19) — ``ollama_keep_alive``. Route through the SSOT
+    # validator ``_ollama_reuse.is_valid_keep_alive`` so this parse + the
+    # admin form parse reject bad shapes uniformly (DA panel MF-3, 2026-
+    # 07-19). Accept ``str`` (Ollama's native form: "10m", "1h", "-1",
+    # "0"), ``int`` (raw seconds; -1 = Forever pin), or ``None`` (falls
+    # back to the ClassifierConfig default so the SSOT is never blank).
+    # Anything else — a typo like "1o" (letter O for minute), a bool
+    # silently coercing to "True" / "False", a leading "+" — warns and
+    # keeps the default; a bad shape would reach Ollama, 400 there, and
+    # fall back to the daemon's silent 5m — the exact recurrence class
+    # this drive is closing.
+    if "ollama_keep_alive" in raw:
+        _keep_alive = raw.get("ollama_keep_alive")
+        if _keep_alive is None:
+            pass  # keep default
+        else:
+            from email_triage._ollama_reuse import is_valid_keep_alive
+            if is_valid_keep_alive(_keep_alive):
+                cfg.ollama_keep_alive = str(_keep_alive)
+            else:
+                _log_config_warn(
+                    "config.classifier.ollama_keep_alive: expected str "
+                    "(e.g. '10m', '1h', '-1', '0') or int seconds "
+                    "(0, -1, or positive), got %r (type=%s) — silently "
+                    "ignored; the classifier keeps "
+                    "ollama_keep_alive=%r. Fix the YAML.",
+                    _keep_alive, type(_keep_alive).__name__,
+                    cfg.ollama_keep_alive,
+                )
     return cfg
 
 
@@ -1185,7 +1789,7 @@ def _parse_routes(raw: dict[str, Any]) -> dict[str, RouteConfig]:
 
 def _parse_escalation(raw: dict[str, Any]) -> EscalationConfig:
     return EscalationConfig(
-        enabled=raw.get("enabled", False),
+        enabled=_cfg_bool(raw, "enabled", default=False, section="escalation"),
         categories=raw.get("categories", ["to-respond", "action-required"]),
     )
 
@@ -1204,12 +1808,55 @@ def _parse_resolver_list(raw: Any, *, default: list[str]) -> list[str]:
 
 
 def _parse_webhooks(raw: list[dict[str, Any]]) -> list[WebhookTarget]:
-    targets = []
+    # Lazy import — the registry is inside src/email_triage/web/ and this
+    # module (``config.py``) is imported early during boot. Deferring
+    # avoids a circular import if ``web`` ever grows a top-level config
+    # dependency.
+    from email_triage.web._webhook_target_types import VALID_TARGET_TYPES
+    targets: list[WebhookTarget] = []
     for item in raw:
+        target_type = (item.get("target_type") or "custom").strip() or "custom"
+        if target_type not in VALID_TARGET_TYPES:
+            raise ConfigError(
+                f"Unknown webhook target_type={target_type!r} "
+                f"(valid: {sorted(VALID_TARGET_TYPES)})"
+            )
+        body_template = item.get("body_template")
+        if body_template is not None and not isinstance(body_template, str):
+            raise ConfigError(
+                "webhook body_template must be a string or omitted "
+                f"(got {type(body_template).__name__})"
+            )
+        # SME-panel 2026-07-15 DA finding — refuse ``{{secret}}`` in
+        # operator body_template. The header render context binds
+        # ``secret``, so a body template ``'{"x":"{{secret}}"}'`` would
+        # exfiltrate the HMAC signing key on every fire. Body render
+        # context is envelope-only (see web/_webhook_template.py) —
+        # this parse-time refusal is the belt to that scoping's
+        # suspenders (Prime Directive #8, fail-closed).
+        #
+        # 2026-07-15 task  SME-panel DA PD-5 fold — the whitespace-
+        # tolerant regex + operator-facing message now live at the ONE
+        # SSOT ``web/_webhook_template.refuses_secret_binding`` and this
+        # call-site delegates. Wizard-save (routers/integrations.py) and
+        # wizard-preview (same) also delegate — three sites, one contract.
+        from email_triage.web._webhook_template import refuses_secret_binding
+        _refusal = refuses_secret_binding(body_template)
+        if _refusal:
+            raise ConfigError(_refusal)
+        _acct = item.get("account_id")
+        if _acct is not None and not isinstance(_acct, str):
+            raise ConfigError(
+                "webhook account_id must be a string or omitted "
+                f"(got {type(_acct).__name__})"
+            )
         targets.append(WebhookTarget(
             url=item.get("url", ""),
             events=item.get("events", []),
             secret_key=item.get("secret_key", ""),
+            target_type=target_type,
+            body_template=body_template,
+            account_id=_acct or None,
         ))
     return targets
 
@@ -1220,6 +1867,92 @@ def _parse_webhooks(raw: list[dict[str, Any]]) -> list[WebhookTarget]:
 
 class ConfigError(Exception):
     """Raised when configuration is invalid or not found."""
+
+
+def _parse_encryption_enabled(value: Any) -> bool:
+    """Strict parse of ``persistence.encryption_enabled`` (punch 547).
+
+    Since punch 547 this field is the ONLY source of encryption intent (the
+    EMAIL_TRIAGE_DB_ENCRYPTION env override is gone), so it must not be
+    coerced: ``bool("false")`` is True, which silently turned a quoted
+    ``'false'`` into encryption ON. Strings route through the shared
+    ``_envbool.parse_bool_tristate`` (PD-5). ``None`` (an empty ``key:``) takes
+    the encrypted default. Anything unparseable REFUSES the config (fail
+    closed): a security knob is never guessed.
+    """
+    if value is None:
+        return PersistenceConfig.encryption_enabled
+    return _parse_config_bool(
+        value, key="persistence.encryption_enabled",
+        hint="Refusing to guess the encryption mode — fix the config file.",
+    )
+
+
+def _parse_config_bool(value: Any, *, key: str, hint: str = "") -> bool:
+    """THE strict YAML boolean parse for config settings (punch 598).
+
+    ``bool(x)`` and a raw ``.get`` both let a hand-edited quoted ``"false"``
+    through as True (any non-empty string is truthy): the webhook kill switch,
+    ``webhooks_allow_external`` and 23 other settings misread it that way. A
+    real bool passes; a string or int routes through the R17 SSOT
+    ``_envbool.parse_bool_tristate`` (``true/false/yes/no/on/off/1/0``, any
+    case). Everything else — null, ``""``, ``2``, ``1.0``, ``maybe`` — REFUSES
+    the config (fail closed): a security setting is never guessed.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is not None and not isinstance(value, float):
+        from email_triage._envbool import parse_bool_tristate
+        parsed = parse_bool_tristate(str(value))
+        if parsed is not None:
+            return parsed
+    raise ConfigError(
+        f"{key}: expected true / false (or yes/no, on/off, 1/0), got "
+        f"{value!r} (type={type(value).__name__}). "
+        + (hint or "Refusing to guess — fix the config file.")
+    )
+
+
+def _cfg_bool(
+    block: dict[str, Any], key: str, *, default: bool, section: str,
+    legacy_key: str | None = None,
+) -> bool:
+    """Read one boolean setting from a YAML block through :func:`_parse_config_bool`.
+
+    A MISSING key takes ``default``; a PRESENT key is parsed strictly, so an
+    explicit null (``key:`` with no value) refuses rather than reading as
+    falsy. ``legacy_key`` is consulted only when ``key`` is absent (the new
+    name wins when both are present).
+    """
+    for name in (key, legacy_key):
+        if name and name in block:
+            dotted = f"{section}.{name}" if section else name
+            return _parse_config_bool(block[name], key=dotted)
+    return default
+
+
+
+def _load_outbound_tls(block: dict[str, Any]) -> "OutboundTLSConfig":
+    """Parse ``outbound_tls`` without ever refusing: an unrecognised boolean
+    keeps the default with a warning; strings are stripped."""
+    from email_triage.tls import coerce_tristate
+
+    out = OutboundTLSConfig()
+    for key in ("cert_check", "cert_enforce", "ignore_env"):
+        if key in block:
+            val = coerce_tristate(block.get(key))
+            if val is None:
+                _log_config_warn(
+                    "config.outbound_tls.%s: unrecognised value %r; keeping %r",
+                    key, block.get(key), getattr(out, key),
+                )
+            else:
+                setattr(out, key, val)
+    for key in ("proxy_url", "no_proxy", "ca_bundle"):
+        val = block.get(key)
+        if val is not None:
+            setattr(out, key, str(val).strip())
+    return out
 
 
 _SEARCH_PATHS = [
@@ -1250,13 +1983,160 @@ def load_config(path: str | Path | None = None) -> TriageConfig:
                 break
 
     if resolved is None:
-        # No config file found — return defaults.
-        return TriageConfig()
+        # No config file found — return defaults. LOG THE MISS, LOUDLY.
+        #
+        # Silence here is what let a config-less container look identical to a
+        # configured one (N-459, 2026-08-18): the app came up, /health said
+        # db:ok, and only a line buried in the boot log distinguished a
+        # deliberate posture from an accident. A missing config is not a
+        # neutral event — it means EVERY security-relevant setting is whatever
+        # the dataclass literals say, so name that fact and name the lesson.
+        _defaults = TriageConfig()
+        # N-242 R24 SSOT: route through triage_logging.get_logger.
+        from email_triage.triage_logging import get_logger
+        get_logger("email_triage.config").warning(
+            "NO CONFIG FILE FOUND (searched: %s) — every setting is a built-in "
+            "default, not your configuration. Encryption-at-rest defaults to "
+            "%s. If you meant to run configured, the config is not where the "
+            "app is looking; if you meant plaintext, set "
+            "persistence.encryption_enabled=false EXPLICITLY so the intent is "
+            "recorded. LESSON (N-459): a config-less boot previously resolved "
+            "to PLAINTEXT and was indistinguishable from a configured install "
+            "— always check this line before trusting a posture.",
+            ", ".join(str(c) for c in _SEARCH_PATHS),
+            "ON" if _defaults.persistence.encryption_enabled else "OFF",
+        )
+        _wire_module_singletons(_defaults)
+        return _defaults
 
     with open(resolved) as f:
         raw = yaml.safe_load(f) or {}
 
-    return _parse_raw(raw)
+    cfg = _parse_raw(raw)
+    _wire_module_singletons(cfg)
+    return cfg
+
+
+def _log_singleton_wire_failure(name: str, exc: BaseException) -> None:
+    """DB-SME F3 / DA-F6 (2026-07-11) — surface a `_wire_module_singletons`
+    setter failure at DEBUG.
+
+    Pre-fix, 9 sites here did ``except Exception: pass`` — a silent-swallow
+    ratchet violation (309-baseline). If a setter is renamed / import-errors
+    the config tune silently reverts to default with zero signal. Emit at
+    DEBUG (boot-path pre-logging-attach can't do INFO cheaply) with the
+    setter name + exception type so grep can find the fault.
+    """
+    # N-242 R24 SSOT: route through triage_logging.get_logger (the
+    # HMAC-chain-safe SSOT); a raw `logging.getLogger` bypass would
+    # trip the TriageLogger SSOT ratchet (baseline 2).
+    from email_triage.triage_logging import get_logger
+    get_logger("email_triage.config._wire").debug(
+        "wire_singleton failed: %s (%s: %s)",
+        name, type(exc).__name__, exc,
+    )
+
+
+def _wire_module_singletons(cfg: TriageConfig) -> None:
+    """-b (2026-07-11) — propagate tunables from a materialized
+    ``TriageConfig`` into the module-level singletons that own them
+    (avoids threading ``cfg`` through every opener callsite).
+
+    Called at the end of ``load_config`` after successful parse. Also
+    fires on the defaults-only path (``load_config()`` with no yaml)
+    so tests that do not go through YAML still see the resolved values.
+    Lazy imports keep config.py free of hard boot-time deps.
+
+    DB-SME F3 / DA-F6 (2026-07-11): the ``except Exception:`` shape is
+    kept intentionally broad because a config-load path CANNOT throw
+    (it's a startup-cost floor). But every failure now emits at DEBUG
+    via :func:`_log_singleton_wire_failure` so a silent-drift can be
+    grep'd, and future setters that import-error (ImportError) or
+    signature-drift (AttributeError/TypeError) leave a trail. Ratchet
+    baseline stays at 309 rather than growing to 320.
+    """
+    # Operator certificate modes (2026-10-21): bind the live config so
+    # email_triage.tls reads outbound_tls / smtp cert settings per connection
+    # (the admin save edits this object in place). Cannot raise.
+    from email_triage.tls import bind_tls_config
+    bind_tls_config(cfg)
+    try:
+        from email_triage.db._engine import configure_sqlite_timeouts
+        configure_sqlite_timeouts(
+            busy_wait_secs=cfg.persistence.sqlite_busy_wait_secs,
+            probe_timeout_secs=cfg.persistence.sqlite_probe_timeout_secs,
+        )
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_sqlite_timeouts", _e)
+    try:
+        from email_triage.classify.hints import configure_hint_regex_timeout
+        configure_hint_regex_timeout(cfg.classifier.hint_regex_timeout_secs)
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_hint_regex_timeout", _e)
+    # -d — module-level HTTP-client timeouts.
+    try:
+        from email_triage.web.watch_runner import configure_webhook_timeout
+        configure_webhook_timeout(cfg.push.webhook_timeout_secs)
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_webhook_timeout", _e)
+    try:
+        from email_triage.web.gmail_push_auth import configure_gmail_cert_timeout
+        configure_gmail_cert_timeout(cfg.push.gmail_cert_timeout_secs)
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_gmail_cert_timeout", _e)
+    try:
+        from email_triage.web.acme_renewer import (
+            configure_acme_dns_query_timeout,
+        )
+        # DA-F1 (2026-07-11): pass BOTH the tcp UPDATE budget and the
+        # udp probe budget so all 15 acme dns.query.* sites read the
+        # config, not literals.
+        # the backlog  (2026-07-12): `acme` lives on TLSConfig, not
+        # TriageConfig — DA-F1 wire (2026-07-11) used the wrong path,
+        # and the AttributeError was silently swallowed by the wrapping
+        # try/except into a _log_singleton_wire_failure warning, leaving
+        # every acme dns.query.* site fall back to the module defaults
+        # instead of the operator's configured budgets.
+        configure_acme_dns_query_timeout(
+            cfg.tls.acme.dns_query_timeout_secs,
+            probe_timeout_secs=cfg.tls.acme.dns_probe_timeout_secs,
+        )
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_acme_dns_query_timeout", _e)
+    try:
+        from email_triage.providers.office365 import configure_o365_http_timeout
+        configure_o365_http_timeout(cfg.ingestion.office365_http_timeout_secs)
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_o365_http_timeout", _e)
+    try:
+        from email_triage.providers.imap import (
+            configure_idle_task_drain_timeout,
+            configure_imap_logout_timeout,
+        )
+        configure_idle_task_drain_timeout(
+            cfg.ingestion.idle_task_drain_timeout_secs,
+        )
+        # DA-F4 (2026-07-11): imap logout shutdown timeout — was
+        # hardcoded 2.0s at providers/imap.py:2200.
+        configure_imap_logout_timeout(
+            cfg.ingestion.imap_logout_timeout_secs,
+        )
+    except Exception as _e:
+        _log_singleton_wire_failure(
+            "configure_idle_task_drain_timeout+configure_imap_logout_timeout", _e,
+        )
+    try:
+        from email_triage.web.watcher import configure_watcher_shutdown_grace
+        configure_watcher_shutdown_grace(
+            cfg.ingestion.watcher_shutdown_grace_secs,
+        )
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_watcher_shutdown_grace", _e)
+    try:
+        from email_triage.embedding_bits import configure_st_probe_timeout
+        configure_st_probe_timeout(cfg.classifier.st_probe_timeout_secs)
+    except Exception as _e:
+        _log_singleton_wire_failure("configure_st_probe_timeout", _e)
 
 
 def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
@@ -1283,23 +2163,49 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         cfg.logging = LoggingConfig(
             level=lg.get("level", "INFO"),
             format=lg.get("format", "json"),
-            hipaa=lg.get("hipaa", False),
+            hipaa=_cfg_bool(lg, "hipaa", default=False, section="logging"),
             file=lg.get("file"),
             retention_days=int(lg.get("retention_days", 30)),
             max_rows=int(lg.get("max_rows", 50000)),
-            require_https_app_layer=bool(
-                lg.get("require_https_app_layer", False)
+            require_https_app_layer=_cfg_bool(
+                lg, "require_https_app_layer", default=False, section="logging",
             ),
             perimeter_tls_attestation=str(
                 lg.get("perimeter_tls_attestation", "none") or "none"
             ),
         )
     if "persistence" in raw:
+        _pers = raw["persistence"] or {}
         cfg.persistence = PersistenceConfig(
-            db_path=raw["persistence"].get("db_path", "./data/triage.db"),
-            encryption_enabled=bool(
-                raw["persistence"].get("encryption_enabled", False)
+            db_path=_pers.get("db_path", "./data/triage.db"),
+            encryption_enabled=_parse_encryption_enabled(
+                # Default from the dataclass, NOT a second literal — a
+                # `persistence:` block that omits the key must inherit the
+                # encrypted default, or the SSOT forks (PD #5).
+                _pers.get(
+                    "encryption_enabled",
+                    PersistenceConfig.encryption_enabled,
+                )
             ),
+            sqlite_busy_wait_secs=float(
+                _pers.get("sqlite_busy_wait_secs", 30.0)
+            ),
+            sqlite_probe_timeout_secs=float(
+                _pers.get("sqlite_probe_timeout_secs", 5.0)
+            ),
+        )
+    if "regulatory_clock" in raw:
+        _rc = raw["regulatory_clock"] or {}
+        cfg.regulatory_clock = RegulatoryClockConfig(
+            detection_enabled=_cfg_bool(
+                _rc, "detection_enabled", default=False, section="regulatory_clock",
+            ),
+            working_day_holidays=[
+                str(d) for d in (_rc.get("working_day_holidays") or [])
+            ],
+            working_week=[
+                int(d) for d in (_rc.get("working_week") or [0, 1, 2, 3, 4])
+            ],
         )
     if "tls" in raw:
         t = raw["tls"] or {}
@@ -1314,7 +2220,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             update_zone=str(rfc_raw.get("update_zone", "")),
             public_resolvers=_parse_resolver_list(
                 rfc_raw.get("public_resolvers"),
-                default=["8.8.8.8", "1.1.1.1", "9.9.9.9"],
+                default=list(DEFAULT_PUBLIC_RESOLVERS),
             ),
             public_propagation_timeout_secs=int(
                 rfc_raw.get("public_propagation_timeout_secs", 1800)
@@ -1326,16 +2232,35 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
                 rfc_raw.get("public_propagation_split_horizon_wait_secs", 600)
             ),
         )
+        http01_raw = (
+            acme_raw.get("http01") or {}
+        ) if isinstance(acme_raw, dict) else {}
+        http01 = Http01Config(
+            mode=str(http01_raw.get("mode", "standalone")),
+            bind_host=str(http01_raw.get("bind_host", "0.0.0.0")),
+            bind_port=int(http01_raw.get("bind_port", 80)),
+            webroot_path=str(http01_raw.get("webroot_path", "")),
+            self_check_timeout_secs=int(
+                http01_raw.get("self_check_timeout_secs", 10)
+            ),
+        )
         domains_raw = acme_raw.get("domains", []) if isinstance(acme_raw, dict) else []
         if isinstance(domains_raw, str):
             domains_raw = [d.strip() for d in domains_raw.split(",") if d.strip()]
         acme = AcmeConfig(
-            enabled=bool(acme_raw.get("enabled", False)) if isinstance(acme_raw, dict) else False,
+            enabled=_cfg_bool(
+                acme_raw, "enabled", default=False, section="tls.acme",
+            ) if isinstance(acme_raw, dict) else False,
             directory_url=str(acme_raw.get(
                 "directory_url",
                 "https://acme-v02.api.letsencrypt.org/directory",
             )) if isinstance(acme_raw, dict) else
                 "https://acme-v02.api.letsencrypt.org/directory",
+            staging_directory_url=str(acme_raw.get(
+                "staging_directory_url",
+                "https://acme-staging-v02.api.letsencrypt.org/directory",
+            )) if isinstance(acme_raw, dict) else
+                "https://acme-staging-v02.api.letsencrypt.org/directory",
             account_email=str(acme_raw.get("account_email", "")) if isinstance(acme_raw, dict) else "",
             domains=list(domains_raw),
             challenge=str(acme_raw.get("challenge", "dns-01")) if isinstance(acme_raw, dict) else "dns-01",
@@ -1343,6 +2268,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             check_interval_hours=int(acme_raw.get("check_interval_hours", 24)) if isinstance(acme_raw, dict) else 24,
             dns_provider=str(acme_raw.get("dns_provider", "rfc2136")) if isinstance(acme_raw, dict) else "rfc2136",
             rfc2136=rfc,
+            http01=http01,
             pre_validation_grace_secs=int(
                 acme_raw.get("pre_validation_grace_secs", 30)
             ) if isinstance(acme_raw, dict) else 30,
@@ -1355,10 +2281,87 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             validation_retry_backoff=str(
                 acme_raw.get("validation_retry_backoff", "exponential")
             ) if isinstance(acme_raw, dict) else "exponential",
-            caa_enforce=bool(
-                acme_raw.get("caa_enforce", False)
+            caa_enforce=_cfg_bool(
+                acme_raw, "caa_enforce", default=False, section="tls.acme",
             ) if isinstance(acme_raw, dict) else False,
+            dns_query_timeout_secs=float(
+                acme_raw.get("dns_query_timeout_secs", 10.0)
+            ) if isinstance(acme_raw, dict) else 10.0,
+            dns_probe_timeout_secs=float(
+                acme_raw.get("dns_probe_timeout_secs", 5.0)
+            ) if isinstance(acme_raw, dict) else 5.0,
         )
+        # Fail-fast: reject a challenge that is not implemented when ACME is
+        # enabled, so a misconfig surfaces HERE with a clear message instead of
+        # deep in the renewer's order loop. A disabled-ACME config with a stale
+        # challenge value is left alone (nothing runs).
+        _SUPPORTED_ACME_CHALLENGES = ("dns-01", "http-01")
+        if acme.enabled and acme.challenge not in _SUPPORTED_ACME_CHALLENGES:
+            raise ConfigError(
+                f"tls.acme.challenge={acme.challenge!r} is not supported — "
+                f"implemented challenges: {list(_SUPPORTED_ACME_CHALLENGES)}. "
+                f"Set tls.acme.challenge to one of those, or set "
+                f"tls.acme.enabled: false and use operator-managed/external TLS."
+            )
+        # HTTP-01 sub-config validation: when challenge=="http-01" AND
+        # ACME is enabled, the mode-specific required field must be set.
+        if acme.enabled and acme.challenge == "http-01":
+            if acme.http01.mode not in ("standalone", "webroot"):
+                raise ConfigError(
+                    f"tls.acme.http01.mode={acme.http01.mode!r} is not supported "
+                    f"— use 'standalone' (built-in :80 listener) or 'webroot' "
+                    f"(operator-supplied proxy serves from a shared directory)."
+                )
+            if acme.http01.mode == "webroot" and not acme.http01.webroot_path:
+                raise ConfigError(
+                    "tls.acme.http01.mode='webroot' requires "
+                    "tls.acme.http01.webroot_path to be set to the directory "
+                    "your reverse proxy serves /.well-known/acme-challenge/ from."
+                )
+            if acme.http01.mode == "webroot" and acme.http01.webroot_path:
+                # hipaa-sme NTH-1 fold — webroot_path collision guard. Reject
+                # a webroot_path that overlaps (equals or is-ancestor-of) the
+                # TLS cert_dir. If a proxy serves /.well-known/acme-challenge/
+                # from a dir that also contains cert material, a request for
+                # /.well-known/acme-challenge/server.key exfiltrates the key.
+                # Full attack chain in hipaa-sme audit 2026-07-17 Q3.
+                from pathlib import Path as _Path
+                try:
+                    _wr = _Path(acme.http01.webroot_path).resolve()
+                except OSError:
+                    _wr = _Path(acme.http01.webroot_path)
+                _sensitive = []
+                if t.get("cert_dir"):
+                    try:
+                        _sensitive.append(("tls.cert_dir", _Path(str(t["cert_dir"])).resolve()))
+                    except OSError:
+                        # PD#8 fail closed: an unresolvable cert_dir must still
+                        # take part in the overlap guard (as the webroot does
+                        # above), not silently drop out of it.
+                        _sensitive.append(("tls.cert_dir", _Path(str(t["cert_dir"]))))
+                # No try/except here: Path ``==`` and ``in .parents`` never
+                # raise (paths on different drives just compare unequal), so
+                # the old ``except ValueError`` was dead code.
+                for _label, _sd in _sensitive:
+                    if _wr == _sd or _sd in _wr.parents or _wr in _sd.parents:
+                        raise ConfigError(
+                            f"tls.acme.http01.webroot_path={acme.http01.webroot_path!r} "
+                            f"overlaps a sensitive directory ({_label}={_sd}). "
+                            f"webroot_path MUST be a dedicated directory — the "
+                            f"reverse proxy WILL serve any file under it via "
+                            f"/.well-known/acme-challenge/."
+                        )
+            if acme.http01.mode == "standalone":
+                if not acme.http01.bind_host:
+                    raise ConfigError(
+                        "tls.acme.http01.mode='standalone' requires "
+                        "tls.acme.http01.bind_host (e.g. '0.0.0.0')."
+                    )
+                if not (1 <= int(acme.http01.bind_port) <= 65535):
+                    raise ConfigError(
+                        f"tls.acme.http01.bind_port={acme.http01.bind_port!r} "
+                        f"is not a valid TCP port (1..65535)."
+                    )
         local_suffixes_raw = t.get("local_url_suffixes", []) or []
         local_suffixes = [
             str(s).strip() for s in local_suffixes_raw if str(s).strip()
@@ -1375,12 +2378,17 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         )
         cfg.tls = TLSConfig(
             cert_dir=str(t.get("cert_dir", "")),
-            enabled=bool(t.get("enabled", False)),
+            enabled=_cfg_bool(t, "enabled", default=False, section="tls"),
             acme=acme,
-            csrf_enforce=bool(t.get("csrf_enforce", True)),
+            csrf_enforce=_cfg_bool(t, "csrf_enforce", default=True, section="tls"),
             csrf_exempt_prefixes=csrf_exempt,
             local_url_suffixes=local_suffixes,
         )
+    # Operator certificate modes + egress env/proxy/CA settings (2026-10-21).
+    # Lenient on purpose: a malformed value logs and keeps the default, it never
+    # refuses the boot (feedback_setup_and_troubleshooting_modes_are_deliberate).
+    if isinstance(raw.get("outbound_tls"), dict):
+        cfg.outbound_tls = _load_outbound_tls(raw["outbound_tls"])
     if "smtp" in raw:
         sm = raw["smtp"]
         cfg.smtp = SmtpConfig(
@@ -1389,8 +2397,20 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             username=sm.get("username", ""),
             from_addr=sm.get("from_addr", ""),
             from_name=sm.get("from_name", ""),
-            use_tls=sm.get("use_tls", True),
+            use_tls=_cfg_bool(sm, "use_tls", default=True, section="smtp"),
+            # Punch 595 via the 598 strict funnel: missing -> False; a null or
+            # unrecognised value is refused at load, never read as True.
+            dev_console_otp=_cfg_bool(sm, "dev_console_otp", default=False, section="smtp"),
         )
+        from email_triage.tls import coerce_tristate as _tri_smtp
+        cfg.smtp.cert_check = _tri_smtp(sm.get("cert_check"))
+        cfg.smtp.cert_enforce = _tri_smtp(sm.get("cert_enforce"))
+        if cfg.smtp.dev_console_otp and cfg.logging.hipaa:
+            raise ConfigError(
+                "smtp.dev_console_otp is refused in HIPAA mode (logging.hipaa "
+                "is true): it prints login codes to the console. Configure "
+                "smtp.host so codes are emailed."
+            )
     if "push" in raw:
         p = raw["push"]
         cfg.push = PushConfig(
@@ -1399,15 +2419,70 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             gmail_topic_name=p.get("gmail_topic_name", ""),
             gmail_subscription_sa_email=p.get("gmail_subscription_sa_email", ""),
             gmail_audience=p.get("gmail_audience", ""),
-            openclaw_webhook_enabled=p.get("openclaw_webhook_enabled", True),
-            openclaw_rate_limit_per_minute=p.get("openclaw_rate_limit_per_minute", 60),
+            # Back-compat: prefer the neutral webhook_* keys; fall back to the
+            # legacy openclaw_* keys so pre-rename configs keep working.
+            # Punch 598: strict parse. The raw read left a quoted "false" as the
+            # truthy string 'false', so the global kill switch did not engage.
+            webhook_enabled=_cfg_bool(
+                p, "webhook_enabled", default=True, section="push",
+                legacy_key="openclaw_webhook_enabled",
+            ),
+            webhook_rate_limit_per_minute=p.get(
+                "webhook_rate_limit_per_minute",
+                p.get("openclaw_rate_limit_per_minute", 60)),
             bulk_max_batch_size=p.get("bulk_max_batch_size", 100),
             office365_subscription_renewal_window_hours=int(
                 p.get("office365_subscription_renewal_window_hours", 24)
             ),
+            webhook_timeout_secs=float(
+                p.get("webhook_timeout_secs", 10.0)
+            ),
+            gmail_cert_timeout_secs=float(
+                p.get("gmail_cert_timeout_secs", 10.0)
+            ),
+        )
+    if "backup" in raw:
+        b = raw["backup"]
+        cfg.backup = BackupConfig(
+            enabled=_cfg_bool(b, "enabled", default=False, section="backup"),
+            cadence=str(b.get("cadence", "manual")).lower(),
+            format=str(b.get("format", "etbk")).lower(),
+            retention=str(b.get("retention", "14")),
+            dir=str(b.get("dir", "")),
+            encryption=str(b.get("encryption", "master-key")).lower(),
+            public_key=str(b.get("public_key", "")),
         )
     if "webhooks" in raw:
         cfg.webhooks = _parse_webhooks(raw["webhooks"])
+    #  deny-by-default external-webhook guard. Presence of the key in
+    # YAML means the operator explicitly allowed external targets; absence
+    # keeps the safe deny default. Paired with the writer emit in
+    # ``_write_config_yaml_locked`` so the admin-form toggle persists across
+    # a restart instead of silently reverting to deny. #8-FULL, census 2026-06-10.
+    if "webhooks_allow_external" in raw:
+        cfg.webhooks_allow_external = _cfg_bool(
+            raw, "webhooks_allow_external", default=False, section="",
+        )
+
+    # N-355 R31 (2026-07-05 trust-repair fix-forward per PHASE2 tranche 
+    # DA + the backlog  = TASK ): the write side landed at
+    # `web/routers/ui/_shared.py:6220` under N-324 R30, but the load side
+    # in `_parse_raw` had NO handler for the `audit` block. Any config
+    # file with `audit.trusted_proxies: [...]` was silently DROPPED on
+    # load — restart reverted the list to empty, XFF audit-identity fell
+    # back to fail-CLOSED (peer_host) per N-337, and the operator's
+    # trusted-proxies claim vanished. Fixes the roundtrip: preserve the
+    # list-of-CIDR-strings shape defined by `AuditConfig`, coerce each
+    # entry to str for YAML resilience, and leave the empty-default
+    # posture intact when `audit` is missing from YAML.
+    if "audit" in raw:
+        a = raw["audit"] or {}
+        _tp = a.get("trusted_proxies", []) or []
+        if isinstance(_tp, str):
+            _tp = [_tp]
+        cfg.audit = AuditConfig(
+            trusted_proxies=[str(x) for x in _tp if x is not None],
+        )
 
     if "ingestion" in raw:
         i = raw["ingestion"] or {}
@@ -1418,6 +2493,18 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             default_poll_interval_minutes=default_iv,
             push_poll_interval_min=push_iv,
             poll_poll_interval_min=poll_iv,
+            idle_task_drain_timeout_secs=float(
+                i.get("idle_task_drain_timeout_secs", 10.0)
+            ),
+            office365_http_timeout_secs=float(
+                i.get("office365_http_timeout_secs", 30.0)
+            ),
+            watcher_shutdown_grace_secs=float(
+                i.get("watcher_shutdown_grace_secs", 3.0)
+            ),
+            imap_logout_timeout_secs=float(
+                i.get("imap_logout_timeout_secs", 2.0)
+            ),
         )
 
 
@@ -1428,20 +2515,20 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         if isinstance(recips, str):
             recips = [r.strip() for r in recips.split(",") if r.strip()]
         cfg.health_email = HealthEmailConfig(
-            enabled=bool(h.get("enabled", False)),
+            enabled=_cfg_bool(h, "enabled", default=False, section="health_email"),
             recipients=list(recips),
             send_at=str(h.get("send_at", "07:15")),
-            include_health=bool(h.get("include_health", True)),
-            include_watchers=bool(h.get("include_watchers", True)),
-            include_triage=bool(h.get("include_triage", True)),
-            include_errors=bool(h.get("include_errors", True)),
-            include_hipaa_events=bool(h.get("include_hipaa_events", True)),
-            include_api_key_events=bool(h.get("include_api_key_events", True)),
-            include_pubsub=bool(h.get("include_pubsub", True)),
-            include_update_available=bool(
-                h.get("include_update_available", True),
+            include_health=_cfg_bool(h, "include_health", default=True, section="health_email"),
+            include_watchers=_cfg_bool(h, "include_watchers", default=True, section="health_email"),
+            include_triage=_cfg_bool(h, "include_triage", default=True, section="health_email"),
+            include_errors=_cfg_bool(h, "include_errors", default=True, section="health_email"),
+            include_hipaa_events=_cfg_bool(h, "include_hipaa_events", default=True, section="health_email"),
+            include_api_key_events=_cfg_bool(h, "include_api_key_events", default=True, section="health_email"),
+            include_pubsub=_cfg_bool(h, "include_pubsub", default=True, section="health_email"),
+            include_update_available=_cfg_bool(
+                h, "include_update_available", default=True, section="health_email",
             ),
-            quiet_mode=bool(h.get("quiet_mode", False)),
+            quiet_mode=_cfg_bool(h, "quiet_mode", default=False, section="health_email"),
             error_rate_threshold_pct=int(h.get("error_rate_threshold_pct", 0)),
         )
 
@@ -1457,13 +2544,21 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             a_recips = [r.strip() for r in a_recips.split(",") if r.strip()]
         cfg.admin_email = AdminEmailConfig(
             recipients=list(a_recips),
-            release_check_url=str(
-                a.get(
-                    "release_check_url",
-                    AdminEmailConfig().release_check_url,
-                ) or AdminEmailConfig().release_check_url,
-            ),
+            # Punch 553: blank means OFF. The old ``get(k, d) or d`` fell
+            # back to GitHub on a blank value, so the check had no off-switch.
+            release_check_url=parse_release_check_url(a),
         )
+
+    # CR-2c deprecation — graceful in-memory migration. If the YAML still carries
+    # the legacy ``health_email.recipients`` and ``admin_email.recipients`` is
+    # empty, promote the legacy list to the canonical field at LOAD. Then
+    # ``daily_health.resolve_admin_recipients`` reads the (now-populated)
+    # canonical field and the once-per-process deprecation WARNING no longer
+    # fires, while the operator's configured recipients are still honoured. The
+    # YAML is rewritten cleanly (admin_email written, legacy cleared) on the next
+    # admin Save. Operator 2026-06-18: "fix the health_email.recipients deprecation."
+    if cfg.health_email.recipients and not cfg.admin_email.recipients:
+        cfg.admin_email.recipients = list(cfg.health_email.recipients)
 
     if "summary_email" in raw:
         s = raw["summary_email"] or {}
@@ -1476,21 +2571,17 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
 
     if "embedding" in raw:
         e = raw["embedding"] or {}
-        fb_raw = e.get("fallback") or {}
-        fb = EmbeddingFallbackConfig(
-            backend=str(
-                fb_raw.get("backend", "") or "",
-            ).strip().lower(),
-            model_name=str(fb_raw.get("model_name", "") or "").strip(),
-            ollama_url=str(fb_raw.get("ollama_url", "") or "").strip(),
-        )
+        _warn_embedding_fallback_ignored(e)
         cfg.embedding = EmbeddingConfig(
             backend=str(e.get("backend", "") or "").strip().lower(),
             model_name=str(e.get("model_name", "") or "").strip(),
             ollama_url=str(
                 e.get("ollama_url", "") or "http://localhost:11434"
             ),
-            fallback=fb,
+            auto_update=_cfg_bool(
+                e, "auto_update", default=EmbeddingConfig.auto_update,
+                section="embedding",
+            ),
         )
 
     #  — optional Redis-backed classification cache.
@@ -1504,21 +2595,22 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         from email_triage.cache.classification import clamp_ttl_secs
         # New 2026-05-13 cache tuning knobs. Defaults sane; YAML
         # round-trips when operator changes them via /config?tab=ai_backends.
-        raw_cap = rc.get("inner_cap_per_sender", 128)
-        try:
-            cap_int = max(1, min(10000, int(raw_cap)))
-        except (TypeError, ValueError):
-            cap_int = 128
+        # N-219c/34 R23: bounded_int SSOT — lo/hi params replace the
+        # max(lo, min(hi, ...)) clamp; default returned on non-numeric.
+        cap_int = bounded_int(
+            rc.get("inner_cap_per_sender", 128),
+            default=128, lo=1, hi=10000,
+        )
         raw_strategy = str(
             rc.get("hint_strategy", "top_k_with_freq") or "top_k_with_freq",
         ).strip().lower()
         if raw_strategy not in ("top_k_with_freq", "top_1_dominant"):
             raw_strategy = "top_k_with_freq"
-        raw_thresh = rc.get("dominant_threshold_pct", 70)
-        try:
-            thresh_int = max(50, min(100, int(raw_thresh)))
-        except (TypeError, ValueError):
-            thresh_int = 70
+        # N-219c/34 R23: bounded_int SSOT — same shape as cap_int above.
+        thresh_int = bounded_int(
+            rc.get("dominant_threshold_pct", 70),
+            default=70, lo=50, hi=100,
+        )
         cfg.redis_cache = RedisCacheConfig(
             url=str(rc.get("url", "") or "").strip(),
             ttl_secs=clamp_ttl_secs(rc.get("ttl_secs")),
@@ -1537,15 +2629,16 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
         for item in raw_windows:
             if not isinstance(item, dict):
                 continue
-            try:
-                w = LLMMaintenanceWindow(
-                    host=str(item.get("host", "") or "").strip(),
-                    cron=str(item.get("cron", "") or "").strip(),
-                    duration_minutes=int(item.get("duration_minutes", 0) or 0),
-                    backend=str(item.get("backend", "") or "").strip(),
-                )
-            except (TypeError, ValueError):
-                continue
+            # N-219c/22 R23: extract int() coerce to SSOT; str() ops can't
+            # raise TypeError/ValueError for the paths above, so the try
+            # was only guarding the int() call.
+            _dm = bounded_int(item.get("duration_minutes", 0) or 0, default=0)
+            w = LLMMaintenanceWindow(
+                host=str(item.get("host", "") or "").strip(),
+                cron=str(item.get("cron", "") or "").strip(),
+                duration_minutes=_dm,
+                backend=str(item.get("backend", "") or "").strip(),
+            )
             if w.cron and w.backend and w.duration_minutes > 0:
                 out.append(w)
         cfg.llm_maintenance_windows = out
@@ -1556,7 +2649,7 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
     # exists — auth shortcuts now live in /admin/dev-keys (per-user
     # keypair, TTL-bound, audit-logged) or /profile/hardware-keys
     # (WebAuthn); DEBUG logging is set via standard Python log config
-    # or LOG_LEVEL.
+    # or the /admin runtime settings.
     if "_dev" in raw:
         raise ConfigError(
             "dev-mode was removed in v0.x; auth shortcuts are "
@@ -1572,8 +2665,9 @@ def _parse_raw(raw: dict[str, Any]) -> TriageConfig:
             rp_id=str(w.get("rp_id", "")),
             rp_name=str(w.get("rp_name", "Email Triage")),
             origin=str(w.get("origin", "")),
-            require_user_verification_for_admin=bool(
-                w.get("require_user_verification_for_admin", False)
+            require_user_verification_for_admin=_cfg_bool(
+                w, "require_user_verification_for_admin", default=False,
+                section="webauthn",
             ),
         )
 
@@ -1641,7 +2735,35 @@ def validate_config(config: TriageConfig) -> list[str]:
                 f"Route '{cat}' does not match any defined category."
             )
 
+    issues.extend(_acme_doh_preflight_issues(config))
+
     return issues
+
+
+def _acme_doh_preflight_issues(config: TriageConfig) -> list[str]:
+    """Punch 589: name the CNAME-delegation config whose DoH pre-flight cannot run.
+
+    An IP missing from :data:`DOH_JSON_ENDPOINTS` is not an error by itself: the
+    UDP:53 checks use it. It only matters when CNAME delegation is configured
+    (the pre-flight runs only then) and NO listed resolver has a JSON endpoint,
+    so the pre-flight is skipped every time. Advisory, not a load-time refusal:
+    a refusal of 9.9.9.9 would fail prod's boot over a check that is a fail-fast
+    convenience (Let's Encrypt still validates the record).
+    """
+    acme = config.tls.acme
+    rfc = acme.rfc2136
+    if not (acme.enabled and acme.challenge == "dns-01" and rfc.update_zone.strip()):
+        return []
+    resolvers = [r.strip() for r in rfc.public_resolvers if r.strip()]
+    if any(r in DOH_JSON_ENDPOINTS for r in resolvers):
+        return []
+    return [
+        "tls.acme.rfc2136.public_resolvers "
+        f"{resolvers} has no resolver with a DNS-over-HTTPS JSON endpoint, so "
+        "the CNAME pre-flight for update_zone "
+        f"{rfc.update_zone!r} is skipped on every renewal. Add one of "
+        f"{sorted(DOH_JSON_ENDPOINTS)}."
+    ]
 
 
 def get_max_mailboxes_per_account(config: TriageConfig) -> int:
@@ -1650,13 +2772,14 @@ def get_max_mailboxes_per_account(config: TriageConfig) -> int:
     Kept as a plain dict lookup (not a dataclass field) to avoid breaking
     any caller that pokes ``config.provider.imap[...]`` directly.
     """
-    try:
-        raw = int(config.provider.imap.get(
+    # N-219c/21 R23: SSOT — bounded_int with default fallback; bound
+    # defensively: 1 <= cap <= 20 (below 1 is pointless; above 20 exceeds
+    # every commercial IMAP server's per-user connection limit).
+    raw = bounded_int(
+        config.provider.imap.get(
             "max_mailboxes_per_account",
             DEFAULT_MAX_MAILBOXES_PER_ACCOUNT,
-        ))
-    except (TypeError, ValueError):
-        return DEFAULT_MAX_MAILBOXES_PER_ACCOUNT
-    # Bound defensively: 1 <= cap <= 20. Below 1 is pointless; above 20
-    # exceeds every commercial IMAP server's per-user connection limit.
-    return max(1, min(raw, 20))
+        ),
+        default=DEFAULT_MAX_MAILBOXES_PER_ACCOUNT, lo=1, hi=20,
+    )
+    return raw

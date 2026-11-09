@@ -83,7 +83,8 @@ class TestDbSecrets:
     @pytest.fixture
     def db(self):
         from email_triage.web.db import init_db
-        return init_db(":memory:")
+        from _db_tracking import track
+        return track(init_db(":memory:"))
 
     @pytest.fixture
     def master_key(self):
@@ -295,7 +296,7 @@ class TestDbSecrets:
         assert begin_idx < select_idx, (
             f"BEGIN must precede SELECT (begin={begin_idx}, "
             f"select={select_idx}); SELECT-before-BEGIN reintroduces "
-            f"the .3 TOCTOU window"
+            f"the #145.3 TOCTOU window"
         )
         # And the BEGIN must be IMMEDIATE (RESERVED lock) — a plain
         # BEGIN is DEFERRED, which gives no protection against
@@ -323,14 +324,15 @@ class TestDbSecrets:
         import threading
         from email_triage.secrets import DbSecrets
         from email_triage.web.db import init_db
+        from _db_tracking import track
 
         db_path = tmp_path / "rotate-lock.db"
-        init_db(str(db_path))
+        track(init_db(str(db_path)))
 
         def _open() -> sqlite3.Connection:
-            c = sqlite3.connect(
+            c = track(sqlite3.connect(
                 str(db_path), check_same_thread=False, timeout=10.0,
-            )
+            ))
             c.row_factory = sqlite3.Row
             return c
 
@@ -418,7 +420,8 @@ class TestDbSecretsWriteLock:
     @pytest.fixture
     def db(self):
         from email_triage.web.db import init_db
-        return init_db(":memory:")
+        from _db_tracking import track
+        return track(init_db(":memory:"))
 
     @pytest.fixture
     def master_key(self):
@@ -602,10 +605,10 @@ class TestExternalProviderRegistry:
         register_external_provider("fake_vault", FakeVault)
         provider = create_secrets_provider(
             "external:fake_vault",
-            external_config={"url": "http://vault", "token": "abc"},
+            external_config={"url": "http://vault.invalid", "token": "abc"},
         )
         assert isinstance(provider, FakeVault)
-        assert provider._url == "http://vault"
+        assert provider._url == "http://vault.invalid"
         assert provider._token == "abc"
 
     def test_unregistered_external_raises(self):
@@ -680,36 +683,34 @@ class TestH07EnvBackendDeprecation:
             "selection time; caplog records: "
             f"{[r.getMessage() for r in caplog.records]}"
         )
-        # The warning should name the carve-out env var so the operator
-        # knows how to suppress (or, in v0.2.0, how to opt in).
+        # Punch 547: the warning no longer offers an env var that silences
+        # it (the EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY carve-out was removed).
         msg_text = " ".join(r.getMessage() for r in deprecation_msgs)
-        assert "EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY" in msg_text
+        assert "EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY" not in msg_text
 
-    def test_warning_suppressed_when_carve_out_env_var_set(
+    def test_retired_carve_out_env_var_no_longer_suppresses(
         self, monkeypatch, caplog,
     ):
-        """Setting EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1 suppresses the
-        deprecation warning — the documented dev/CI opt-in."""
+        """Punch 547: EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1 used to silence the
+        H-07 warning — an env var switching off a control's signal. It is
+        ignored now (and refused at process start)."""
         import logging
         import email_triage.triage_logging as _tl
+        from email_triage import secrets as _secrets
         from email_triage.secrets import create_secrets_provider, EnvSecrets
 
         monkeypatch.setattr(_tl, "_hipaa_mode", False)
+        monkeypatch.setattr(_secrets, "_env_backend_selection_warned", False)
         monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", "1")
 
         with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
             provider = create_secrets_provider("env")
 
         assert isinstance(provider, EnvSecrets)
-        deprecation_msgs = [
-            r for r in caplog.records
-            if "H-07" in r.getMessage()
-            or "DEPRECATED" in r.getMessage()
-        ]
-        assert not deprecation_msgs, (
-            "carve-out env var set; deprecation warning should be "
-            f"silent but got: {[r.getMessage() for r in deprecation_msgs]}"
-        )
+        assert any(
+            "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
+            for r in caplog.records
+        ), "the retired carve-out var must no longer silence the warning"
 
     def test_warning_suppressed_in_hipaa_mode(self, monkeypatch, caplog):
         """In HIPAA mode the G1' RuntimeError handles env-backend
@@ -824,27 +825,6 @@ class TestH07EnvBackendDeprecation:
             f"{second_count}"
         )
 
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "True", "yes", "Yes", "YES"])
-    def test_carve_out_var_truthy_values(self, monkeypatch, caplog, value):
-        """Carve-out env var truthy values (case-insensitive) suppress."""
-        import logging
-        import email_triage.triage_logging as _tl
-        from email_triage.secrets import create_secrets_provider
-
-        monkeypatch.setattr(_tl, "_hipaa_mode", False)
-        monkeypatch.setenv("EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY", value)
-
-        with caplog.at_level(logging.WARNING, logger="email_triage.secrets"):
-            create_secrets_provider("env")
-
-        deprecation_msgs = [
-            r for r in caplog.records
-            if "H-07" in r.getMessage() or "DEPRECATED" in r.getMessage()
-        ]
-        assert not deprecation_msgs, (
-            f"truthy carve-out value {value!r} should suppress the "
-            f"warning; got: {[r.getMessage() for r in deprecation_msgs]}"
-        )
 
     @pytest.mark.parametrize(
         "value", ["", "0", "false", "FALSE", "no", "NO", "off", "garbage", "  "],

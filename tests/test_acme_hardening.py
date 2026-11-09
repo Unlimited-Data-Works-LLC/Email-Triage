@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _db_tracking import track
 from email_triage import single_flight as sf
 from email_triage.config import AcmeConfig, Rfc2136Config
 from email_triage.single_flight import SingleFlightBusy
@@ -498,7 +499,7 @@ def _make_renewer(domains: list[str] | None = None) -> AcmeRenewer:
     secrets = MagicMock()
     secrets.get.return_value = None
     secrets.set.return_value = None
-    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db = track(sqlite3.connect(":memory:", check_same_thread=False))
     return AcmeRenewer(
         cfg=cfg, cert_dir="/tmp/test-acme",
         secrets_store=secrets, db=db,
@@ -528,11 +529,11 @@ async def test_issue_now_async_serialises_concurrent_calls(fresh_lock_dict):
 
     with patch.object(AcmeRenewer, "issue_now", side_effect=slow_issue):
         first = asyncio.create_task(
-            renewer.issue_now_async(directory_url="https://example/dir"),
+            renewer.issue_now_async(directory_url="https://example.invalid/dir"),
         )
         await holder_started.wait()
         with pytest.raises(SingleFlightBusy):
-            await renewer.issue_now_async(directory_url="https://example/dir")
+            await renewer.issue_now_async(directory_url="https://example.invalid/dir")
         holder_release.set()
         result = await first
         assert result == {"present": True}
@@ -549,8 +550,8 @@ async def test_issue_now_async_different_domains_do_not_block(fresh_lock_dict):
 
     with patch.object(AcmeRenewer, "issue_now", side_effect=quick_issue):
         results = await asyncio.gather(
-            a.issue_now_async(directory_url="https://example/dir"),
-            b.issue_now_async(directory_url="https://example/dir"),
+            a.issue_now_async(directory_url="https://example.invalid/dir"),
+            b.issue_now_async(directory_url="https://example.invalid/dir"),
         )
     assert all(r == {"domain": "ok"} for r in results)
 

@@ -23,7 +23,10 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from email_triage._isotime import parse_iso
+import html
+from email_triage.web.error_html import error_article, error_chip
+
+from email_triage._isotime import parse_iso_aware, to_utc_iso
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
 from email_triage.web import settings_keys as _S
@@ -40,6 +43,7 @@ from email_triage.web.auth import (
 )
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import (
+    is_admin as _is_admin,  # N-222h R22 SSOT alias (local `is_admin` shadows callable)
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
@@ -57,25 +61,6 @@ _log = get_logger("web.ui.oauth")
 router = APIRouter()
 
 
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-
 from . import _shared
 # Snapshot every helper from _shared into this module's globals so
 # handler bare-name references resolve. globals().update is used
@@ -86,13 +71,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -148,7 +152,7 @@ async def gmail_api_auth_start(
     return HTMLResponse(
         f'<article style="border-left:3px solid var(--pico-color-amber-500);padding:0.75rem 1rem;">'
         f'<p><strong>Step 1.</strong> Click below to authorize in Google.</p>'
-        f'<p><a href="{url}" target="_blank" role="button">Open Google sign-in</a></p>'
+        f'<p><a href="{html.escape(url, quote=True)}" target="_blank" role="button">Open Google sign-in</a></p>'
         f'<p><strong>Step 2.</strong> After approving, Google redirects back here automatically. '
         f'Refresh the Accounts page to see the new ✓ Authenticated chip.</p>'
         f'</article>'
@@ -202,11 +206,11 @@ async def gmail_api_auth_start_manual(
         f'<p><strong>Step 1.</strong> Open this URL in a browser and approve:</p>'
         f'<p style="font-family:var(--pico-font-family-monospace);font-size:0.8rem;'
         f' word-break:break-all;background:var(--pico-card-background-color);padding:0.5rem;">'
-        f'<a href="{url}" target="_blank">{url}</a></p>'
+        f'<a href="{html.escape(url, quote=True)}" target="_blank">{html.escape(url)}</a></p>'
         f'<p><strong>Step 2.</strong> Your browser will fail to load <code>http://127.0.0.1:1/...</code> '
         f'— that is expected. Copy the URL from the address bar (or just the <code>code</code> value) '
         f'and paste it below.</p>'
-        f'<form hx-post="/accounts/{account_id}/gmail-api/auth/complete-manual"'
+        f'<form hx-post="/accounts/{html.escape(str(account_id))}/gmail-api/auth/complete-manual"'
         f' hx-target="#gmail-api-auth-panel" hx-swap="innerHTML">'
         f'<label>Pasted redirect URL or code'
         f'<input type="text" name="pasted" required placeholder="http://127.0.0.1:1/?code=..." autocomplete="off">'
@@ -255,7 +259,7 @@ async def gmail_api_auth_complete_manual(
         )
     except GmailAuthError as e:
         return HTMLResponse(
-            f'<small style="color:var(--pico-del-color);">Auth failed: {e}</small>'
+            error_chip(e, prefix='Auth failed: ')
         )
 
     refresh_token = token_payload.get("refresh_token", "")
@@ -273,6 +277,24 @@ async def gmail_api_auth_complete_manual(
         sk = _secret_key_for_account(account_id, "gmail_api")
         if sk:
             secrets.set(sk, refresh_token)
+            # N-271 R28: fresh OAuth credentials just landed →
+            # invalidate the provider-labels cache so the picker
+            # doesn't serve labels derived under the OLD (revoked or
+            # rotated) credentials for up to 5 min.
+            try:
+                from email_triage.providers.provider_labels import (
+                    invalidate_cache_for_account,
+                )
+                invalidate_cache_for_account(int(account_id))
+            except Exception as _n271_e:  # N-294 R30 (HIPAA-SME follow-up)
+                # Best-effort still, but the failure is now observable —
+                # a broken invalidator SSOT (e.g. new required arg) previously
+                # silently deleted the invalidation across all 4 sites.
+                from email_triage.triage_logging import get_logger as _gl
+                _gl(__name__).debug(
+                    "provider_labels invalidate best-effort failed",
+                    extra={"error": type(_n271_e).__name__, "account_id": account_id},
+                )
 
         # Sync calendar_enabled with the account's current opt-in,
         # since the scopes we just asked Google for were derived from
@@ -305,7 +327,7 @@ async def gmail_api_auth_complete_manual(
     # confirmation underneath the auth controls. Operator sees both
     # at once without a page reload.
     return HTMLResponse(
-        f'<div id="auth-stale-banner-{account_id}" hx-swap-oob="true">'
+        f'<div id="auth-stale-banner-{html.escape(str(account_id), quote=True)}" hx-swap-oob="true">'
         f'<article style="border-left:3px solid var(--pico-ins-color);'
         f'background:var(--pico-card-background-color, transparent);'
         f'padding:0.6rem 0.9rem;margin:0 0 0.75rem 0;">'
@@ -351,7 +373,7 @@ async def oauth_google_callback(request: Request):
         return HTMLResponse(
             f'<article style="max-width:40rem;margin:2rem auto;padding:1rem;'
             f'border-left:3px solid var(--pico-del-color);">'
-            f'<strong>Google returned an error:</strong> {error}'
+            f'<strong>Google returned an error:</strong> {html.escape(error)}'
             f'<p><a href="/accounts">Back to accounts</a></p>'
             f'</article>',
             status_code=400,
@@ -370,6 +392,11 @@ async def oauth_google_callback(request: Request):
     if not isinstance(payload, dict):
         return HTMLResponse("Invalid state shape.", status_code=400)
 
+    # NOTE: ``payload`` is the itsdangerous-signed STATE TOKEN we
+    # issued (verified above via ``serializer.loads`` — a tampered ``acct`` fails the
+    # signature and never reaches here), NOT inbound request input. So this is OUT of
+    # the request-int-parse class (test_safe_int_request_parse_pin) and stays a bare
+    # ``int()`` — a signed value we control, effectively safe.
     account_id = int(payload.get("acct", 0))
     # B2: state flag carries whether calendar scope was in the request.
     # Older states (pre-B2) used a ``purpose`` string — fall back to
@@ -380,7 +407,7 @@ async def oauth_google_callback(request: Request):
 
     db = get_db(request)
     secrets = get_secrets(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
     from email_triage.web.db import (
         get_email_account, set_bool_setting, set_setting,
     )
@@ -419,14 +446,13 @@ async def oauth_google_callback(request: Request):
             client_secret=client_secret,
         )
     except GmailAuthError as e:
-        return HTMLResponse(
-            f'<article style="max-width:40rem;margin:2rem auto;padding:1rem;'
-            f'border-left:3px solid var(--pico-del-color);">'
-            f'<strong>Token exchange failed:</strong> {e}'
-            f'<p><a href="/accounts">Back to accounts</a></p>'
-            f'</article>',
-            status_code=400,
-        )
+        # N-179 R21_2 (2026-07-02): route via error_article SSOT
+        # (auto-scrubs Exception via scrub_exc + html-escapes). The
+        # "Back to accounts" link is a fixed pico-styled call-to-action
+        # — kept out of the SSOT (which is generic) and appended here.
+        body = error_article(e, heading="Token exchange failed", purpose="provider")
+        body += '<p><a href="/accounts">Back to accounts</a></p>'
+        return HTMLResponse(body, status_code=400)
     refresh_token = token_payload.get("refresh_token", "")
     if not refresh_token:
         return HTMLResponse(
@@ -448,6 +474,23 @@ async def oauth_google_callback(request: Request):
         sk = _secret_key_for_account(account_id, "gmail_api")
         if sk:
             secrets.set(sk, refresh_token)
+            # N-271 R28: fresh OAuth credentials just landed →
+            # invalidate the provider-labels cache. Sibling of the
+            # manual-code completion above.
+            try:
+                from email_triage.providers.provider_labels import (
+                    invalidate_cache_for_account,
+                )
+                invalidate_cache_for_account(int(account_id))
+            except Exception as _n271_e:  # N-294 R30 (HIPAA-SME follow-up)
+                # Best-effort still, but the failure is now observable —
+                # a broken invalidator SSOT (e.g. new required arg) previously
+                # silently deleted the invalidation across all 4 sites.
+                from email_triage.triage_logging import get_logger as _gl
+                _gl(__name__).debug(
+                    "provider_labels invalidate best-effort failed",
+                    extra={"error": type(_n271_e).__name__, "account_id": account_id},
+                )
 
         # Stamp the OAuth flow type. This handler is the Web-app /
         # Primary -- push-enabled callback; tokens unlock Start Push.
@@ -487,17 +530,10 @@ async def oauth_google_callback(request: Request):
         # Don't double-fire if a real (non-poll-mode) watch already
         # exists with a future expires_at.
         from email_triage.web.db import get_gmail_watch
+        from email_triage.web.gmail_watch_status import is_gmail_watch_live
         existing_watch = await db_call(get_gmail_watch, db, account_id)
-        watch_already_live = False
-        if existing_watch:
-            topic = (existing_watch.get("topic_name") or "").strip()
-            if topic:
-                exp = parse_iso(existing_watch.get("expires_at", ""))
-                if exp is not None:
-                    if exp.tzinfo is None:
-                        exp = exp.replace(tzinfo=timezone.utc)
-                    if exp > datetime.now(timezone.utc):
-                        watch_already_live = True
+        # N-263d R28 SSOT — topic-non-empty + future-expiry predicate.
+        watch_already_live = is_gmail_watch_live(existing_watch)
         if (
             push_topic and push_enabled
             and not watch_already_live
@@ -511,14 +547,18 @@ async def oauth_google_callback(request: Request):
                 try:
                     data = await provider.register_watch(push_topic)
                     from datetime import timedelta
-                    exp_ms = int(data.get("expiration", 0))
+                    # /run18 : ``data`` is the Gmail register_watch API
+                    # RESPONSE — a malformed ``expiration`` must not raise an
+                    # uncaught ValueError → 500 (external-API robustness). Coerce
+                    # via the _safe_int SSOT, not a bare int().
+                    exp_ms = _shared._safe_int(data.get("expiration"), 0)
                     now_iso = datetime.now(timezone.utc)
                     exp_iso = (
-                        datetime.fromtimestamp(
+                        to_utc_iso(datetime.fromtimestamp(
                             exp_ms / 1000, tz=timezone.utc,
-                        ).isoformat()
+                        ))
                         if exp_ms
-                        else (now_iso + timedelta(days=7)).isoformat()
+                        else to_utc_iso(now_iso + timedelta(days=7))
                     )
                     history_id = str(data.get("historyId") or "")
                     cfg_email = (
@@ -555,24 +595,56 @@ async def oauth_google_callback(request: Request):
                 finally:
                     try:
                         await provider.close()
-                    except Exception:
-                        pass
+                    except Exception as _swallow_exc:
+                        _log.debug(
+                            "provider/probe close failed (best-effort teardown)",
+                            error=fmt_exc(_swallow_exc),
+                        )
     except Exception as exc:
         auto_watch_error = (
             f"Auth complete; watch start failed: {fmt_exc(exc)}. "
             "Click Start watch on the account page to retry."
         )
+        # Census run23 #1 — before this the OAuth-callback auto-start-watch
+        # failure was DOUBLY narrow: neither the auth_stale sibling
+        # (record_provider_outcome) nor the lifecycle SSOT SET half
+        # (record_gmail_watch_outcome) fired, so /health saw a green watch
+        # while the callback banner showed the only surface for the failure.
+        # Wire both so a failed auto-start is visible in the same places as
+        # every other push-consumer / manual-restart failure branch.
+        try:
+            from email_triage.web.app import record_provider_outcome
+            await db_call(record_provider_outcome, db, acct, exc)
+        except Exception as _swallow_exc:
+            _log.error(
+                "oauth callback: record_provider_outcome failed; auth_stale state may be missing",
+                exc_info=_swallow_exc,
+            )
+        try:
+            from email_triage.web.db import record_gmail_watch_outcome
+            await db_call(
+                record_gmail_watch_outcome, db,
+                account_id=account_id, error_text=fmt_exc(exc),
+            )
+        except Exception as watch_exc:
+            _log.error(
+                "gmail_watches errored-status write failed on OAuth auto-watch",
+                account_id=account_id, exc_info=watch_exc,
+            )
 
     auto_banner = ""
     if auto_watch_msg:
+        # auto_watch_msg is a server-constructed string literal — no escape needed.
         auto_banner = (
             '<p style="margin-top:0.5rem;color:var(--pico-ins-color);">'
             f'&#10003; {auto_watch_msg}</p>'
         )
     elif auto_watch_error:
+        # N-83: auto_watch_error may contain fmt_exc(exc) — escape before HTML
+        # interpolation to prevent reflected-XSS from provider/exception text.
         auto_banner = (
             '<p style="margin-top:0.5rem;color:var(--pico-del-color);">'
-            f'&#9888; {auto_watch_error}</p>'
+            f'&#9888; {html.escape(auto_watch_error)}</p>'
         )
 
     return HTMLResponse(

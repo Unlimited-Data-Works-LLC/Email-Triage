@@ -15,7 +15,9 @@ from typing import Any
 
 import httpx
 
-from email_triage._isotime import parse_iso
+from email_triage._egress import Intent, egress_async_client
+from email_triage._isotime import parse_iso, to_utc_iso_z, to_utc_iso_no_suffix
+from email_triage.engine.ics import attendee_mailboxes, native_attendees_safe  # punch 823
 from email_triage.engine.models import CalendarEvent
 from email_triage.providers.calendar_base import (
     CalendarProvider,
@@ -27,7 +29,31 @@ from email_triage.providers.office365 import (
     Office365Provider,
 )
 
-logger = logging.getLogger("email_triage.providers.office365_calendar")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.providers.office365_calendar")  # N-196b R21_4
+
+
+def _iana_tz_name(dt: datetime) -> str | None:
+    """N-289 R30 — best-effort IANA timezone name for an aware datetime.
+
+    MS Graph accepts IANA names (`America/New_York`) or Windows names
+    (`Eastern Standard Time`) for the `timeZone` field. Returns the
+    tzinfo's key attribute (Python 3.9+ ZoneInfo carries `.key`), or
+    the UTC offset abbreviation as a fallback. Returns None if dt is
+    naive (caller must fall back to UTC).
+    """
+    if dt.tzinfo is None:
+        return None
+    # ZoneInfo carries `.key`; pytz carries `.zone`; datetime.timezone
+    # returns an offset name like `UTC+05:00`.
+    for attr in ("key", "zone"):
+        val = getattr(dt.tzinfo, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    name = dt.tzname()
+    if name and "UTC" in name.upper():
+        return "UTC"
+    return name or None
 
 
 class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
@@ -52,11 +78,21 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
         client_id: str = "",
         tenant_id: str = "common",
         client_secret: str = "",
-        token_cache_path: str = "./data/msal_cache.json",
+        # N-202 R22 (2026-07-02): NO DEFAULT — see office365.py::__init__
+        # for the full rationale. Shared-singleton path pooled OAuth
+        # refresh tokens across accounts (§164.310(d)(2)(i)); now required.
+        token_cache_path: str = "",
         username: str = "",
         scopes: list[str] | None = None,
         timeout: float = 30.0,
     ):
+        # N-202: fail-closed on missing token_cache_path (see office365.py).
+        if not token_cache_path:
+            raise ValueError(
+                "Office365CalendarProvider: token_cache_path is REQUIRED "
+                "(pre-N-202 shared-singleton default). Route through "
+                "providers.factory.msal_cache_path_for_account(account_id)."
+            )
         # Reuse the MSAL token-acquire machinery from the mail provider.
         from email_triage.providers.office365 import (
             CALENDAR_SCOPES, DEFAULT_SCOPES,
@@ -87,7 +123,8 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
         # Graph's bearer token is stable for the client's lifetime, so
         # bake it onto the client; _on_unauthorized rotates it in place.
         token = await self._mail.acquire_token()
-        return httpx.AsyncClient(
+        return egress_async_client(
+            intent=Intent.PROVIDER_API,
             base_url=GRAPH_BASE,
             headers={"Authorization": f"Bearer {token}"},
             timeout=self._timeout,
@@ -115,7 +152,10 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
                 return None, False
             if dt.tzinfo is None:
                 # Graph returns all-day-event endpoints without
-                # a timezone offset; treat as UTC midnight.
+                # a timezone offset; treat as UTC midnight. This branch
+                # ALSO carries the is_all_day signal — do NOT collapse
+                # to parse_iso_aware (which would erase the signal). See
+                # trust-audit db-sme verdict on N-357b tranche 4 REJECT.
                 dt = dt.replace(tzinfo=timezone.utc)
                 is_all_day = True
             return dt.astimezone(timezone.utc), is_all_day
@@ -177,8 +217,8 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
         limit: int = 250,
     ) -> list[CalendarEvent]:
         params = {
-            "startDateTime": time_min.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "endDateTime": time_max.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "startDateTime": to_utc_iso_z(time_min),
+            "endDateTime": to_utc_iso_z(time_max),
             "$top": str(min(limit, 250)),
             "$orderby": "start/dateTime",
         }
@@ -209,8 +249,8 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
     ) -> list[CalendarEvent]:
         """Return Graph events flagged as out-of-office (showAs == 'oof')."""
         params = {
-            "startDateTime": time_min.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "endDateTime": time_max.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "startDateTime": to_utc_iso_z(time_min),
+            "endDateTime": to_utc_iso_z(time_max),
             "$filter": "showAs eq 'oof'",
             "$top": "250",
             "$orderby": "start/dateTime",
@@ -253,26 +293,49 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
         }
         if event.location:
             body["location"] = {"displayName": event.location}
-        if event.start:
-            body["start"] = {
-                "dateTime": event.start.astimezone(timezone.utc).isoformat().replace("+00:00", ""),
-                "timeZone": "UTC",
-            }
-        if event.end:
-            body["end"] = {
-                "dateTime": event.end.astimezone(timezone.utc).isoformat().replace("+00:00", ""),
-                "timeZone": "UTC",
-            }
+        # N-289 R30 (row 65): all-day events must NOT be UTC-anchored.
+        # Serialize the LOCAL date-at-midnight with the event's tzinfo
+        # name (falling back to UTC if the caller didn't set tz) —
+        # otherwise an all-day event renders on the wrong day for
+        # viewers in a non-UTC timezone. Timed events keep the UTC
+        # normalization.
         if event.all_day:
+            if event.start:
+                start_local = event.start
+                tz_name = _iana_tz_name(start_local) or "UTC"
+                body["start"] = {
+                    "dateTime": start_local.strftime("%Y-%m-%dT00:00:00"),
+                    "timeZone": tz_name,
+                }
+            if event.end:
+                end_local = event.end
+                tz_name = _iana_tz_name(end_local) or "UTC"
+                body["end"] = {
+                    "dateTime": end_local.strftime("%Y-%m-%dT00:00:00"),
+                    "timeZone": tz_name,
+                }
             body["isAllDay"] = True
+        else:
+            if event.start:
+                body["start"] = {
+                    "dateTime": to_utc_iso_no_suffix(event.start),
+                    "timeZone": "UTC",
+                }
+            if event.end:
+                body["end"] = {
+                    "dateTime": to_utc_iso_no_suffix(event.end),
+                    "timeZone": "UTC",
+                }
+        # "transparent" = show as FREE (doesn't block the day) — used for
+        # reminders / deadline markers. Graph's field is showAs; default "opaque"
+        # sends nothing (Graph's own default is busy), so existing callers are
+        # unaffected.
+        if event.transparency == "transparent":
+            body["showAs"] = "free"
         if event.attendees:
             body["attendees"] = [
-                {
-                    "emailAddress": {"address": a.get("email", "")},
-                    "type": "required",
-                }
-                for a in event.attendees
-                if a.get("email")
+                {"emailAddress": {"address": addr}, "type": "required"}
+                for addr in attendee_mailboxes(event.attendees)
             ]
         return body
 
@@ -300,6 +363,8 @@ class Office365CalendarProvider(_CalendarHttpMixin, CalendarProvider):
     ) -> None:
         # Graph routes by event id; calendar_id accepted for
         # API symmetry but not required (event ids are global).
+        if "attendees" in partial and not native_attendees_safe(partial["attendees"]):
+            raise ValueError("update_event: every attendee must be one safe mailbox")
         await self._request("PATCH", f"/me/events/{event_id}", json_data=partial)
 
     async def delete_event(

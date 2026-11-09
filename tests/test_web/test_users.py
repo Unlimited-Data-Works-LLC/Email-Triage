@@ -108,7 +108,7 @@ class TestDisabledOtpSkipped:
         set_user_disabled(db, regular_user["id"], True, actor_user_id=admin_user["id"])
 
         # Spike SMTP config so the live send path would normally fire.
-        client.app.state.config.smtp.host = "smtp.example.com"
+        client.app.state.config.smtp.host = "smtp.example.invalid"
         client.app.state.config.smtp.port = 587
         client.app.state.config.smtp.from_addr = "no-reply@example.com"
 
@@ -141,7 +141,7 @@ class TestDisabledOtpSkipped:
 class TestDisabledApiKey:
     def test_disabled_user_api_key_rejected(self, db, regular_user, admin_user):
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "test", regular_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "test", regular_user["id"], actor_user_id=regular_user["id"])
 
         # Works before disable.
         assert verify_api_key(db, raw_key) is not None
@@ -154,10 +154,10 @@ class TestDisabledApiKey:
 
     def test_disabled_user_api_key_rejected_via_http(self, client, db, regular_user, admin_user):
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "test", regular_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "test", regular_user["id"], actor_user_id=regular_user["id"])
         set_user_disabled(db, regular_user["id"], True, actor_user_id=admin_user["id"])
         resp = client.get(
-            "/api/openclaw/accounts",
+            "/api/v1/accounts",
             headers={"Authorization": f"Bearer {raw_key}"},
         )
         assert resp.status_code == 401

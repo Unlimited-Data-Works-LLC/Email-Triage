@@ -23,7 +23,7 @@
                     border-left: 3px solid #d4a016; padding: 0.75rem 1rem;">
         <strong>&#128338; {{ bk }} in scheduled maintenance{{ m.help("Your AI classifier is in a scheduled maintenance window — set up by your administrator. New mail keeps arriving and is held in a queue; once the window ends (for example at 01:30 UTC tonight) the queue drains automatically. Nothing to do here.") }}</strong>
         <p style="margin:0.3rem 0 0 0;">
-            Back at <strong>{{ llm_banner.maintenance_window.ends_at_local_hm }}</strong>.
+            Back at <strong>{{ llm_banner.maintenance_window.ends_at_utc_hm }}</strong>.
             {% if llm_banner.queued %}
             {{ llm_banner.queued }} message{% if llm_banner.queued != 1 %}s{% endif %} waiting in the retry queue.
             {% endif %}
@@ -65,6 +65,36 @@
 </section>
 {% endif %}
 
+{# ── #302 — bounded-backfill saturation banner ──────────────────────
+     A Gmail history-expired / O365 delta-resync recovery was capped, so
+     older mail in the gap may be un-triaged. Surfaced here (landing
+     page) AND as a per-account chip on /accounts (which carries the
+     dismiss). #}
+{% if backfill_capped_accounts %}
+<section>
+    <article style="background:#fff8e1;border-left:3px solid #b58900;
+                    padding:0.75rem 1rem;">
+        <strong>&#9888; Some mail may not have been triaged</strong>
+        <p style="margin:0.3rem 0;font-size:0.9rem;">
+            A mailbox sync skipped some mail: a recovery from an expired
+            cursor was capped, or the server renumbered an IMAP folder and
+            the sync restarted. Older messages in the gap may not have been
+            triaged. Run a whole-mailbox triage to backfill, then dismiss
+            the notice on the account.
+        </p>
+        <ul style="margin:0.3rem 0 0 1rem;font-size:0.9rem;">
+            {% for b in backfill_capped_accounts %}
+            <li>
+                <a href="/accounts">{{ b.account_name or ('Account #' ~ b.account_id) }}</a>
+                — {% if b.kind == 'imap_uidvalidity' %}folder renumbered{% else %}recovery capped{% endif %}
+                {% if b.at %}<small style="color:var(--pico-muted-color);">(at {{ b.at[:19] }} UTC)</small>{% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+    </article>
+</section>
+{% endif %}
+
 {# ── Admin-only: health summary + admin quick-nav ────────────────────
      Operator caught (2026-05-12): each of the 4 chips as its own
      full-width 2-col card produced too much whitespace + the
@@ -79,6 +109,8 @@
      Admin quick-nav trimmed to the three actually-used entries
      (Accounts, Config, System Log); the rest were never clicked
      according to operator. #}
+{# #304 — restore-key freshness (admin only) now folded into the Health card
+   below as a single clickable line (was a full-width strip; operator 2026-06-18). #}
 {% if is_admin and health_chips %}
 <section class="admin-health-strip">
     <div class="et-cards">
@@ -91,6 +123,21 @@
                 </small>
             </header>
             <div class="et-card-body" style="gap:0.35rem;">
+                {# #315 Part 4 — N-151 SOFT-gate row. Rendered ONLY when the
+                   MSAL master key probe reports the credential store is
+                   currently unavailable. Placed at the TOP of the card so
+                   it's the first thing an admin sees; styled with the
+                   house warning idiom (var(--pico-del-color) + &#9888;).
+                   Portable copy — no the monitoring system/ops-tokens/admin-only paths.
+                   When active=False the whole row is omitted (no empty
+                   box, per operator "don't cry wolf" rule). #}
+                {% if n151_soft_gate and n151_soft_gate.active %}
+                <div>
+                    <strong style="color:var(--pico-del-color);">&#9888;
+                    Credential store SOFT-gate active</strong>
+                    &mdash; {{ n151_soft_gate.reason }}{{ m.help("The encrypted OAuth/MSAL token cache cannot silent-refresh right now because its master key is not resolvable. New sign-ins still work; scheduled watchers on Office 365 accounts may re-prompt for auth. See Detailed health below for the exact reason enum.") }}
+                </div>
+                {% endif %}
                 <div>
                     <strong>{% if health_chips.gateway.ok %}&#10003;{% else %}&#9888;{% endif %}
                     Gateway:</strong>
@@ -106,6 +153,14 @@
                     Errors (24h):</strong>
                     {{ health_chips.errors.label }}{{ m.help("Count of ERROR-level rows in log_entries over the last 24h. Green at 0, warns when non-zero. Click 'System Log' below to filter to ERROR rows for the last 24h and see the actual exceptions.") }}
                 </div>
+                <div>
+                    <strong>&#128273; Last key export:</strong>
+                    {% if last_key_export %}
+                    <a href="/config?tab=backup">{{ last_key_export[:10] }}</a>
+                    {% else %}
+                    <a href="/config?tab=backup" style="color:var(--pico-del-color);">never &#9888;</a>
+                    {% endif %}{{ m.help("The key-only backup export — the restore key for the automated backups. Keep it current; click the date to open Backup settings.") }}
+                </div>
                 <div style="margin-top:0.35rem;font-size:0.85em;">
                     <a href="/admin/stats">Detailed health &rarr;</a>
                 </div>
@@ -120,7 +175,11 @@
                 <strong>{% if health_chips.watchers.ok %}&#10003;{% else %}&#9888;{% endif %}
                 {% set provs = health_chips.watchers.providers or {} %}
                 {% set total_accts = (provs.values() | sum(attribute='total')) %}
-                {% set total_covered = (total_accts - (provs.values() | sum(attribute='uncovered'))) %}
+                {% set total_off = (provs.values() | sum(attribute='watching_off')) %}
+                {# Covered = actively ingesting (push or poll). "Watching off"
+                   accounts are deliberately not watched, so they're excluded
+                   from covered AND from uncovered. #}
+                {% set total_covered = (total_accts - (provs.values() | sum(attribute='uncovered')) - total_off) %}
                 {{ total_covered }}/{{ total_accts }} accounts covered</strong>
 
                 {# Per-provider breakdown — only shown when that provider has
@@ -142,6 +201,7 @@
                         {% if b.poll %}{{ b.poll }} poll{% endif %}
                         {% if b.push_plus_poll %} ({{ b.push_plus_poll }} both){% endif %}
                         {% if b.uncovered %}<span style="color:var(--pico-del-color);">, {{ b.uncovered }} uncovered ⚠</span>{% endif %}
+                        {% if b.watching_off %}<span style="color:var(--pico-muted-color);">, {{ b.watching_off }} watching off</span>{% endif %}
                     </small>
                     {% endif %}
                 {% endfor %}
@@ -158,14 +218,40 @@
                 </small>
                 {% endif %}
 
-                {# Per-account alert detail — only when something actually
-                   needs operator attention. #}
+                {# Per-account "Needs attention" — REAL problems only (an
+                   intentionally-disabled watcher is shown neutrally below, never
+                   here). Each carries the issue in plain words + a fix link to
+                   that account's watcher settings. #}
                 {% if health_chips.watchers.alerts %}
-                <small style="color:var(--pico-del-color);">
+                {% set _alert_text = {
+                    'no_ingestion': 'watcher is enabled but not running — new mail is not being classified',
+                    'push_dropped_no_poll': 'real-time watcher dropped and there is no polling fallback',
+                } %}
+                <div style="margin-top:0.45rem;">
+                    <strong style="color:var(--pico-del-color);font-size:0.85rem;">&#9888; Needs attention</strong>
                     {% for a in health_chips.watchers.alerts %}
-                    {{ a.account_name or ('#' ~ a.account_id) }}{% if a.owner %} ({{ a.owner }}){% endif %}: {{ a.alert | replace('_', ' ') }}{% if not loop.last %}; {% endif %}
+                    <small style="display:block;color:var(--pico-del-color);">
+                        {{ a.account_name or ('#' ~ a.account_id) }}{% if a.owner %} ({{ a.owner }}){% endif %}:
+                        {{ _alert_text.get(a.alert, a.alert | replace('_', ' ')) }}
+                        &middot; <a href="/accounts/{{ a.account_id }}/edit">Fix watcher &rarr;</a>
+                    </small>
                     {% endfor %}
-                </small>
+                </div>
+                {% endif %}
+
+                {# Watching off (by choice) — the operator deliberately turned
+                   push AND poll off on an active account. Neutral, with a
+                   one-click re-enable. NOT an error, never flips the chip. #}
+                {% if health_chips.watchers.paused %}
+                <div style="margin-top:0.45rem;">
+                    <strong style="color:var(--pico-muted-color);font-size:0.85rem;">&#9208;&#65039; Watching off (by choice)</strong>
+                    {% for a in health_chips.watchers.paused %}
+                    <small style="display:block;color:var(--pico-muted-color);">
+                        {{ a.account_name or ('#' ~ a.account_id) }}{% if a.owner %} ({{ a.owner }}){% endif %}
+                        &middot; <a href="/accounts/{{ a.account_id }}/edit">re-enable &rarr;</a>
+                    </small>
+                    {% endfor %}
+                </div>
                 {% endif %}
             </div>
         </article>
@@ -340,7 +426,7 @@
                     {% for run in recent_runs %}
                     <tr>
                         <td>
-                            <span class="local-datetime" data-utc="{{ run.created_at }}">{{ run.created_at[:16] }}</span>
+                            <time datetime="{{ run.created_at }}" data-us-datetime>{{ run.created_at | us_datetime }}</time>
                         </td>
                         <td>{{ run.account_name }}</td>
                         <td style="text-align:right;">{{ run.total_messages }}</td>
@@ -349,6 +435,14 @@
                     {% endfor %}
                 </tbody>
             </table>
+            {# #301 — this widget caps at the 5 most recent; say so when #}
+            {# there are older runs so 5 rows don't read as the whole.   #}
+            {% if recent_runs_has_more %}
+            <p style="margin:0.5rem 0 0 0;font-size:0.8rem;color:var(--pico-muted-color);">
+                Showing your 5 most recent runs — older runs aren't shown here;
+                open an account's <a href="/triage/jobs">Bulk runs</a> for its full history.
+            </p>
+            {% endif %}
             {% else %}
             <p style="color: var(--pico-muted-color);margin:0;">
                 No triage runs yet. Go to <a href="/triage">Run Triage</a> to process some emails.
@@ -357,23 +451,6 @@
         </div>
     </article>
 </section>
-
-<script>
-// Convert UTC datetimes to local display.
-document.querySelectorAll('.local-datetime').forEach(function(el) {
-    var utc = el.getAttribute('data-utc');
-    if (!utc) return;
-    try {
-        var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
-        var d = new Date(hastz ? utc : utc + 'Z');
-        el.textContent = d.toLocaleString(undefined, {
-            month: 'short', day: 'numeric',
-            hour: '2-digit', minute: '2-digit'
-        });
-        el.title = utc;
-    } catch(e) {}
-});
-</script>
 
 <style>
 .admin-health-strip { margin-bottom: 1rem; }

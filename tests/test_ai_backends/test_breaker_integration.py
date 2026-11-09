@@ -85,20 +85,20 @@ def _http_status_error() -> httpx.HTTPStatusError:
 
 def _make_openai() -> OpenAIAdapter:
     return OpenAIAdapter(
-        endpoint="https://api.openai.com/v1", api_key="sk-test",
+        endpoint="https://api.openai.invalid/v1", api_key="sk-test",
     )
 
 
 def _make_gemini() -> GeminiAdapter:
     return GeminiAdapter(
-        endpoint="https://generativelanguage.googleapis.com/v1beta",
+        endpoint="https://generativelanguage.googleapis.invalid/v1beta",
         api_key="gem-test-key",
     )
 
 
 def _make_azure() -> AzureOpenAIAdapter:
     return AzureOpenAIAdapter(
-        endpoint="https://my-resource.openai.azure.com",
+        endpoint="https://my-resource.openai.azure.invalid",
         api_key="az-test-key",
         deployment="my-deployment",
     )

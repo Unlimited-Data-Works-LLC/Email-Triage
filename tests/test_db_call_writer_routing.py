@@ -8,6 +8,7 @@ the threadpool. This file proves that routing.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import pytest
 
@@ -276,7 +277,7 @@ async def test_real_saturation_sheds_audit_emitter_and_lands_gap_row(
 
     # Real DB conn — the gap-event row will be written here (db_call's
     # _record_shed_audit_write takes conn = args[0]).
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
 
     writer = SqliteWriterThread(maxsize=1)
     writer.start()

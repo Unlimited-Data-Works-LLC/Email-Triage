@@ -1,0 +1,60 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator).
+   TECH-SKILL:  runs the install; not assumed to know Python packaging.
+   COPY RULES:  plain words; say what happened, what it means for embedding
+                right now, and the ONE thing to do. No package names here
+                (they are on the AI Backends card).
+
+   Punch 569 D6 — "Embedding runtime update required". Shown on every admin
+   page while the installed runtime is stale (still serving) or refused, and
+   after an update that needs a restart. NOT dismissable: it goes away when
+   the condition does. With embedding.auto_update OFF: ONE primary button,
+   which posts the atomic update (POST /config/ai-backends/embedding-update).
+   With it ON (the default, operator decision 2026-10-25) the app updates the
+   runtime itself: the banner says so and carries no button. Context:
+   ``embedding_runtime_banner`` from ``_shared._embedding_runtime_banner_ctx``
+   (``embedding_bits.update_notice``); None/undefined renders nothing.
+
+   GLOBAL-SLOT RULE (553; pinned by test_n556_update_check_ssot_pin::
+   test_base_included_partials_add_no_page_controls): included from base.html
+   on EVERY page, so no ``<form>`` and no submit button, which would match each
+   page's own form/submit selectors. The button is ``type="button"`` with
+   ``hx-post``; the CSRF token rides the ``htmx:configRequest`` header
+   (static/csrf.js), as 553's disclosure dismiss does. The route answers an
+   htmx POST with the AI Backends install card, which replaces this banner in
+   place and shows the update's progress.
+#}
+{% if embedding_runtime_banner is defined and embedding_runtime_banner %}
+<aside id="embedding-runtime-banner" role="alert"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid {% if embedding_runtime_banner.serving %}var(--pico-mark-color, orange){% else %}var(--pico-del-color){% endif %};
+              background:var(--pico-card-background-color);">
+    <strong>{{ embedding_runtime_banner.headline }}</strong>
+    <p style="margin:0.3rem 0;">{{ embedding_runtime_banner.consequence }}</p>
+    {% if embedding_runtime_banner.advisories %}
+    <p style="margin:0.3rem 0;"><small>Advisories:
+        {% for a in embedding_runtime_banner.advisories %}<code>{{ a }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+    </small></p>
+    {% endif %}
+    {% if embedding_runtime_banner.kind in ("update", "auto", "auto_failed", "auto_deferred") %}
+    {% if embedding_runtime_banner.pause_note %}
+    <p style="margin:0.3rem 0;"><strong>{{ embedding_runtime_banner.pause_note }}</strong></p>
+    {% endif %}
+    {% endif %}
+    {# Operator decision 2026-10-25: kinds "auto" / "auto_failed" mean the app
+       updates the runtime ITSELF, so there is no button and no request to
+       click; the headline and consequence say what is happening. #}
+    {% if embedding_runtime_banner.kind == "update" %}
+    <p style="margin:0.4rem 0 0 0;">
+        <button type="button" class="embedding-runtime-update"
+                hx-post="/config/ai-backends/embedding-update"
+                hx-target="#embedding-runtime-banner" hx-swap="outerHTML"
+                style="margin:0;width:auto;">Update embedding runtime</button>
+        <small style="color:var(--pico-muted-color);">
+            The new runtime is installed beside the current one and every file
+            is checked; the current one stays until the new one is verified.
+        </small>
+    </p>
+    {% endif %}
+</aside>
+{% endif %}

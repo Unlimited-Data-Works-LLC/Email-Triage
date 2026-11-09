@@ -48,7 +48,8 @@ from email_triage.web.webauthn_auth import (
 
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
-    return init_db(str(tmp_path / "test.db"))
+    from _db_tracking import track
+    return track(init_db(str(tmp_path / "test.db")))
 
 
 @pytest.fixture
@@ -61,6 +62,44 @@ def user_id(db) -> int:
     )
     db.commit()
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Revoke bumps session_epoch
+# ---------------------------------------------------------------------------
+
+class TestRevokeBumpsSessionEpoch:
+    """Revoking a passkey must cut the owner's live sessions (bump
+    ``session_epoch``), not merely block the next login — a revoked
+    (possibly compromised) credential whose session survives is the gap."""
+
+    @staticmethod
+    def _epoch(db, user_id):
+        return db.execute(
+            "SELECT session_epoch FROM users WHERE id = ?", (user_id,),
+        ).fetchone()[0]
+
+    def test_revoke_bumps_owner_epoch(self, db, user_id):
+        kid = add_hardware_key(
+            db, user_id=user_id, credential_id=b"\x09" * 16,
+            public_key=b"p", sign_count=0, transports=[], aaguid=None,
+            nickname="yk",
+        )
+        before = self._epoch(db, user_id)
+        assert revoke_hardware_key(db, kid) is True
+        assert self._epoch(db, user_id) == before + 1
+
+    def test_idempotent_revoke_does_not_rebump(self, db, user_id):
+        kid = add_hardware_key(
+            db, user_id=user_id, credential_id=b"\x0a" * 16,
+            public_key=b"p", sign_count=0, transports=[], aaguid=None,
+            nickname="yk2",
+        )
+        assert revoke_hardware_key(db, kid) is True
+        mid = self._epoch(db, user_id)
+        # already revoked → rowcount 0 → MUST NOT bump again
+        assert revoke_hardware_key(db, kid) is False
+        assert self._epoch(db, user_id) == mid
 
 
 # ---------------------------------------------------------------------------
@@ -193,18 +232,18 @@ class TestChallengeStore:
     def test_store_and_consume_round_trip(self, db, user_id):
         cid = store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-            challenge=b"abc",
+            challenge=b"abc", require_user_verification=False,
         )
         assert cid > 0
         ch = consume_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
         )
-        assert ch == b"abc"
+        assert ch.challenge == b"abc"
 
     def test_consume_is_single_use(self, db, user_id):
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-            challenge=b"abc",
+            challenge=b"abc", require_user_verification=False,
         )
         consume_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
@@ -218,36 +257,36 @@ class TestChallengeStore:
     def test_kind_isolation(self, db, user_id):
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-            challenge=b"reg",
+            challenge=b"reg", require_user_verification=False,
         )
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"auth",
+            challenge=b"auth", require_user_verification=False,
         )
         # Each kind has its own challenge.
         assert consume_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-        ) == b"reg"
+        ).challenge == b"reg"
         assert consume_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-        ) == b"auth"
+        ).challenge == b"auth"
 
     def test_email_keyed_lookup(self, db):
         # Email-keyed challenges (used during the authenticate flow
         # before user resolution).
         store_webauthn_challenge(
             db, user_id=None, email="x@y.com", kind="authenticate",
-            challenge=b"e",
+            challenge=b"e", require_user_verification=False,
         )
         assert consume_webauthn_challenge(
             db, user_id=None, email="x@y.com", kind="authenticate",
-        ) == b"e"
+        ).challenge == b"e"
 
     def test_prune_removes_expired(self, db, user_id):
         # Insert a challenge with TTL=0 — already expired.
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-            challenge=b"old", ttl_seconds=0,
+            challenge=b"old", require_user_verification=False, ttl_seconds=0,
         )
         # Sleep is unnecessary — TTL of 0 puts expires_at == now, which
         # the prune query (expires_at <= now) catches.
@@ -326,7 +365,7 @@ class TestFinishRegistrationIntegration:
         verify call that would check it."""
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="register",
-            challenge=b"fake-challenge",
+            challenge=b"fake-challenge", require_user_verification=False,
         )
 
     def test_aaguid_as_str_uuid_is_accepted_and_stored_as_bytes(
@@ -424,13 +463,13 @@ class TestFinishRegistrationIntegration:
         user = {"id": user_id, "email": "u@e.com", "name": "U", "role": "user"}
         finish_registration(
             db, user=user, rp_id="example.com",
-            origin=["https://example.com", "https://example.com:8080"],
+            origin=["https://example.com", "https://example.com:8081"],
             response_json={"id": "x", "rawId": "x", "type": "public-key",
                            "response": {"transports": []}},
             nickname="k",
         )
         assert captured["expected_origin"] == [
-            "https://example.com", "https://example.com:8080",
+            "https://example.com", "https://example.com:8081",
         ]
 
     def test_no_pending_challenge_raises(self, db, user_id, monkeypatch):
@@ -465,7 +504,7 @@ class TestFinishAuthenticationIntegration:
         return SimpleNamespace(new_sign_count=new_count)
 
     def test_sign_count_update_round_trip(self, db, user_id, monkeypatch):
-        """Verify path: existing hardware key, mock library verify,
+        """Verify path: existing passkey, mock library verify,
         finish_authentication updates sign_count and returns key id."""
         cred_id = b"\xcc" * 32
         kid = add_hardware_key(
@@ -475,7 +514,7 @@ class TestFinishAuthenticationIntegration:
         )
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"ch",
+            challenge=b"ch", require_user_verification=False,
         )
         verified = self._make_verified_authentication(new_count=42)
         monkeypatch.setattr(
@@ -508,7 +547,7 @@ class TestFinishAuthenticationIntegration:
         """No matching hardware_keys row -> verify is never called."""
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"ch",
+            challenge=b"ch", require_user_verification=False,
         )
 
         def fail_if_called(**_):
@@ -558,7 +597,7 @@ class TestFinishAuthenticationIntegration:
         )
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"ch",
+            challenge=b"ch", require_user_verification=False,
         )
 
         def fail_if_called(**_):
@@ -637,7 +676,7 @@ class TestSignCountMonotonicity:
         )
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"ch",
+            challenge=b"ch", require_user_verification=False,
         )
 
         def fake_verify(**kwargs):
@@ -675,7 +714,7 @@ class TestSignCountMonotonicity:
         )
         store_webauthn_challenge(
             db, user_id=user_id, email=None, kind="authenticate",
-            challenge=b"ch",
+            challenge=b"ch", require_user_verification=False,
         )
         verified = SimpleNamespace(new_sign_count=11)
         monkeypatch.setattr(

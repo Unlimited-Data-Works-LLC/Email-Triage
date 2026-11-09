@@ -1,5 +1,6 @@
 """Tests for the newsletter digest generator."""
 
+from _db_tracking import track
 import json
 from datetime import datetime, timezone
 
@@ -27,8 +28,8 @@ def _make_message(
 ) -> EmailMessage:
     if links is None:
         links = [
-            ("AI Breakthrough", "https://example.com/ai"),
-            ("New Chip", "https://example.com/chip"),
+            ("AI Breakthrough", "https://example.invalid/ai"),
+            ("New Chip", "https://example.invalid/chip"),
         ]
     return EmailMessage(
         message_id=uid,
@@ -93,7 +94,7 @@ class TestExtractArticles:
 
         classifier = AsyncMock()
         classifier.complete.return_value = json.dumps([
-            {"headline": "AI Breakthrough", "summary": "Major advance in LLMs.", "url": "https://example.com/ai"},
+            {"headline": "AI Breakthrough", "summary": "Major advance in LLMs.", "url": "https://example.invalid/ai"},
             {"headline": "New Chip", "summary": "Intel releases new chip.", "url": None},
         ])
 
@@ -102,7 +103,7 @@ class TestExtractArticles:
 
         assert len(articles) == 2
         assert articles[0].headline == "AI Breakthrough"
-        assert articles[0].url == "https://example.com/ai"
+        assert articles[0].url == "https://example.invalid/ai"
         assert articles[1].headline == "New Chip"
         assert articles[1].url is None
 
@@ -157,7 +158,7 @@ class TestExtractArticles:
         classifier = AsyncMock()
         classifier.complete.return_value = json.dumps([
             {"headline": "Fake", "summary": "x",
-             "url": "https://evil.com/hallucinated"},
+             "url": "https://evil.invalid/hallucinated"},
         ])
         msg = _make_message(
             links=[("Real Link", "https://real.com/a")],
@@ -210,7 +211,7 @@ class TestBuildDigestHtml:
                 sender_name="Techpresso",
                 sender_email="news@techpresso.com",
                 articles=[
-                    Article("AI Update", "Big news in AI.", "https://example.com/ai"),
+                    Article("AI Update", "Big news in AI.", "https://example.invalid/ai"),
                     Article("Chip News", "New chip released.", None),
                 ],
             ),
@@ -224,7 +225,7 @@ class TestBuildDigestHtml:
         assert "<strong>Techpresso</strong>" in html
         assert "AI Update" in html
         assert "Chip News" in html
-        assert "https://example.com/ai" in html
+        assert "https://example.invalid/ai" in html
         assert "Read more" in html
 
     def test_multiple_senders(self):
@@ -269,7 +270,7 @@ class TestGenerateDigest:
 
         classifier = AsyncMock()
         classifier.complete.return_value = json.dumps([
-            {"headline": "Article 1", "summary": "Summary 1.", "url": "https://ex.com/1"},
+            {"headline": "Article 1", "summary": "Summary 1.", "url": "https://ex.invalid/1"},
         ])
 
         provider = AsyncMock()
@@ -497,7 +498,7 @@ class TestH06DigestArchiveFailureAudit:
         """
         from email_triage.web.db import init_db, create_email_account
         from datetime import datetime, timezone
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         # Seed a user (FK target; account_id needs a real owner).
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
@@ -739,3 +740,90 @@ class TestH06DigestArchiveFailureAudit:
         assert "PHI-bearing" not in detail
         assert "Dr. Smith" not in detail
         assert "smith@clinic" not in detail
+
+
+class TestBuildDigestHtmlUsDatetimeFilter:
+    """Regression: `build_digest_html` renders operator html_template
+    using `{{ ... | us_datetime }}` without TemplateRuntimeError.
+
+    Pre-fix (2026-07-15): `Environment(autoescape=...)` was constructed
+    without calling `_us_datetime.install_filter(env)`, so an operator
+    template referencing the filter raised at render time. See
+    `tests/test_us_datetime_install_filter_ssot_pin.py` for the
+    interprocedural pin (scope: FileSystemLoader-Env); this test
+    covers the bare-Env twin at `actions/digest.py:501`.
+    """
+
+    def test_operator_template_may_use_us_datetime_filter(self):
+        groups = {
+            "boss@example.com": SenderGroup(
+                sender_email="boss@example.com",
+                sender_name="Boss",
+                articles=[
+                    Article(
+                        headline="Q4 numbers",
+                        summary="Quarterly figures inside.",
+                        url="https://example.invalid/q4",
+                    ),
+                ],
+            ),
+        }
+        # Operator-supplied template with the us_datetime filter.
+        # Pre-fix: raises `TemplateRuntimeError: No filter named 'us_datetime' found`.
+        html_template = (
+            "<h1>{{ digest_name }}</h1>"
+            "<p>Rendered at: {{ date_str | us_datetime }}</p>"
+            "{% for group in groups %}<p>{{ group.sender_name }}</p>{% endfor %}"
+        )
+        html = build_digest_html(
+            groups,
+            "2026-07-15T14:30:00+00:00",
+            html_template=html_template,
+            digest_name="Test Digest",
+        )
+        # Filter accepts ISO string; renders US-locale form (e.g.
+        # "7/15/2026 …"). We don't pin exact string — timezone-aware —
+        # but we do assert:
+        assert "Rendered at:" in html
+        assert "7/15/2026" in html  # US m/d/y locale evidence
+        assert "Test Digest" in html
+        assert "Boss" in html
+
+    def test_operator_template_may_use_us_datetime_filter_on_ts_shape(self):
+        """Panel-folded (hipaa-sme GO-WITH-FIXES 2026-07-15): assert the
+        filter also works on a `{{ ts | us_datetime }}` template shape,
+        not just `{{ date_str | ... }}` — covers the surface class, not
+        the single filter-name-in-context happenstance."""
+        groups = {
+            "boss@example.com": SenderGroup(
+                sender_email="boss@example.com",
+                sender_name="Boss",
+                articles=[
+                    Article(
+                        headline="Q4 numbers",
+                        summary="Quarterly figures inside.",
+                        url=None,
+                    ),
+                ],
+            ),
+        }
+        # `ts` isn't in the render context — the filter should still
+        # register cleanly (StrictUndefined isn't used here so the
+        # empty value renders as ''), the key assertion is NO
+        # `TemplateRuntimeError: No filter named 'us_datetime' found`.
+        html_template = (
+            "<h1>{{ digest_name }}</h1>"
+            "<p>ts: {{ ts | us_datetime }}</p>"
+            "<p>date_str: {{ date_str | us_datetime }}</p>"
+        )
+        html = build_digest_html(
+            groups,
+            "2026-07-15T14:30:00+00:00",
+            html_template=html_template,
+            digest_name="Test Digest",
+        )
+        # Filter registration success = renders without exception.
+        # Verify both shapes reached the render:
+        assert "ts:" in html
+        assert "date_str:" in html
+        assert "7/15/2026" in html  # date_str filter output

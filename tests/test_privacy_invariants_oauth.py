@@ -362,10 +362,10 @@ async def test_o365_device_code_flow_log_no_token_leak(
             return {
                 "user_code": "ABCD-EFGH",
                 "device_code": "device-XYZ",
-                "verification_uri": "https://microsoft.com/devicelogin",
+                "verification_uri": "https://microsoft.invalid/devicelogin",
                 "message": (
                     "To sign in, use a web browser to open "
-                    "https://microsoft.com/devicelogin and enter "
+                    "https://microsoft.invalid/devicelogin and enter "
                     "the code ABCD-EFGH"
                 ),
                 "expires_in": 900,

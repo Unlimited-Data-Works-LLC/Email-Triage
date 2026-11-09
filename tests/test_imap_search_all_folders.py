@@ -97,6 +97,34 @@ async def test_search_all_folders_falls_back_on_backend_error():
 
 
 @pytest.mark.asyncio
+async def test_search_all_folders_reraises_a_certificate_failure():
+    """Punch 651: a server certificate that does not verify is a trust
+    failure, not a search glitch. It propagates instead of narrowing the
+    search to INBOX under the generic fallback warning."""
+    import ssl
+
+    from email_triage.engine.models import MailFilter
+
+    provider = _make_provider(mailbox="INBOX")
+    fallback = AsyncMock(return_value=["50"])
+
+    with patch(
+        "email_triage.providers.imap_blocking.search_all_folders_blocking",
+        AsyncMock(side_effect=ssl.SSLCertVerificationError("bad cert")),
+    ), patch.object(
+        provider, "_search_in_current_mailbox", fallback,
+    ), patch.object(
+        provider, "_connect", AsyncMock(return_value=object()),
+    ):
+        with pytest.raises(ssl.SSLCertVerificationError):
+            await provider.search_all_folders(
+                "", limit=10, filter=MailFilter(from_addr="x@y", folder="*"),
+            )
+
+    fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_search_wildcard_folder_dispatches_to_all_folders():
     """``filter.folder == '*'`` → search() returns flat UIDs from
     search_all_folders for backwards compat with single-folder

@@ -7,6 +7,7 @@ endpoints live in tests/test_web/test_calendars_route.py.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from email_triage.web.calendars import (
     ROLES,
@@ -217,7 +218,7 @@ def test_surrogate_resolver_rejects_self_surrogate(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -248,7 +249,7 @@ def test_resolve_surrogate_rejects_cross_owner(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     # Two users, each with one Gmail account.
@@ -301,7 +302,7 @@ def test_resolve_surrogate_rejects_wrong_provider_type(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -341,7 +342,7 @@ def test_resolve_surrogate_refuses_when_consumer_is_hipaa(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -381,7 +382,7 @@ def test_resolve_surrogate_refuses_when_target_is_hipaa(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -421,7 +422,7 @@ def test_resolve_surrogate_refuses_when_both_sides_hipaa(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -483,7 +484,7 @@ def test_resolve_surrogate_returns_target_when_valid(tmp_path):
     )
     from email_triage.web.calendars import resolve_surrogate_account
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone
@@ -531,7 +532,7 @@ def _seed_user_and_two_accounts(tmp_path):
     )
     from email_triage.web import settings_keys as _S
     from email_triage.config import TriageConfig
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, TriageConfig().classifier.categories)
 
     from datetime import datetime, timezone

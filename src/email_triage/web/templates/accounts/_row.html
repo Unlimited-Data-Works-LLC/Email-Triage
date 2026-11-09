@@ -53,6 +53,14 @@
         <div style="line-height:1.4;">
             {% if acct.is_active %}
             <span style="color:var(--pico-ins-color);">Enabled</span>
+            {# N-108: a deactivated account is either Edit-PAUSED (credentials
+               intact, a toggle resumes it) or REMOVED (credentials purged — a
+               re-enable needs them re-entered). has_credentials is only set when
+               secrets are checkable, so an unset value falls through to the plain
+               "Disabled" (no false signal). #}
+            {% elif acct.has_credentials is defined and not acct.has_credentials %}
+            <span style="color:var(--pico-muted-color);"
+                  title="This account was Removed — its credentials were purged. To re-enable it, open Edit and re-enter its credentials; a toggle alone won't reconnect it.">Disabled — credentials removed</span>
             {% else %}
             <span style="color:var(--pico-muted-color);">Disabled</span>
             {% endif %}
@@ -69,6 +77,37 @@
                class="contrast" style="padding:0.1rem 0.5rem;font-size:0.75rem;margin:0;background:white;color:var(--pico-del-color);">
                 Re-auth
             </a>
+        </div>
+        {% endif %}
+        {# #302 — bounded-backfill saturation chip. A cursor-expiry
+           recovery (Gmail history-expired / O365 delta-resync) hit the
+           cap, so older mail in the gap may not have been triaged. The
+           operator runs a full whole-mailbox triage, then dismisses.
+           Punch 854: the chip now stays until dismissed, so its text
+           follows its kind (an IMAP UIDVALIDITY reseed is not a cap). #}
+        {% if acct.get('backfill_capped') %}
+        {% set bf = acct.backfill_capped %}
+        <div id="backfill-chip-{{ acct.id }}"
+             style="margin-top:0.25rem;display:inline-flex;align-items:center;gap:0.4rem;
+                    padding:0.25rem 0.6rem;border-radius:var(--pico-border-radius);
+                    background:var(--pico-color-amber-500);color:white;font-size:0.85rem;"
+             {% if bf.get('kind') == 'imap_uidvalidity' %}
+             title="The server renumbered the {% if bf.get('source_mailbox') %}{{ bf.get('source_mailbox') }} {% endif %}folder (its UIDVALIDITY changed), so the sync restarted from that point and mail in the gap was skipped{% if bf.get('at') %} at {{ bf.get('at')[:19] }} UTC{% endif %}. Run a whole-mailbox triage to backfill, then dismiss.">
+            ⚠ Folder renumbered — older mail may be un-triaged
+             {% else %}
+             title="A cursor-expiry recovery was capped at {{ bf.get('cap') }} messages ({{ bf.get('window') }}){% if bf.get('at') %} at {{ bf.get('at')[:19] }} UTC{% endif %}. Older mail in the gap may be un-triaged — run a whole-mailbox triage to backfill, then dismiss.">
+            ⚠ Sync recovery capped — older mail may be un-triaged
+             {% endif %}
+            <form method="post" action="/accounts/{{ acct.id }}/backfill-capped/dismiss"
+                  hx-post="/accounts/{{ acct.id }}/backfill-capped/dismiss"
+                  hx-target="#backfill-chip-{{ acct.id }}" hx-swap="outerHTML"
+                  style="display:inline;margin:0;">
+                {{ csrf_input(request) }}
+                <button type="submit" class="contrast"
+                        style="padding:0.1rem 0.5rem;font-size:0.75rem;margin:0;background:white;color:var(--pico-color-amber-600,#b8860b);">
+                    Dismiss
+                </button>
+            </form>
         </div>
         {% endif %}
         {# Watch status always visible — green pulsing dot when the
@@ -118,9 +157,9 @@
             {{ acct.cadence_status | safe }}
         </div>
         {% endif %}
-        {% if not acct.hipaa and not hipaa_mode and acct.openclaw_status is defined %}
+        {% if not acct.hipaa and not hipaa_mode and acct.webhook_status is defined %}
         <div style="font-size:0.85rem;line-height:1.4;margin-top:0.2rem;">
-            {{ acct.openclaw_status | safe }}
+            {{ acct.webhook_status | safe }}
         </div>
         {% endif %}
         {% if not acct.hipaa and not hipaa_mode and acct.calendar_status is defined %}
@@ -141,11 +180,19 @@
                     hx-post="/accounts/{{ acct.id }}/test"
                     hx-target="#test-result-{{ acct.id }}"
                     hx-swap="innerHTML">Test</button>
+            {# N-108: Remove = soft-deactivate (purge creds + is_active=0), NEVER
+               hard-delete. Only shown for an ACTIVE account; a deactivated one
+               shows "Disabled" (status column above) and is re-enabled via the
+               Edit panel's is_active toggle — the EXISTING mechanism, which
+               restarts the watcher. No parallel reactivate path (it would
+               overload is_active vs the Edit-pause state). #}
+            {% if acct.is_active %}
             <button class="outline secondary" style="padding:0.25rem 0.5rem;margin:0;color:var(--pico-del-color);"
                     hx-delete="/accounts/{{ acct.id }}"
                     hx-target="#acct-row-{{ acct.id }}"
                     hx-swap="outerHTML"
-                    hx-confirm="Delete account '{{ acct.name }}'?">Del</button>
+                    hx-confirm="Remove account '{{ acct.name }}'? It is DEACTIVATED (paused, credentials purged) — NOT deleted: the account record and its tamper-evident audit trail are RETAINED. To re-enable it later, open Edit and RE-ENTER its credentials (they are purged on Remove, so a simple toggle won't reconnect it).">Remove</button>
+            {% endif %}
         </div>
         <div id="test-result-{{ acct.id }}" style="margin-top:0.25rem;"></div>
     </td>

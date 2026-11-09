@@ -4,13 +4,15 @@ fallback that bypasses aioimaplib's broken parser.
 These tests stub out ``imaplib.IMAP4_SSL`` / ``imaplib.IMAP4`` so we
 exercise the code paths without a live IMAP server. End-to-end
 verification against a real server is done via the post-deploy
-reproduce against ``/api/openclaw/accounts/{id}/bulk/mail``.
+reproduce against ``/api/v1/accounts/{id}/bulk/mail``.
 """
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import MagicMock, patch
 
+from _tls_assertions import assert_verifying_context as _assert_verifying
 import pytest
 
 
@@ -20,15 +22,19 @@ from email_triage.providers.imap_blocking import (  # noqa: E402
 )
 
 
+
 def _stub_imap4_ssl_class(
     *,
     login_typ: str = "OK",
     select_typ: str = "OK",
     fetch_typ: str = "OK",
     fetch_data: list | None = None,
+    plain: bool = False,
 ):
     """Return a class that, when instantiated, yields a mock client
     with the given canned responses on login/select/uid/logout.
+    ``plain=True`` stands in for ``imaplib.IMAP4(host, port)``, which takes
+    no context; otherwise the factory requires a verifying ``ssl_context``.
     """
     if fetch_data is None:
         fetch_data = [
@@ -36,13 +42,20 @@ def _stub_imap4_ssl_class(
             b" FLAGS (\\Seen))",
         ]
 
-    def _factory(host, port):
+    def _client():
         client = MagicMock()
         client.login = MagicMock(return_value=(login_typ, [b""]))
         client.select = MagicMock(return_value=(select_typ, [b"1"]))
         client.uid = MagicMock(return_value=(fetch_typ, fetch_data))
         client.logout = MagicMock()
         return client
+
+    if plain:
+        return lambda host, port: _client()
+
+    def _factory(host, port, *, ssl_context):
+        _assert_verifying(ssl_context)
+        return _client()
 
     return _factory
 
@@ -64,7 +77,8 @@ def test_blocking_fetch_extracts_bytes_and_flags():
 def test_blocking_fetch_uses_body_peek_header_when_headers_only():
     captured = {}
 
-    def _factory(host, port):
+    def _factory(host, port, *, ssl_context):
+        _assert_verifying(ssl_context)
         client = MagicMock()
         client.login = MagicMock(return_value=("OK", [b""]))
         client.select = MagicMock(return_value=("OK", [b"1"]))
@@ -153,7 +167,7 @@ def test_blocking_fetch_raises_on_fetch_failure():
 
 def test_blocking_fetch_uses_imap4_when_ssl_disabled():
     factory_ssl = _stub_imap4_ssl_class()
-    factory_plain = _stub_imap4_ssl_class()
+    factory_plain = _stub_imap4_ssl_class(plain=True)
     with patch("imaplib.IMAP4_SSL", side_effect=factory_ssl) as ssl_mock, \
          patch("imaplib.IMAP4", side_effect=factory_plain) as plain_mock:
         _blocking_fetch(
@@ -170,7 +184,8 @@ def test_blocking_fetch_quotes_mailbox_with_whitespace():
     quoted on the wire — stdlib imaplib doesn't auto-quote."""
     captured = {}
 
-    def _factory(host, port):
+    def _factory(host, port, *, ssl_context):
+        _assert_verifying(ssl_context)
         client = MagicMock()
         client.login = MagicMock(return_value=("OK", [b""]))
 
@@ -204,7 +219,8 @@ def test_blocking_fetch_leaves_atom_safe_mailbox_bare():
     quoting — bare form is valid + matches existing wire shape."""
     captured = {}
 
-    def _factory(host, port):
+    def _factory(host, port, *, ssl_context):
+        _assert_verifying(ssl_context)
         client = MagicMock()
         client.login = MagicMock(return_value=("OK", [b""]))
 

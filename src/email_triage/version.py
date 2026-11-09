@@ -32,7 +32,6 @@ scope for this commit.
 
 from __future__ import annotations
 
-import os
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -40,6 +39,8 @@ from pathlib import Path
 from typing import Optional
 
 from email_triage import __version__ as APP_VERSION
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
+from email_triage._dbapi_errors import DB_ERRORS, DB_OPERATIONAL_ERRORS
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,23 @@ STATUS_INCOMPATIBLE_ROLLBACK = "incompatible_rollback"
 #: surface it so the operator gets a readable message instead of a
 #: startup traceback.
 STATUS_DOWNGRADE_NOT_SUPPORTED = "downgrade_not_supported"
+
+#: The DB file exists but its applied schema version could not be read (the
+#: open or the read failed). Only ``version-check`` reports it (the strict read);
+#: it is never computed by :func:`compute_version_status`, because there is no
+#: version to compare. 2026-10-18: the deploy pre-flight read a live DB it could
+#: not open as schema 0, which is "older than every image", so the downgrade and
+#: rollback gates could not fire on that read and the deploy proceeded.
+STATUS_DB_UNREADABLE = "db_unreadable"
+
+
+class DbSchemaUnreadableError(RuntimeError):
+    """The strict schema read could not open or read an existing DB file.
+
+    Raised only by ``read_db_schema_version(..., strict=True)``; the original
+    driver error is chained as ``__cause__``. A decisional caller (the deploy's
+    ``version-check``) must refuse on it; reporting 0 instead is the fail-open
+    this type exists to prevent (PD-8)."""
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +273,27 @@ def read_target_schema_caps() -> int:
     return max((m.version for m in MIGRATIONS), default=0)
 
 
-def read_db_schema_version(db_path: str | Path) -> int:
+def read_db_schema_version(db_path: str | Path, *, strict: bool = False) -> int:
     """Highest migration version applied to the live DB.
 
     Opens ``db_path`` read-only so the helper is safe to call from a
-    CLI / banner path that should not touch the live DB. Returns 0 on
-    any error (missing file, locked, no ``schema_migrations`` table) —
-    callers must distinguish "0 because fresh DB" from "0 because we
-    couldn't read it" themselves if that matters.
+    CLI / banner path that should not touch the live DB. By default returns
+    0 on any error (missing file, locked, no ``schema_migrations`` table):
+    the banner and health renders use that default, a non-decisional render
+    degradation (R14's one allowed fail-open).
+
+    ``strict=True`` is for a caller that DECIDES on the number (the deploy's
+    ``version-check``): 0 then means only "the DB opened and has no applied
+    migration"; a missing file, a failed open or a failed read raises
+    :class:`DbSchemaUnreadableError`. 2026-10-18: a WAL-mode DB with no
+    ``-wal``/``-shm`` in a read-only directory cannot be opened (SQLite cannot
+    create its ``-wal`` sidecar, the first file it needs; sqlite.org/wal.html "Read-Only Databases"), the default
+    read reported 0, and the deploy proceeded on it.
     """
 
     p = Path(db_path).expanduser()
+    if strict:
+        return _read_db_schema_version_strict(p)
     if not p.exists():
         return 0
     # N-17: on an encrypted install this read must go through the
@@ -276,77 +304,119 @@ def read_db_schema_version(db_path: str | Path) -> int:
     # open verbatim (no PRAGMAs — a read-only conn rejects PRAGMA
     # journal_mode, so it must NOT go through open_dedicated_conn, which
     # sets WAL). The encrypted branch uses _make_encrypted_conn directly
-    # (PRAGMA key first); under encryption the read is a harmless SELECT
-    # on a read-write handle.
-    from email_triage.db._engine import (
-        dedicated_conn_is_encrypted,
-        open_dedicated_encrypted_conn_readish,
-    )
+    # (PRAGMA key first). Punch 556 / N-559: the encrypted branch is now a
+    # SQLCipher ``mode=ro`` handle too, not a read-write one.
+    # the backlog  (Census v3 #8) — route through the SSOT
+    # ``open_dedicated_conn_readish`` (boot-encryption-aware RO opener).
+    # The pre-fix encrypted/plaintext hand-roll drifted vs init_db on
+    # ``timeout=30.0`` + ``cached_statements=0``; the SSOT carries the
+    # full argument set uniformly across the 7 census-flagged sites.
+    from email_triage.db._engine import open_dedicated_conn_readish
 
     try:
-        if dedicated_conn_is_encrypted():
-            conn = open_dedicated_encrypted_conn_readish(str(p))
-        else:
-            conn = sqlite3.connect(
-                f"file:{p}?mode=ro", uri=True, check_same_thread=False,
-            )
-    except sqlite3.Error:
+        conn = open_dedicated_conn_readish(str(p))
+    except DB_ERRORS:
+        # Both drivers (punch 560: sqlcipher3's classes do not inherit
+        # from sqlite3's, so the funnel carries both).
         return 0
     except Exception:
-        # sqlcipher3 raises its own DBAPI Error subclass (not sqlite3.Error)
-        # on a bad key / unreadable file — keep the helper's "return 0 on
-        # any open failure" contract rather than crashing a banner render.
+        # A non-DB open failure (e.g. no master key stamped) — keep the
+        # helper's "return 0 on any open failure" contract rather than
+        # crashing a banner render.
         return 0
     try:
-        try:
-            row = conn.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()
-        except sqlite3.OperationalError:
-            # Table not created yet — pre-framework install, or
-            # truly fresh DB.
-            return 0
-        if row is None or row[0] is None:
-            return 0
-        return int(row[0])
+        return read_schema_version(conn)
     finally:
         conn.close()
 
 
-_PREVIOUS_CAPS_ENV = "EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS"
+def _read_db_schema_version_strict(p: Path) -> int:
+    """The ``strict=True`` arm of :func:`read_db_schema_version`: the same SSOT
+    opener, but every failure raises :class:`DbSchemaUnreadableError` (chained)
+    instead of reading as 0."""
+    from email_triage.db._engine import open_dedicated_conn_readish
+
+    if not p.exists():
+        raise DbSchemaUnreadableError(f"database file not found: {p}")
+    try:
+        conn = open_dedicated_conn_readish(str(p))
+    except Exception as e:  # noqa: BLE001 — every open failure is a refusal here
+        raise DbSchemaUnreadableError(
+            f"could not open {p} to read its schema version: {e}"
+        ) from e
+    try:
+        return read_schema_version(conn, strict=True)
+    except DbSchemaUnreadableError:
+        raise
+    except Exception as e:  # noqa: BLE001 — the plaintext open is lazy: it fails here
+        raise DbSchemaUnreadableError(
+            f"could not read the schema version of {p}: {e}"
+        ) from e
+    finally:
+        conn.close()
 
 
-def read_previous_schema_caps() -> Optional[int]:
-    """Best-effort read of the `:previous` image's declared schema cap.
+def read_schema_version(conn: sqlite3.Connection, *, strict: bool = False) -> int:
+    """Pure, side-effect-free schema-version read off an OPEN connection:
+    ``MAX(version)`` from ``schema_migrations``, or 0 if the table is absent /
+    empty.
 
-    The deploy host knows this number; the running container does not
-    (the `:previous` image is on the host's local registry, not inside
-    the running image). For this slice we expose a single env-var hook
-    so ``scripts/deploy.sh`` can inject the value at container start:
+    The SSOT for reading the applied schema version off a live connection
+    WITHOUT the migration-framework's ``_ensure_bookkeeping`` side effect
+    (``web.migrations.schema_version`` CREATEs the bookkeeping table on read —
+    correct for the framework, WRONG for a read-only banner/health render that
+    must never mutate). ``read_db_schema_version`` (path-based, above) and the
+    daily-health banner both route through it (census run15  — the raw
+    ``MAX(version)`` SELECT lived in two places). Does NOT close ``conn`` (the
+    caller owns its lifecycle)."""
+    if strict:
+        # strict (version-check): "table absent" is decided by a catalog read,
+        # never by an error, so a failed open (the plaintext ``mode=ro`` open is
+        # lazy and fails HERE) or any other read error propagates to the caller
+        # instead of reading as 0. The catalog read is also the forced open.
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if present is None:
+            return 0
+        row = conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+    else:
+        try:
+            row = conn.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()
+        except DB_OPERATIONAL_ERRORS:
+            # Table not created yet — pre-framework install, or truly fresh DB.
+            return 0
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
 
-        EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS=<int>
 
-    When unset (the common case today), returns ``None``. The banner
-    falls back to "update available" without the rollback-incompat
-    escalation — strictly less alarming, never falsely loud. The
-    full wiring (`deploy.sh` reads ``:previous`` image labels,
-    injects the env var on each restart) is part of the  follow-up
-    work, not this slice.
+def parse_previous_schema_caps(raw: str | None) -> Optional[int]:
+    """Parse the `:previous` image's declared schema cap.
 
-    Accepts strings ``"0"`` and ``""`` defensively; both are treated
-    as "no value available" rather than "schema 0" since the latter
-    would be misleading for an install with any registered
-    migrations.
+    The deploy host knows this number; the running container does not.
+    ``scripts/deploy.sh`` reads it from the ``:previous`` image and passes it
+    to ``email-triage version-check --previous-schema-caps N`` — the deploy's
+    fail-closed rollback-safety compare (exit 2 → deploy aborts).
+
+    Punch 547: this used to be read from the
+    ``EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS`` env var, and an unset or inflated
+    value silently OPENED that gate. It is now only ever an explicit argument.
+
+    ``None`` / ``""`` / ``"0"`` / non-integer / < 1 -> ``None`` ("no value
+    available" — never "schema 0", which would be misleading for an install
+    with any registered migrations).
     """
-
-    raw = os.environ.get(_PREVIOUS_CAPS_ENV, "").strip()
+    raw = (raw or "").strip()
     if not raw or raw == "0":
         return None
-    try:
-        v = int(raw)
-    except ValueError:
-        return None
-    if v < 1:
+    v = parse_int_or_none(raw)  # N-219b R23: SSOT
+    if v is None or v < 1:
         return None
     return v
 
@@ -357,6 +427,9 @@ def read_previous_schema_caps() -> Optional[int]:
 
 def gather_version_status(
     db_path: str | Path | None,
+    previous_schema_caps: Optional[int] = None,
+    *,
+    strict: bool = False,
 ) -> VersionStatus:
     """Build a :class:`VersionStatus` from live introspection.
 
@@ -369,14 +442,19 @@ def gather_version_status(
     :func:`compute_version_status`. Tests exercise the wrapper sparingly;
     the bulk of the suite covers :func:`compute_version_status`
     directly because that's where the rules live.
+
+    ``strict`` is passed to :func:`read_db_schema_version`: the deploy's
+    ``version-check`` sets it, so an existing DB it cannot read raises
+    :class:`DbSchemaUnreadableError` instead of reporting schema 0. The banner
+    and /health callers keep the default.
     """
 
     target_caps = read_target_schema_caps()
-    previous_caps = read_previous_schema_caps()
+    previous_caps = previous_schema_caps
     if db_path is None:
         db_schema = 0
     else:
-        db_schema = read_db_schema_version(db_path)
+        db_schema = read_db_schema_version(db_path, strict=strict)
 
     return compute_version_status(
         db_schema_version=db_schema,

@@ -11,6 +11,7 @@ No real PII in fixtures: every actor is ``user@example.com`` /
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -54,7 +55,7 @@ def _make_db() -> sqlite3.Connection:
     to a threadpool worker via ``db_call``, so the connection must
     permit cross-thread use.
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -64,15 +65,13 @@ def _make_db() -> sqlite3.Connection:
             created_under_system_hipaa INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # Apply v12 (creates sent_mail_index) + v14 (adds the M-6
-    # is_captured_pair column) + v15.
-    from email_triage.web.migrations import MIGRATIONS
-    for ver in (12, 14, 15):
-        for m in MIGRATIONS:
-            if m.version == ver:
-                m.body(conn)
-                break
-    conn.commit()
+    #  — apply EVERY migration that touches sent_mail_index, in version
+    # order, rather than a hardcoded version tuple. A future migration that adds
+    # a sent_mail_index column (as 's v32 embedding_dimension did — which had
+    # to be hand-appended to the old ``(12, 14, 15, 32)`` tuple) is then picked
+    # up automatically, so this fixture stays current-by-construction.
+    from _migration_fixtures import apply_table_migrations
+    apply_table_migrations(conn, "sent_mail_index")
     return conn
 
 
@@ -150,7 +149,7 @@ class TestMigrationV12:
         framework runs. Verifying v12 in isolation is what this test
         is for; the full ``init_db`` path is exercised elsewhere.
         """
-        conn = sqlite3.connect(":memory:")
+        conn = track(sqlite3.connect(":memory:"))
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)"
@@ -181,7 +180,7 @@ class TestMigrationV12:
         """
         from email_triage.web.db import init_db
         from email_triage.web.migrations import schema_version
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         try:
             assert schema_version(conn) >= 12
             rows = conn.execute(
@@ -196,7 +195,7 @@ class TestMigrationV12:
         """A DB that already has the table (legacy hand-roll) re-runs
         v12 as a no-op via ``CREATE TABLE IF NOT EXISTS``.
         """
-        conn = sqlite3.connect(":memory:")
+        conn = track(sqlite3.connect(":memory:"))
         conn.execute(
             "CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)"
         )
@@ -697,7 +696,7 @@ class TestMigrationV15:
         (is_captured_pair) only. Used to seed rows that pre-date v15
         so the backfill has work to do.
         """
-        conn = sqlite3.connect(":memory:")
+        conn = track(sqlite3.connect(":memory:"))
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE email_accounts (id INTEGER PRIMARY KEY)"
@@ -1218,3 +1217,77 @@ class TestWriteLockHeldDuringDbTouch:
             "write lock was NOT held during the commit — DELETE + commit "
             "must be one atomic block under the lock"
         )
+
+
+class TestE5Prefix:
+    """ — E5 models get symmetric query:/passage: prefixes + a
+    '+e5prefix' model stamp; non-E5 models are unchanged. The stamp MUST
+    be written + filtered consistently or retrieve returns nothing (the
+    recall-critical invariant this class guards)."""
+
+    def _stamp(self, conn, acct):
+        return conn.execute(
+            "SELECT embedding_model FROM sent_mail_index "
+            "WHERE account_id = ?",
+            (acct,),
+        ).fetchone()["embedding_model"]
+
+    async def test_non_e5_model_no_prefix_bare_stamp(self):
+        conn = _make_db()
+        acct = _seed_account(conn)
+        backend = _FakeBackend()
+        idx = SentMailIndex(
+            conn, acct, embedding_backend=backend,
+            embedding_model="all-MiniLM-L6-v2",
+        )
+        await idx.index_message(_msg("hello there", uid="u1"))
+        assert backend.calls
+        assert not backend.calls[-1].startswith("passage: ")
+        assert self._stamp(conn, acct) == "all-MiniLM-L6-v2"
+
+    async def test_e5_model_passage_prefix_and_stamp(self):
+        conn = _make_db()
+        acct = _seed_account(conn)
+        backend = _FakeBackend()
+        idx = SentMailIndex(
+            conn, acct, embedding_backend=backend,
+            embedding_model="intfloat/multilingual-e5-base",
+        )
+        await idx.index_message(_msg("hello there", uid="u1"))
+        assert backend.calls[-1].startswith("passage: ")
+        assert self._stamp(conn, acct) == (
+            "intfloat/multilingual-e5-base+e5prefix"
+        )
+        #  dimension-NULL fix coverage: index_message MUST stamp the
+        # per-row dimension (the _FakeBackend returns a 4-dim vector).
+        # Guards the exact NULL bug the v32 docstring documents — a
+        # regression dropping embedding_dimension from the INSERT fails
+        # HERE (without this assertion the fix shipped uncovered).
+        dim = conn.execute(
+            "SELECT embedding_dimension FROM sent_mail_index "
+            "WHERE account_id = ?", (acct,),
+        ).fetchone()["embedding_dimension"]
+        assert dim == 4
+
+    async def test_e5_query_prefix_and_stamp_roundtrip(self):
+        conn = _make_db()
+        acct = _seed_account(conn)
+        backend = _FakeBackend()
+        idx = SentMailIndex(
+            conn, acct, embedding_backend=backend,
+            embedding_model="intfloat/multilingual-e5-base",
+        )
+        await idx.index_message(_msg("sounds good happy to help", uid="u1"))
+        await idx.index_message(_msg(
+            "see you tomorrow", uid="u2",
+            rfc_id="<m2@example.com>", subject="Re: tomorrow",
+        ))
+        hits = await idx.retrieve_similar(
+            "happy to help sounds good", top_k=2,
+        )
+        # The query embed got a "query: " prefix...
+        assert any(c.startswith("query: ") for c in backend.calls)
+        # ...and the write-stamp == filter-stamp, so retrieve matches the
+        # e5-stamped rows. A stamp mismatch would yield [] here — this is
+        # the recall-critical consistency check.
+        assert len(hits) == 2

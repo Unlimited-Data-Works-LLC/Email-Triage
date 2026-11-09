@@ -32,7 +32,8 @@ from email_triage.engine.models import (
 from email_triage.providers.base import EmailProvider
 from email_triage._errfmt import fmt_exc
 
-logger = logging.getLogger("email_triage.actions.move")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.actions.move")  # N-196b R21_4
 
 
 class MoveAction(Action):
@@ -85,9 +86,8 @@ class MoveAction(Action):
 
         if not folder:
             logger.info(
-                "No folder mapping for category '%s', skipping move",
-                classification.category,
-                extra=_extras(),
+                "No folder mapping for category, skipping move",
+                extra={**_extras(), "category": classification.category},
             )
             return ActionOutput(
                 result=ActionResult.SKIPPED,
@@ -108,16 +108,24 @@ class MoveAction(Action):
                     exists = folder in folders or folder.lower() in {
                         f.lower() for f in folders
                     }
-                except Exception:
+                except Exception as exc:
                     # list_folders not supported / transient error — fall
                     # through to create-attempt below. Best-effort.
-                    pass
+                    logger.warning(
+                        "move: list_folders failed; attempting create anyway",
+                        folder=folder,
+                        error=fmt_exc(exc),
+                    )
 
                 if not exists:
                     try:
                         await provider.create_folder(folder)
-                    except NotImplementedError:
-                        pass
+                    except NotImplementedError as exc:
+                        logger.debug(
+                            "move: provider does not support create_folder; continuing",
+                            folder=folder,
+                            error=fmt_exc(exc),
+                        )
                     except RuntimeError as create_err:
                         # Only swallow "already exists"-shaped messages.
                         # Everything else (permission, namespace, quota)
@@ -144,9 +152,8 @@ class MoveAction(Action):
             )
         except NotImplementedError:
             logger.info(
-                "Provider %s does not support move, skipping",
-                provider.name,
-                extra=_extras(),
+                "Provider does not support move, skipping",
+                extra={**_extras(), "provider": provider.name},
             )
             return ActionOutput(
                 result=ActionResult.SKIPPED,

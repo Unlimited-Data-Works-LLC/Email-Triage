@@ -140,3 +140,21 @@ In rough operator order:
 - Backup / recovery: README "Backup & Disaster Recovery".
 - Incident response: [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md).
 - Local-only audit detail: `internal compliance review` (gitignored).
+
+## Shared-host container co-tenancy (SELinux MCS)
+
+When email-triage runs as a container on a host it shares with other
+containers, SELinux type enforcement keeps every container away from host
+files, but only the MCS level separates one `container_t` process from another,
+and all of them may use `container_file_t` files. A data or config directory at
+the shared level `s0` is readable and writable by every container on the host,
+so a process that escapes another container with its SELinux context intact
+could reach the database and the key beside it. The controls: the container is
+pinned to one two-category MCS level through a host quadlet drop-in
+(`SecurityLabelLevel=`); a persistent fcontext rule labels the data and config
+directories `container_file_t` at that level; every deploy container that mounts
+them runs at the same level; and the deploy refuses on an SELinux host when the
+level is missing, malformed, or the unit runs unconfined. The isolation holds
+only while SELinux is Enforcing. Detection of cross-container attempts depends
+on AVC denials being audited and alerted on, which is host configuration. See
+`internal documentation` ("Exit 9 and exit 10") for the operator side.

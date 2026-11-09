@@ -119,7 +119,7 @@ class TestWizardStep2Imap:
             "/accounts/new/step2-imap",
             data={
                 "account_id": str(aid),
-                "host": "imap.example.com",
+                "host": "imap.example.invalid",
                 "port": "993",
                 "username": "u@example.com",
                 "password": "secret",
@@ -137,7 +137,7 @@ class TestWizardStep2Imap:
             (aid,),
         ).fetchone()
         cfg = json.loads(row["config_json"])
-        assert cfg["host"] == "imap.example.com"
+        assert cfg["host"] == "imap.example.invalid"
         assert cfg["username"] == "u@example.com"
         assert cfg["use_ssl"] is True
 
@@ -163,7 +163,7 @@ class TestWizardStep2Imap:
             "/accounts/new/step2-imap",
             data={
                 "account_id": str(admin_acct_id),
-                "host": "h", "port": "993",
+                "host": "h.invalid", "port": "993",
                 "username": "u", "password": "p",
             },
             cookies=user_cookies,
@@ -328,7 +328,9 @@ class TestWizardStep5:
         loc = r.headers.get("location", "")
         # Wizard completion lands on /accounts with a success banner;
         # changed from /dashboard?wizard=done in the auto-chain pass.
-        assert loc.startswith("/accounts?success=")
+        # N-232b R25: routed through `_redirect.msg_qs` so the flash is
+        # readable via `read_flash`; wire shape is `?msg=<url-encoded>`.
+        assert loc.startswith("/accounts?msg=")
 
         cfg = json.loads(db.execute(
             "SELECT config_json FROM email_accounts WHERE id = ?",
@@ -410,7 +412,7 @@ class TestWizardDisabledUntilDone:
         from email_triage.web.db import create_email_account
         aid = create_email_account(
             db, regular_user["id"],
-            "Manual-defaults-active", "imap", {"host": "example.com"},
+            "Manual-defaults-active", "imap", {"host": "example.invalid"},
             hipaa=False,
         )
         row = db.execute(
@@ -428,7 +430,7 @@ class TestWizardDisabledUntilDone:
         from email_triage.web.db import create_email_account, set_account_active
         aid = create_email_account(
             db, regular_user["id"],
-            "FlipTarget", "imap", {"host": "h.example.com"},
+            "FlipTarget", "imap", {"host": "h.example.invalid"},
             hipaa=False, is_active=False,
         )
         # Off → on

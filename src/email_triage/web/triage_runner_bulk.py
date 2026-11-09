@@ -58,9 +58,12 @@ from email_triage.web.db import (
     update_triage_job_cursor,
 )
 from email_triage.web.db_threadpool import db_call
+from email_triage._errfmt import fmt_exc, scrub_class_error_for_persist, scrub_error_for_persist  # N-42: scrub exc text into error_text
+from email_triage._int_utils import bounded_int  # N-219c/6 R23
 
 
-_log = logging.getLogger("email_triage.web.triage_runner_bulk")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.triage_runner_bulk")  # N-196b R21_4
 
 # Poll cadence between queue checks. Short enough that a freshly
 # submitted job starts within a few seconds; long enough that an
@@ -189,6 +192,17 @@ async def _process_one_message(
         try:
             message = await ctx.provider.fetch_message(msg_id)
         except Exception as e:
+            # #1 (census run16 / db-sme + DA MUST-FIX) — a per-message fetch 401
+            # here is a DEAD TOKEN: re-raise so it propagates through
+            # run_triage_all's gather (return_exceptions=False) to the outer SET
+            # edge (record_provider_outcome @1144) instead of being recorded as a
+            # per-message "error" + returned cleanly, which lets run_triage_all's
+            # post-search CLEAR mask the revoked credential. The search leg lives
+            # in the CALLER (run_triage_all's search_iter) — a cross-FUNCTION
+            # asymmetry the census's 5-site (within-one-function) list missed.
+            from email_triage.web._auth_revoked import is_auth_revoked_exc
+            if is_auth_revoked_exc(e):
+                raise
             _log.warning(
                 "bulk per-message fetch error",
                 extra={"job_id": job_id, "msg_id": msg_id, "err": repr(e)},
@@ -196,11 +210,11 @@ async def _process_one_message(
             err_entry = {
                 "message_id": msg_id,
                 "status": "error",
-                "error": f"{type(e).__name__}: {e}",
+                "error": scrub_class_error_for_persist(e),
             }
             await db_call(
                 _record_outcome, conn, err_entry, "e",
-                [f"{type(e).__name__}: {e}"],
+                [scrub_class_error_for_persist(e)],
             )
             return "e"
 
@@ -222,7 +236,7 @@ async def _process_one_message(
             entry = {
                 "message_id": msg_id,
                 "status": "error",
-                "error": f"{type(e).__name__}: {e}",
+                "error": scrub_class_error_for_persist(e),
             }
             status = "e"
 
@@ -295,6 +309,7 @@ async def run_style_mine_job(
     from email_triage.web.routers.ui import (
         _create_provider_from_account, _build_classifier_from_config,
     )
+    from email_triage.web._audit import safe_audit_write_async
 
     job_id = job["job_id"]
     account_id = job["account_id"]
@@ -306,13 +321,11 @@ async def run_style_mine_job(
     # install-wide default. Clamp defensively.
     #  — run_style_mine_job is awaited from the bulk dispatcher
     # loop on the event-loop thread; route the setting read off-loop.
-    from email_triage.web.db_threadpool import db_call
     limit = await db_call(get_style_learning_mine_limit_default, conn)
     if raw_query.startswith("style_mine:limit="):
-        try:
-            limit = int(raw_query.split("=", 1)[1])
-        except (TypeError, ValueError):
-            pass
+        limit = bounded_int(  # N-219c/6 R23: SSOT
+            raw_query.split("=", 1)[1], default=limit,
+        )
     if limit < 1:
         limit = 1
     elif limit > STYLE_LEARNING_MINE_LIMIT_MAX:
@@ -376,32 +389,82 @@ async def run_style_mine_job(
         # ASYNC-DB: terminal-state write off the loop.
         await db_call(
             finish_triage_job, conn, job_id, status="failed",
-            error_text=f"setup: {type(e).__name__}: {e}",
+            error_text=f"setup: {fmt_exc(e, with_class=True)}",
         )
         return
 
     # HIPAA audit bookend (actor != owner only) — mirrors the inline
-    # path's _record_style_data_hipaa_access. The inline path writes
-    # one row; this path bookends two (in_progress at start, final
-    # outcome at end) because the work is long-running and an
-    # auditor wants both timestamps.
+    # path's audit_phi_access (web/routers/ui/_shared.py SSOT). The
+    # inline path writes one row; this path bookends two (in_progress
+    # at start, final outcome at end) because the work is long-running
+    # and an auditor wants both timestamps.
     audit_event_id: int | None = None
-    if (
-        actor_user_id is not None
-        and account_hipaa
-        and actor_user_id != owner_id
+    # N-79: PD#14 predicate SSOT — a system-initiated (actor=None) bulk
+    # style-mine of a HIPAA mailbox is a non-owner PHI read and MUST audit
+    # (drops the old `actor_user_id is not None` clause, the N-72 sibling bug).
+    from email_triage.db.audit import phi_access_audit_required
+    if phi_access_audit_required(
+        account_hipaa=account_hipaa,
+        actor_user_id=actor_user_id,
+        owner_id=owner_id,
     ):
-        try:
-            # ASYNC-DB: HIPAA audit-row write off the loop.
-            audit_event_id = await db_call(
+        # ASYNC-DB: HIPAA audit-row write off the loop.
+        # Census run17 #3 — route the swallowed emit through the
+        # best-effort audit SSOT so a write failure surfaces to /health's
+        # audit-failure drift counter instead of being log-only.
+        audit_event_id = await safe_audit_write_async(
+            lambda: db_call(
                 record_hipaa_access_event,
                 conn, actor_user_id, account_id, "style_mine_bulk",
                 outcome="in_progress",
+            ),
+            description=f"phi_access style_mine_bulk in_progress account_id={account_id}",
+            table="hipaa_access_events",
+            emitter="record_hipaa_access_event",
+        )
+
+    # N-114 — HIPAA + BAA egress gate (§164.308(b)(1), shared SSOT). The style-
+    # mine ships sent-mail BODIES to `classifier` (extract_style_profile /
+    # _per_alias below); the opt-in (is_style_knobs_hipaa_allow, gated upstream)
+    # governs the M-1/M-2 typed knobs ONLY, never the M-3 body-mine egress (the
+    # leak: the opt-in wrongly lifted it). For a HIPAA account on an external
+    # non-BAA'd classifier that raw PHI must NOT egress. Refuse the whole mine
+    # BEFORE either the per-alias or single-profile path; no-op for local /
+    # BAA-acked (baa_block_status → None). (Belt-and-suspenders with the
+    # extract_style_profile in-fn gate.)
+    if account_hipaa:
+        from email_triage.classify.baa_gate import baa_block_status
+        _sm_blk = await db_call(baa_block_status, conn, classifier, True)
+        if _sm_blk is not None:
+            if audit_event_id is not None:
+                # Allow-list step 2 (B1): finalise through the SSOT.
+                await safe_audit_write_async(
+                    lambda: db_call(
+                        update_hipaa_access_event, conn, audit_event_id,
+                        "blocked",
+                        f"baa_gate: backend={_sm_blk['backend']} host={_sm_blk['host']}",
+                    ),
+                    description=(
+                        f"style_mine_finalise job={job_id} "
+                        f"audit_event_id={audit_event_id} outcome=blocked"
+                    ),
+                    table="hipaa_access_events",
+                    emitter="update_hipaa_access_event",
+                )
+            await db_call(
+                finish_triage_job, conn, job_id, status="failed",
+                error_text=(
+                    "style_mine: HIPAA account blocked from non-BAA classifier "
+                    f"({_sm_blk['backend']} @ {_sm_blk['host'] or '?'}). "
+                    "Acknowledge a BAA on /config or switch to a local Ollama."
+                ),
             )
-        except Exception:
-            _log.exception(
-                "HIPAA audit row write failed (style_mine in_progress)"
-            )
+            return
+
+    # N-82 (Defect B) — auth_stale lifecycle funnel for the style-mine
+    # credentialed search. Late import to avoid the app.py circular import.
+    from email_triage.web.app import record_provider_outcome
+    from email_triage.web._auth_revoked import is_auth_revoked_exc
 
     failed_with: str | None = None
     try:
@@ -448,6 +511,10 @@ async def run_style_mine_job(
                     filter=MailFilter(folder=folder),
                 )
             except Exception as e:
+                # N-82 — auth-revoked: re-raise to the outer except so the
+                # chip is SET. Transient errors are swallowed (continue).
+                if is_auth_revoked_exc(e):
+                    raise
                 _log.warning(
                     "style_mine: per-folder search failed; continuing",
                     extra={
@@ -461,6 +528,20 @@ async def run_style_mine_job(
                 if key not in seen_keys:
                     seen_keys.add(key)
                     merged_pairs.append(key)
+        # N-82 — all per-folder searches completed without auth error; the
+        # credential is alive. CLEAR any prior stale chip. Outside the loop
+        # so one db_call covers the whole sweep.
+        # NOTE (vs run_triage_all's `if not cancelled and not failed_with`):
+        # this CLEAR needs no failed_with guard because it is reached ONLY when
+        # the search loop fell through cleanly — an auth-revoked error re-raises
+        # (above) to the outer except → SET edge, and `failed_with` is not yet
+        # assigned on this path (the no_messages/finalise assignments are
+        # downstream). Keep this CLEAR before any failure assignment so a future
+        # refactor can't let a failed run reach it (PD#18 set-broad/clear-narrow).
+        try:
+            await db_call(record_provider_outcome, conn, acct, None)
+        except Exception:
+            pass
 
         # ASYNC-DB: counter write off the loop.
         await db_call(
@@ -474,6 +555,13 @@ async def run_style_mine_job(
                 msg = await provider.fetch_message(mid, folder=folder)
                 messages.append(msg)
             except Exception as e:
+                # #1 (census run16) — auth-revoked on the FETCH leg must
+                # propagate like the SEARCH leg already does (N-82), so it
+                # reaches the outer record_provider_outcome SET edge instead of
+                # being swallowed and letting the post-search CLEAR mask a
+                # revoked credential. Transient errors still continue.
+                if is_auth_revoked_exc(e):
+                    raise
                 _log.warning(
                     "style_mine: fetch failed; continuing",
                     extra={
@@ -536,6 +624,7 @@ async def run_style_mine_job(
                         messages, classifier,
                         known_addresses=known_addresses,
                         captured_message_ids=captured_ids,
+                        account_hipaa=account_hipaa, conn=conn,  # N-114 BAA gate
                     )
                 )
 
@@ -577,8 +666,12 @@ async def run_style_mine_job(
                             set_style_profile(
                                 conn, account_id, best.to_dict(),
                             )
-                        except Exception:
-                            pass
+                        except Exception as style_exc:
+                            _log.warning(
+                                "bulk triage: account-wide style profile refresh failed",
+                                account_id=account_id,
+                                error=fmt_exc(style_exc),
+                            )
                     # 2026-05-18 — bump by the actual message count,
                     # not 1. Pre-fix this incremented total_processed
                     # by 1 (the agent's "one logical output = one
@@ -611,6 +704,7 @@ async def run_style_mine_job(
                 profile = await extract_style_profile(
                     messages, classifier,
                     captured_message_ids=captured_ids,
+                    account_hipaa=account_hipaa, conn=conn,  # N-114 BAA egress gate
                 )
 
                 def _persist_profile(conn):
@@ -635,11 +729,17 @@ async def run_style_mine_job(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        failed_with = f"{type(e).__name__}: {e}"
+        failed_with = fmt_exc(e, with_class=True)
         _log.exception(
             "style_mine: run failed",
             extra={"job_id": job_id},
         )
+        # N-82 — auth-revoked failure (re-raised from per-folder search or
+        # any other credentialed op) → SET the re-auth chip, needle-filtered.
+        try:
+            await db_call(record_provider_outcome, conn, acct, e)
+        except Exception:
+            pass
     finally:
         try:
             await provider.close()
@@ -669,17 +769,21 @@ async def run_style_mine_job(
     # Close HIPAA audit row.
     if audit_event_id is not None:
         outcome = "error" if failed_with else "success"
-        try:
-            # ASYNC-DB: HIPAA audit-row update off the loop.
-            await db_call(
+        # ASYNC-DB: HIPAA audit-row update off the loop, through the
+        # SSOT (allow-list step 2, B1).
+        await safe_audit_write_async(
+            lambda: db_call(
                 update_hipaa_access_event,
                 conn, audit_event_id, outcome,
                 f"style_mine job {job_id}",
-            )
-        except Exception:
-            _log.exception(
-                "HIPAA audit row update failed (style_mine final)"
-            )
+            ),
+            description=(
+                f"style_mine_finalise job={job_id} "
+                f"audit_event_id={audit_event_id} outcome={outcome}"
+            ),
+            table="hipaa_access_events",
+            emitter="update_hipaa_access_event",
+        )
 
 
 async def run_triage_all(
@@ -727,6 +831,7 @@ async def run_triage_all(
         TriageContext, build_default_registry,
         _build_rule_labels_map, _build_rule_provider_labels_map,
     )
+    from email_triage.web._audit import safe_audit_write_async
 
     job_id = job["job_id"]
     account_id = job["account_id"]
@@ -786,7 +891,7 @@ async def run_triage_all(
         # ASYNC-DB: terminal-state write off the loop.
         await db_call(
             finish_triage_job, conn, job_id, status="failed",
-            error_text=f"setup: {type(e).__name__}: {e}",
+            error_text=f"setup: {fmt_exc(e, with_class=True)}",
         )
         return
 
@@ -795,20 +900,30 @@ async def run_triage_all(
     # first-party access; admin / delegate sweeping someone else's
     # is third-party PHI access + gets the §164.312(b) row.
     audit_event_id: int | None = None
-    if (
-        actor_user_id is not None
-        and account_hipaa
-        and actor_user_id != owner_id
+    # N-79: PD#14 predicate SSOT — a system-initiated (actor=None) whole-mailbox
+    # triage of a HIPAA account is a non-owner PHI read and MUST audit (drops
+    # the old `actor_user_id is not None` clause, the N-72 sibling bug). The
+    # comment above already states intent: "gets the §164.312(b) row".
+    from email_triage.db.audit import phi_access_audit_required
+    if phi_access_audit_required(
+        account_hipaa=account_hipaa,
+        actor_user_id=actor_user_id,
+        owner_id=owner_id,
     ):
-        try:
-            # ASYNC-DB: HIPAA audit-row write off the loop.
-            audit_event_id = await db_call(
+        # ASYNC-DB: HIPAA audit-row write off the loop.
+        # Census run17 #3 — route the swallowed emit through the
+        # best-effort audit SSOT so a write failure surfaces to /health's
+        # audit-failure drift counter instead of being log-only.
+        audit_event_id = await safe_audit_write_async(
+            lambda: db_call(
                 record_hipaa_access_event,
                 conn, actor_user_id, account_id, "bulk_triage",
                 outcome="in_progress",
-            )
-        except Exception:
-            _log.exception("HIPAA audit row write failed (in_progress)")
+            ),
+            description=f"phi_access bulk_triage in_progress account_id={account_id}",
+            table="hipaa_access_events",
+            emitter="record_hipaa_access_event",
+        )
 
     #  — terminal-state flags initialised BEFORE the outer try so
     # the audit-row close in its ``finally`` can read them even when a
@@ -959,6 +1074,14 @@ async def run_triage_all(
             fire_watches=True,
         )
 
+        # N-82 (Defect B) — auth_stale lifecycle funnel for the bulk-triage
+        # credentialed search. Mirrors the topic_backscan.py wiring: SET the
+        # chip on an auth-revoked search failure (needle-filtered; transient
+        # errors do not set it), CLEAR it on a clean run. Late import to
+        # avoid the app.py circular import (same pattern as background_sweepers
+        # and topic_backscan).
+        from email_triage.web.app import record_provider_outcome
+
         try:
             async for batch, batch_cursor in provider.search_iter(
                 effective_query,
@@ -1032,14 +1155,30 @@ async def run_triage_all(
                     _persist_batch_progress, conn,
                     processed, skipped, errors, batch_cursor,
                 )
+            # N-82 — search_iter completed without exception (may have been
+            # cancelled by the inner break above, but the credential proved
+            # alive for at least the first page). CLEAR any prior stale chip.
+            # Outside the for-loop so one db_call covers the whole sweep.
+            if not cancelled and not failed_with:
+                try:
+                    await db_call(record_provider_outcome, conn, acct, None)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             # Process shutdown. Don't write a terminal row — leave it
             # 'running' so the next start's requeue picks it up.
             # Re-raise so the supervisor sees the cancellation cleanly.
             raise
         except Exception as e:
-            failed_with = f"{type(e).__name__}: {e}"
+            failed_with = fmt_exc(e, with_class=True)
             _log.exception("bulk run failed", extra={"job_id": job_id})
+            # N-82 — auth-revoked search failure → SET the re-auth chip
+            # (needle-filtered: transient errors do not set it). Mirrors
+            # topic_backscan.py's wiring on the same credential.
+            try:
+                await db_call(record_provider_outcome, conn, acct, e)
+            except Exception:
+                pass
         finally:
             try:
                 await provider.close()
@@ -1054,6 +1193,14 @@ async def run_triage_all(
 
         # Resolve terminal state. Cancelled writes are owned by the UI
         # path; only finalise here if the row is still 'running'.
+        # ``_completion`` carries the clean-done signal + the authoritative
+        # job-row counts out to the event loop so the run18 census #7 bulk
+        # terminal emit can fire (a threadpool db_call cannot ``await`` the
+        # async webhook). Set ONLY when THIS run writes 'done' — so a
+        # cancelled/failed sweep, or an already-terminal row on resume,
+        # emits nothing.
+        _completion: dict = {"done": False}
+
         def _finalise_bulk_job(conn):
             # ASYNC-DB: terminal-state resolution read +
             # (conditional) finish write, one off-loop hop.
@@ -1068,8 +1215,43 @@ async def run_triage_all(
                     )
                 else:
                     finish_triage_job(conn, job_id, status="done")
+                    _completion["done"] = True
+                    _completion["total_seen"] = latest["total_seen"] or 0
+                    _completion["total_processed"] = (
+                        latest["total_processed"] or 0
+                    )
+                    _completion["total_errors"] = latest["total_errors"] or 0
 
         await db_call(_finalise_bulk_job, conn)
+
+        # run18 census #7 — emit triage.completed for a bulk sweep that
+        # finished cleanly. The per-message triage_runs rows are already
+        # written by _record_outcome, so record=False: this only fires the
+        # outbound webhook, with the run-level tallies read off the
+        # job row (no 10k-element results list). HIPAA accounts are
+        # hard-skipped inside fire_triage_completed. Best-effort: a webhook
+        # failure must never fail the job.
+        if _completion["done"]:
+            dispatcher = getattr(app.state, "event_dispatcher", None)
+            if dispatcher is not None:
+                from email_triage.web.events import complete_triage_run
+                try:
+                    await complete_triage_run(
+                        dispatcher, conn, app.state.config, acct,
+                        run_id=f"bulk_{job_id}",
+                        query=f"bulk:{job_id}",
+                        trigger="bulk",
+                        total_messages=_completion["total_seen"],
+                        results_count=_completion["total_processed"],
+                        errors_count=_completion["total_errors"],
+                        elapsed_secs=0.0,
+                        record=False,
+                    )
+                except Exception as e:
+                    _log.warning(
+                        "bulk triage.completed dispatch failed",
+                        extra={"job_id": job_id, "err": repr(e)},
+                    )
     except asyncio.CancelledError:
         #  — a cancel anywhere in the job-setup window (before the
         # inner try took over) still reaches here. Mark cancelled so
@@ -1085,7 +1267,7 @@ async def run_triage_all(
         # so the finally closes the row as "error", then re-raise to
         # preserve the prior propagate-to-caller behaviour.
         if failed_with is None:
-            failed_with = f"{type(e).__name__}: {e}"
+            failed_with = fmt_exc(e, with_class=True)
         raise
     finally:
         #  — ALWAYS close the HIPAA audit row. This finally covers
@@ -1096,15 +1278,21 @@ async def run_triage_all(
                 "cancelled" if cancelled
                 else ("error" if failed_with else "success")
             )
-            try:
-                # ASYNC-DB: HIPAA audit-row update off the loop.
-                await db_call(
+            # ASYNC-DB: HIPAA audit-row update off the loop, through
+            # the SSOT (allow-list step 2, B1).
+            await safe_audit_write_async(
+                lambda: db_call(
                     update_hipaa_access_event,
                     conn, audit_event_id, outcome,
                     f"bulk job {job_id}",
-                )
-            except Exception:
-                _log.exception("HIPAA audit row update failed")
+                ),
+                description=(
+                    f"bulk_triage_finalise job={job_id} "
+                    f"audit_event_id={audit_event_id} outcome={outcome}"
+                ),
+                table="hipaa_access_events",
+                emitter="update_hipaa_access_event",
+            )
 
 
 async def bulk_triage_runner(app) -> None:
@@ -1178,6 +1366,15 @@ async def bulk_triage_runner(app) -> None:
                     run_embedding_reindex_job,
                 )
                 await run_embedding_reindex_job(app, conn, job)
+            elif kind == "topic_backscan":
+                #  — back-scan HISTORICAL mail for one (topic, account)
+                # over a 30/60/90-day window. Lazy-imported so the topic
+                # matcher / classify stack isn't pulled on every dispatcher
+                # tick (most installs aren't actively back-scanning).
+                from email_triage.jobs.topic_backscan import (
+                    run_topic_backscan_job,
+                )
+                await run_topic_backscan_job(app, conn, job)
             else:
                 await run_triage_all(app, conn, job)
         except asyncio.CancelledError:
@@ -1190,10 +1387,16 @@ async def bulk_triage_runner(app) -> None:
             )
             raise
         except Exception as e:
-            _log.exception(
-                "Bulk triage job raised — marking failed",
-                extra={"job_id": job["job_id"]},
+            # Fail LOUD on a code defect (incident_2026-06-11): a programming
+            # defect (ImportError/AttributeError/NameError/TypeError) fails
+            # every time for every input — it logs CRITICAL with a CODE-DEFECT
+            # banner + flips /health degraded, NOT a quiet "failed job" that
+            # looks like a transient auth/network blip. Operational failures log
+            # as before. ``failure_text`` stamps the CODE-DEFECT error_text.
+            from email_triage.job_drain_safety import (
+                failure_text, note_drain_failure,
             )
+            note_drain_failure(_log, job_id=job["job_id"], kind=kind, exc=e)
             try:
                 def _safety_net_finish(conn, job_id, err_text):
                     # ASYNC-DB: re-read + conditional finish write,
@@ -1210,7 +1413,7 @@ async def bulk_triage_runner(app) -> None:
 
                 await db_call(
                     _safety_net_finish, conn, job["job_id"],
-                    f"{type(e).__name__}: {e}",
+                    failure_text(e),
                 )
             except Exception:
                 _log.exception(

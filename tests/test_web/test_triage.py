@@ -28,7 +28,7 @@ class TestTriagePage:
         db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user["id"], "Test IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Test IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
 
@@ -69,7 +69,7 @@ class TestAccountRoutes:
         cursor = db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name, "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (user_id, name, "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         return cursor.lastrowid
@@ -243,7 +243,7 @@ class TestFolderRoutes:
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, "Test IMAP", "imap",
-             json.dumps({"host": "mail.test.com", "username": "test@test.com"}),
+             json.dumps({"host": "mail.test.invalid", "username": "test@test.com"}),
              now, now),
         )
         db.commit()
@@ -291,7 +291,7 @@ class TestFolderPrefsRoutes:
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, "Test IMAP", "imap",
-             json.dumps({"host": "mail.test.com", "username": "test@test.com"}),
+             json.dumps({"host": "mail.test.invalid", "username": "test@test.com"}),
              now, now),
         )
         db.commit()
@@ -341,6 +341,52 @@ class TestFolderPrefsRoutes:
         assert prefs["INBOX.Triage"] is True
         assert prefs["INBOX.Archive"] is False
 
+    def test_save_prefs_with_more_than_a_thousand_form_fields(
+        self, client, db, admin_cookies, admin_user,
+    ):
+        """Punch 443: the form posts two fields per folder, and Starlette's
+        default max_fields=1000 is enforced for urlencoded bodies. 1 200 folders
+        (2 400 fields) hard-400ed before the route used parse_form."""
+        acct_id = self._create_account(db, admin_user["id"])
+        paths = [f"INBOX.F{i}" for i in range(1_200)]
+        resp = client.post(
+            f"/accounts/{acct_id}/folders/prefs",
+            data={"all_folders": paths, "included": paths[:600]},
+            cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303, resp.text[:200]
+        from email_triage.web.db import get_folder_prefs
+        prefs = get_folder_prefs(db, acct_id)
+        assert len(prefs) == 1_200
+        assert prefs["INBOX.F0"] is True and prefs["INBOX.F1199"] is False
+
+    def test_save_prefs_refuses_an_oversize_folder_field(
+        self, client, db, admin_cookies, admin_user,
+    ):
+        """Punch 443 (db-sme S1): with the field count raised, each field is capped
+        at 8 KiB (a folder path), so 50 000 x 1 MiB cannot be posted. An oversize
+        field is a 400 and the saved prefs are untouched."""
+        from email_triage.web.db import get_folder_prefs, save_folder_prefs
+        from email_triage.web.form_limits import FORM_FOLDER_PATH_MAX_PART_SIZE
+        acct_id = self._create_account(db, admin_user["id"])
+        save_folder_prefs(db, acct_id, {"INBOX.Keep": True})
+        resp = client.post(
+            f"/accounts/{acct_id}/folders/prefs",
+            data={"all_folders": ["INBOX.A", "X" * (FORM_FOLDER_PATH_MAX_PART_SIZE * 2)]},
+            cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 400, resp.status_code
+        assert get_folder_prefs(db, acct_id) == {"INBOX.Keep": True}
+        ok = client.post(
+            f"/accounts/{acct_id}/folders/prefs",
+            data={"all_folders": ["X" * (FORM_FOLDER_PATH_MAX_PART_SIZE // 2)]},
+            cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert ok.status_code == 303, ok.status_code
+
     def test_save_prefs_forbidden(self, client, db, user_cookies, regular_user, admin_user):
         acct_id = self._create_account(db, admin_user["id"])
         resp = client.post(
@@ -360,7 +406,7 @@ class TestDigestRoutes:
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, "Test IMAP", "imap",
-             json.dumps({"host": "mail.test.com", "username": "test@test.com"}),
+             json.dumps({"host": "mail.test.invalid", "username": "test@test.com"}),
              now, now),
         )
         db.commit()
@@ -561,7 +607,7 @@ class TestDiscoverPage:
         db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user["id"], "My IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "My IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
 
@@ -615,7 +661,7 @@ class TestDiscoverRun:
         cursor = db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user["id"], "Admin IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Admin IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         acct_id = cursor.lastrowid
@@ -632,7 +678,7 @@ class TestDiscoverRun:
         cursor = db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, is_active, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 0, ?, ?)",
-            (admin_user["id"], "Disabled IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Disabled IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         acct_id = cursor.lastrowid
@@ -774,7 +820,7 @@ class TestDiscoverFolders:
         cursor = db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user["id"], "Admin IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Admin IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         acct_id = cursor.lastrowid
@@ -792,7 +838,7 @@ class TestDiscoverFolders:
         db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user["id"], "Test IMAP", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Test IMAP", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
 
@@ -809,7 +855,7 @@ class TestDiscoverFolders:
         cursor = db.execute(
             "INSERT INTO email_accounts (user_id, name, provider_type, config_json, is_active, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 0, ?, ?)",
-            (admin_user["id"], "Disabled", "imap", json.dumps({"host": "mail.test.com"}), now, now),
+            (admin_user["id"], "Disabled", "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         acct_id = cursor.lastrowid
@@ -850,7 +896,7 @@ class TestTriageRunsActorUserId:
             " created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 1, ?, ?)",
             (user_id, "Test IMAP", "imap",
-             json.dumps({"host": "mail.test.com"}), now, now),
+             json.dumps({"host": "mail.test.invalid"}), now, now),
         )
         db.commit()
         return cursor.lastrowid
@@ -972,7 +1018,7 @@ class TestRunTriageActorThrough:
             " created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 1, ?, ?)",
             (admin_user["id"], "Test IMAP", "imap",
-             _json.dumps({"host": "mail.test.com", "username": "u@t.com"}),
+             _json.dumps({"host": "mail.test.invalid", "username": "u@t.com"}),
              now, now),
         )
         db.commit()
@@ -1028,7 +1074,7 @@ class TestRunTriageActorThrough:
             " created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 1, ?, ?)",
             (admin_user["id"], "Test IMAP", "imap",
-             _json.dumps({"host": "mail.test.com", "username": "u@t.com"}),
+             _json.dumps({"host": "mail.test.invalid", "username": "u@t.com"}),
              now, now),
         )
         db.commit()

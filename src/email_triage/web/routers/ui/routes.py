@@ -23,6 +23,8 @@ from zoneinfo import available_timezones
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from email_triage.web.error_html import error_chip
+
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
 from email_triage.web import settings_keys as _S
@@ -39,6 +41,7 @@ from email_triage.web.auth import (
 )
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import (
+    is_admin as _is_admin,  # N-222h R22 SSOT alias (local `is_admin` shadows callable)
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
@@ -49,30 +52,12 @@ from email_triage.web.dependencies import (
 )
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c R23
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.routes")
 
 router = APIRouter()
-
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 
 from . import _shared
@@ -85,13 +70,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -151,10 +155,15 @@ async def routes_top_level_page(request: Request, user: RequireUser):
         from email_triage.web.db import (
             get_email_account, list_email_accounts,
         )
-        if user["role"] == "admin":
-            all_accounts = list_email_accounts(db)
+        # N-109: this feeds the /routes account <select> picker — a human picks
+        # a mailbox to attach routes to. active_only=True hides deactivated
+        # (Removed, creds-purged) accounts from the picker.
+        if _is_admin(user):  # N-222h R22 (was: user["role"] == "admin")
+            all_accounts = list_email_accounts(db, active_only=True)
         else:
-            all_accounts = list_email_accounts(db, user_id=user["id"])
+            all_accounts = list_email_accounts(
+                db, user_id=user["id"], active_only=True,
+            )
         manageable = [
             {"id": a["id"], "name": a["name"]} for a in all_accounts
         ]
@@ -163,10 +172,7 @@ async def routes_top_level_page(request: Request, user: RequireUser):
 
         target_id: int | None = None
         if raw_aid:
-            try:
-                target_id = int(raw_aid)
-            except (TypeError, ValueError):
-                target_id = None
+            target_id = parse_int_or_none(raw_aid)  # N-219c R23: SSOT
         if target_id is None:
             target_id = _get_last_routes_account_id(db, user["id"])
         if target_id is None:
@@ -207,7 +213,7 @@ async def routes_top_level_page(request: Request, user: RequireUser):
     await db_call(_set_last_routes_account_id, db, user["id"], target_id)
 
     # HTMX swap: return only the body partial.
-    if request.headers.get("HX-Request") == "true":
+    if _shared.is_htmx(request):
         return await _render(
             templates, request,
             "accounts/_routes_body.html", ctx,
@@ -223,7 +229,7 @@ async def accounts_routes_save(
     """Save a single category → actions mapping for an account."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     from email_triage.web.db import upsert_account_route
 
@@ -235,6 +241,20 @@ async def accounts_routes_save(
     # Parse selected actions and their configs.
     actions = []
     action_names = form.getlist("actions")
+    # Punch 596 — refuse an action the editor does not offer (a hand-posted
+    # `escalate` used to persist with an empty config). Fail-closed: nothing
+    # is saved.
+    unoffered = _unoffered_route_actions(action_names)
+    if unoffered:
+        import html as _html_mod
+        return HTMLResponse(
+            '<small style="color:var(--pico-del-color);">Not saved: '
+            + ", ".join(
+                f"<code>{_html_mod.escape(n)}</code>" for n in unoffered
+            )
+            + " is not an action this page offers.</small>",
+            status_code=400,
+        )
     for action_name in action_names:
         action_config: dict[str, Any] = {}
         if action_name == "move":
@@ -278,6 +298,16 @@ async def accounts_routes_save(
                 action_config["labels"] = internal_slugs
             if provider_names:
                 action_config["provider_labels"] = provider_names
+        elif action_name == "clock":
+            #  — the operator-configured regulatory template (seeded def code)
+            # + who submits. responsibility is out-of-band operator config (the
+            # only sanctioned source per N-96), validated to the enum.
+            template = (form.get("clock_template") or "").strip()
+            responsibility = (form.get("clock_responsibility") or "unknown").strip()
+            if template:
+                action_config["template"] = template
+            if responsibility in ("i_submit", "sponsor_submits", "unknown"):
+                action_config["responsibility"] = responsibility
         actions.append({"action": action_name, "config": action_config})
 
     await db_call(upsert_account_route, db, account_id, category, actions)
@@ -307,7 +337,9 @@ async def accounts_routes_save(
                 _create_provider_from_account, acct, secrets,
             )
             try:
-                will_create = await _probe_missing_labels(provider, targets)
+                will_create = await _probe_missing_labels(
+                    provider, targets, account_id=account_id,
+                )
             finally:
                 try:
                     await provider.close()
@@ -329,7 +361,15 @@ async def accounts_routes_save(
     saved_at = _dt.now().strftime("%H:%M")
     msg_parts = [f"Saved {saved_at}"]
     if will_create:
-        joined = ", ".join(f"<code>{n}</code>" for n in will_create)
+        # N-68 (root-cause-scope sibling — the lead's review caught this 2nd
+        # site the first cut missed): ``will_create`` is form-DERIVED (the
+        # category / folder names the operator submitted, echoed back by the
+        # label probe), so interpolating it raw into this HTMLResponse is the
+        # same reflected-XSS class as the save-all handler. Escape each name.
+        import html as _html_mod
+        joined = ", ".join(
+            f"<code>{_html_mod.escape(n)}</code>" for n in will_create
+        )
         msg_parts.append(
             f'Will auto-create {joined} on first matching email.'
         )
@@ -364,10 +404,7 @@ async def accounts_routes_save_all(
     from email_triage.web.db import upsert_account_route
 
     form = await request.form()
-    try:
-        row_count = int(form.get("row_count", "0"))
-    except (TypeError, ValueError):
-        row_count = 0
+    row_count = _safe_int(form.get("row_count"), 0)  #  — request int via SSOT
 
     valid_cats = set(
         (await db_call(
@@ -385,9 +422,27 @@ async def accounts_routes_save_all(
             errors.append(f"Row {i}: category missing.")
             continue
         if cat not in valid_cats:
-            errors.append(f"Row {i}: unknown category {cat!r}.")
+            # N-68: cat is attacker-controlled form input; repr() escapes
+            # quotes but NOT angle brackets — a raw interpolation into
+            # the HTMLResponse f-string below is reflected XSS.
+            # Use html.escape() so angle brackets/quotes are neutralised
+            # before the value lands in the response body.
+            import html as _html_mod
+            errors.append(
+                f"Row {i}: unknown category {_html_mod.escape(repr(cat))}."
+            )
             continue
         action_names = form.getlist(f"row_{i}_actions")
+        # Punch 596 — same refusal as the per-row save; the batch aborts.
+        unoffered = _unoffered_route_actions(action_names)
+        if unoffered:
+            import html as _html_mod
+            errors.append(
+                f"Row {i}: not an offered action: "
+                + ", ".join(_html_mod.escape(n) for n in unoffered)
+                + "."
+            )
+            continue
         move_folder = (form.get(f"row_{i}_move_folder") or "").strip()
         #  follow-up — per-row provider-label multi-select for
         # the existing ``label`` action. JS in _routes_body.html
@@ -450,8 +505,7 @@ async def accounts_routes_save_all(
         await db_call(_save_all_db_work)
     except Exception as e:
         return HTMLResponse(
-            f'<small style="color:var(--pico-del-color);">'
-            f"Save failed: {e}</small>",
+            error_chip(e, prefix='Save failed: '),
             status_code=500,
         )
 
@@ -469,7 +523,7 @@ async def accounts_routes_delete(
     """Delete a route mapping."""
     #  — preamble collapsed to ``OwnedAccount``.
     user, acct, db, _ = owned
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     from email_triage.web.db import delete_account_route
 

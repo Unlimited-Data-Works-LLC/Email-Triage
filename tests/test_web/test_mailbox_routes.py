@@ -11,7 +11,7 @@ from email_triage.web.db import (
 
 def _make_account(db, regular_user):
     return create_email_account(
-        db, regular_user["id"], "ACCT", "imap", {"host": "x.example.com"},
+        db, regular_user["id"], "ACCT", "imap", {"host": "x.example.invalid"},
     )
 
 

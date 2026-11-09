@@ -27,9 +27,9 @@ class TestBuildDiscoverPrompt:
     """Tests for build_discover_prompt()."""
 
     def test_contains_email_content(self):
-        msg = _make_email(subject="Invoice ", sender="billing@acme.com")
+        msg = _make_email(subject="Invoice #1234", sender="billing@acme.com")
         prompt = build_discover_prompt(msg)
-        assert "Invoice " in prompt
+        assert "Invoice #1234" in prompt
         assert "billing@acme.com" in prompt
 
     def test_contains_json_format_instructions(self):
@@ -43,7 +43,8 @@ class TestBuildDiscoverPrompt:
 
     def test_injection_guard_present(self):
         prompt = build_discover_prompt(_make_email())
-        assert "EMAIL DATA ONLY" in prompt
+        assert "<<<UNTRUSTED_DATA>>>" in prompt
+        assert "<<<END_UNTRUSTED_DATA>>>" in prompt
 
     def test_slug_format_instructions(self):
         prompt = build_discover_prompt(_make_email())

@@ -39,6 +39,9 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from email_triage._int_utils import parse_int_or_none  # N-219b R23
+from email_triage._isotime import now_utc_iso
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from typing import Any
 
 from email_triage.actions.base import (
@@ -61,14 +64,12 @@ from email_triage.providers.calendar_base import (
     CalendarScopeError,
 )
 
-log = logging.getLogger("email_triage.actions.self_sent_event")
+log = get_logger("email_triage.actions.self_sent_event")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
 # Address matching
 # ---------------------------------------------------------------------------
-
-_ADDR_RE = re.compile(r"<\s*([^<>\s]+@[^<>\s]+)\s*>")
 
 
 def _extract_address(raw: str) -> str:
@@ -76,37 +77,25 @@ def _extract_address(raw: str) -> str:
     sender string. ``"Operator A <op@example.com>"`` -> ``"op@example.com"``.
     Bare addresses pass through. Case-folded; surrounding whitespace
     stripped. Empty string when no address is found.
+
+    A7 (census 2026-06-09): delegates to the bare-address SSOT (was a
+    local ``_ADDR_RE`` + a naive ``split()[-1].strip("<>")`` fallback).
     """
-    if not raw:
-        return ""
-    s = str(raw).strip()
-    m = _ADDR_RE.search(s)
-    if m:
-        return m.group(1).strip().lower()
-    # Bare address — strip any obvious junk.
-    return s.split()[-1].strip("<>").lower()
+    from email_triage.mail_headers import extract_bare_address
+    return extract_bare_address(raw)
 
 
 # ---------------------------------------------------------------------------
 # Subject normalisation
 # ---------------------------------------------------------------------------
 
-_SUBJECT_PREFIX_RE = re.compile(r"^\s*(?:re|fwd?|fw)\s*:\s*", re.IGNORECASE)
-
-
 def _strip_reply_prefix(subject: str) -> str:
-    """Strip leading ``Re:`` / ``Fwd:`` / ``Fw:`` (any case) from a
-    subject. Multiple chained prefixes are stripped iteratively
-    (``Re: Re: Lunch`` -> ``Lunch``)."""
-    if not subject:
-        return ""
-    out = subject
-    while True:
-        new = _SUBJECT_PREFIX_RE.sub("", out, count=1)
-        if new == out:
-            break
-        out = new
-    return out.strip()
+    """Strip leading ``Re:`` / ``Fwd:`` / ``Fw:`` (any case) from a subject,
+    chained prefixes stripped iteratively (``Re: Re: Lunch`` -> ``Lunch``).
+    Converged onto the ``mail_headers`` SSOT (census run13 ); keeps the
+    trailing ``.strip()`` this consumer applied."""
+    from email_triage.mail_headers import strip_reply_prefix
+    return strip_reply_prefix(subject).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +158,8 @@ def _parse_time(text: str) -> tuple[int, int] | None:
     m = _TIME_RE.match(text.strip())
     if not m:
         return None
-    try:
-        hour = int(m.group("hour"))
-    except (TypeError, ValueError):
+    hour = parse_int_or_none(m.group("hour"))  # N-219b R23: SSOT
+    if hour is None:
         return None
     minute_raw = m.group("minute")
     minute = int(minute_raw) if minute_raw else 0
@@ -260,10 +248,7 @@ def _extract_event_time(
     m = _MONTH_DAY_TIME_RE.search(body)
     if m:
         month = _MONTHS.get(m.group("month").lower())
-        try:
-            day = int(m.group("day"))
-        except (TypeError, ValueError):
-            day = None
+        day = parse_int_or_none(m.group("day"))  # N-219c/4 R23: SSOT
         if month and day and 1 <= day <= 31:
             t = _parse_time(m.group("time"))
             if t is not None:
@@ -431,7 +416,7 @@ class SelfSentEventAction(Action):
         # Build event from message.
         summary = _strip_reply_prefix(message.subject) or "Note to self"
         body_preview = (message.body_text or "")[: self.BODY_PREVIEW_CHARS]
-        ts_iso = datetime.now(timezone.utc).isoformat()
+        ts_iso = now_utc_iso()
         description = (
             f"{body_preview}\n\n"
             f"Auto-extracted from self-sent message at {ts_iso}"
@@ -499,8 +484,11 @@ class SelfSentEventAction(Action):
         # Per-message dedup stamp. Best-effort —
         # a DB blip here must not cause an action failure.
         db = state_bag.get("db")
-        rfc_id = (message.headers or {}).get("Message-Id") or (
-            message.headers or {}).get("Message-ID") or message.message_id
+        # A6 (census 2026-06-09): message-level SSOT — any header casing
+        # (was Message-Id/Message-ID only, missing lowercase), then the
+        # provider-native id. Shared casing authority.
+        from email_triage.mail_headers import get_message_rfc_id
+        rfc_id = get_message_rfc_id(message)
         account_id = state_bag.get("account_id")
         if db is not None and account_id and rfc_id:
             try:
@@ -509,8 +497,12 @@ class SelfSentEventAction(Action):
                 #  — mark_triaged is @db_write; action.execute runs
                 # on the event-loop thread, so dispatch via db_call.
                 await db_call(mark_triaged, db, int(account_id), str(rfc_id))
-            except Exception:
-                pass
+            except Exception as exc:
+                log.error(
+                    "self_sent_event: mark_triaged dedup/audit stamp not written",
+                    account_id=account_id,
+                    exc_info=exc,
+                )
 
         await record_idempotent_done(
             flow, message, self.name, external_id=str(new_event_id),

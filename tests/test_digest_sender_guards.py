@@ -65,6 +65,11 @@ class _FakeSmtp:
 
 
 @pytest.mark.asyncio
+@pytest.mark.audit_failure_expected(
+    match='recipient_digest_sent route=/internal/recipient-digest account_id=42 digest_id=digest_x',
+    count=1,
+    reason='incidental (punch 629 r3): the stub db object has no execute(), so the recipient_digest_sent audit write fails',
+)
 async def test_send_proceeds_when_to_addr_matches(
     acct_imap, dcfg_custom,
 ):
@@ -236,7 +241,8 @@ def _row(category="newsletter", sender="x@y", subject="s",
 
 
 def test_candidates_returns_filtered_rows(acct_imap, dcfg_custom):
-    """Cheap path: gather rows + apply filter. Returns a list."""
+    """Cheap path: gather rows + apply filter. Returns
+    (rows, total_matched)."""
     from email_triage.web.app import _filter_digest_candidates
 
     rows_in = [_row(subject=f"s{i}") for i in range(3)]
@@ -244,18 +250,19 @@ def test_candidates_returns_filtered_rows(acct_imap, dcfg_custom):
         "email_triage.actions.recipient_digest.gather_digest_rows",
         return_value=rows_in,
     ):
-        rows_out = _filter_digest_candidates(
+        rows_out, total_matched = _filter_digest_candidates(
             db=object(), acct=acct_imap, dcfg=dcfg_custom,
             now_utc=datetime.now(timezone.utc), last_sent=None,
         )
     assert len(rows_out) == 3
+    assert total_matched == 3  # no cap hit → denominator == shown
     assert all(r["category"] == "newsletter" for r in rows_out)
 
 
 def test_candidates_empty_window_returns_empty_list(
     acct_imap, dcfg_custom,
 ):
-    """Empty gather → empty candidate list. UI renders the
+    """Empty gather → empty candidate list + 0 total. UI renders the
     'no matching messages' muted message."""
     from email_triage.web.app import _filter_digest_candidates
 
@@ -263,11 +270,57 @@ def test_candidates_empty_window_returns_empty_list(
         "email_triage.actions.recipient_digest.gather_digest_rows",
         return_value=[],
     ):
-        rows_out = _filter_digest_candidates(
+        rows_out, total_matched = _filter_digest_candidates(
             db=object(), acct=acct_imap, dcfg=dcfg_custom,
             now_utc=datetime.now(timezone.utc), last_sent=None,
         )
     assert rows_out == []
+    assert total_matched == 0
+
+
+def test_candidates_over_cap_reports_pre_cap_total(
+    acct_imap, dcfg_custom,
+):
+    """ — when max_rows caps the list, the returned rows are the
+    capped subset but total_matched is the honest pre-cap count, so
+    the UI can render 'showing N of M'."""
+    from email_triage.web.app import _filter_digest_candidates
+
+    dcfg_custom.format.max_rows = 2
+    rows_in = [_row(subject=f"s{i}") for i in range(5)]
+    with patch(
+        "email_triage.actions.recipient_digest.gather_digest_rows",
+        return_value=rows_in,
+    ):
+        rows_out, total_matched = _filter_digest_candidates(
+            db=object(), acct=acct_imap, dcfg=dcfg_custom,
+            now_utc=datetime.now(timezone.utc), last_sent=None,
+        )
+    assert len(rows_out) == 2       # capped subset is what would send
+    assert total_matched == 5       # but the honest denominator is 5
+
+
+def test_candidates_apply_cap_false_returns_full_set(
+    acct_imap, dcfg_custom,
+):
+    """ reachability — apply_cap=False returns the FULL filtered set
+    (no max_rows slice) so the Show-matches dry-run can PAGE through every
+    match, not just the first max_rows that would send."""
+    from email_triage.web.app import _filter_digest_candidates
+
+    dcfg_custom.format.max_rows = 2
+    rows_in = [_row(subject=f"s{i}") for i in range(5)]
+    with patch(
+        "email_triage.actions.recipient_digest.gather_digest_rows",
+        return_value=rows_in,
+    ):
+        rows_out, total_matched = _filter_digest_candidates(
+            db=object(), acct=acct_imap, dcfg=dcfg_custom,
+            now_utc=datetime.now(timezone.utc), last_sent=None,
+            apply_cap=False,
+        )
+    assert len(rows_out) == 5       # uncapped — every match is reachable
+    assert total_matched == 5
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +333,8 @@ async def test_render_payload_returns_tuple_for_grouped_list(
     acct_imap, dcfg_custom,
 ):
     """grouped_list → sync render path. Returns
-    (subject, html_body, plain_body, rows). No SMTP, no LLM."""
+    (subject, html_body, plain_body, rows, total_matched). No SMTP,
+    no LLM."""
     from email_triage.web.app import _render_digest_payload
 
     rows_in = [_row(subject="A"), _row(subject="B")]
@@ -288,7 +342,7 @@ async def test_render_payload_returns_tuple_for_grouped_list(
         "email_triage.actions.recipient_digest.gather_digest_rows",
         return_value=rows_in,
     ):
-        subject, html_body, plain_body, rows_out = (
+        subject, html_body, plain_body, rows_out, total_matched = (
             await _render_digest_payload(
                 db=object(),
                 secrets=type("S", (), {"get": lambda *a, **k: ""})(),
@@ -302,13 +356,46 @@ async def test_render_payload_returns_tuple_for_grouped_list(
     assert html_body  # rendered HTML
     assert plain_body  # plain fallback
     assert len(rows_out) == 2
+    assert total_matched == 2  # under cap → no omission
+
+
+@pytest.mark.asyncio
+async def test_render_payload_over_cap_injects_omission_notice(
+    acct_imap, dcfg_custom,
+):
+    """ — when max_rows drops messages, the rendered body the
+    recipient receives carries an in-body notice naming the count,
+    and total_matched reports the honest pre-cap denominator."""
+    from email_triage.web.app import _render_digest_payload
+
+    dcfg_custom.format.max_rows = 2
+    rows_in = [_row(subject=f"s{i}") for i in range(5)]
+    with patch(
+        "email_triage.actions.recipient_digest.gather_digest_rows",
+        return_value=rows_in,
+    ):
+        subject, html_body, plain_body, rows_out, total_matched = (
+            await _render_digest_payload(
+                db=object(),
+                secrets=type("S", (), {"get": lambda *a, **k: ""})(),
+                acct=acct_imap, dcfg=dcfg_custom, hipaa=False,
+                now_utc=datetime.now(timezone.utc),
+                last_sent=None,
+            )
+        )
+    assert len(rows_out) == 2
+    assert total_matched == 5
+    # Both bodies tell the recipient the digest was capped.
+    assert "3" in html_body and "omitted" in html_body.lower()
+    assert "3 omitted" in plain_body or "3 matching" not in plain_body
+    assert "omitted" in plain_body.lower()
 
 
 @pytest.mark.asyncio
 async def test_render_payload_empty_window_returns_blanks(
     acct_imap, dcfg_custom,
 ):
-    """0 rows → all four return values blank/empty.
+    """0 rows → all string return values blank/empty + 0 total.
 
     Caller (_fire_one_digest, /preview, /candidates) branches on
     rows being empty to render a 'nothing matched' message."""
@@ -318,7 +405,7 @@ async def test_render_payload_empty_window_returns_blanks(
         "email_triage.actions.recipient_digest.gather_digest_rows",
         return_value=[],
     ):
-        subject, html_body, plain_body, rows_out = (
+        subject, html_body, plain_body, rows_out, total_matched = (
             await _render_digest_payload(
                 db=object(),
                 secrets=type("S", (), {"get": lambda *a, **k: ""})(),
@@ -331,3 +418,4 @@ async def test_render_payload_empty_window_returns_blanks(
     assert html_body == ""
     assert plain_body == ""
     assert rows_out == []
+    assert total_matched == 0

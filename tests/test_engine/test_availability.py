@@ -431,7 +431,7 @@ class TestOnePerDaySpread:
         events on contact-derived calendars come back transparent
         from Google; ``showAs == "free"`` from MS Graph maps to
         transparent. Operator-symptom (2026-05-14): a Monday
-        all-day "an all-day birthday" event blanked the whole day
+        all-day "Alice's birthday" event blanked the whole day
         from suggestions even though it has no real busy time."""
         # Two events on Monday: a transparent all-day birthday +
         # an opaque 10:30-11:30 actual meeting. Expect slots BEFORE
@@ -439,7 +439,7 @@ class TestOnePerDaySpread:
         birthday = _ev(
             _utc(2026, 4, 20, 0, 0), _utc(2026, 4, 21, 0, 0),
             all_day=True, transparency="transparent",
-            summary="an all-day birthday",
+            summary="Alice's birthday",
         )
         meeting = _ev(
             _utc(2026, 4, 20, 10, 30), _utc(2026, 4, 20, 11, 30),
@@ -484,7 +484,7 @@ class TestOnePerDaySpread:
         per Google API spec) must block 2026-04-21 in the USER'S
         local timezone, NOT shift back by the timezone offset.
 
-        Operator-symptom 2026-05-14: an all-day birthday stored as
+        Operator-symptom 2026-05-14: Alice's birthday stored as
         ``date: "2026-05-19"`` (Tue) blanked Mon 5/18 from
         suggestions because the pre-fix code did
         ``.astimezone(America/New_York).date()`` → ``2026-05-18 20:00
@@ -507,12 +507,12 @@ class TestOnePerDaySpread:
             horizon_start=MONDAY,
             horizon_end=MONDAY + timedelta(days=2),
             length_minutes=30, count=2,
-            timezone_name="America/New_York",
+            timezone_name="America/Detroit",
         )
         assert len(slots) == 2
         # Both slots should be on Monday (Tue is correctly blocked).
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/New_York")
+        tz = ZoneInfo("America/Detroit")
         for s, _ in slots:
             assert s.astimezone(tz).date() == datetime(
                 2026, 4, 20, tzinfo=tz,

@@ -111,7 +111,7 @@ class TestUnifiedAuthScopes:
             config={"account": "me@gmail.com", "calendar_opted_in": True},
         )
         _seed_install_oauth(client.app)
-        client.app.state.config.push.public_url = "https://test.example.com"
+        client.app.state.config.push.public_url = "https://test.example.invalid"
         try:
             resp = client.post(
                 f"/accounts/{aid}/gmail-api/auth/start", cookies=admin_cookies,
@@ -131,7 +131,7 @@ class TestUnifiedAuthScopes:
             config={"account": "me@gmail.com"},  # no calendar opt-in
         )
         _seed_install_oauth(client.app)
-        client.app.state.config.push.public_url = "https://test.example.com"
+        client.app.state.config.push.public_url = "https://test.example.invalid"
         try:
             resp = client.post(
                 f"/accounts/{aid}/gmail-api/auth/start", cookies=admin_cookies,

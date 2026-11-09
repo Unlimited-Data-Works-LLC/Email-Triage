@@ -25,12 +25,10 @@ Patterns NOT blocked (safe):
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
-
-REPO_SRC = Path(__file__).resolve().parents[1] / "src"
+from _pin_harness import iter_src_files, relpath
 
 # Token-bearing field names that must NOT appear as a logged value.
 TOKEN_NAMES = {
@@ -52,13 +50,6 @@ RAW_TOKEN_PATTERNS = [
 LOG_CALL_RE = re.compile(
     r"\b(log|logger|_log)\.(info|debug|warning|error|exception|critical)\b"
 )
-
-
-def _iter_python_files() -> list[Path]:
-    return [
-        p for p in REPO_SRC.rglob("*.py")
-        if "__pycache__" not in p.parts
-    ]
 
 
 def _is_log_line(line: str) -> bool:
@@ -112,7 +103,7 @@ def _line_emits_token_value(line: str) -> bool:
 def test_no_token_values_in_log_calls():
     """No log line in src/ emits a token-bearing field as its value."""
     offenders: list[str] = []
-    for path in _iter_python_files():
+    for path in iter_src_files():
         try:
             text = path.read_text(encoding="utf-8")
         except Exception:
@@ -121,7 +112,7 @@ def test_no_token_values_in_log_calls():
             if not _is_log_line(line):
                 continue
             if _line_emits_token_value(line):
-                rel = path.relative_to(REPO_SRC.parent)
+                rel = relpath(path)
                 offenders.append(f"{rel}:{i}: {line.strip()}")
 
     assert not offenders, (
@@ -139,7 +130,7 @@ def test_no_raw_jwt_in_source():
     secret or a hard-coded test fixture that should live in tests/.
     """
     offenders: list[str] = []
-    for path in _iter_python_files():
+    for path in iter_src_files():
         try:
             text = path.read_text(encoding="utf-8")
         except Exception:
@@ -148,7 +139,7 @@ def test_no_raw_jwt_in_source():
             for m in pat.finditer(text):
                 # File and approximate line.
                 line_no = text.count("\n", 0, m.start()) + 1
-                rel = path.relative_to(REPO_SRC.parent)
+                rel = relpath(path)
                 offenders.append(f"{rel}:{line_no}: {m.group(0)[:40]}...")
 
     assert not offenders, (
@@ -254,7 +245,7 @@ async def test_exchange_code_for_tokens_does_not_log_secrets(
             client_id="cid",
             client_secret=_TEST_CLIENT_SECRET,
             code=_TEST_AUTH_CODE,
-            redirect_uri="https://example.com/cb",
+            redirect_uri="https://example.invalid/cb",
         )
 
     # Sanity: the function returned the token shape it received.

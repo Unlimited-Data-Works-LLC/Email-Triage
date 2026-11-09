@@ -33,7 +33,7 @@ from email_triage.web.db import (
 
 def _make_acct(db, owner_id: int, name: str = "Acct") -> int:
     return create_email_account(
-        db, owner_id, name, "imap", {"host": "mail.example.com"},
+        db, owner_id, name, "imap", {"host": "mail.example.invalid"},
     )
 
 
@@ -196,7 +196,8 @@ async def test_runner_dispatches_style_mine_kind(
         def to_dict(self):
             return {"persona_summary": "friendly", "sample_count": 1}
 
-    async def _fake_extract(messages, classifier, *, captured_message_ids=None):
+    async def _fake_extract(messages, classifier, *, captured_message_ids=None,
+                            account_hipaa=False, conn=None):  # N-114 BAA gate kwargs
         return _FakeProfile()
 
     monkeypatch.setattr(

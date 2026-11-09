@@ -81,7 +81,7 @@ def other_user_cookies(other_user):
 def _make_hipaa_acct(db, owner_id: int, name: str = "MedAcct") -> int:
     """Create a HIPAA-flagged IMAP account owned by ``owner_id``."""
     aid = create_email_account(
-        db, owner_id, name, "imap", {"host": "mail.example.com"},
+        db, owner_id, name, "imap", {"host": "mail.example.invalid"},
     )
     set_account_hipaa(db, aid, True, actor_id=owner_id)
     return aid
@@ -89,7 +89,7 @@ def _make_hipaa_acct(db, owner_id: int, name: str = "MedAcct") -> int:
 
 def _make_acct(db, owner_id: int, name: str = "Acct") -> int:
     return create_email_account(
-        db, owner_id, name, "imap", {"host": "mail.example.com"},
+        db, owner_id, name, "imap", {"host": "mail.example.invalid"},
     )
 
 
@@ -200,7 +200,7 @@ class TestOwnerTick:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 "style_knobs_hipaa_allow": "1",
@@ -226,7 +226,7 @@ class TestOwnerTick:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 # style_knobs_hipaa_allow omitted → unticked.
@@ -248,7 +248,7 @@ class TestOwnerTick:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 "style_knobs_hipaa_allow": "1",
@@ -294,7 +294,7 @@ class TestNonOwnerRefuse:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 "style_knobs_hipaa_allow": "1",
@@ -340,7 +340,7 @@ class TestNonOwnerRefuse:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 "style_knobs_hipaa_allow": "1",
@@ -373,7 +373,7 @@ class TestNonOwnerRefuse:
             data={
                 "name": "MedAcct",
                 "provider_type": "imap",
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "username": "owner@example.com",
                 "is_active": "1",
                 # No style_knobs_hipaa_allow at all.
@@ -411,12 +411,13 @@ class TestNoOperatorIdentifiers:
         src = inspect.getsource(db_mod.record_hipaa_access_event)
         # The function body must not reach for user.email anywhere.
         # (The signature exposes account_id + actor_user_id only;
-        # detail is caller-supplied.)
+        # detail is caller-supplied.) Operator HOST names and the internal domain
+        # are not listed here: naming them would ship them (punch 617). A host name
+        # in any shipped .py literal is caught repo-wide by the publish pin
+        # test_no_shipped_py_carries_a_homelab_name_the_curator_cannot_rewrite.
         for forbidden in (
-            "@examplerealm",
-            "exampleuser",
+            "alice",
             "openclaw",
-            "the gateway host",
         ):
             assert forbidden not in src, (
                 f"record_hipaa_access_event source mentions "

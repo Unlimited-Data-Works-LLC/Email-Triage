@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ class TestLazyHttpClient:
         """N sequential ``get()`` calls -> one ``httpx.AsyncClient(...)``."""
         with patch("email_triage._http_client.httpx.AsyncClient") as mock_cls:
             mock_cls.return_value = MagicMock()
-            holder = LazyHttpClient(timeout=120.0)
+            holder = LazyHttpClient(intent=Intent.LOCAL_ONLY, timeout=120.0)
             for _ in range(20):
                 await holder.get()
             assert mock_cls.call_count == 1
@@ -60,7 +60,7 @@ class TestLazyHttpClient:
             "email_triage._http_client.httpx.AsyncClient",
             side_effect=fake_ctor,
         ):
-            holder = LazyHttpClient(timeout=10.0)
+            holder = LazyHttpClient(intent=Intent.LOCAL_ONLY, timeout=10.0)
 
             # Pre-load the lock by constructing once -- the second
             # waiter then re-checks and finds the cached value.
@@ -80,7 +80,7 @@ class TestLazyHttpClient:
     async def test_aclose_idempotent_when_never_built(self):
         """``aclose()`` on a holder whose client was never requested
         is a silent no-op."""
-        holder = LazyHttpClient(timeout=5.0)
+        holder = LazyHttpClient(intent=Intent.LOCAL_ONLY, timeout=5.0)
         await holder.aclose()  # must not raise
 
     @pytest.mark.asyncio
@@ -92,7 +92,7 @@ class TestLazyHttpClient:
             client_a.aclose = AsyncMock()
             client_b = MagicMock()
             mock_cls.side_effect = [client_a, client_b]
-            holder = LazyHttpClient(timeout=10.0)
+            holder = LazyHttpClient(intent=Intent.LOCAL_ONLY, timeout=10.0)
             first = await holder.get()
             assert first is client_a
             await holder.aclose()
@@ -265,10 +265,13 @@ class TestWatchRunnerWebhookLongLived:
         reset for that file; this duplicate keeps this test file
         self-contained.
         """
+        # -e: _WEBHOOK_CLIENT is a lazy None-initialised singleton;
+        # rebind the module attribute to None so the next
+        # ``_get_webhook_client()`` rebuilds.
         from email_triage.web import watch_runner
-        watch_runner._WEBHOOK_CLIENT._client = None
+        watch_runner._WEBHOOK_CLIENT = None
         yield
-        watch_runner._WEBHOOK_CLIENT._client = None
+        watch_runner._WEBHOOK_CLIENT = None
 
     @pytest.mark.asyncio
     async def test_n_posts_one_client(self):
@@ -299,8 +302,11 @@ class TestWatchRunnerWebhookLongLived:
     @pytest.mark.asyncio
     async def test_aclose_module_drains(self):
         """``aclose_module()`` aclose's the pool + safe to call dry."""
+        # -e: _WEBHOOK_CLIENT is a lazy None-initialised singleton, so
+        # binding it at import time captures ``None``. Use the getter to
+        # trigger lazy construction, then aclose via the public module fn.
         from email_triage.web.watch_runner import (
-            _WEBHOOK_CLIENT, aclose_module,
+            _get_webhook_client, aclose_module,
         )
         # Dry-call (never built) — must not raise.
         await aclose_module()
@@ -311,7 +317,7 @@ class TestWatchRunnerWebhookLongLived:
             mock_client = MagicMock()
             mock_client.aclose = AsyncMock()
             mock_cls.return_value = mock_client
-            await _WEBHOOK_CLIENT.get()
+            await _get_webhook_client().get()
             await aclose_module()
             mock_client.aclose.assert_awaited_once()
 
@@ -325,15 +331,27 @@ class TestCertCacheLongLived:
     @pytest.mark.asyncio
     async def test_n_refreshes_one_client(self):
         """3 refresh() cycles construct httpx.AsyncClient exactly once."""
-        from email_triage.web.gmail_push_auth import _CertCache
+        from email_triage.web.gmail_push_auth import (
+            GmailPushTransientFetchError,
+            _CertCache,
+        )
 
         jwks_resp = MagicMock()
         jwks_resp.status_code = 200
         jwks_resp.json.return_value = {"keys": []}
 
+        # punch 548: `_refresh` is rate-gated to one fetch per
+        # `_JWKS_MIN_REFRESH_INTERVAL_SECS`, so three back-to-back refreshes
+        # would raise instead of fetching. The subject of THIS test is client
+        # REUSE across N fetches, not the gate, so the floor is set to 0 for
+        # the duration (the constant is read at call time precisely so this
+        # works) and the three fetches happen as before.
         with patch(
             "email_triage._http_client.httpx.AsyncClient",
-        ) as mock_cls:
+        ) as mock_cls, patch(
+            "email_triage.web.gmail_push_auth."
+            "_JWKS_MIN_REFRESH_INTERVAL_SECS", 0.0,
+        ):
             mock_client = MagicMock()
             mock_client.get = AsyncMock(return_value=jwks_resp)
             mock_client.aclose = AsyncMock()
@@ -341,7 +359,14 @@ class TestCertCacheLongLived:
 
             cache = _CertCache(ttl_seconds=3600)
             for _ in range(3):
-                await cache._refresh()
+                # punch 548 / DB-546-5: an empty `keys` list no longer
+                # installs an empty table -- it preserves whatever is held
+                # and raises the transient error. The fixture keeps its
+                # `{"keys": []}` body because the subject here is CLIENT
+                # REUSE across N fetches, and a raising refresh still had to
+                # make the fetch.
+                with pytest.raises(GmailPushTransientFetchError):
+                    await cache._refresh()
             await cache.aclose()
             assert mock_cls.call_count == 1
             assert mock_client.get.await_count == 3

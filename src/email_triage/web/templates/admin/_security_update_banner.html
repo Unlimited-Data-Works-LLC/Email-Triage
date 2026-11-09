@@ -1,0 +1,58 @@
+{# Admin security-update banner (punch 553, operator decision 553-2).
+
+   AUDIENCE:    admin (system operator). Never rendered for other users:
+                ``_shared._inject_update_check_banners_ctx`` returns None
+                for a non-admin, and this partial self-guards on it.
+   TECH-SKILL:  medium — knows how to apply an update.
+   COPY RULES:  plain English; say what to do and by when it matters.
+                NOT dismissable: there is no close button, and the dismiss
+                route only accepts disclosure ids, never this banner.
+
+   Reads ``update_check_banners.security`` — shape from
+   ``update_check.security_update_pending``. Shows until the RUNNING version
+   reaches the target (derived every render, never stored).
+#}
+{% if update_check_banners is defined and update_check_banners and update_check_banners.security %}
+{% set _sec = update_check_banners.security %}
+<aside id="security-update-banner" role="alert"
+       data-reason="{{ _sec.reason }}" data-severity="{{ _sec.severity }}"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+    <strong>
+        {% if _sec.reason == "marker_absent" %}
+        Update available: it may fix a security problem
+        {% elif _sec.reason == "marker_unparseable" %}
+        Update available: treat it as a security update
+        {% else %}
+        Security update required
+        {% endif %}
+    </strong>
+    <p style="margin:0.3rem 0 0;">
+        This server runs version <code>{{ _sec.running_version }}</code>.
+        {% if _sec.reason == "marker_absent" %}
+        The newest release{% if _sec.latest_tag %} (<code>{{ _sec.latest_tag }}</code>){% endif %}
+        does not say whether it fixes a security problem, so treat it as
+        one and update.
+        {% elif _sec.reason == "marker_unparseable" %}
+        The newest release{% if _sec.latest_tag %} (<code>{{ _sec.latest_tag }}</code>){% endif %}
+        carries security information this server could not read, so treat
+        it as a security update and update.
+        {% else %}
+        Update to <code>{{ _sec.target_version or _sec.latest_tag }}</code>
+        or later: it fixes a security problem rated
+        <strong>{{ _sec.severity }}</strong>.
+        {% endif %}
+    </p>
+    {% if _sec.advisories %}
+    <p style="margin:0.3rem 0 0;font-size:0.9em;">
+        Advisories: {% for a in _sec.advisories %}<code>{{ a }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+    <p style="margin:0.3rem 0 0;font-size:0.85em;color:var(--pico-muted-color);">
+        This notice stays until this server is updated.
+        {% if _sec.checked_at %}Last checked <time datetime="{{ _sec.checked_at }}" data-us-datetime>{{ _sec.checked_at | us_datetime }}</time>.{% endif %}
+        {% if _sec.release_url %}<a href="{{ _sec.release_url }}" rel="noopener noreferrer" target="_blank">Read the release notes</a>.{% endif %}
+    </p>
+</aside>
+{% endif %}

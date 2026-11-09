@@ -19,7 +19,6 @@ config path:
 |---|---|
 | `/app/data` (volume) | SQLite database, MSAL token cache, the lazy-installed embedding runtime |
 | `/app/config` (volume) | `email-triage.yaml` + optional TLS certs |
-| `EMAIL_TRIAGE_CONFIG` | Path to the config inside the container (default `/app/config/email-triage.yaml`) |
 
 Compose is the simplest path (`compose.yaml` ships in the repo):
 
@@ -39,7 +38,7 @@ podman run -d --name email-triage \
     -v ./data:/app/data \
     -v ./config:/app/config \
     --secret ET_MASTER_KEY \
-    ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+    ghcr.io/unlimited-data-works-llc/email-triage:0.2.0
 ```
 
 The container's built-in healthcheck reports readiness on `/health`.
@@ -73,15 +72,46 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 > `email-triage backup export` produces a separate `*.etbkkey` bundle;
 > store it apart from the data bundle.
 
-The deprecated `env` backend is allowed for local dev / CI only; set
-`EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1` there to silence the deprecation
-warning. **HIPAA mode rejects the `env` backend at boot unconditionally**
-— the carve-out var does not bypass it. (Sunset: hard error in v0.2.0
+The deprecated `env` backend is allowed for local dev / CI only; it always
+logs a deprecation warning (the `EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY` switch that
+silenced it was removed in punch 547, and a process that still sets it is
+refused at start). **HIPAA mode rejects the `env` backend at boot
+unconditionally**. (Sunset: hard error in v0.2.0
 non-HIPAA, removed in v0.3.0.)
 
-## Encryption at rest (v0.1.2)
+### If the credential-store soft-gate alert fires
 
-v0.1.2 can encrypt the single SQLite database file with **SQLCipher
+The admin alert "credential store SOFT-gate active" means the app cannot
+open its credential store with the master key it was given. Office 365
+accounts keep working only until their cached tokens are needed.
+
+> **Do not generate a new key.** The command above creates a DIFFERENT key.
+> A new key orphans every stored credential and, with encryption at rest,
+> the database. Recovery means putting the SAME key back.
+
+1. Read `msal_master_key_status` on `/health/detail` (sign in as an admin;
+   or, inside the container with `ET_HEALTH_OPS_TOKEN` set, request it on the
+   loopback with an `X-Ops-Token` header, see the table below) and the
+   alert's reason (`unavailable`, `probe_error` or `import_error`).
+2. Check which backend `secrets.backend` names (the table above) and that it
+   still supplies the original key: the container secret, keyfile or keyring
+   entry exists and is unchanged.
+3. If the key is gone from that backend, put the same key back from your
+   stored copy. From the key-only bundle,
+   `email-triage restore <file>.etbkkey --master-key-out <path>` asks for the
+   bundle passphrase and writes the raw key to `<path>`; it does not put the
+   key back, and without `--master-key-out` it refuses. Load that key into the
+   backend `secrets.backend` names (for the container secret:
+   `podman secret rm ET_MASTER_KEY`, then
+   `podman secret create ET_MASTER_KEY < <path>`), then remove the raw key:
+   `shred -u <path>`.
+4. Restart the container.
+5. Office 365 accounts whose cached tokens still cannot be decrypted sign in
+   again once.
+
+## Encryption at rest (v0.2.0)
+
+v0.2.0 can encrypt the single SQLite database file with **SQLCipher
 (AES-256)**, keyed by an HKDF-SHA256 derivation of the master key — no
 new key to manage. **New installs are encrypted by default** — the `init`
 scaffold and the example configs set `encryption_enabled: true`. The setting
@@ -92,9 +122,11 @@ keeps booting unchanged after an upgrade until you migrate it.
 Linux/container only — already baked into the published image) and a
 reachable master key.
 
-**Control it** with either:
-- YAML — `persistence: { encryption_enabled: true }`, or
-- env — `EMAIL_TRIAGE_DB_ENCRYPTION=true` (overrides the YAML field).
+**Control it** in the config file only — `persistence: { encryption_enabled: true }`.
+There is no environment override (punch 547): a process that still sets
+`EMAIL_TRIAGE_DB_ENCRYPTION` is refused at start, and a config that says
+`false` over an already-encrypted database file refuses to boot rather than
+open ciphertext as plaintext.
 
 **New install:** the database is created encrypted at first boot
 (`init_db_encrypted`) — no migration step. Set `encryption_enabled: false`
@@ -107,8 +139,7 @@ to opt out.
 # 2. Migrate in place (derives the SQLCipher key from ET_MASTER_KEY;
 #    leaves a *.plaintext.bak rollback alongside the DB):
 email-triage db encrypt --db /app/data/triage.db --yes
-# 3. Redeploy with encryption enabled (EMAIL_TRIAGE_DB_ENCRYPTION=true
-#    or persistence.encryption_enabled: true).
+# 3. Set persistence.encryption_enabled: true in the config file, redeploy.
 ```
 
 The migration is reversible with `email-triage db decrypt`. Once the
@@ -124,6 +155,140 @@ On encrypted installs the backup bundle's SQLite snapshot is itself
 SQLCipher-encrypted before the Fernet wrap, so the export never stages
 plaintext data on disk.
 
+## Automated backup
+
+Beyond the on-demand bundle export (above), the app can write **scheduled,
+verified, encrypted snapshots** on its own. Configure it either in the UI
+(**Admin → Config → Backup**) or in the `backup:` section of
+`email-triage.yaml` — both write the same config:
+
+```yaml
+backup:
+  enabled: false        # master switch; leave OFF until a restore path exists
+  cadence: manual       # manual (CLI/host-cron only) | daily | weekly
+  format: etbk          # etbk (full bundle: DB+config+certs) | db (raw snapshot)
+  retention: "14"       # keep-count, or "14d" (days) / "2w" (weeks)
+  dir: ""               # blank -> <data_dir>/backups
+  encryption: master-key  # master-key | public-key
+  public_key: ""        # public-key mode only (see below)
+```
+
+These are config-file (or UI) settings, **not** environment variables — a
+backup toggle buried in an env block is invisible and easy to lose.
+
+**Triggering a run.** The in-app sweeper fires on `cadence` (`daily`/`weekly`);
+`manual` runs no timer. Any time, you can force a run from inside the container:
+
+```bash
+podman exec email-triage email-triage backup now          # queue a run
+podman exec email-triage email-triage backup now --wait    # block until done
+```
+
+If the app is down, the CLI prints `FATAL: unavailable, app offline` rather
+than silently doing nothing (the backup runs *inside* the supervised app so the
+snapshot is consistent and the audit chain stays single-writer).
+
+**Each snapshot is verified before it counts.** The order is
+archive + compress → **restorability check** (cipher + full `integrity_check` +
+a schema sentinel) → seal. A snapshot that fails verification is discarded, and
+old backups are pruned only *after* a verified-good new one lands — a run of
+failures can never rotate your good backups away.
+
+**Two encryption modes:**
+
+- **`master-key`** (default) — the snapshot is sealed with a key derived from
+  this install's master key. To restore you also need the **master-key-only**
+  export (Admin → Backup → *Master key only*). Do that export **before** you
+  enable, and store it apart from the snapshots. The dashboard and the daily
+  health email show a *Last key export* reminder so a stale key export is
+  visible.
+- **`public-key`** (write-only) — each snapshot's random passphrase is sealed
+  to an X25519 **public** key you supply. The container holds only the public
+  half, so even a fully compromised container cannot **read** its own backups;
+  restore requires the matching **private** key, kept off-box. **Generate the
+  keypair on a trusted workstation, not the server:**
+
+  ```bash
+  email-triage backup gen-keypair       # prints a public + private PEM pair
+  ```
+
+  Paste only the **public** key into the config (`public_key:` or the UI
+  textarea). Keep the private key in your own key management — the server never
+  sees it. A bad/empty public key is rejected at save time, so public-key mode
+  can't silently arm against a key the runs would fail to seal to.
+
+  **Public-key mode requires `format: etbk`** (the full bundle). The off-box
+  seal is applied only to the bundle; the raw `db` snapshot has no seal layer,
+  so a `public-key` + `db` combination is refused — at save time AND at run
+  time — rather than silently writing a snapshot the on-box master key could
+  still read.
+
+**Output directory and off-box copies.** Snapshots land in `dir` (default
+`<data_dir>/backups`, a container-local volume). Getting them **off** the box
+is a host-side concern this app deliberately doesn't own: point a host job
+(rsync/Iperius/a scheduled copy) at that directory and relocate to your SMB
+share or offsite target. A fail-closed freshness check (e.g. the monitoring system watching
+the newest `_LATEST.json`) belongs on the host too.
+
+**Restoring** an automated snapshot uses the same CLI restore path as a
+hand-exported bundle:
+
+```bash
+email-triage restore <snapshot>                     # master-key mode (+ key export)
+email-triage restore <snapshot> --private-key <pem>  # public-key mode
+```
+
+### How to verify a backup
+
+A backup you have never proven you can open is not a backup. After your first
+automated run — and any time you rotate the keypair — **verify it end-to-end
+with the off-box private key, on a trusted machine.** Never copy the private key
+to the server; verification happens where the private key already lives (your
+admin workstation), not on the host.
+
+The fast, **non-destructive** check is `restore … --list`: it unwraps the
+public-key seal, decrypts the bundle, verifies the manifest hash, and prints the
+contents **without extracting anything** (no files written, no SQLCipher needed —
+so it runs fine on Windows).
+
+**Public-key mode:**
+
+1. Copy the snapshot off the host to your trusted box (the backups live on the
+   host volume, e.g. on the deploy host `/srv/email-triage/data/backups/`):
+   ```bash
+   scp you@the deploy host:/srv/email-triage/data/backups/<snapshot>.etbk .
+   ```
+2. Verify with your private key (Windows: `python -m email_triage restore …`):
+   ```bash
+   email-triage restore <snapshot>.etbk --private-key backup-private.pem --list
+   ```
+3. Confirm the output:
+   - `Public-key bundle unwrapped with the private key.` → your private key
+     opened the seal (key custody works).
+   - a manifest summary — hostname, exported-at, schema version, and the file
+     list including `triage.db` → the bundle is intact and decryptable.
+   A wrong/corrupt key or a tampered bundle fails loudly (`Public-key unwrap
+   failed` / `Decryption failed` / `Bundle integrity check failed`).
+
+**What this proves (layered validation):**
+
+- **At backup time** (on the server, with SQLCipher): the inner database was
+  extracted and integrity-checked *before* sealing — `_LATEST.json` records
+  `integrity: ok`. That proves the database is a valid, restorable SQLCipher DB.
+- **At verify time** (off-box, with your private key): the seal opens and the
+  bundle decrypts. That proves your key custody works and the backup is
+  recoverable.
+
+Together = end-to-end validated: the right key opens a known-good backup.
+
+**Master-key mode:** the same, minus the private key —
+`email-triage restore <snapshot>.etbk --list` and supply the *master-key-only*
+export passphrase when prompted.
+
+A full **extract** test (drop `--list`) writes the contents to side-by-side
+`.restore` files; **delete them afterward** — they are decrypted artifacts you
+don't want lying around.
+
 ## Startup environment variables
 
 These override the matching `email-triage.yaml` fields at boot (env
@@ -131,12 +296,10 @@ wins). Set them in the container `environment:` block.
 
 | Variable | Effect |
 |---|---|
-| `EMAIL_TRIAGE_CONFIG` | Path to `email-triage.yaml` inside the container |
-| `EMAIL_TRIAGE_DB_ENCRYPTION` | `true`/`1` enables SQLCipher encryption-at-rest (overrides `persistence.encryption_enabled`) |
-| `EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY` | `1` silences the `env`-backend deprecation warning (dev/CI only; no effect in HIPAA mode) |
-| `EMAIL_TRIAGE_CSRF_ENFORCE` | `true` flips CSRF from soft-launch (count-only) to hard enforcement |
 | `EMAIL_TRIAGE_AUDIT_STRICT` | `1` makes audit-write failures re-raise synchronously instead of fail-soft (debug aid) |
 | `EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE` | Integer bound for the single-writer queue (backpressure tuning) |
+| `ET_TOPIC_MATCH_CONFIDENCE_FLOOR` | Topic-digest surfacing floor — float in `[0,1]`, default `0.5`; `0` disables. Hits below it are hidden from digests, reversibly (see *Configuration → Topic Digest* in the README). Env-only (no YAML field). |
+| `ET_HEALTH_OPS_TOKEN` | Shared secret (≥16 chars) enabling a loopback-only `X-Ops-Token` bypass to fetch `/health/detail` without an admin session. Unset/blank (default) disables it. Env-only. |
 
 HIPAA mode itself is a YAML setting (`logging.hipaa: true`), not an env
 var. In HIPAA mode the `env` secrets backend is rejected, MFA is
@@ -186,6 +349,44 @@ If your container engine separates image-layer storage from the persistent-volum
    but the FastAPI app's `state.embedding_backend` is not yet
    pointing at it.
 
+> **Later releases update the runtime by themselves.** When a release changes
+> `scripts/embedding-bits-manifest.json`, the app notices at boot (and every 10
+> minutes), stages the new set beside the installed one, checks every file
+> against the publisher hashes, swaps, and rolls back on any failure; no click.
+> It compares the installed runtime ONLY with the manifest shipped in the running
+> image: it never asks PyPI, PyTorch or Hugging Face what is newer, and it
+> downloads only the files and hashes that manifest names, from the hosts the
+> first install already uses. The admin gets one email saying what changed. A security change keeps the old
+> runtime refused until the swap; a failed attempt is retried with a 15 minute to
+> 6 hour backoff and emails the admin every 6 hours while embedding is off or a
+> security fix is undone. An install made for the first time is still an explicit
+> admin action. Two things the app never does by itself: it does not swap a
+> NON-security update under a runtime this process has already loaded (embedding
+> would pause until a restart, so the update waits and applies at the next start;
+> the admin page and the daily health email say so), and it does not replace a
+> runtime whose files changed after they were verified (`disk_marker_mismatch`,
+> `duplicate_versions`, `marker_invalid`) or whose image manifest cannot be read
+> (`manifest_unreadable`): those could be tampering, so the app emails the admin
+> URGENT every 6 hours and waits for the admin's click, which then keeps the
+> replaced files for inspection. Each such detection is also written to the audit
+> log (event `embedding_runtime_update`, outcome `denied:integrity`), once per
+> process, whether or not anyone clicks. The replaced files stay on the data
+> volume beside the live runtime, in a directory named like
+> `<runtime>.evidence-<timestamp>`; the update's audit row names it, no later
+> update purges it, and it stays until an admin deletes it by hand (each one is
+> a full copy of the runtime, so remove it once the inspection is done). At boot
+> the first embedding load waits (at most 15 minutes) for the first update
+> decision, so a non-security update is applied before anything imports the old
+> runtime; one that still gets deferred at three starts in a row, or for seven
+> days, turns the daily health email to Attention and emails the admin once a day.
+>
+> To keep the click (a site under formal change control, such as a medical
+> researcher's reuse of this install), set `embedding.auto_update: false` in the
+> config file. Two cautions: set it BEFORE the upgraded release first starts
+> (its first update runs seconds after boot), and note it is read at start only,
+> so restart after changing it. An admin Save on a release older than v0.2.0
+> drops the key, so set it after the last Save on the old release.
+
 > The installer always verifies file hashes against the pinned
 > manifest. There is no `--force` or `--skip-hash` flag — a hash
 > mismatch is a hard refusal. Re-running on a clean failed state
@@ -203,11 +404,11 @@ sideloaded onto the target.
 ```bash
 # Stages all files + verifies hashes + packages
 ./scripts/download-embedding-bits.sh \
-    ./embedding-bits-v0.1.x.tar.zst
+    ./embedding-bits-v0.2.x.tar.zst
 
 # Outputs:
-#   ./embedding-bits-v0.1.x.tar.zst
-#   ./embedding-bits-v0.1.x.tar.zst.sha256
+#   ./embedding-bits-v0.2.x.tar.zst
+#   ./embedding-bits-v0.2.x.tar.zst.sha256
 ```
 
 Resumable — the script caches downloads under
@@ -218,11 +419,11 @@ A second run skips already-good files.
 
 ```bash
 # Copy both files to the target. Verify the sidecar:
-sha256sum -c embedding-bits-v0.1.x.tar.zst.sha256
+sha256sum -c embedding-bits-v0.2.x.tar.zst.sha256
 
 # Extract into the sideload dir (default /app/data/runtime-deps/sideload):
 mkdir -p /app/data/runtime-deps/sideload
-zstd -d embedding-bits-v0.1.x.tar.zst -c \
+zstd -d embedding-bits-v0.2.x.tar.zst -c \
     | tar -x -C /app/data/runtime-deps/sideload
 
 # Trigger the installer via the admin UI:
@@ -241,9 +442,37 @@ Alternative end-to-end via `scripts/install-embedding-bits.sh`:
 
 ```bash
 # Wraps verify + extract + sideload in one command:
-./scripts/install-embedding-bits.sh extract embedding-bits-v0.1.x.tar.zst
+./scripts/install-embedding-bits.sh extract embedding-bits-v0.2.x.tar.zst
 ./scripts/install-embedding-bits.sh sideload
 ```
+
+## Updating the embedding runtime after an upgrade
+
+When a release changes the embedding packages, the runtime already on the data
+volume is older than the one the new image expects. **One step:**
+
+> Open **Config → AI Backends** as an admin and click **Update embedding
+> runtime** (the same button is in the banner at the top of the admin pages).
+
+The update installs the new runtime beside the current one, hash-checks every
+file against the image's pinned manifest, swaps it in, checks it again, and only
+then deletes the old one. If anything fails, the old runtime stays in place.
+
+You do not have to look for it. As soon as the new image starts, the app
+**emails the admin** (once), shows the banner on the admin pages, and repeats
+the notice in the daily health email until the update is done. Until then:
+
+* **Not a security fix** — the current runtime keeps serving. "Not a security fix" is how the release classified the change when it shipped. An advisory published later against the older runtime is not re-checked while it keeps serving, so update promptly anyway.
+* **A security fix** (or the release does not say) — embedding is switched off
+  until you update.
+
+If the page says **restart the container to load the new runtime**, the
+running app had already loaded the old runtime; restart the container once.
+Air-gapped installs: stage the new bundle as in
+[Air-gap install via sideload](#air-gap-install-via-sideload), then enter the
+bundle's directory into **Update from bundle** under *Re-verify / Re-install*
+on the AI Backends card (the same atomic update, from the bundle instead of the
+network).
 
 ## Re-verifying an existing install
 

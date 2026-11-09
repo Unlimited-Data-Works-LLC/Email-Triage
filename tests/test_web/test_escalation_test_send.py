@@ -43,7 +43,7 @@ class _FakeSMTP:
     raise_on_send: type[Exception] | None = None
     raise_message: str = ""
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, timeout=None):
         type(self).captured["host"] = host
         type(self).captured["port"] = port
 
@@ -53,7 +53,7 @@ class _FakeSMTP:
     def __exit__(self, *a):
         return False
 
-    def starttls(self):
+    def starttls(self, *, context=None):
         type(self).captured["tls"] = True
 
     def login(self, u, p):
@@ -83,7 +83,7 @@ def smtp_capture(monkeypatch):
 @pytest.fixture
 def smtp_configured(app):
     """Wire a working SMTP config + secret on app.state."""
-    app.state.config.smtp.host = "smtp.test.example.com"
+    app.state.config.smtp.host = "smtp.test.example.invalid"
     app.state.config.smtp.port = 587
     app.state.config.smtp.username = "triage@example.com"
     app.state.config.smtp.from_addr = "triage@example.com"

@@ -109,46 +109,22 @@ async def _discover_imap_sent(provider) -> tuple[str, str]:
     Returns ``(folder_name, discovery_method)`` so the caller can
     log the method used (special-use / name-match / default).
     """
-    # Pass 1 — SPECIAL-USE via the raw LIST response. We need access
-    # to the underlying aioimaplib client; the IMAPProvider exposes
-    # it via the private ``_connect`` coroutine. Be tolerant of a
-    # provider shape we don't recognise — fall through to pass 2.
+    # Pass 1 — SPECIAL-USE + name fallback via the public
+    # ``discover_special_use_folder(flag, fallbacks)`` method (N-273
+    # R28). Previously this function reached into `provider._connect`
+    # and drove the raw LIST response itself — the exact private-
+    # surface coupling punch  called out. The provider method now
+    # owns the LIST drive + parse; this caller just picks the flag
+    # + candidates.
     try:
-        connect = getattr(provider, "_connect", None)
-        if connect is not None:
-            client = await connect()
-            result, data = await client.list('""', "*")
-            if result == "OK":
-                decoded: list[str] = []
-                for line in data:
-                    if isinstance(line, bytes):
-                        line = line.decode(errors="replace")
-                    decoded.append(line)
-                # Look for the \Sent SPECIAL-USE flag.
-                for line in decoded:
-                    if "\\sent" in line.lower():
-                        match = re.search(r'"([^"]*)"\s*$', line.rstrip())
-                        if match and match.group(1):
-                            return match.group(1), "special-use"
-                # Pass 2a — name-based fallback on the raw LIST
-                # response (catches servers that don't emit
-                # SPECIAL-USE but DO carry a sensible name).
-                for candidate in _IMAP_SENT_FALLBACKS:
-                    for line in decoded:
-                        # Match the trailing quoted folder name; the
-                        # LIST line shape is ``* LIST (<flags>)
-                        # "<delim>" "<name>"`` so the candidate must
-                        # equal the LAST quoted token (not appear
-                        # anywhere on the line — that would match
-                        # delimiter quirks).
-                        match = re.search(
-                            r'"([^"]*)"\s*$', line.rstrip(),
-                        )
-                        if match and match.group(1) == candidate:
-                            return candidate, "name-match"
+        method = getattr(provider, "discover_special_use_folder", None)
+        if method is not None:
+            found = await method("\\Sent", _IMAP_SENT_FALLBACKS)
+            if found is not None:
+                return found
     except Exception as e:
         log.warning(
-            "IMAP Sent folder LIST probe failed; falling back",
+            "IMAP Sent folder SPECIAL-USE probe failed; falling back",
             error=type(e).__name__,
         )
 

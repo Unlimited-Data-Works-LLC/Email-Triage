@@ -14,6 +14,7 @@ No real PII anywhere -- every actor is ``user@example.com`` /
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import hashlib
 import json
@@ -42,7 +43,7 @@ def _make_db() -> sqlite3.Connection:
     ``init_db`` -- just the v12 migration body so we keep tests fast
     + scoped to the layer under test.
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE email_accounts (
@@ -558,7 +559,7 @@ class TestDraftReplyThreadsContact:
             set_rag_sent_index_enabled,
             set_style_learning_master_enabled,
         )
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
             "INSERT INTO users (email, name, role, created_at) "

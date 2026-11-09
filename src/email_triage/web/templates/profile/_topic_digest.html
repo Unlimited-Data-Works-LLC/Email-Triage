@@ -1,0 +1,181 @@
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / delegate). The person who
+                wants to watch a subject — a study, a project, a
+                thread of interest — across their own mailboxes.
+   TECH-SKILL:  low. Computer-literate professional (exec, doctor,
+                lawyer, researcher). Not terminal users; not protocol
+                readers.
+   COPY RULES:
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md.
+     - No protocol jargon (RFC, ISO 8601, "language model", "LLM",
+       "substring match", "regex"). Plain English. "AI" not "LLM".
+     - No raw account_id in user-rendered text — names + counts only.
+       See feedback_no_account_id_alone.md.
+     - Disabled controls speak via their disabled state — never
+       "Ask your administrator".
+   ─────────────────────────────────────────────────────────────
+   MASTER card-list view. Consumes ctx key ``topics`` — an
+   iterable of topic summaries. Each item exposes:
+       .id              stable id (used only in HTMX target ids + edit href)
+       .name            plain topic name (card header)
+       .subject_summary one-line subject digest ("SELENA +2 more")
+       .mailbox_count   int — how many of the requester's mailboxes
+       .enabled         bool — the per-card on/off toggle
+       .last_sent_at    pre-humanized string, or falsy = never sent
+       .protected_mode  bool — any selected mailbox is HIPAA-protected
+   The detail editor lives at its own full-page URL (§3c) and is
+   reached from each card / the New Topic button — never inlined here.
+#}
+<section id="topic-digest">
+    <h3>Topic Digest{{ m.help("A Topic watches for a subject — a study, a project, a thread of interest — across the mailboxes you pick, and collects what matches into one digest. Set up a Topic once; matching rides your normal mail sorting, so there's nothing extra to run.") }}</h3>
+    <p>
+        Watch a subject across your mailboxes and get a digest of what
+        matches. Each Topic below is one subject you're following — open
+        one to tune it, or start a new one.
+    </p>
+
+    {# New Topic — full-page nav to a blank detail editor (§3b). A
+       Topic has subjects + a mailbox picker + details, so it warrants
+       the full editor from the first keystroke, not an inline add. #}
+    <p style="margin:0.75rem 0 1.25rem 0;">
+        <a href="/profile/topic-digest/new" role="button"
+           style="padding:0.45rem 1rem;">
+            New Topic
+        </a>
+    </p>
+
+    {% if topics %}
+    <div class="route-cards">
+        {% for topic in topics %}
+        <article id="topic-card-{{ topic.id }}" class="topic-card route-card">
+            <header class="route-card-header">
+                <strong>
+                    <a href="/profile/topic-digest/{{ topic.id }}/edit"
+                       style="text-decoration:none;color:var(--pico-color);">
+                        {{ topic.name }}
+                    </a>
+                </strong>
+                {% if topic.subject_summary %}
+                <small class="route-card-desc">{{ topic.subject_summary }}</small>
+                {% endif %}
+                <small class="route-card-desc">
+                    {{ topic.mailbox_count }}
+                    mailbox{{ "es" if topic.mailbox_count != 1 else "" }}{{ m.help("How many of your mailboxes this Topic watches. Open the Topic to change which ones.") }}
+                </small>
+                {% if topic.protected_mode %}
+                {# Protected-mode badge — §1a most-restrictive-wins.
+                   AUDIENCE-appropriate: no admin paths; the escape
+                   hatch (remove that mailbox in the editor) is implied,
+                   not instructed. #}
+                <small class="topic-protected-badge"
+                       title="This Topic includes a HIPAA-protected mailbox, so it runs in protected mode — registry-only study lookup, and matches are stored protected.">
+                    🔒 Protected mode
+                </small>
+                {% endif %}
+            </header>
+
+            <div class="route-card-body">
+                {# Enabled toggle — per-card HTMX autosave (§3b). 500ms
+                   debounce mirrors the routes per-row autosave idiom
+                   (_routes_body.html). Posts the topic id + the new
+                   enabled state to the shared save endpoint; the chip
+                   slot below shows the saved confirmation. #}
+                <form class="topic-card-toggle-form"
+                      hx-post="/profile/topic-digest/save"
+                      hx-target="#topic-msg-{{ topic.id }}"
+                      hx-swap="innerHTML"
+                      hx-trigger="change from:closest form delay:500ms">
+                    {{ csrf_input(request) }}
+                    <input type="hidden" name="topic_id" value="{{ topic.id }}">
+                    <input type="hidden" name="enabled_only" value="1">
+                    <label class="route-action-toggle" style="min-width:0;">
+                        <input type="checkbox" name="enabled" value="1"
+                               {% if topic.enabled %}checked{% endif %}>
+                        <span>Enabled{{ m.help("Off pauses this Topic without deleting it — no new matches collect and no digest sends while it's off. Flip it back on any time.") }}</span>
+                    </label>
+                    <span id="topic-msg-{{ topic.id }}"
+                          class="route-card-msg" aria-live="polite"></span>
+                </form>
+
+                <small style="color:var(--pico-muted-color);display:block;">
+                    {% if topic.last_sent_at %}
+                    Last digest: <time datetime="{{ topic.last_sent_at }}" data-us-datetime>{{ topic.last_sent_at | us_datetime }}</time>
+                    {% else %}
+                    Last digest: never sent
+                    {% endif %}
+                </small>
+
+                <small style="display:block;">
+                    <a href="/profile/topic-digest/{{ topic.id }}/edit">
+                        Open &amp; tune &rarr;
+                    </a>
+                </small>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+    {% else %}
+    {# Empty state (§3b / N11) — one friendly card + the New Topic
+       button (already above). Plain English, no jargon, no admin paths. #}
+    <article class="topic-card route-card topic-empty-card">
+        <div style="grid-column:1 / -1;">
+            <strong style="display:block;margin-bottom:0.35rem;">No topics yet.</strong>
+            <p style="margin:0;color:var(--pico-muted-color);">
+                Create one to watch a subject — a study, a project, a
+                thread of interest — across your mailboxes, and get a
+                digest of what matches.
+            </p>
+        </div>
+    </article>
+    {% endif %}
+</section>
+
+<style>
+/* Topic cards reuse the routes .route-cards / .route-card grid
+   (_routes_body.html) — these few rules only layer Topic-specific
+   chrome (the protected badge + the empty-card single-column span). */
+.topic-card .route-card-header {
+    gap: 0.25rem;
+}
+.topic-protected-badge {
+    display: inline-block;
+    width: max-content;
+    margin-top: 0.15rem;
+    padding: 0.05rem 0.5rem;
+    border-radius: 0.7rem;
+    background: var(--pico-card-sectioning-background-color, #2a2f3a);
+    border: 1px solid var(--pico-muted-border-color);
+    color: var(--pico-muted-color);
+    font-size: 0.75rem;
+    cursor: help;
+}
+.topic-empty-card {
+    grid-template-columns: 1fr;
+}
+/* Saved-chip fade after a successful enabled-toggle autosave. The
+   class is added by the routes-style afterRequest handler below. */
+.topic-card-toggle-form .route-card-msg.fade-out {
+    opacity: 0;
+    transition: opacity 0.6s ease-out;
+}
+</style>
+
+<script>
+(function () {
+    /* Enabled-toggle autosave chip fade — mirrors the routes per-row
+       idiom (_routes_body.html). 3s after a successful toggle save,
+       fade the confirmation chip. Scoped to the topic toggle forms so
+       it never collides with the routes handler when both render. */
+    document.addEventListener("htmx:afterRequest", function (ev) {
+        var form = ev.target;
+        if (!form || !form.classList
+            || !form.classList.contains("topic-card-toggle-form")) return;
+        var chip = form.querySelector(".route-card-msg");
+        if (!chip) return;
+        chip.classList.remove("fade-out");
+        setTimeout(function () { chip.classList.add("fade-out"); }, 3000);
+    });
+})();
+</script>

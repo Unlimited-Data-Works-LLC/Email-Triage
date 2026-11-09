@@ -26,6 +26,8 @@ this is pure relocation — the recipient-scoping, redaction, and quiet-hours
 
 from __future__ import annotations
 
+from email_triage.secrets import read_secret
+
 import asyncio
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +35,7 @@ from fastapi import FastAPI
 
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
 
 #: Logger record name preserved as "web.app" for byte-identical digest logs.
 log = get_logger("web.app")
@@ -51,6 +54,7 @@ async def _daily_health_email_sender(app: FastAPI) -> None:
     boundary, or the supervisor lease moves to another instance — the
     same shape the recipient-digest sender uses for its idempotence.
     """
+    from email_triage.web.admin_alerts import fire_all as _fire_admin_alerts
     from email_triage.web.daily_health import (
         resolve_admin_recipients,
         send_daily_health_email,
@@ -62,47 +66,107 @@ async def _daily_health_email_sender(app: FastAPI) -> None:
     async def _tick() -> None:
         cfg = app.state.config
         hc = cfg.health_email
+        now_local = datetime.now().astimezone()
+        current_hm = now_local.strftime("%H:%M")
         # CR-2c — recipient list comes from the canonical
         # ``admin_email.recipients`` with a fallback to the legacy
         # ``health_email.recipients`` field.
         if hc.enabled and resolve_admin_recipients(cfg):
-            now_local = datetime.now().astimezone()
             today_key = now_local.strftime("%Y-%m-%d")
-            current_hm = now_local.strftime("%H:%M")
             if current_hm != hc.send_at:
-                return
-            # DB-backed guard: read the persisted last-sent date.
-            state = await db_call(
-                get_setting, app.state.db, _DAILY_HEALTH_STATE_KEY,
-            ) or {}
-            if (state or {}).get("last_sent_date") == today_key:
-                return
-            # Stamp BEFORE the send so a crash / lease handoff between
-            # the stamp and the send does not re-fire — at-most-once is
-            # the safer failure mode for a health-status notification.
-            await db_call(
-                set_setting, app.state.db, _DAILY_HEALTH_STATE_KEY,
-                {"last_sent_date": today_key},
-            )
-            # Pass ``app`` so the listener-restart-pending check
-            # runs and can promote a stale toggle to
-            # attention_reasons.
-            #  — send_daily_health_email does extensive synchronous
-            # reads on the SHARED app.state.db connection. A bare
-            # asyncio.to_thread runs it unlocked → collides with
-            # db_call workers on the same sqlite3.Connection. Route it
-            # through db_call so the process-wide DB lock serialises it.
-            sent, reason = await db_call(
-                send_daily_health_email,
-                app.state.db,
+                # F4 hoist (2026-07-10): fall through to the
+                # admin-alert sweep even on off-schedule ticks so the
+                # N-151 SOFT-gate + siblings advance every 60 s
+                # regardless of whether hc.send_at was crossed on
+                # THIS tick.  The admin-alert primitive carries its
+                # own per-event cooldown; no double-send risk.
+                pass
+            else:
+                # DB-backed guard: read the persisted last-sent date.
+                state = await db_call(
+                    get_setting, app.state.db, _DAILY_HEALTH_STATE_KEY,
+                ) or {}
+                if (state or {}).get("last_sent_date") != today_key:
+                    # Stamp BEFORE the send so a crash / lease handoff
+                    # between the stamp and the send does not re-fire —
+                    # at-most-once is the safer failure mode for a
+                    # health-status notification.
+                    await db_call(
+                        set_setting, app.state.db, _DAILY_HEALTH_STATE_KEY,
+                        {"last_sent_date": today_key},
+                    )
+                    # Pass ``app`` so the listener-restart-pending check
+                    # runs and can promote a stale toggle to
+                    # attention_reasons.
+                    #  — send_daily_health_email does extensive
+                    # synchronous reads on the SHARED app.state.db
+                    # connection.  A bare asyncio.to_thread runs it
+                    # unlocked → collides with db_call workers on the
+                    # same sqlite3.Connection.  Route it through
+                    # db_call so the process-wide DB lock serialises it.
+                    # Panel B3 db F569-5: the punch-569 section scans the
+                    # runtime prefix; compute it OFF the DB lock (N-543).
+                    from email_triage.web.daily_health import (
+                        gather_embedding_runtime_section,
+                    )
+                    _er = await asyncio.to_thread(
+                        gather_embedding_runtime_section, app.state.config,
+                    )
+                    sent, reason = await db_call(
+                        send_daily_health_email,
+                        app.state.db,
+                        app.state.config,
+                        app.state.secrets,
+                        getattr(app.state, "watcher_manager", None),
+                        app=app,
+                        embedding_runtime_section=_er,
+                    )
+                    log.info(
+                        "Daily health email tick fired",
+                        sent=sent, reason=reason, at=current_hm,
+                    )
+                    # N-227b R22 — stamp app.state.<name>_status so
+                    # /admin can observe the sweeper's outcome.  Was
+                    # previously blind.
+                    app.state.daily_health_email_sender_status = {
+                        "sent": bool(sent),
+                        "reason": str(reason) if reason else "",
+                        "at": now_local.isoformat(),
+                        "date_key": today_key,
+                    }
+
+        #  Part 2 — Fire the registered admin-alert events on
+        # every tick, not only after a health-email send.  F4 hoist
+        # (2026-07-10): moved OUT of the ``if hc.enabled and
+        # resolve_admin_recipients(cfg)`` block so a mis-configured or
+        # disabled health-email sender does NOT silently mute the
+        # operator alerts (the very failure mode the alerts exist to
+        # surface).  Each event carries its own per-key ``cooldown_hours``
+        # floor + reason-change edge detection, so ticking every 60 s
+        # is safe — the state machine collapses repeat probes.
+        #
+        # F3 caller-side: ``fire_all`` is now ``async``; the SMTP send
+        # happens off the DB thread inside the primitive, and the DB
+        # reads/writes are routed through db_call internally.  Await
+        # directly — do NOT re-wrap in ``db_call`` (that would put the
+        # SMTP work back onto the DB thread and stall the writer).
+        try:
+            alert_results = await _fire_admin_alerts(
                 app.state.config,
-                app.state.secrets,
-                getattr(app.state, "watcher_manager", None),
-                app=app,
+                app.state.db,
             )
             log.info(
-                "Daily health email tick fired",
-                sent=sent, reason=reason, at=current_hm,
+                "Admin-alert sweep fired",
+                results=alert_results,
+                at=current_hm,
+            )
+        except Exception as exc:
+            # Fail-CLOSED-BUT-QUIET: an alert failure MUST NOT bubble
+            # out of the tick or the supervisor restarts a loop whose
+            # primary job (daily-health) already succeeded.
+            log.error(
+                "Admin-alert sweep raised",
+                error=fmt_exc(exc),
             )
 
     #  — lease-gated so one instance owns the daily send.
@@ -117,9 +181,24 @@ async def _daily_health_email_sender(app: FastAPI) -> None:
 def _filter_digest_candidates(
     *,
     db, acct: dict, dcfg, now_utc, last_sent: str | None,
-) -> list[dict]:
+    apply_cap: bool = True,
+) -> tuple[list[dict], int]:
     """Cheap dry-run: resolve window + gather rows + apply custom
-    filter. Returns the rows that WOULD feed into the renderer.
+    filter. Returns ``(rows, total_matched)``.
+
+    ``rows`` is what WOULD feed into the renderer — post-filter AND
+    (when ``apply_cap``) post-``max_rows`` cap. ``total_matched`` is
+    the count post-filter but BEFORE the cap, so every caller can
+    surface "showing N of M" when the row limit dropped some. Before
+     the cap silently sliced ``rows[:max_rows]`` and the dropped
+    messages vanished from BOTH the candidate preview and the digest
+    the user actually received, with no "and N more" — operator-facing
+    data loss (silent-truncation audit, row ).
+
+    ``apply_cap=False`` returns the FULL filtered list (no max_rows
+    slice) — the Show-matches dry-run uses it to PAGE through every
+    match, so the operator can see the whole match
+    set, not just the first ``max_rows`` that would actually send.
 
     No provider fetch. No LLM. Same logic as ``_fire_one_digest``
     steps 1-3, hoisted into a sibling so the "Show matches" UI
@@ -151,24 +230,155 @@ def _filter_digest_candidates(
     )
     if not is_preset:
         rows = [r for r in rows if row_matches_filter(r, dcfg.filter)]
+    # total_matched is the post-filter count BEFORE the cap — the
+    # honest denominator for "showing N of M". The preset path does
+    # not cap (the ``if not is_preset`` below), so its denominator
+    # equals len(rows) and omitted is always 0.
+    total_matched = len(rows)
+    if not is_preset and apply_cap:
         if dcfg.format.max_rows and len(rows) > dcfg.format.max_rows:
             rows = rows[: dcfg.format.max_rows]
-    return rows
+    return rows, total_matched
+
+
+def _digest_omission_notice_html(
+    *, shown: int, total: int, max_rows: int,
+) -> str:
+    """One small HTML block telling the recipient the digest was
+    capped at ``max_rows`` and ``total - shown`` messages were left
+    out. Returned for injection before ``</body>`` by
+    :func:`_render_digest_payload`. Empty string when nothing was
+    dropped (caller already guards, but keep it total)."""
+    omitted = max(0, total - shown)
+    if omitted <= 0:
+        return ""
+    import html as _html
+    return (
+        "<div style=\"margin:14px 0;padding:10px 12px;"
+        "border-left:3px solid #b58900;background:#fff8e1;"
+        "font-size:13px;color:#5c4400;border-radius:3px;\">"
+        f"Showing the {shown} most recent of "
+        f"<strong>{total}</strong> matching messages. "
+        f"{omitted} older message{'s were' if omitted != 1 else ' was'} "
+        f"omitted by this digest's row limit "
+        f"(max_rows&nbsp;=&nbsp;{_html.escape(str(max_rows))}). "
+        "Raise the limit in the digest settings to include more."
+        "</div>"
+    )
+
+
+def _inject_before_body_close(html_body: str, block: str) -> str:
+    """Insert ``block`` just before the last ``</body>`` in
+    ``html_body`` (case-insensitive). If there is no body close tag
+    (a fragment), append. One funnel so every render format — preset,
+    newsletter, custom table/grouped/plain — gets the notice the same
+    way without threading it through each renderer's signature."""
+    if not block:
+        return html_body
+    import re as _re
+    m = None
+    for m in _re.finditer(r"</body\s*>", html_body, _re.IGNORECASE):
+        pass  # keep the LAST match
+    if m is None:
+        return html_body + block
+    i = m.start()
+    return html_body[:i] + block + html_body[i:]
+
+
+def _build_compliance_clocks_section_html(clocks: list[dict]) -> str:
+    """ — the per-recipient "Regulatory deadlines" digest section (HTML).
+
+    Input is :func:`list_compliance_clocks_for_account` output, already
+    HIPAA-MINIMAL (label + state + days_left + account_name; NO ``case_ref`` /
+    ``raw_deadline_phrase``). One advisory ``<section>``; empty string when
+    there are no clocks (caller skips injection). Wording funnels through
+    ``clock_deadline_phrase`` so it matches the escalation email exactly (PD#5).
+    ``html.escape`` the label defensively even though it is seed-data policy
+    text."""
+    if not clocks:
+        return ""
+    import html as _html
+
+    from email_triage.db.regulatory_clock import clock_deadline_phrase
+    items = []
+    for c in clocks:
+        label = _html.escape(str(c.get("label") or "Regulatory deadline"))
+        when = _html.escape(clock_deadline_phrase(c.get("days_left")))
+        days_left = c.get("days_left")
+        overdue = isinstance(days_left, int) and days_left < 0
+        color = "#b00020" if overdue else "#334155"
+        items.append(
+            f"<div style=\"margin:4px 0;color:{color};\">"
+            f"<strong>{label}</strong> &middot; {when}</div>"
+        )
+    return (
+        "<section style=\"margin:1.5em 0;padding:0.35em 0.9em;"
+        "border-left:4px solid #2563eb;background:#f1f5f9;border-radius:4px;\">"
+        "<h3 style=\"font-size:1.15em;margin:0.4em 0;color:#1e293b;\">"
+        "Regulatory deadlines</h3>"
+        + "".join(items)
+        + "<div style=\"margin-top:6px;font-size:12px;color:#888;\">"
+        "Reminders based on your configured policy — verify against your SOP. "
+        "Advisory, not an official record.</div>"
+        "</section>"
+    )
+
+
+def _build_compliance_clocks_section_plain(clocks: list[dict]) -> str:
+    """Plain-text twin of :func:`_build_compliance_clocks_section_html`."""
+    if not clocks:
+        return ""
+    from email_triage.db.regulatory_clock import clock_deadline_phrase
+    lines = ["Regulatory deadlines"]
+    for c in clocks:
+        label = str(c.get("label") or "Regulatory deadline")
+        lines.append(f"  - {label}: {clock_deadline_phrase(c.get('days_left'))}")
+    lines.append(
+        "  (Reminders based on your configured policy — verify against your "
+        "SOP. Advisory, not an official record.)"
+    )
+    return "\n".join(lines)
+
 
 async def _render_digest_payload(
     *,
     db, secrets, acct: dict, dcfg, hipaa: bool,
     now_utc, last_sent: str | None, config=None,
-) -> tuple[str, str, str, list[dict]]:
+    redact_pii: bool = False,
+) -> tuple[str, str, str, list[dict], int]:
     """Render the digest's email payload without sending it.
 
-    Returns ``(subject, html_body, plain_body, rows)``. Empty
-    ``rows`` means the window had no matching rows; the three
-    string fields are empty strings in that case. ``rows`` is the
-    actual list (not just the count) so the caller can pass it
-    to ``send_recipient_digest`` — the preset path's legacy
-    default subject uses ``len(rows)`` when subject_override is
+    ``redact_pii`` (N-174) is the display-minimum-necessary gate for the
+    sender + subject cells, threaded down to the PRESET renderer
+    (``recipient_digest.render_html`` / ``render_plain``). Default
+    ``False`` = the DELIVERED behavior (``_fire_one_digest`` omits it →
+    verbatim to the account's own authorized mailbox, byte-unchanged).
+    The PREVIEW handler (``digest_preview``) passes
+    ``redact_pii=effective_hipaa`` because that surface is reachable by a
+    managing non-owner — the sibling of N-162 / N-172. N-175 COMPLETED
+    the net: ALL THREE dispatch branches now honor ``redact_pii`` — the
+    preset (``recipient_digest.render_html`` / ``render_plain``, N-174),
+    the custom dispatcher (``render_digest`` → table / grouped_list /
+    plain_list), AND the newsletter (``render_newsletter_async`` →
+    ``generate_digest`` → ``build_digest_html``). Every preview-reachable
+    render path that emits matched-message sender/subject PHI redacts it
+    when ``redact_pii`` is True; the DELIVERED send (``_fire_one_digest``)
+    omits the flag → every branch stays byte-unchanged to the account's
+    own authorized mailbox.
+
+    Returns ``(subject, html_body, plain_body, rows, total_matched)``.
+    Empty ``rows`` means the window had no matching rows; the three
+    string fields are empty strings and ``total_matched`` is 0 in that
+    case. ``rows`` is the actual list (not just the count) so the
+    caller can pass it to ``send_recipient_digest`` — the preset path's
+    legacy default subject uses ``len(rows)`` when subject_override is
     None, so we need the list to keep that contract intact.
+
+    ``total_matched`` is the post-filter count BEFORE the ``max_rows``
+    cap. When it exceeds ``len(rows)`` an omission notice is injected
+    into ``html_body`` / ``plain_body`` so the recipient sees that the
+    digest was capped (silent-truncation audit ); the caller may
+    also surface the count in its own header.
 
     Provider fetch + LLM extraction fire for newsletter formats
     here — the cost moment. Caller chooses what to do with the
@@ -191,16 +401,19 @@ async def _render_digest_payload(
     # ``async def`` so route it through db_call to run off the loop
     # under the process-wide DB lock.
     from email_triage.web.db_threadpool import db_call as _db_call
-    rows = await _db_call(
+    rows, total_matched = await _db_call(
         _filter_digest_candidates,
         db=db, acct=acct, dcfg=dcfg,
         now_utc=now_utc, last_sent=last_sent,
     )
     if not rows:
-        return ("", "", "", [])
+        return ("", "", "", [], 0)
 
     is_preset = dcfg.id == PRESET_ID
-    account_email = (acct.get("email_address") or "").strip()
+    # census run17  — resolve via the account_email SSOT, not the open-coded
+    # materialized key; local renamed off the SSOT name to avoid shadowing it.
+    from email_triage.db.accounts import account_email
+    acct_email = account_email(acct)
 
     # Render dispatch — preset (legacy table), newsletter (async
     # provider re-fetch + LLM extraction), or the sync custom
@@ -209,16 +422,18 @@ async def _render_digest_payload(
         html_body = render_preset_html(
             rows=rows,
             account_name=acct.get("name", ""),
-            account_email=account_email,
+            account_email=acct_email,
             hipaa=hipaa,
             fallback_dt_iso=now_utc.isoformat(),
+            redact_pii=redact_pii,
         )
         plain_body = render_preset_plain(
             rows=rows,
             account_name=acct.get("name", ""),
-            account_email=account_email,
+            account_email=acct_email,
             hipaa=hipaa,
             fallback_dt_iso=now_utc.isoformat(),
+            redact_pii=redact_pii,
         )
     elif dcfg.format.render_as in ("newsletter", "newsletter_classic"):
         from email_triage.actions.digest_render import (
@@ -284,40 +499,49 @@ async def _render_digest_payload(
                 config.summary_email.signature or ""
             )
         except AttributeError:
-            pass
+            log.debug("digest: summary_email signature not configured; footer left empty")
         try:
             html_body = await render_newsletter_async(
                 cfg=dcfg, provider=provider, classifier=classifier,
                 messages=messages,
                 account_name=acct.get("name", ""),
-                account_email=account_email,
+                account_email=acct_email,
                 hipaa=hipaa,
-                date_str=now_utc.strftime("%A, %B %d, %Y"),
+                # N-269 R28: route through the LOCAL date-header SSOT
+                # (LIVE tz-off-by-one drift fix — census R28 flagged this
+                # as UTC-derived while its 2 sibling sites are local).
+                date_str=__import__(
+                    "email_triage._isotime", fromlist=["now_local_date_header"]
+                ).now_local_date_header(),
                 signature=_signature,
                 digest_name=getattr(dcfg, "name", "") or "",
                 html_template=getattr(
                     dcfg.format, "html_template", "",
                 ) or "",
+                redact_pii=redact_pii,
             )
         finally:
             try:
                 await provider.close()
-            except Exception:
-                pass
-        import re as _re
-        plain_body = _re.sub(r"<[^>]+>", "", html_body)
-        plain_body = _re.sub(r"\n{3,}", "\n\n", plain_body)
+            except Exception as close_exc:
+                log.warning("digest: provider close failed", error=fmt_exc(close_exc))
+        #  — HTML→text via the engine.html_text SSOT (drops script/style
+        # content + keeps block structure; was an ad-hoc tag-strip).
+        from email_triage.engine.html_text import html_to_text
+        plain_body = html_to_text(html_body)
     else:
         html_body = render_digest(
             cfg=dcfg, rows=rows,
             account_name=acct.get("name", ""),
-            account_email=account_email,
+            account_email=acct_email,
             hipaa=hipaa,
             fallback_dt_iso=now_utc.isoformat(),
+            redact_pii=redact_pii,
         )
-        import re as _re
-        plain_body = _re.sub(r"<[^>]+>", "", html_body)
-        plain_body = _re.sub(r"\n{3,}", "\n\n", plain_body)
+        #  — HTML→text via the engine.html_text SSOT (drops script/style
+        # content + keeps block structure; was an ad-hoc tag-strip).
+        from email_triage.engine.html_text import html_to_text
+        plain_body = html_to_text(html_body)
 
     # Subject: preset uses the legacy default in send_recipient_digest
     # (signalled via empty string here; SMTP-bound caller passes None
@@ -329,7 +553,63 @@ async def _render_digest_payload(
     else:
         subject = build_custom_digest_subject(dcfg, now_utc.astimezone())
 
-    return (subject, html_body, plain_body, rows)
+    #  — if the max_rows cap dropped messages, tell the recipient
+    # in the body they actually receive. One injection point here
+    # covers every render format (preset / newsletter / custom).
+    omitted = max(0, total_matched - len(rows))
+    if omitted:
+        notice_html = _digest_omission_notice_html(
+            shown=len(rows), total=total_matched,
+            max_rows=int(getattr(dcfg.format, "max_rows", 0) or 0),
+        )
+        html_body = _inject_before_body_close(html_body, notice_html)
+        plain_body = (
+            plain_body.rstrip()
+            + f"\n\n— Showing the {len(rows)} most recent of "
+            f"{total_matched} matching messages; {omitted} omitted "
+            f"by this digest's row limit. Raise the limit to include "
+            f"more.\n"
+        )
+
+    #  — per-recipient "Regulatory deadlines" section. The recipient's OWN
+    # account's compliance clocks (label + days only). ACCOUNT-scoped (not the
+    # user-wide list) so a digest for one account never surfaces another owned
+    # account's deadlines. No NEW HIPAA access-event is needed here — NOT via an
+    # "owner self-access" actor check (this send is SYSTEM-initiated,
+    # actor_user_id=None) but because the digest envelope is recipient-LOCKED to
+    # the data-subject account's OWN mailbox (the fail-closed to_addr ==
+    # acct.email_address guard in _fire_one_digest) AND the whole hipaa=True send
+    # already emits its §164.312(b) access-event row. The section adds no new
+    # recipient and no PHI beyond the digest envelope. (A maintainer reusing this
+    # reader on an ACTOR-bearing surface — a logged-in user viewing clocks — MUST
+    # add the actor≠owner access-event there.)
+    # One injection point → every render format gets it. Off-loop via db_call.
+    # Fail-OPEN by design: surfacing the clocks is a NON-DECISIONAL render
+    # enhancement, so a clock-read hiccup (DB error, pre-#34 schema) must NEVER
+    # break the actual digest send — PD#8's one permitted fail-open. Log + skip.
+    try:
+        from email_triage.db.regulatory_clock import (
+            list_compliance_clocks_for_account,
+        )
+        clocks = await _db_call(
+            list_compliance_clocks_for_account,
+            db, account_id=acct["id"],
+            account_name=acct.get("name"), now_iso=now_utc.isoformat(),
+        )
+        if clocks:
+            html_body = _inject_before_body_close(
+                html_body, _build_compliance_clocks_section_html(clocks),
+            )
+            plain_body = (
+                plain_body.rstrip()
+                + "\n\n" + _build_compliance_clocks_section_plain(clocks) + "\n"
+            )
+    except Exception as e:
+        log.warning(
+            "Digest sender: regulatory-clock section skipped", error=str(e),
+        )
+
+    return (subject, html_body, plain_body, rows, total_matched)
 
 async def _fire_one_digest(
     *,
@@ -372,6 +652,7 @@ async def _fire_one_digest(
     # db_call so they run off the event loop under the process-wide DB
     # lock instead of stalling the loop on the RLock.
     from email_triage.web.db_threadpool import db_call
+    from email_triage.web._audit import safe_audit_write_async
 
     # HIPAA recipient hardening: defense-in-depth assertion that the
     # send target is one of the addresses that route into this
@@ -395,8 +676,13 @@ async def _fire_one_digest(
     # mismatch case the guard exists to catch (delivery to a third
     # party's address) is still rejected.
     from email_triage.web.db import account_addresses
-    valid_targets = {a for a in account_addresses(acct) if a}
-    norm_to = (to_addr or "").strip().lower()
+    # N-253 R25: route through the canonical-email SSOT so a display-
+    # name-wrapped `Alice <a@x>` and the bare `a@x` compare identically
+    # against the allow-list — §164.312(a)(1) unauthorized-recipient
+    # enforcement.
+    from email_triage.mail_headers import canonical_email
+    valid_targets = {canonical_email(a) for a in account_addresses(acct) if a}
+    norm_to = canonical_email(to_addr)
     if not valid_targets or norm_to not in valid_targets:
         log.error(
             "Digest send refused: recipient mismatch",
@@ -416,7 +702,9 @@ async def _fire_one_digest(
     # Render via the shared payload helper. Preview / Show-matches
     # routes call the same helper without coming through here, so
     # the render shape is bit-identical across all three paths.
-    subject, html_body, plain_body, rows = await _render_digest_payload(
+    (
+        subject, html_body, plain_body, rows, _total_matched,
+    ) = await _render_digest_payload(
         db=db, secrets=secrets, acct=acct, dcfg=dcfg,
         hipaa=hipaa, now_utc=now_utc, last_sent=last_sent,
         config=config,
@@ -445,7 +733,7 @@ async def _fire_one_digest(
     # Preset uses the legacy default in send_recipient_digest;
     # _render_digest_payload signals this with subject == "".
     subject_override = subject or None
-    smtp_password = secrets.get("SMTP_PASSWORD") or ""
+    smtp_password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
     await asyncio.to_thread(
         send_recipient_digest,
         smtp_host=smtp.host,
@@ -486,9 +774,41 @@ async def _fire_one_digest(
                 account_id=acct["id"], digest_id=dcfg.id,
                 error=fmt_exc(e),
             )
-        try:
-            from email_triage.web.db import record_access_event
-            await db_call(
+        # N-73 / §164.312(b) — HIPAA recipient-digest send must write a
+        # hipaa_access_events row (not just access_log) when the account
+        # is HIPAA-flagged. Mirrors the N-33-B pattern from
+        # web/topic_digest_sender.py. The actor is None (system-initiated).
+        # Audit failure must NEVER fail the send: the emit is routed through
+        # the safe_audit_write_async SSOT (log-on-failure, visible to /health's
+        # audit-failure drift counter), not a hand-rolled swallowing try/except
+        # that hid the failure from the drift counter (census run17 #3).
+        if hipaa:
+            from email_triage.web.db import record_hipaa_access_event
+            await safe_audit_write_async(
+                lambda: db_call(
+                    record_hipaa_access_event,
+                    db,
+                    None,                           # system-initiated send
+                    int(acct["id"]),
+                    "recipient_digest_sent",
+                    "ok",
+                    (
+                        f"digest_id={dcfg.id} kind={dcfg.kind} "
+                        f"row_count={len(rows)}"
+                        # to_addr deliberately excluded — db/audit contract:
+                        # account_id is the column; never email in detail.
+                    ),
+                ),
+                description=f"recipient_digest_sent hipaa_access account_id={acct['id']} digest_id={dcfg.id}",
+                table="hipaa_access_events",
+                emitter="record_hipaa_access_event",
+            )
+        # Route the access-log emit through the safe_audit_write_async SSOT
+        # (census run17 #3) so a write failure is logged uniformly and stays
+        # visible to /health's audit-failure drift counter.
+        from email_triage.web.db import record_access_event
+        await safe_audit_write_async(
+            lambda: db_call(
                 record_access_event,
                 db,
                 actor_user_id=None,
@@ -499,18 +819,20 @@ async def _fire_one_digest(
                 status_code=200,
                 outcome="recipient_digest_sent",
                 detail=(
+                    # N-136 (§164.514(b) minimum-necessary): the recipient email
+                    # (to_addr) is deliberately EXCLUDED from access_log.detail —
+                    # account_id is already the column, and the sibling
+                    # hipaa_access emit above honors the same "never email in
+                    # detail" db/audit contract.
                     f"digest_id={dcfg.id} kind={dcfg.kind} "
                     f"row_count={len(rows)} hipaa={hipaa} "
-                    f"to={to_addr} "
                     f"filter_advanced={'yes' if dcfg.filter.advanced else 'no'}"
                 ),
-            )
-        except Exception as e:
-            log.warning(
-                "Digest sender: audit row write failed",
-                account_id=acct["id"], digest_id=dcfg.id,
-                error=fmt_exc(e),
-            )
+            ),
+            description=f"recipient_digest_sent route=/internal/recipient-digest account_id={acct['id']} digest_id={dcfg.id}",
+            table="access_log",
+            emitter="record_access_event",
+        )
     log.info(
         "Digest sent",
         account_id=acct["id"], digest_id=dcfg.id,
@@ -564,22 +886,25 @@ async def _recipient_digest_sender(app: FastAPI) -> None:
         smtp = cfg.smtp
         now_local = datetime.now().astimezone()
         now_utc = datetime.now(timezone.utc)
+        # N-227b R22 — heartbeat stamp so /admin can observe the sweeper
+        # ran. Per-digest outcome is logged separately; the app.state
+        # snapshot answers "did the sweeper run at all recently?".
+        app.state.recipient_digest_sender_status = {"at": now_local.isoformat()}
 
         for acct in await db_call(list_email_accounts, db):
             if not acct.get("is_active", True):
                 continue
             acct_id = acct["id"]
-            to_addr = (acct.get("email_address") or "").strip()
+            # census run17  — account_email SSOT, not the open-coded key.
+            from email_triage.db.accounts import account_email
+            to_addr = account_email(acct)
             if not to_addr:
                 # Account hasn't been saved with credentials yet —
                 # skip silently per pre-Phase-4 behaviour.
                 continue
 
-            from email_triage.triage_logging import is_hipaa_mode
-            hipaa = (
-                is_hipaa_mode()
-                or bool(acct.get("hipaa", False))
-            )
+            from email_triage.triage_logging import account_hipaa_effective
+            hipaa = account_hipaa_effective(account=acct)
 
             try:
                 digest_cfgs = await db_call(list_digest_configs, db, acct_id)

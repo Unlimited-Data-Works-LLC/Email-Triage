@@ -22,8 +22,11 @@
 #   <staging>/wheels/                      torch + sentence-
 #                                          transformers wheels +
 #                                          transitives
-#   <staging>/hf-cache/sentence-transformers_all-MiniLM-L6-v2/
-#                                          the model file set
+#   <staging>/hf-cache/<hf_cache_dir>/    one subtree per manifest
+#                                          'models' entry (e.g.
+#                                          sentence-transformers_all-
+#                                          MiniLM-L6-v2/, intfloat_
+#                                          multilingual-e5-base/)
 #
 # Sideload path on the target (inside the container or with shell
 # access to /app/data/runtime-deps):
@@ -58,7 +61,9 @@ fi
 # --- staging dir (deterministic so re-runs are resumable) ---
 STAGING="${EMBEDDING_BITS_STAGING:-${HOME}/.cache/email-triage-embedding-bits}"
 mkdir -p "${STAGING}/wheels"
-mkdir -p "${STAGING}/hf-cache/sentence-transformers_all-MiniLM-L6-v2"
+# Per-model hf-cache subdirs are created in the mirror step below (one
+# per manifest 'models' entry); just create the shared parent here.
+mkdir -p "${STAGING}/hf-cache"
 
 echo "Staging dir: ${STAGING}"
 echo "Manifest:    ${MANIFEST}"
@@ -78,39 +83,29 @@ python3 "${SCRIPT_DIR}/build-embedding-bits-manifest.py" \
 # the wheels/ + hf-cache/ structure the installer expects.
 echo ""
 echo "==> Mirroring into wheels/ + hf-cache/ layout"
+# The mirror lives in the builder (stage_sideload_layout) so it resolves
+# cache paths through the same _cache_slot rule the download used and walks
+# every arch's wheels via iter_wheel_entries — punch 555: the inline copy
+# here walked manifest["wheels"] only and staged no per-arch wheel.
 python3 - <<PYEOF
+import importlib.util
 import json
-import shutil
 from pathlib import Path
 
+spec = importlib.util.spec_from_file_location(
+    "_embedding_manifest_builder", "${SCRIPT_DIR}/build-embedding-bits-manifest.py",
+)
+builder = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(builder)
+
 manifest = json.loads(Path("${MANIFEST}").read_text(encoding="utf-8"))
-cache = Path("${STAGING}/.builder-cache")
-out_wheels = Path("${STAGING}/wheels")
-out_hf = Path("${STAGING}/hf-cache/sentence-transformers_all-MiniLM-L6-v2")
-
-for w in manifest.get("wheels", []):
-    src = cache / w["filename"]
-    dst = out_wheels / w["filename"]
-    if not src.exists():
-        raise SystemExit(f"Missing in cache: {src}")
-    if not dst.exists() or dst.stat().st_size != src.stat().st_size:
-        shutil.copy2(src, dst)
-
-for m in manifest.get("models", []):
-    for f in m.get("files", []):
-        # model files: cache layout flattens '/' to '_'; we restore
-        # the original layout in hf-cache/
-        flat = f["name"].replace("/", "_")
-        src = cache / m["name"] / flat
-        dst = out_hf / f["name"]
-        if not src.exists():
-            raise SystemExit(f"Missing in cache: {src}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if not dst.exists() or dst.stat().st_size != src.stat().st_size:
-            shutil.copy2(src, dst)
-
-print(f"Staged {len(list(out_wheels.iterdir()))} wheels + "
-      f"{sum(1 for _ in out_hf.rglob('*') if _.is_file())} model files")
+try:
+    wheels, hf_files = builder.stage_sideload_layout(
+        manifest, Path("${STAGING}/.builder-cache"), Path("${STAGING}"),
+    )
+except FileNotFoundError as e:
+    raise SystemExit(str(e))
+print(f"Staged {wheels} wheels + {hf_files} model files")
 PYEOF
 
 # --- package into a zstd tarball ---

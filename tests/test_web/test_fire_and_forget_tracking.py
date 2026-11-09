@@ -35,8 +35,12 @@ class TestFireAndForgetRegistryShape:
     def test_pending_set_lazy_init(self, app):
         """The registry is created on first add. Absent until then —
         same lazy-init shape as ``app.state._audit_pending``."""
-        # Fresh app from the autouse reset — no fire-and-forget yet.
-        assert getattr(app.state, "_fire_and_forget_pending", None) is None
+        # Fresh app from the autouse reset — no fire-and-forget yet. Since punch
+        # 629 the web conftest installs an EMPTY failure-recording registry
+        # (``_a_failed_pending_task_fails_the_test``), which the app's lazy
+        # ``getattr(..., None)`` adopts; outside the web suite it is absent.
+        pending = getattr(app.state, "_fire_and_forget_pending", None)
+        assert pending is None or len(pending) == 0
 
     def test_pending_set_idempotent_discard(self, app):
         """``set.discard`` is idempotent — calling it twice on the

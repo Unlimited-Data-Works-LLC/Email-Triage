@@ -1,0 +1,35 @@
+{# Outbound-webhook preview MODE radios (punch 414, spec DEC-4).
+
+   ONE partial, two callers: the wizard page renders it with `canned`
+   checked, and the preview fragment re-renders it out-of-band with the
+   EFFECTIVE mode, so a HIPAA-refused live request flips the radio back to
+   `canned` instead of leaving the operator on a mode that was refused.
+
+   Context (both required, set by the caller via `with`):
+     preview_mode      "canned" | "live" -- the mode that actually rendered.
+     preview_mode_oob  bool -- True when included in the HTMX fragment. #}
+<fieldset id="outbound-preview-mode"{% if preview_mode_oob %} hx-swap-oob="true"{% endif %}
+          style="display:flex;flex-wrap:wrap;gap:1rem;align-items:center;border:0;padding:0;margin:0 0 0.4rem;font-size:0.85rem;">
+    <label style="margin:0;">
+        <input type="radio" name="outbound_preview_mode" value="canned"
+               {% if preview_mode != "live" %}checked{% endif %}
+               hx-post="/admin/integrations/webhook-preview"
+               hx-trigger="change"
+               hx-target="#outbound-body-preview"
+               hx-swap="innerHTML"
+               hx-include="none"
+               hx-vals='js:{...etOutboundPreviewVals()}'>
+        Canned demo
+    </label>
+    <label style="margin:0;">
+        <input type="radio" name="outbound_preview_mode" value="live"
+               {% if preview_mode == "live" %}checked{% endif %}
+               hx-post="/admin/integrations/webhook-preview"
+               hx-trigger="change"
+               hx-target="#outbound-body-preview"
+               hx-swap="innerHTML"
+               hx-include="none"
+               hx-vals='js:{...etOutboundPreviewVals()}'>
+        My last real event
+    </label>
+</fieldset>

@@ -1,4 +1,4 @@
-"""In-memory token-bucket rate limiter for the OpenClaw API.
+"""In-memory token-bucket rate limiter for the outbound-webhook API.
 
 Single-instance only — when we scale horizontally this becomes a
 Redis-backed bucket. The bucket interface stays the same.
@@ -108,14 +108,14 @@ class TokenBucket:
 
 def get_rate_limiter(request: Request) -> TokenBucket:
     """Return the process-wide rate limiter, creating it on first use."""
-    bucket = getattr(request.app.state, "openclaw_rate_limit", None)
+    bucket = getattr(request.app.state, "webhook_rate_limit", None)
     if bucket is None:
         config = getattr(request.app.state, "config", None)
         rate = 60
         if config is not None:
-            rate = getattr(config.push, "openclaw_rate_limit_per_minute", 60)
+            rate = getattr(config.push, "webhook_rate_limit_per_minute", 60)
         bucket = TokenBucket(rate_per_min=rate)
-        request.app.state.openclaw_rate_limit = bucket
+        request.app.state.webhook_rate_limit = bucket
     return bucket
 
 

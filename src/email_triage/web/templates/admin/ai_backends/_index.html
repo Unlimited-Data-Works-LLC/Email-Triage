@@ -112,20 +112,20 @@
                 {% set _bucket = item.bucket %}
                 {% if _bucket == "expired" %}
                 <strong style="color:var(--pico-del-color);">
-                    Expired ({{ item.baa_expires_at }})
+                    Expired (<time datetime="{{ item.baa_expires_at }}" data-us-date>{{ item.baa_expires_at | us_date }}</time>)
                 </strong>
                 {% elif _bucket == "expiring_urgent" %}
                 <strong style="color:var(--pico-del-color);">
-                    {{ item.baa_expires_at }}
+                    <time datetime="{{ item.baa_expires_at }}" data-us-date>{{ item.baa_expires_at | us_date }}</time>
                     ({{ item.days_until_expiry }} days)
                 </strong>
                 {% elif _bucket == "expiring_soon" %}
                 <span style="color:var(--pico-mark-color, orange);">
-                    {{ item.baa_expires_at }}
+                    <time datetime="{{ item.baa_expires_at }}" data-us-date>{{ item.baa_expires_at | us_date }}</time>
                     ({{ item.days_until_expiry }} days)
                 </span>
                 {% else %}
-                {{ item.baa_expires_at }}
+                <time datetime="{{ item.baa_expires_at }}" data-us-date>{{ item.baa_expires_at | us_date }}</time>
                 {% endif %}
                 {% else %}
                 <span style="color:var(--pico-muted-color);">—</span>

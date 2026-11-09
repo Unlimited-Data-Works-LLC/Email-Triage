@@ -1,0 +1,47 @@
+{# Admin egress-disclosure banners (punch 553, operator decision 553-1).
+
+   AUDIENCE:    admin (system operator). Never rendered for other users:
+                ``_shared._inject_update_check_banners_ctx`` returns None
+                for a non-admin, and this partial self-guards on it.
+   TECH-SKILL:  low — needs to know what leaves the server, not how.
+   COPY RULES:  plain English: what is on, which server it contacts, what
+                it sends, how to turn it off. One banner per enabled flow.
+
+   Reads ``update_check_banners.disclosures`` — rows from
+   ``update_check.active_disclosure_banners`` (enabled, not yet dismissed by
+   THIS admin). Dismissal is per admin and durable: the button posts the
+   row's id to ``/admin/disclosures/dismiss``, which stores it in the
+   per-user dismissal store and returns an empty fragment.
+
+   GLOBAL-SLOT RULE (553 landing, E2E failure on 02af36ff): this partial is
+   included from base.html on EVERY admin page, so it must not add a
+   ``<form>``, a ``type="submit"`` button or an ``hx-vals`` attribute. Each
+   would match a page's own form/submit/starter-button selectors (the help
+   page's ``button[type="submit"]`` resolved to two elements and a click
+   dismissed the banner instead of submitting the question). The dismiss
+   control is therefore a ``type="button"`` whose own name/value htmx sends
+   with the POST; the CSRF token rides the ``htmx:configRequest`` header
+   (static/csrf.js), as the dashboard dismiss-step button does.
+#}
+{% if update_check_banners is defined and update_check_banners and update_check_banners.disclosures %}
+{% for d in update_check_banners.disclosures %}
+<aside class="egress-disclosure" data-disclosure="{{ d.kind }}"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-primary);
+              background:var(--pico-card-background-color);">
+    <strong>{{ d.title }}</strong>{% if d.host %}: this server contacts
+    <code>{{ d.host }}</code>{% endif %}.
+    <p style="margin:0.3rem 0 0;">{{ d.sends }}</p>
+    <p style="margin:0.3rem 0 0;font-size:0.9em;">{{ d.turn_off }}</p>
+    <p style="margin:0.4rem 0 0;">
+        <button type="button" class="outline secondary egress-disclosure-dismiss"
+                name="disclosure_id" value="{{ d.id }}"
+                hx-post="/admin/disclosures/dismiss"
+                hx-target="closest aside" hx-swap="outerHTML"
+                style="margin:0;padding:0.2rem 0.6rem;font-size:0.85em;width:auto;">
+            Got it, hide this
+        </button>
+    </p>
+</aside>
+{% endfor %}
+{% endif %}

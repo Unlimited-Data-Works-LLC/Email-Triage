@@ -16,6 +16,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import pytest
 
@@ -39,7 +40,7 @@ def db(tmp_path):
     """Init-DB fixture — sqlite file per test, settings table ready."""
     from email_triage.web.db import init_db
     db_path = tmp_path / "triage.db"
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     yield conn
     conn.close()
 
@@ -381,7 +382,7 @@ def test_backfill_flips_category_newsletter_grouped_list():
         _backfill_newsletter_render_as,
     )
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('u@x', 'u', 'user', '2026-01-01')",
@@ -416,7 +417,7 @@ def test_backfill_idempotent_on_second_run():
         _backfill_newsletter_render_as,
     )
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('u@x', 'u', 'user', '2026-01-01')",
@@ -451,7 +452,7 @@ def test_backfill_skips_table_render():
         _backfill_newsletter_render_as,
     )
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('u@x', 'u', 'user', '2026-01-01')",
@@ -486,7 +487,7 @@ def test_backfill_skips_non_newsletter_categories():
         _backfill_newsletter_render_as,
     )
 
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('u@x', 'u', 'user', '2026-01-01')",

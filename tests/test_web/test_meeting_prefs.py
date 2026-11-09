@@ -16,7 +16,7 @@ class TestProfileTimezoneDropdown:
         self, client, admin_cookies, admin_user, monkeypatch,
     ):
         """Fresh user with no saved prefs gets $TZ in the rendered input."""
-        monkeypatch.setenv("TZ", "America/New_York")
+        monkeypatch.setenv("TZ", "America/Detroit")
         resp = client.get("/profile", cookies=admin_cookies)
         assert resp.status_code == 200
         # Locate the timezone input specifically.
@@ -29,8 +29,8 @@ class TestProfileTimezoneDropdown:
         tag = match.group(0)
         val = re.search(r'value="([^"]*)"', tag)
         assert val is not None, f"no value attr in tag: {tag!r}"
-        assert val.group(1) == "America/New_York", (
-            f"expected America/New_York, got {val.group(1)!r}; full tag: {tag!r}"
+        assert val.group(1) == "America/Detroit", (
+            f"expected America/Detroit, got {val.group(1)!r}; full tag: {tag!r}"
         )
 
     def test_profile_default_timezone_falls_back_to_utc_when_no_env(
@@ -65,7 +65,7 @@ class TestProfileTimezoneDropdown:
             f"expected full IANA list, got only {len(options)} options"
         )
         # Spot-check a few entries from different regions.
-        assert "America/New_York" in options
+        assert "America/Detroit" in options
         assert "Europe/Berlin" in options
         assert "Asia/Tokyo" in options
         assert "UTC" in options

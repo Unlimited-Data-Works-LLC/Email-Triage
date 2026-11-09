@@ -25,7 +25,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# /sw.js route (custom handler in routers/ui.py)
+# /sw.js route (custom handler in routers/ui/admin.py)
 # ---------------------------------------------------------------------------
 
 def test_sw_js_served_from_root(client):

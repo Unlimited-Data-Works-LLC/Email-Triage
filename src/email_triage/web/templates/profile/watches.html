@@ -230,18 +230,43 @@
             {{ m.help("Send a short alert to your notification address — example: when an invoice arrives or your boss writes. Set your notification address on the My Settings → Profile tab. The alert is one line: category + sender + subject. Accounts marked Protected Health Info get a redacted version (first name only, no subject).") }}
         </label>
 
+        {% if escalate_recipients is defined %}
+        <p class="watch-alert-recipient" style="margin:0 0 0.5rem 1.5rem;font-size:0.88em;">
+            {% if escalate_recipients %}
+            Alerts go to: <strong>{{ escalate_recipients|join(", ") }}</strong>
+            {% else %}
+            No notification address is set yet, so alerts will not be sent. Add one on the My Settings → Profile tab.
+            {% endif %}
+        </p>
+        {% endif %}
+
         {# Webhook is power-user plumbing — hide behind a disclosure so
            non-technical operators don't have to think about HMAC
            signatures, JSON bodies, or URLs. The default-collapsed
-           pattern matches admin/integrations.html "How do I find these
+           pattern matches admin/config_tabs/integrations.html "How do I find these
            values?". #}
-        <details style="margin:0.5rem 0 0.25rem 0;
+        {# N-564 (hipaa-sme B7 / DA B1): saving a watch with no recorded
+           creator re-claims it, so its webhook is shown OPEN and named
+           first; a collapsed field is not shown. #}
+        {% set _reclaim = (watch_unattributed is defined and watch_unattributed) %}
+        <details{% if _reclaim %} open{% endif %} style="margin:0.5rem 0 0.25rem 0;
                         padding:0.5rem 0.75rem;
                         border-left:3px solid var(--pico-muted-border-color);
                         background:var(--pico-card-background-color, transparent);">
             <summary style="cursor:pointer;font-weight:600;">
                 Advanced — call a webhook
             </summary>
+
+            {% if _reclaim %}
+            <p class="watch-reclaim-warning" role="alert"
+               style="color:var(--pico-del-color, #b45309);margin:0.5rem 0 0.4rem 0;">
+                This watch has no recorded owner and is not firing. Check the
+                webhook address before you save:
+                {% if rep.actions.webhook.url %}<strong>{{ rep.actions.webhook.url }}</strong>
+                ({% if rep.actions.webhook.enabled %}on{% else %}off{% endif %}){% else %}none is set{% endif %}.
+                Saving turns the watch back on with this address.
+            </p>
+            {% endif %}
 
             <p style="color:var(--pico-muted-color);font-size:0.88em;
                       margin:0.5rem 0 0.4rem 0;">
@@ -266,6 +291,33 @@
                        style="max-width:32rem;">
             </label>
         </details>
+    </fieldset>
+
+    {# #48 — auto-retire after N matches. Optional; 0 = run indefinitely. #}
+    <fieldset style="margin-top:0.5rem;">
+        <legend style="font-size:0.9rem;">Auto-retire (optional)</legend>
+        <label style="font-size:0.85rem;">
+            Stop this watch automatically after it has matched this many
+            emails (leave 0 to keep it running indefinitely):
+            <input type="number" name="auto_retire_after" min="0" step="1"
+                   value="{{ rep.actions.auto_retire.after_n }}"
+                   style="max-width:8rem;">
+        </label>
+        <small style="display:block;color:#555;margin-top:0.25rem;">
+            The count is the total across every account this watch covers, not
+            per account.
+        </small>
+        <label style="font-size:0.85rem;margin-top:0.5rem;">
+            When it reaches that many:
+            <select name="auto_retire_action" style="max-width:18rem;">
+                <option value="disable"{% if rep.actions.auto_retire.action != 'delete' %} selected{% endif %}>Turn it off (you can switch it back on later)</option>
+                <option value="delete"{% if rep.actions.auto_retire.action == 'delete' %} selected{% endif %}>Delete it permanently</option>
+            </select>
+        </label>
+        <small style="display:block;color:#555;margin-top:0.25rem;">
+            "Delete it permanently" removes the watch and can't be undone. To
+            keep the option of switching it back on, choose "Turn it off".
+        </small>
     </fieldset>
 
     <div style="display:flex;gap:0.5rem;margin-top:1rem;">
@@ -308,6 +360,11 @@
             {% if g.account_ids|length == 1 %}account{% else %}accounts{% endif %} ·
             {% if r.enabled %}On{% else %}Off{% endif %}
         </small>
+        {% if g.not_firing %}
+        <small class="watch-not-firing" style="color:var(--pico-del-color, #b45309);">
+            {% if g.unattributed %}Not firing — open it and save to reactivate{% else %}{% set _r = g.not_firing_reasons %}Not firing —{% if 'creator_not_owner_hipaa' in _r %} this mailbox holds protected health info, so only watches its owner set up run on it.{% endif %}{% if 'all_accounts_hipaa' in _r %} it is set for all mailboxes, and every mailbox it could run on holds protected health info, where only a watch set up for that one mailbox runs.{% endif %}{% if _r|reject('in', ['creator_not_owner_hipaa', 'all_accounts_hipaa'])|list %} the person who set it up can no longer use this mailbox.{% endif %} Delete it, or create it again.{% endif %}
+        </small>
+        {% endif %}
         <span style="margin-left:auto;">
             <a href="/profile/watches/{{ g.group_id }}/edit"
                role="button" class="outline secondary"

@@ -6,12 +6,13 @@ and the app has many background tasks writing concurrently.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from email_triage.web.db import init_db
 
 
 def test_init_db_sets_busy_timeout(tmp_path):
-    conn = init_db(tmp_path / "triage.db")
+    conn = track(init_db(tmp_path / "triage.db"))
     try:
         # 30s: the 5s window was narrower than the startup
         # background-task write burst, causing `database is locked`
@@ -22,7 +23,7 @@ def test_init_db_sets_busy_timeout(tmp_path):
 
 
 def test_init_db_keeps_wal_and_foreign_keys(tmp_path):
-    conn = init_db(tmp_path / "triage.db")
+    conn = track(init_db(tmp_path / "triage.db"))
     try:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

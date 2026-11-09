@@ -99,11 +99,11 @@ def test_table_generic_uses_digest_name_in_heading():
     )
     out = render_table_generic(
         cfg=cfg, rows=[_row()],
-        account_name="ExampleUser@example.com",
-        account_email="bob@example.com",
+        account_name="Example Inbox",
+        account_email="alice@example.com",
         hipaa=False,
     )
-    assert "<h2>AI Newsletters — ExampleUser@example.com</h2>" in out
+    assert "<h2>AI Newsletters — Example Inbox</h2>" in out
     assert "<table" in out
     # Row content present + escaped.
     assert "Q4 numbers" in out

@@ -17,7 +17,7 @@
 <p style="color:var(--pico-del-color);"><small>{{ err }}</small></p>
 {% endif %}
 
-<form method="post" action="/admin/integrations/save">
+<form method="post" action="/admin/integrations/save" autocomplete="off">
     {{ csrf_input(request) }}
 
 {# ── Google OAuth (install-wide client credentials, B1 lift) ──── #}
@@ -98,10 +98,7 @@
         <tr>
             <td><strong>Client ID</strong></td>
             <td>
-                <input type="text" name="google_oauth_web_client_id"
-                       value="{{ config.google_oauth.web_client_id }}"
-                       placeholder="xxxx-xxxx.apps.googleusercontent.com"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.cred_text_input("google_oauth_web_client_id", config.google_oauth.web_client_id, "xxxx-xxxx.apps.googleusercontent.com", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 Registered redirect URI must be
@@ -112,9 +109,7 @@
             <td><strong>Client Secret</strong></td>
             <td>
                 {% set has_web_secret = config.google_oauth.web_client_secret %}
-                <input type="password" name="google_oauth_web_client_secret"
-                       placeholder="{{ '•••••• (stored — leave blank to keep)' if has_web_secret else 'GOCSPX-...' }}"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.secret_input("google_oauth_web_client_secret", has_web_secret, "GOCSPX-...", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 Required — Google's token exchange rejects the request without it.
@@ -130,10 +125,7 @@
         <tr>
             <td><strong>Client ID</strong></td>
             <td>
-                <input type="text" name="google_oauth_desktop_client_id"
-                       value="{{ config.google_oauth.desktop_client_id }}"
-                       placeholder="xxxx-xxxx.apps.googleusercontent.com"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.cred_text_input("google_oauth_desktop_client_id", config.google_oauth.desktop_client_id, "xxxx-xxxx.apps.googleusercontent.com", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 No redirect URI registration needed — Google auto-allows loopback
@@ -144,9 +136,7 @@
             <td><strong>Client Secret</strong></td>
             <td>
                 {% set has_desk_secret = config.google_oauth.desktop_client_secret %}
-                <input type="password" name="google_oauth_desktop_client_secret"
-                       placeholder="{{ '•••••• (stored — leave blank to keep)' if has_desk_secret else 'GOCSPX-...' }}"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.secret_input("google_oauth_desktop_client_secret", has_desk_secret, "GOCSPX-...", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 Required for Desktop clients too. Google requires the secret on
@@ -221,10 +211,12 @@
         <tr>
             <td><strong>Tenant ID</strong></td>
             <td>
-                <input type="text" name="office365_oauth_tenant_id"
-                       value="{{ config.office365_oauth.tenant_id }}"
-                       placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or organizations"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.combo_input(
+                    "office365_oauth_tenant_id",
+                    config.office365_oauth.tenant_id,
+                    ["organizations"],
+                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx or organizations",
+                    attrs="style='margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;'") }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 Org tenant GUID, or <code>organizations</code> for
@@ -236,10 +228,7 @@
         <tr>
             <td><strong>Client ID</strong></td>
             <td>
-                <input type="text" name="office365_oauth_client_id"
-                       value="{{ config.office365_oauth.client_id }}"
-                       placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.cred_text_input("office365_oauth_client_id", config.office365_oauth.client_id, "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 Application (client) ID from the app's Overview page.
@@ -249,9 +238,7 @@
             <td><strong>Client Secret</strong></td>
             <td>
                 {% set has_o365_secret = config.office365_oauth.client_secret %}
-                <input type="password" name="office365_oauth_client_secret"
-                       placeholder="{{ '•••••• (stored — leave blank to keep)' if has_o365_secret else 'Microsoft client secret value' }}"
-                       style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                {{ m.secret_input("office365_oauth_client_secret", has_o365_secret, "Microsoft client secret value", 'style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;"') }}
             </td>
             <td><small style="color:var(--pico-muted-color);">
                 The secret VALUE (not the secret ID) from Certificates
@@ -330,26 +317,61 @@
     "every push gets rejected" mystery.
 </small></p>
 
-<h3 style="margin-top:2rem;">Outbound webhook (OpenClaw)</h3>
+<h3 style="margin-top:2rem;">Outbound webhook</h3>
 <p>
     <small style="color:var(--pico-muted-color);">
     Email-triage emits HMAC-SHA256-signed POSTs to a single destination
-    when triage outcomes land. Set the URL to enable; clear the URL to
+    when triage outcomes land — for services such as OpenClaw, Slack, or
+    an in-house automation. Set the URL to enable; clear the URL to
     turn it off entirely. Per-account on/off + quiet-hours chips on
     each account's Integrations tab gate the emit at fire time.
     </small>
 </p>
 
 <label>
-    Destination URL
-    <input type="url" name="outbound_webhook_url"
-           value="{{ outbound_target.url if outbound_target else '' }}"
-           placeholder="https://openclaw.your-tailnet.ts.net/email-triage/notify">
+    Target type
+    <select name="outbound_webhook_target_type" id="outbound-target-type"
+            hx-post="/admin/integrations/webhook-preview"
+            hx-trigger="change"
+            hx-target="#outbound-body-preview"
+            hx-swap="innerHTML"
+            hx-include="none"
+            hx-vals='js:{...etOutboundPreviewVals()}'>
+        {% for opt in outbound_target_types %}
+        <option value="{{ opt.key }}"
+                data-url-hint="{{ opt.url_shape_hint }}"
+                data-default-template="{{ opt.default_template }}"
+                data-docs-url="{{ opt.docs_url }}"
+                data-required-fields="{{ opt.required_fields | join(',') }}"
+                {% if opt.key == outbound_selected_target_type %}selected{% endif %}>
+            {{ opt.label }}
+        </option>
+        {% endfor %}
+    </select>
 </label>
 <p><small style="color:var(--pico-muted-color);">
-    Leave blank to disable outbound emit entirely. The receiver verifies
-    the HMAC signature in the <code>X-Email-Triage-Signature</code>
-    header against the shared secret below.
+    Pick the receiver's native shape and email-triage reshapes each
+    signed emit into the expected wire body. <strong>Custom</strong>
+    posts our envelope <code>{"event","timestamp","data":{…}}</code>
+    verbatim (existing behaviour — HMAC-signed for relay integrations).
+    <span id="outbound-target-docs-hint" style="display:none;"> —
+    <a href="#" target="_blank" id="outbound-target-docs-link">
+    receiver docs &rarr;</a></span>
+</small></p>
+
+<label>
+    Destination URL
+    <input type="url" name="outbound_webhook_url"
+           id="outbound-webhook-url"
+           value="{{ outbound_target.url if outbound_target else '' }}"
+           placeholder="https://your-receiver.example.net/email-triage/notify">
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Leave blank to disable outbound emit entirely. For Custom targets
+    the receiver verifies the HMAC signature in the
+    <code>X-Signature-256</code> header against the shared secret
+    below. Typed targets (Slack / PagerDuty / …) verify by their own
+    means; the HMAC still travels but is ignored by the receiver.
 </small></p>
 
 <fieldset style="margin-top:0.75rem;">
@@ -377,14 +399,20 @@
 
 <label>
     Shared secret
-    <input type="password" name="outbound_webhook_secret"
-           placeholder="{{ '•••••• (stored — leave blank to keep)' if outbound_secret_set else 'paste a long random string' }}">
+    {{ m.secret_input("outbound_webhook_secret", outbound_secret_set, "paste a long random string") }}
 </label>
 <p><small style="color:var(--pico-muted-color);">
     Used to compute the HMAC-SHA256 signature on every emit. Paste the
-    same value into your OpenClaw side. {% if outbound_secret_set %}A
+    same value into your webhook receiver. {% if outbound_secret_set and not outbound_secret_unreadable %}A
     secret is stored; leave blank to keep.{% endif %}
 </small></p>
+{% if outbound_secret_unreadable %}
+<p><small style="color:var(--pico-del-color);">
+    &#9888; A secret is stored but cannot be decrypted (secrets master-key
+    mismatch) &mdash; HMAC-signed webhook deliveries are being dropped.
+    Check the secrets master key, then paste the secret again to re-store it.
+</small></p>
+{% endif %}
 
 <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;">
     <input type="checkbox" name="webhooks_allow_external" value="1"
@@ -395,7 +423,234 @@
     Off by default. When off, only local URLs (loopback, RFC1918,
     <code>.local</code>, or any configured local-URL suffix) are
     delivered to. Turning this on lets the install ship signed events
-    to any HTTPS endpoint — required if your OpenClaw lives off-LAN.
+    to any HTTPS endpoint — required if your webhook receiver lives off-LAN.
+</small></p>
+
+<label style="margin-top:1rem;">
+    Account scope <small style="color:var(--pico-muted-color);">
+        (advanced; leave blank for all accounts)</small>
+    <input type="text" name="outbound_webhook_account_id"
+           value="{{ outbound_account_id }}"
+           placeholder="empty = wildcard (fires on every account)">
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Scope this target to a single account_id. Empty = wildcard
+    (backward-compatible default — the target receives fires from every
+    account). Set a specific account_id (matches the DB row's ``id``
+    column on the accounts table) to close the DA-F3b cross-account
+    fanning class: fires from OTHER accounts no longer reach this
+    target. A no-context broadcast (kill-switch, health ping) also
+    skips scoped targets (DA-F2 close). YAML-editable via the
+    ``account_id:`` key under a ``webhooks:`` entry.
+</small></p>
+
+<details style="margin-top:1rem;border:1px dashed var(--pico-muted-border-color);border-radius:4px;padding:0.5rem 0.75rem;">
+    <summary style="cursor:pointer;">
+        <strong>Advanced: raw body template</strong>
+        <small style="color:var(--pico-muted-color);">
+            &nbsp;(auto-filled from Target type; edit for custom
+            shape)
+        </small>
+    </summary>
+    <p style="margin:0.5rem 0 0.25rem;"><small style="color:var(--pico-muted-color);">
+        Mustache-style placeholders — <code>{{ '{{data.category}}' }}</code>,
+        <code>{{ '{{data.subject}}' }}</code>, <code>{{ '{{data.sender}}' }}</code>,
+        <code>{{ '{{data.flow_id}}' }}</code>,
+        <code>{{ '{{data.pd_routing_key}}' }}</code>,
+        <code>{{ '{{event}}' }}</code>, <code>{{ '{{timestamp}}' }}</code>.
+        All substitutions are JSON-string-escaped. Leave blank to use
+        the target-type's built-in default. The
+        <code>{{ '{{secret}}' }}</code> placeholder is REFUSED here —
+        the signing/auth secret is header-context-only (Slack/Discord
+        need no body-secret; Opsgenie's GenieKey renders into the
+        <code>Authorization</code> header automatically).
+    </small></p>
+    <textarea name="outbound_webhook_body_template"
+              id="outbound-body-template"
+              rows="4"
+              hx-post="/admin/integrations/webhook-preview"
+              hx-trigger="keyup changed delay:400ms"
+              hx-target="#outbound-body-preview"
+              hx-swap="innerHTML"
+              hx-include="none"
+              hx-vals='js:{...etOutboundPreviewVals()}'
+              style="width:100%;font-family:var(--pico-font-family-monospace);font-size:0.85rem;"
+              placeholder="Leave blank for the target-type's default">{{ outbound_body_template }}</textarea>
+    <p style="margin:0.25rem 0 0;"><small id="outbound-body-template-required-hint"
+       style="color:var(--pico-muted-color);"></small></p>
+
+    {# ── Live preview (task #56) ────────────────────────────────
+       Server-side render via HTMX (task #55 decision memo). The
+       preview reuses the exact ``render_for_target`` SSOT that
+       fires production emit — bytes here are byte-identical to
+       what a real fire would POST. A client-side Mustache/
+       Handlebars renderer would let the operator craft a
+       template that renders in preview but strips/breaks on the
+       wire (helpers, sections, iteration — none of which the
+       server side supports). Server-side render = zero
+       divergence risk (Prime Directive #1). #}
+    <div style="margin-top:0.75rem;padding:0.5rem 0.75rem;border-radius:4px;background:var(--pico-card-background-color);">
+        {# Punch 414 -- canned demo vs the target's last real event. The
+           same partial is re-rendered out-of-band by the preview fragment
+           so a refused live request flips the radio back to canned. #}
+        {% with preview_mode="canned", preview_mode_oob=false %}
+        {% include "admin/config_tabs/_webhook_preview_mode.html" %}
+        {% endwith %}
+        <label style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;font-size:0.85rem;margin:0 0 0.4rem;">
+            <span><strong>Live preview</strong> — sample event:</span>
+            <select id="outbound-preview-sample-event"
+                    name="sample_event"
+                    hx-post="/admin/integrations/webhook-preview"
+                    hx-trigger="change"
+                    hx-target="#outbound-body-preview"
+                    hx-swap="innerHTML"
+                    hx-include="none"
+                    hx-vals='js:{...etOutboundPreviewVals()}'
+                    style="width:auto;font-size:0.85rem;padding:0.15rem 0.4rem;margin:0;">
+                <option value="triage.completed" selected>triage.completed</option>
+                <option value="flow.classified">flow.classified</option>
+            </select>
+            <button type="button"
+                    hx-post="/admin/integrations/webhook-preview"
+                    hx-target="#outbound-body-preview"
+                    hx-swap="innerHTML"
+                    hx-include="none"
+                    hx-vals='js:{...etOutboundPreviewVals()}'
+                    class="outline"
+                    style="padding:0.15rem 0.6rem;font-size:0.8rem;margin:0;">
+                Refresh
+            </button>
+        </label>
+        <div id="outbound-body-preview">
+            <small style="color:var(--pico-muted-color);">
+                Change the target type, edit the template, or pick a
+                sample event to render a live preview here — bytes are
+                identical to what production emit would POST for the
+                same inputs.
+            </small>
+        </div>
+    </div>
+</details>
+
+<div id="outbound-hipaa-lock-banner"
+     style="margin-top:0.75rem;padding:0.5rem 0.75rem;border-left:3px solid var(--pico-ins-color);background:var(--pico-card-background-color);">
+    <small>
+        <strong>HIPAA-mode lock:</strong> when this install (or any
+        specific account) is HIPAA-flagged, the operator template above
+        is <strong>IGNORED</strong> at fire time and the receiver gets
+        a minimal <code>{event, category, timestamp, flow_id}</code>
+        shape — regardless of the target type selected.
+        Defense-in-depth atop the <code>_FORBIDDEN_KEYS</code> payload
+        guard. §164.312(e)(1) transmission-security posture.
+        (SME-panel 2026-07-15 HIPAA F1 — banner unconditional so the
+        notice reaches an operator whose JS fails to load.)
+    </small>
+</div>
+
+<script>
+// ONE source for the preview request's fields (punch 414: the mode radios and
+// the account scope join the existing three). Every preview hx-vals calls this
+// instead of repeating the object. `account_id` is what the wizard form holds
+// right now, so the server can gate on it; the server never trusts it alone.
+function etOutboundPreviewVals() {
+    var mode = document.querySelector('input[name=outbound_preview_mode]:checked');
+    var acct = document.querySelector('[name=outbound_webhook_account_id]');
+    return {
+        target_type: document.getElementById('outbound-target-type').value,
+        body_template: document.getElementById('outbound-body-template').value,
+        sample_event: document.getElementById('outbound-preview-sample-event').value,
+        mode: mode ? mode.value : 'canned',
+        account_id: acct ? acct.value : ''
+    };
+}
+// Live mode renders the target's real event, so the sample-event dropdown has
+// nothing to pick: disable it while the (server-confirmed) mode is live.
+function etOutboundSyncSampleSelect() {
+    var mode = document.querySelector('input[name=outbound_preview_mode]:checked');
+    var sel = document.getElementById('outbound-preview-sample-event');
+    if (sel) sel.disabled = !!mode && mode.value === 'live';
+}
+document.addEventListener('change', etOutboundSyncSampleSelect);
+document.addEventListener('htmx:afterSettle', etOutboundSyncSampleSelect);
+</script>
+<script>
+(function() {
+    var typeSel = document.getElementById('outbound-target-type');
+    var urlInp  = document.getElementById('outbound-webhook-url');
+    var tmplBox = document.getElementById('outbound-body-template');
+    var docsHint = document.getElementById('outbound-target-docs-hint');
+    var docsLink = document.getElementById('outbound-target-docs-link');
+    var reqHint = document.getElementById('outbound-body-template-required-hint');
+    // NOTE: HIPAA-lock banner is now server-rendered unconditionally
+    // (SME-panel 2026-07-15 HIPAA F1 / DA B) — no JS toggle. The banner
+    // reaches operators whose JS fails to load; the server-side lock at
+    // web/_webhook_template.py::render_for_target is the actual gate.
+    if (!typeSel) return;
+    function currentOpt() { return typeSel.options[typeSel.selectedIndex]; }
+    function apply() {
+        var opt = currentOpt();
+        if (!opt) return;
+        var hint = opt.getAttribute('data-url-hint') || '';
+        var dflt = opt.getAttribute('data-default-template') || '';
+        var docs = opt.getAttribute('data-docs-url') || '';
+        var req  = opt.getAttribute('data-required-fields') || '';
+        if (urlInp && hint) urlInp.placeholder = hint;
+        // Only overwrite the template box when it's empty — never
+        // clobber an operator edit on a mere dropdown change (matches
+        // the never-clobber pattern used across secret + config fields).
+        if (tmplBox && !tmplBox.value) tmplBox.placeholder = dflt || 'Leave blank for the target-type’s default';
+        if (docsHint && docsLink) {
+            if (docs) {
+                docsLink.href = docs;
+                docsHint.style.display = 'inline';
+            } else {
+                docsHint.style.display = 'none';
+            }
+        }
+        if (reqHint) {
+            if (req) {
+                reqHint.textContent = 'Required data fields: ' + req.split(',').join(', ') + '. Missing at fire time refuses delivery (fail-closed).';
+            } else {
+                reqHint.textContent = '';
+            }
+        }
+    }
+    typeSel.addEventListener('change', apply);
+    apply();
+})();
+</script>
+
+{# ── Internet Search (Topic free-text web search) ──────────── #}
+<h3 style="margin-top:2rem;">Internet Search <small style="color:var(--pico-muted-color);">(optional — self-hosted SearXNG)</small></h3>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    Powers the Topic editor's free-text “Look up” — type a few words and
+    the editor offers public web summaries to help fill in a Topic's
+    Details. Default OFF; paste a self-hosted SearXNG URL to opt in.
+    </small>
+</p>
+<p>
+    <small style="color:var(--pico-muted-color);">
+    <strong>Protected (HIPAA) Topics never use this</strong> — a Topic that
+    includes a HIPAA-flagged mailbox is always limited to public
+    study-registry numbers (e.g. NCT00000419), regardless of this setting.
+    <strong>On-LAN only.</strong> Only the operator's typed query is sent —
+    never any mailbox content. Point it at an audited LAN host
+    (e.g. <code>http://your-lan-host:8080</code>); the host needs JSON
+    output enabled.
+    </small>
+</p>
+<label>
+    SearXNG URL{{ m.help("Base URL of a self-hosted SearXNG instance with JSON output enabled (search.formats includes json). Format: http://host:port — no trailing path. Leave blank to disable free-text search; the Topic editor then offers registry-number (NCT) lookups only. Example: http://your-lan-host:8080.") }}
+    {{ m.combo_input(
+        "web_search_searxng_url",
+        web_search_searxng_url,
+        ["http://your-lan-host:8080"],
+        placeholder="http://your-lan-host:8080") }}
+</label>
+<p><small style="color:var(--pico-muted-color);">
+    Blank to disable — the Topic editor then offers registry-number lookups
+    only. Server-side fetch; failures fall through to “type Details by hand”.
 </small></p>
 
 {# ── Classification cache ──────────────────────────────────── #}
@@ -431,9 +686,11 @@
 
 <label>
     Redis URL{{ m.help("Connection URL for the cache backend. Format: redis://host:port/db. Leave blank to disable caching entirely. Example: redis://your-lan-host:6379/0 — the trailing /0 selects logical database 0; bump to /2 (or any 0-15) if other services share the same Redis. Use rediss:// (two s's) for TLS.") }}
-    <input type="text" name="redis_cache_url"
-           value="{{ redis_cache_url }}"
-           placeholder="redis://your-lan-host:6379/0">
+    {{ m.combo_input(
+        "redis_cache_url",
+        redis_cache_url,
+        ["redis://localhost:6379/0", "redis://your-lan-host:6379/0", "rediss://your-lan-host:6379/0"],
+        placeholder="redis://your-lan-host:6379/0") }}
 </label>
 <p><small style="color:var(--pico-muted-color);">
     Blank to disable. Lazy connection — nothing connects until the first
@@ -507,6 +764,37 @@
 
 <button type="submit" style="margin-top:0.5rem;">Save</button>
 </form>
+
+{# Manual flush — a SEPARATE form from the config Save above (HTML forbids
+   nested forms) so a stray click here never submits the whole config. The
+   button is disabled when no cache URL is set — flushing an unconfigured
+   cache is a no-op. (#151; restored after the config-tabs refactor dropped
+   it — the route/handler/result-block all survived, only this form was
+   lost, leaving the flush feature unreachable from the UI.) #}
+<form method="post" action="/admin/integrations/cache/flush"
+      style="display:inline-block;margin-top:0.5rem;"
+      onsubmit="return confirm('Drop every cached classification across every account? Next classifications will re-call the language model until the cache warms up again. This cannot be undone.');">
+    {{ csrf_input(request) }}
+    <button type="submit" class="outline secondary"
+            {% if not redis_cache_url %}disabled{% endif %}
+            style="font-size:0.85em;">
+        Flush cached classifications
+    </button>
+    <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
+        Drops every <code>et:cls:*</code> key. Other services sharing
+        this Redis instance are unaffected.{{ m.help("Use after changing your categories, classifier model, or rules — anything that would make old cached classifications wrong. Without a flush, stale entries roll off naturally over the TTL (default 30 days).") }}
+    </small>
+</form>
+{% if flushed is defined and flushed %}
+<p><small style="color:var(--pico-ins-color);">
+    Flushed {{ flushed }} cached classification{% if flushed != 1 %}s{% endif %}.
+</small></p>
+{% endif %}
+{% if flush_err %}
+<p><small style="color:var(--pico-del-color);">
+    Flush failed: {{ flush_err }}
+</small></p>
+{% endif %}
 
 <form method="post" action="/admin/integrations/counters/reset"
       style="display:inline-block;margin-top:0.5rem;">

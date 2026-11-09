@@ -21,6 +21,7 @@ from email_triage.web.db import (
     claim_next_queued_triage_job,
     count_active_triage_jobs_for_account,
     count_processed_messages_in_job,
+    count_triage_jobs,
     create_triage_job,
     finish_triage_job,
     get_triage_job,
@@ -47,7 +48,7 @@ def _mk_account(db, *, owner_id: int, name: str = "acct1"):
         "VALUES (?, 'imap', ?, 1, ?, ?, ?)",
         (
             name,
-            json.dumps({"username": "u@example.com", "host": "h", "port": 993}),
+            json.dumps({"username": "u@example.com", "host": "h.invalid", "port": 993}),
             "2026-01-01T00:00:00",
             "2026-01-01T00:00:00",
             owner_id,
@@ -93,6 +94,54 @@ class TestTriageJobsHelpers:
         # By status
         done_rows = list_triage_jobs(db, status="done")
         assert {r["job_id"] for r in done_rows} == {j1}
+
+    def test_account_ids_scope_applies_before_limit(
+        self, db, regular_user, admin_user,
+    ):
+        """ — the per-user scope must be pushed INTO the query so the
+        LIMIT applies AFTER it. Otherwise a user whose only job is older
+        than other users' jobs is hidden when the global newest-N is full
+        of other users' rows."""
+        mine = _mk_account(db, owner_id=regular_user["id"], name="mine")
+        theirs = _mk_account(db, owner_id=admin_user["id"], name="theirs")
+
+        # My one job is created FIRST (oldest).
+        my_job = create_triage_job(
+            db, account_id=mine, actor_user_id=regular_user["id"],
+            query="x", rate_msg_per_min=1, concurrency=1,
+        )
+        # Five NEWER jobs belong to another user.
+        for _ in range(5):
+            create_triage_job(
+                db, account_id=theirs, actor_user_id=admin_user["id"],
+                query="x", rate_msg_per_min=1, concurrency=1,
+            )
+
+        # OLD (buggy) behaviour: global newest-3 would be all "theirs",
+        # then client-filter to mine → []. The scoped query must still
+        # surface my job even with a tight cap.
+        scoped = list_triage_jobs(db, account_ids={mine}, limit=3)
+        assert {r["job_id"] for r in scoped} == {my_job}
+
+    def test_account_ids_empty_scope_returns_empty(self, db):
+        """An empty visibility scope → [] and count 0, never a global
+        fetch that could leak other users' jobs."""
+        assert list_triage_jobs(db, account_ids=set(), limit=10) == []
+        assert count_triage_jobs(db, account_ids=set()) == 0
+
+    def test_count_triage_jobs_matches_list_filters(self, db, regular_user):
+        """count_triage_jobs is the honest denominator: same filters as
+        list, minus the limit — so 'newest N of M' is accurate."""
+        a = _mk_account(db, owner_id=regular_user["id"], name="a")
+        for _ in range(7):
+            create_triage_job(
+                db, account_id=a, actor_user_id=regular_user["id"],
+                query="x", rate_msg_per_min=1, concurrency=1,
+            )
+        shown = list_triage_jobs(db, account_ids={a}, limit=3)
+        total = count_triage_jobs(db, account_ids={a})
+        assert len(shown) == 3
+        assert total == 7  # the denominator the "newest 3 of 7" notice uses
 
     def test_count_active_excludes_terminal(self, db, regular_user):
         acct_id = _mk_account(db, owner_id=regular_user["id"])
@@ -521,7 +570,7 @@ class TestBulkTriageRunner:
             "VALUES (?, 'imap', ?, 1, ?, ?, ?, 1)",
             (
                 "hipaa-box",
-                json.dumps({"username": "u@x.com", "host": "h", "port": 993}),
+                json.dumps({"username": "u@x.com", "host": "h.invalid", "port": 993}),
                 "2026-01-01T00:00:00", "2026-01-01T00:00:00",
                 regular_user["id"],
             ),
@@ -632,6 +681,188 @@ class TestBulkTriageRunner:
 
 
 # ---------------------------------------------------------------------------
+# run18 census #7 — bulk TERMINAL triage.completed emit
+# ---------------------------------------------------------------------------
+
+class TestBulkTerminalEmit:
+    """A bulk sweep must fire ``triage.completed`` (through the
+    ``complete_triage_run`` SSOT, ``record=False`` — the per-message
+    ``triage_runs`` rows are already written) EXACTLY ONCE on a clean
+    ``done``, carrying the authoritative job-row tallies; and must emit
+    NOTHING on a failed or already-terminal (cancelled) job.
+
+    Drives the real ``run_triage_all`` end-to-end with stubbed provider +
+    classifier (no backends). The emit runs on the event loop *after* the
+    threadpool ``db_call(_finalise_bulk_job, ...)`` returns, so the whole
+    thing is exercised via ``asyncio.run`` exactly as production schedules it.
+    """
+
+    @staticmethod
+    def _make_app(db):
+        app_obj = types.SimpleNamespace()
+        from email_triage.config import TriageConfig
+        app_obj.state = types.SimpleNamespace(
+            db=db, secrets=None, config=TriageConfig(),
+            # Non-None so the emit's `if dispatcher is not None` gate opens;
+            # complete_triage_run itself is spied, so the value is inert.
+            event_dispatcher=object(),
+        )
+        return app_obj
+
+    @staticmethod
+    def _patch_backends(monkeypatch, provider):
+        """Stub the provider + classifier builders run_triage_all calls at
+        setup, so no real IMAP/LLM backend is needed."""
+        from email_triage.web.routers import ui as _ui_mod
+
+        class _StubClassifier:
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(
+            _ui_mod, "_create_provider_from_account",
+            lambda acct, secrets: provider,
+        )
+        monkeypatch.setattr(
+            _ui_mod, "_build_classifier_from_config",
+            lambda config: _StubClassifier(),
+        )
+
+    @staticmethod
+    def _spy_emit(monkeypatch):
+        """Replace events.complete_triage_run (resolved by run_triage_all's
+        late `from email_triage.web.events import complete_triage_run`) with
+        an AsyncMock spy."""
+        from unittest.mock import AsyncMock
+        spy = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "email_triage.web.events.complete_triage_run", spy,
+        )
+        return spy
+
+    def test_clean_done_emits_once_with_job_row_counts(
+        self, db, regular_user, monkeypatch,
+    ):
+        from email_triage.web import triage_runner_bulk as bulk
+
+        acct_id = _mk_account(db, owner_id=regular_user["id"])
+        job_id = create_triage_job(
+            db, account_id=acct_id, actor_user_id=regular_user["id"],
+            query="is:unread", rate_msg_per_min=1, concurrency=1,
+        )
+        # The runner finalises a row that is still 'running'.
+        db.execute(
+            "UPDATE triage_jobs SET status='running' WHERE job_id=?", (job_id,),
+        )
+        # Authoritative tallies the emit must read off the job row. An empty
+        # search adds nothing, so these survive verbatim to the terminal emit
+        # (proves the counts come from the row, not from a per-run list).
+        bump_triage_job_counters(db, job_id, seen=5, processed=3, errors=1)
+        db.commit()
+
+        class _EmptyProvider:
+            async def search_iter(self, query, batch_size=200, resume_cursor=None):
+                return
+                yield  # mark as async generator (empty sweep)
+
+            async def close(self):
+                pass
+
+        self._patch_backends(monkeypatch, _EmptyProvider())
+        spy = self._spy_emit(monkeypatch)
+        app_obj = self._make_app(db)
+        job = get_triage_job(db, job_id)
+
+        asyncio.run(bulk.run_triage_all(app_obj, db, job))
+
+        # Clean terminal.
+        assert get_triage_job(db, job_id)["status"] == "done"
+        # Emitted exactly once, through the SSOT, emit-only (record=False),
+        # trigger="bulk", with the job-row tallies (total_seen/processed/errors).
+        assert spy.await_count == 1, spy.await_args_list
+        kw = spy.await_args.kwargs
+        assert kw["record"] is False
+        assert kw["trigger"] == "bulk"
+        assert kw["run_id"] == f"bulk_{job_id}"
+        assert kw["total_messages"] == 5      # total_seen
+        assert kw["results_count"] == 3       # total_processed
+        assert kw["errors_count"] == 1        # total_errors
+
+    def test_failed_job_does_not_emit(
+        self, db, regular_user, monkeypatch,
+    ):
+        from email_triage.web import triage_runner_bulk as bulk
+
+        acct_id = _mk_account(db, owner_id=regular_user["id"])
+        job_id = create_triage_job(
+            db, account_id=acct_id, actor_user_id=regular_user["id"],
+            query="is:unread", rate_msg_per_min=1, concurrency=1,
+        )
+        db.execute(
+            "UPDATE triage_jobs SET status='running' WHERE job_id=?", (job_id,),
+        )
+        db.commit()
+
+        class _BoomProvider:
+            async def search_iter(self, query, batch_size=200, resume_cursor=None):
+                raise RuntimeError("provider search blew up")
+                yield  # async generator marker (unreachable)
+
+            async def close(self):
+                pass
+
+        self._patch_backends(monkeypatch, _BoomProvider())
+        spy = self._spy_emit(monkeypatch)
+        app_obj = self._make_app(db)
+        job = get_triage_job(db, job_id)
+
+        # The runner catches the search failure, finalises 'failed', returns.
+        asyncio.run(bulk.run_triage_all(app_obj, db, job))
+
+        assert get_triage_job(db, job_id)["status"] == "failed"
+        assert spy.await_count == 0, "a failed sweep must not emit triage.completed"
+
+    def test_already_terminal_cancelled_does_not_emit(
+        self, db, regular_user, monkeypatch,
+    ):
+        from email_triage.web import triage_runner_bulk as bulk
+
+        acct_id = _mk_account(db, owner_id=regular_user["id"])
+        job_id = create_triage_job(
+            db, account_id=acct_id, actor_user_id=regular_user["id"],
+            query="is:unread", rate_msg_per_min=1, concurrency=1,
+        )
+        # Operator/UI already cancelled it before this run reaches terminal —
+        # the batch-loop cancel check trips AND _finalise_bulk_job no-ops
+        # (latest status != 'running'). Either way: no emit.
+        db.execute(
+            "UPDATE triage_jobs SET status='cancelled' WHERE job_id=?", (job_id,),
+        )
+        bump_triage_job_counters(db, job_id, seen=2, processed=2)
+        db.commit()
+
+        class _OneBatchProvider:
+            async def search_iter(self, query, batch_size=200, resume_cursor=None):
+                yield (["m1"], None)  # one batch → loop enters → cancel-check
+
+            async def close(self):
+                pass
+
+        self._patch_backends(monkeypatch, _OneBatchProvider())
+        spy = self._spy_emit(monkeypatch)
+        app_obj = self._make_app(db)
+        job = get_triage_job(db, job_id)
+
+        asyncio.run(bulk.run_triage_all(app_obj, db, job))
+
+        # Row stays cancelled (run did not re-finalise it) and NOTHING emitted.
+        assert get_triage_job(db, job_id)["status"] == "cancelled"
+        assert spy.await_count == 0, (
+            "an already-terminal (cancelled) sweep must not emit triage.completed"
+        )
+
+
+# ---------------------------------------------------------------------------
 # /config — admin knobs persist + clamp
 # ---------------------------------------------------------------------------
 
@@ -710,6 +941,52 @@ class TestTriageJobsUI:
                           cookies=user_cookies,
                           follow_redirects=False)
         assert resp.status_code == 404
+
+    def test_jobs_index_paginates_reachable(
+        self, client, db, regular_user, user_cookies, monkeypatch,
+    ):
+        """/ reachability — the Bulk-runs index pages via ?offset=
+        so a user's full run history past the cap is reachable. Cap
+        monkeypatched small (2) so the pager actually fires + we can prove
+        page 2 holds DIFFERENT jobs than page 1 (real reachability, not a
+        revert-survivable 200)."""
+        import email_triage.web.routers.ui.triage_classify as tc
+        monkeypatch.setattr(tc, "_JOBS_CAP", 2)
+        acct = _mk_account(db, owner_id=regular_user["id"])
+        job_ids = []
+        for i in range(5):  # 5 jobs > cap of 2
+            job_ids.append(create_triage_job(
+                db, account_id=acct, actor_user_id=regular_user["id"],
+                query=f"q{i}", rate_msg_per_min=1, concurrency=1,
+            ))
+        # Page 1: pager fires (5 > 2) with a reachable 'load older'.
+        r1 = client.get("/triage/jobs", cookies=user_cookies)
+        assert r1.status_code == 200
+        assert "of 5" in r1.text
+        assert "load older" in r1.text
+        assert "offset=2" in r1.text
+        # Page 1 holds the 2 NEWEST jobs (created last).
+        assert job_ids[4] in r1.text and job_ids[3] in r1.text
+        assert job_ids[0] not in r1.text  # oldest not on page 1
+        # Page 2 (offset=2): DIFFERENT jobs + a 'newer' link back.
+        r2 = client.get("/triage/jobs?offset=2", cookies=user_cookies)
+        assert r2.status_code == 200
+        assert "newer" in r2.text
+        assert job_ids[2] in r2.text and job_ids[1] in r2.text
+        assert job_ids[4] not in r2.text  # page-1 job absent from page 2
+
+    def test_jobs_index_under_cap_no_pager(
+        self, client, db, regular_user, user_cookies,
+    ):
+        """Under the cap → no 'load older' (don't cry wolf)."""
+        acct = _mk_account(db, owner_id=regular_user["id"])
+        create_triage_job(
+            db, account_id=acct, actor_user_id=regular_user["id"],
+            query="x", rate_msg_per_min=1, concurrency=1,
+        )
+        resp = client.get("/triage/jobs", cookies=user_cookies)
+        assert resp.status_code == 200
+        assert "load older" not in resp.text
 
     def test_progress_renders_when_authorised(
         self, client, db, regular_user, user_cookies,
@@ -904,7 +1181,7 @@ class TestTriagePreview:
             "VALUES (?, 'imap', ?, 1, ?, ?, ?, 1)",
             (
                 "hipaa-acct",
-                json.dumps({"username": "u@example.com", "host": "h", "port": 993}),
+                json.dumps({"username": "u@example.com", "host": "h.invalid", "port": 993}),
                 "2026-01-01T00:00:00",
                 "2026-01-01T00:00:00",
                 owner_id,

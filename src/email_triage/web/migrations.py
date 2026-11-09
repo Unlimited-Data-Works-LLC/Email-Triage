@@ -65,6 +65,9 @@ Only when neither shape matches do we raise — that's the real
 
 from __future__ import annotations
 
+from email_triage._errfmt import fmt_exc
+from email_triage._isotime import now_utc_iso, now_utc_iso_z
+
 import ast
 import functools
 import hashlib
@@ -72,12 +75,12 @@ import inspect
 import logging
 import sqlite3
 import textwrap
-import time
 from dataclasses import dataclass
 from typing import Callable
 
 
-_log = logging.getLogger("email_triage.web.migrations")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.migrations")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +382,7 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         for version, name, old, new in rewrites:
             _log.info(
                 "migration checksum rewritten from pre-#228 raw-source "
-                "shape to post-#228 normalized-AST shape ( one-time "
+                "shape to post-#228 normalized-AST shape (#286 one-time "
                 "transition; no migration body changed)",
                 extra={"_extra": {
                     "version": version,
@@ -410,7 +413,7 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
         try:
             conn.execute("BEGIN IMMEDIATE")
             m.body(conn)
-            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            now = now_utc_iso_z()
             conn.execute(
                 "INSERT INTO schema_migrations "
                 "(version, name, applied_at, checksum) "
@@ -434,7 +437,7 @@ def run_migrations(conn: sqlite3.Connection) -> list[int]:
             )
             raise MigrationError(
                 f"migration {m.version} ({m.name!r}) failed: "
-                f"{type(exc).__name__}: {exc}"
+                f"{fmt_exc(exc, with_class=True)}"
             ) from exc
 
     return applied_now
@@ -645,7 +648,7 @@ def _v5_flip_digest_preview_off(conn: sqlite3.Connection) -> None:
         key = r["key"] if hasattr(r, "keys") else r[0]
         raw = r["value_json"] if hasattr(r, "keys") else r[1]
         try:
-            data = json.loads(raw) if raw else None
+            data = json.loads(raw) if raw else None  # json-col-ok migration-time (frozen, skip-safe)
         except (TypeError, ValueError):
             continue
         if not isinstance(data, list):
@@ -677,13 +680,13 @@ def _v6_backfill_account_tz_default(conn: sqlite3.Connection) -> None:
     do timezone arithmetic. The local strings are computed against
     a per-account ``tz`` field stored under ``email_accounts.config_json``.
 
-    This migration backfills the default (``America/New_York``) for
+    This migration backfills the default (``America/Detroit``) for
     every existing account row whose config_json does NOT already
     have a ``tz`` key. Future accounts get the default at create-
     time via the account form (the dropdown defaults to
-    ``America/New_York`` when no value is supplied).
+    ``America/Detroit`` when no value is supplied).
 
-    Why ``America/New_York`` and not UTC: the install was originally
+    Why ``America/Detroit`` and not UTC: the install was originally
     seeded for a single Eastern US household. Defaulting to UTC
     would cause the API to render UTC times to humans, which is
     explicitly disallowed in the handover spec. Operators in
@@ -701,14 +704,14 @@ def _v6_backfill_account_tz_default(conn: sqlite3.Connection) -> None:
         rid = row["id"] if hasattr(row, "keys") else row[0]
         raw = row["config_json"] if hasattr(row, "keys") else row[1]
         try:
-            cfg = json.loads(raw or "{}")
+            cfg = json.loads(raw or "{}")  # json-col-ok migration-time (frozen, skip-safe)
         except (TypeError, ValueError):
             continue
         if not isinstance(cfg, dict):
             continue
         if "tz" in cfg:
             continue
-        cfg["tz"] = "America/New_York"
+        cfg["tz"] = "America/Detroit"
         conn.execute(
             "UPDATE email_accounts SET config_json = ? WHERE id = ?",
             (json.dumps(cfg), rid),
@@ -1039,11 +1042,16 @@ def _v12_create_sent_mail_index(conn: sqlite3.Connection) -> None:
 
     sqlite-vec virtual-table integration is OPT-IN at runtime: the
     migration creates only the canonical TABLE so installs without
-    the extension still apply v12 cleanly. The helper in
-    ``actions/sent_mail_index.py`` builds the vec0 virtual table
-    on first use when ``app.state.sqlite_vec_available`` is True;
-    when False, retrieval falls back to in-memory cosine over the
-    rows in this table.
+    the extension still apply v12 cleanly. NOTE (corrected
+    2026-06-19): the vec0 virtual-table fast path is NOT yet
+    implemented — ``actions/sent_mail_index.py`` ALWAYS retrieves via
+    an in-memory cosine scan over the rows in this table, even when
+    ``app.state.sqlite_vec_available`` is True (the flag is plumbed
+    through to ``self._vec_available`` but not yet consumed;
+    benchmark-gated follow-up). An earlier edition of this docstring
+    claimed the helper "builds the vec0 virtual table on first use" —
+    it does not. The TABLE this migration creates is the durable
+    store either way.
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sent_mail_index (
@@ -1580,7 +1588,7 @@ def _v20_sent_folder_override_string_to_list(conn: sqlite3.Connection) -> None:
         rid = row["id"] if hasattr(row, "keys") else row[0]
         raw = row["config_json"] if hasattr(row, "keys") else row[1]
         try:
-            cfg = json.loads(raw or "{}")
+            cfg = json.loads(raw or "{}")  # json-col-ok migration-time (frozen, skip-safe)
         except (TypeError, ValueError):
             continue
         if not isinstance(cfg, dict):
@@ -1907,7 +1915,7 @@ def _v26_create_ai_backends(conn: sqlite3.Connection) -> None:
                                    ``openai``        — api.openai.com (or proxy)
                                    ``azure_openai``  — Azure-hosted GPT
                                    ``gemini``        — Google generativelanguage.googleapis.com
-                                 Anthropic intentionally absent — per
+                                 AI provider intentionally absent — per
                                  ``feedback_no_anthropic``. GitHub
                                  Copilot evaluated 2026-05-15 and
                                  discarded — ToS scope-restricts
@@ -2795,11 +2803,14 @@ def _v32_add_sent_mail_index_embedding_dimension(
         avoiding a stale-by-name-but-compatible-by-dim false negative.
 
     Idempotent column-add — skipped on installs where the column
-    already exists. New rows backfill via the next index_message
-    call (the dimension is derived from the embedding vector's
-    actual length, stored alongside the packed bytes); rows from
-    pre-v32 have NULL dimension which the reindex job treats as
-    "unknown, re-embed".
+    already exists. New rows stamp the dimension at index time (the
+    embedding vector's actual length). NOTE: the
+    ``index_message`` INSERT did NOT actually write this column until
+     fixed it, so rows indexed in the v32→#37 window ALSO have NULL
+    dimension — not just pre-v32 rows. The reindex job treats any NULL
+    dimension as "unknown, re-embed", so the gap was harmless but the
+    original "backfill via the next index_message call" promise was
+    false until .
     """
     cur = conn.execute("PRAGMA table_info(sent_mail_index)")
     existing = {row[1] for row in cur.fetchall()}
@@ -3222,6 +3233,13 @@ def _v38_create_audit_gap_events(conn: sqlite3.Connection) -> None:
                                                 without storing the PHI here)
     ``exc_type``               TEXT NOT NULL  — e.g. "OperationalError"
     ``exc_msg``                TEXT NOT NULL  — truncated to 500 chars
+                                                (since punch  it may start with
+                                                the writer's "[chain-tail-unreadable:
+                                                <class>] " marker, and exception text
+                                                that starts with a backslash or could
+                                                be read as the marker is escaped with
+                                                one leading backslash;
+                                                see ``_write_audit_gap_event``)
     ``prev_hash``              TEXT NOT NULL DEFAULT ''  — chain link
     ``row_hash``               TEXT NOT NULL DEFAULT ''  — HMAC-SHA256 of
                                                           canonical row
@@ -3271,3 +3289,944 @@ def _v38_create_audit_gap_events(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_gap_events_helper "
         "ON audit_gap_events (helper_name)"
     )
+
+
+@register(39, "add_ai_backends_backup_models")
+def _v39_add_ai_backends_backup_models(conn: sqlite3.Connection) -> None:
+    """ — ordered backup-model list per AI backend.
+
+    Adds ``backup_models_json`` (nullable TEXT holding a JSON array of
+    model-name strings) to ``ai_backends``. The model resolver tries the
+    row's primary ``model`` first, then walks this list as
+    CAPABILITY/RESOURCE fallback. Every entry is a model on the SAME
+    backend row — same endpoint, same vendor (BAA) agreement — so
+    failover never crosses a BAA boundary (the agreement gates the
+    backend, not the model name).
+
+    Nullable + additive: pre-#44 images simply ignore the column, so a
+    ``:previous`` image rollback still opens the DB. Column-presence
+    guarded via ``PRAGMA table_info`` so a re-run is a no-op.
+
+    The install-default classifier's backup list lives in config
+    (``ClassifierConfig.backup_models`` / YAML), not this table — the
+    hot classifier is built from ``config.classifier``, while this
+    column drives the per-account ``ai_backends`` style-learning path.
+    """
+    cols = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(ai_backends)"
+        ).fetchall()
+    }
+    # ``cols`` is empty when the ai_backends table doesn't exist yet
+    # (PRAGMA on a missing table returns no rows). Guard on ``cols`` so
+    # this is a clean no-op in that case instead of a bare ALTER that
+    # raises "no such table" — in the normal upgrade path v26 creates
+    # the table well before v39 runs.
+    if cols and "backup_models_json" not in cols:
+        conn.execute(
+            "ALTER TABLE ai_backends "
+            "ADD COLUMN backup_models_json TEXT"
+        )
+
+
+@register(40, "create_topic_digest_tables")
+def _v40_create_topic_digest_tables(conn: sqlite3.Connection) -> None:
+    """ — Topic / Study Digest data model (design §2).
+
+    A user-defined **Topic** is a subject the app watches for across one
+    or more of the user's mailboxes, surfaced as a special-case digest.
+    The match rides the primary classify pass (no separate scan); the
+    only thing this layer persists is ``(account, message)`` hit pairs,
+    the Topic config, a back-scan verdict cache, and the per-channel
+    digest send watermarks. **No mail bodies are stored** — headers are
+    rendered on demand, in memory, then discarded.
+
+    Four tables, created in **dependency order in ONE transaction** (the
+    runner wraps every body in ``BEGIN IMMEDIATE … COMMIT``; a partial
+    failure rolls the whole set back):
+
+      topics              → parent; user-scoped Topic config.
+      topic_hits          → child of topics; one row per matched message.
+      study_match_cache   → child of topics; back-scan verdict cache.
+      study_digest_state  → child of topics; per-format send watermark.
+
+    **B2 cascade (design §8):** the three child tables carry
+    ``ON DELETE CASCADE`` on ``topic_id`` so deleting a Topic hard-deletes
+    its PHI-bearing hit rows + caches (minimise PHI-at-rest). The scrubbed
+    feedback record (removed-hit teaching) lives elsewhere and is NOT
+    cascaded away here.
+
+    **B3 UPSERT key (design §2 / §8):** ``topic_hits`` carries
+    ``UNIQUE(topic_id, account_id, rfc822_message_id)``. RFC 5322
+    ``Message-ID`` is the durable cross-folder identity (the IMAP
+    ``provider_uid`` is only valid within ``(folder, uidvalidity)``), so it
+    is the conflict target the back-scan/live-classify UPSERT resolves on
+    with ``first_seen_at = MIN(...)`` (see ``actions/topic_configs.py``).
+
+    Idempotent — every statement is ``CREATE TABLE/INDEX IF NOT EXISTS``,
+    so a re-run on a DB that already has the tables is a clean no-op.
+    """
+    # --- topics (parent) ---------------------------------------------------
+    #
+    # User-scoped (NOT account-scoped): the account multi-select lives
+    # INSIDE the Topic as ``selected_account_ids`` (a JSON array). The
+    # composed digest schedule / window / format are stored as JSON blobs
+    # (``schedule_json`` / ``window_json`` / ``format_json``) so the
+    # TopicConfig dataclass can compose the existing DigestSchedule /
+    # DigestWindow / DigestFormat shapes without forking their columns.
+    #
+    #   topic_version  monotonic int, bumps on any change to
+    #                  name/subjects/details/accounts → cache-invalidate
+    #                  + back-scan trigger.
+    #   mode           'full' | 'differential' | 'both' (digest shape).
+    #   details_source where Details came from ('manual' | 'nct' | 'web' …)
+    #                  — provenance, free-text label, no enum gate here.
+    #   deleted_at     soft-delete tombstone (NULL = live).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS topics (
+            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id                   INTEGER NOT NULL
+                                        REFERENCES users(id) ON DELETE CASCADE,
+            name                      TEXT    NOT NULL,
+            subjects_json             TEXT    NOT NULL DEFAULT '[]',
+            details                   TEXT    NOT NULL DEFAULT '',
+            details_source            TEXT    NOT NULL DEFAULT 'manual',
+            selected_account_ids_json TEXT    NOT NULL DEFAULT '[]',
+            mode                      TEXT    NOT NULL DEFAULT 'full'
+                                        CHECK (mode IN ('full','differential','both')),
+            retention_days            INTEGER NOT NULL DEFAULT 90,
+            schedule_json             TEXT    NOT NULL DEFAULT '{}',
+            window_json               TEXT    NOT NULL DEFAULT '{}',
+            format_json               TEXT    NOT NULL DEFAULT '{}',
+            topic_version             INTEGER NOT NULL DEFAULT 1,
+            enabled                   INTEGER NOT NULL DEFAULT 1,
+            created_at                TEXT    NOT NULL,
+            updated_at                TEXT    NOT NULL,
+            deleted_at                TEXT
+        )
+    """)
+    # The dominant access pattern is "list this user's live Topics".
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_topics_user
+            ON topics(user_id)
+    """)
+
+    # --- topic_hits (child of topics) -------------------------------------
+    #
+    # One row per matched message. Stores message IDENTITY only — never a
+    # body. ``rfc822_message_id`` (RFC 5322 Message-ID) is the durable
+    # cross-folder identity; ``(folder, provider_uid, uidvalidity)`` is the
+    # fast fetch key used at render time (relocate by Message-ID SEARCH if
+    # the UID 404s or uidvalidity rolled).
+    #
+    #   first_seen_at     when this hit was first recorded — MIN-preserved
+    #                     under the UPSERT (a back-scan rediscovering an
+    #                     already-live hit must NOT push first_seen_at
+    #                     forward, or Differential mis-fires).
+    #   last_confirmed_at most-recent confirmation — MAX-advanced.
+    #   removed_at        soft-remove (per-hit "this was wrong" feedback).
+    #   expired_at        soft-expire by retention sweep (feedback/audit
+    #                     rows survive a soft-expire).
+    #   reason_terms_json the matched Topic-TERMS (the user's own public
+    #                     Subject/Details terms the email hit — safe to
+    #                     store: it is the user's public text, NOT a body
+    #                     quote and NOT generative prose). Stored as a JSON
+    #                     list. (design §0 / R6.)
+    #   confidence        match strength [0.0..1.0] from the classify/pre-
+    #                     filter pass — drives ranking + the Differential
+    #                     cut. 0.0 default for legacy/keyword-only hits.
+    #   source            where this hit was discovered: 'live' (the primary
+    #                     classify pass), 'backscan' (explicit history scan),
+    #                     or 'included' (operator-forced inclusion). Default
+    #                     'live'.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS topic_hits (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id            INTEGER NOT NULL
+                                  REFERENCES topics(id) ON DELETE CASCADE,
+            account_id          INTEGER NOT NULL
+                                  REFERENCES email_accounts(id)
+                                  ON DELETE CASCADE,
+            folder              TEXT    NOT NULL DEFAULT '',
+            provider_uid        TEXT,
+            uidvalidity         INTEGER NOT NULL DEFAULT 0,
+            rfc822_message_id   TEXT    NOT NULL,
+            reason_terms_json   TEXT    NOT NULL DEFAULT '[]',
+            confidence          REAL    NOT NULL DEFAULT 0.0,
+            source              TEXT    NOT NULL DEFAULT 'live',
+            first_seen_at       TEXT    NOT NULL,
+            last_confirmed_at   TEXT    NOT NULL,
+            removed_at          TEXT,
+            expired_at          TEXT,
+            UNIQUE(topic_id, account_id, rfc822_message_id)
+        )
+    """)
+    # Render/digest builds scan live hits per Topic; the partial filter on
+    # the soft-state columns keeps the common "live hits for this Topic"
+    # query off the removed/expired rows.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_topic_hits_topic_live
+            ON topic_hits(topic_id, first_seen_at)
+            WHERE removed_at IS NULL AND expired_at IS NULL
+    """)
+    # Account-removal soft-expire + the render-time UID fetch both key on
+    # account; the retention sweep keys on expired_at.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_topic_hits_account
+            ON topic_hits(account_id)
+    """)
+
+    # --- study_match_cache (child of topics, back-scan only) --------------
+    #
+    # Lets a re-preview skip already-scanned historical mail. Steady-state
+    # matches don't need it (the hit row IS the cached positive verdict);
+    # this is purely the back-scan's "I already looked at this message at
+    # this topic_version" memo.
+    #
+    #   reason_terms_json the matched Topic-TERMS (JSON list of the user's
+    #                 own public Subject/Details terms — NOT free text /
+    #                 NOT a body quote) — the back-scan verdict cache stays
+    #                 structured so it never becomes a PHI-prose store
+    #                 (design §2). Same canonical name + shape as
+    #                 ``topic_hits.reason_terms_json``.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS study_match_cache (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id            INTEGER NOT NULL
+                                  REFERENCES topics(id) ON DELETE CASCADE,
+            topic_version       INTEGER NOT NULL,
+            account_id          INTEGER NOT NULL
+                                  REFERENCES email_accounts(id)
+                                  ON DELETE CASCADE,
+            rfc822_message_id   TEXT    NOT NULL,
+            matched             INTEGER NOT NULL DEFAULT 0,
+            confidence          REAL    NOT NULL DEFAULT 0.0,
+            reason_terms_json   TEXT    NOT NULL DEFAULT '[]',
+            scanned_at          TEXT    NOT NULL,
+            UNIQUE(topic_id, topic_version, account_id, rfc822_message_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_study_match_cache_topic_ver
+            ON study_match_cache(topic_id, topic_version)
+    """)
+
+    # --- study_digest_state (child of topics) -----------------------------
+    #
+    # Separate send watermarks for Full vs Differential (UNIQUE on
+    # (topic_id, format)). The watermark advances transactionally AFTER a
+    # successful send (at-least-once, idempotent-by-watermark — a failed
+    # send re-includes, never silently drops).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS study_digest_state (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id             INTEGER NOT NULL
+                                   REFERENCES topics(id) ON DELETE CASCADE,
+            format               TEXT    NOT NULL,
+            last_sent_watermark  TEXT,
+            last_sent_at         TEXT,
+            UNIQUE(topic_id, format)
+        )
+    """)
+
+
+@register(41, "topics_add_digests_json")
+def _v41_topics_add_digests_json(conn: sqlite3.Connection) -> None:
+    """ v2 — multiple named digests per Topic.
+
+    A Topic now carries a LIST of digests — each with its own cadence /
+    send-time / days-of-week, its full|differential|both ``mode``, and
+    the rich render ``format`` the regular per-account digests use — so a
+    researcher can run e.g. a daily incremental on weekdays at 22:00 PLUS
+    a weekly full on Monday at 07:00 (the operator's own example). The
+    list is stored as a JSON array in a new ``digests_json`` column.
+
+    The legacy single ``mode`` / ``schedule_json`` / ``format_json``
+    columns are KEPT (the model mirrors ``digests[0]`` back into them), so
+    a rollback to the single-digest code still renders this Topic's
+    primary digest — this migration is purely additive and
+    rollback-safe.
+
+    Backfill: every existing Topic gets a one-element ``digests`` list
+    synthesized from its current mode + schedule + format, so no Topic
+    loses delivery config across the bump. Idempotent — the ALTER is
+    column-presence-guarded and the backfill only fills rows whose
+    ``digests_json`` is still empty.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    cols = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(topics)"
+        ).fetchall()
+    }
+    # Empty ``cols`` = topics table absent (PRAGMA on a missing table
+    # returns no rows). In the normal upgrade path v40 creates it first;
+    # guard so a fresh-DB ordering quirk is a clean no-op, not a raise.
+    if not cols:
+        return
+    if "digests_json" not in cols:
+        conn.execute(
+            "ALTER TABLE topics "
+            "ADD COLUMN digests_json TEXT NOT NULL DEFAULT '[]'"
+        )
+
+    rows = conn.execute(
+        "SELECT id, mode, schedule_json, format_json, digests_json "
+        "FROM topics"
+    ).fetchall()
+    for r in rows:
+        def _c(idx: int, key: str) -> Any:
+            return r[key] if hasattr(r, "keys") else r[idx]
+
+        existing = _c(4, "digests_json") or ""
+        try:
+            parsed = _json.loads(existing) if existing else []
+        except (TypeError, ValueError):
+            parsed = []
+        if isinstance(parsed, list) and parsed:
+            continue  # already migrated — leave it
+
+        mode = _c(1, "mode") or "full"
+        if mode not in ("full", "differential", "both"):
+            mode = "full"
+        try:
+            sched = _json.loads(_c(2, "schedule_json") or "{}")
+        except (TypeError, ValueError):
+            sched = {}
+        try:
+            fmt = _json.loads(_c(3, "format_json") or "{}")
+        except (TypeError, ValueError):
+            fmt = {}
+        digest = {
+            "id": f"tdig_{_uuid.uuid4().hex[:12]}",
+            "name": "Digest",
+            "enabled": True,
+            "mode": mode,
+            "schedule": sched if isinstance(sched, dict) else {},
+            "format": fmt if isinstance(fmt, dict) else {},
+        }
+        conn.execute(
+            "UPDATE topics SET digests_json = ? WHERE id = ?",
+            (_json.dumps([digest]), _c(0, "id")),
+        )
+
+
+@register(42, "create_topic_feedback")
+def _v42_create_topic_feedback(conn: sqlite3.Connection) -> None:
+    """ v3 — operator feedback (thumbs up / down) on Topic matches, with a
+    learned per-Topic reinforcement signal (operator 2026-06-12, "curation +
+    reinforcement loop").
+
+    Two effects ride one table:
+
+      * MESSAGE-level curation — a vote on a specific matched message sets that
+        message's ``topic_hits.source`` to ``'included'`` / ``'excluded'`` (no
+        new column; the existing UPSERT carries it).
+      * SENDER-level reinforcement — the SAME vote also records a learned
+        per-Topic signal keyed on the message's SENDER, so FUTURE matching
+        honors it: a thumbs-DOWN sender is auto-dropped from this Topic's
+        matches, a thumbs-UP sender is always kept. This is the operator's own
+        curation — SAME category as the shipped ``list_rules`` sender patterns
+        (operator-defined sender rules) — stored SQLCipher-encrypted-at-rest
+        and CASCADE-deleted with the Topic (design §8 B2), so it adds no
+        PHI-at-rest surface beyond the existing operator-rule / topic-hit stores.
+
+    ``signal_type`` distinguishes the two; ``UNIQUE(topic_id, signal_type,
+    signal_value)`` lets a re-vote UPSERT (flip up<->down). ``vote`` is +1 / -1.
+    Idempotent (CREATE ... IF NOT EXISTS). Created in the encryption-aware DB
+    the runner already holds (Prime Directive  — encrypted-at-rest default).
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS topic_feedback (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id          INTEGER NOT NULL
+                                REFERENCES topics(id) ON DELETE CASCADE,
+            account_id        INTEGER,
+            signal_type       TEXT    NOT NULL
+                                CHECK (signal_type IN ('sender','message')),
+            signal_value      TEXT    NOT NULL,
+            vote              INTEGER NOT NULL CHECK (vote IN (-1, 1)),
+            rfc822_message_id TEXT,
+            created_at        TEXT    NOT NULL,
+            updated_at        TEXT    NOT NULL,
+            UNIQUE(topic_id, signal_type, signal_value)
+        )
+    """)
+    # The matcher loads "all SENDER signals for this Topic" on every Preview /
+    # back-scan / live match — index that access path.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_topic_feedback_topic_type
+            ON topic_feedback(topic_id, signal_type)
+    """)
+
+
+@register(43, "audit_chain_columns")
+def _v43_audit_chain_columns(conn: sqlite3.Connection) -> None:
+    """ / N-15 — extend the 8 plain-INSERT audit-event tables with the HMAC
+    chain columns so each audit trail becomes tamper-evident, like ``log_entries``
+    and ``audit_gap_events`` (the only two chains before ).
+
+    §-anchors: §164.312(b) Audit Controls + §164.312(c)(1) Integrity Controls.
+    The PHI-access boundary log (``hipaa_access_events`` — the who-touched-whose-
+    PHI record) and its 7 siblings were plain INSERTs: an insider with DB write
+    could silently delete/alter a row with no tamper-evidence. This is the
+    schema half of closing that gap; the chained writers + verifier + the
+    inverse pin land in the same change set.
+
+    Columns added to each table (mirrors the ``audit_gap_events`` v38 shape):
+      * ``prev_hash``          TEXT NOT NULL DEFAULT ''  — chain link
+      * ``row_hash``           TEXT NOT NULL DEFAULT ''  — HMAC-SHA256 of the
+                                                          canonical row
+      * ``hash_alg``           TEXT (nullable)           — 'hmac-sha256-v1' once
+                                                          the HMAC registry is
+                                                          provisioned
+      * ``master_key_version`` INTEGER (nullable)        — which HMAC key version
+                                                          signed the row
+
+    Tables (the complete PD#4 enumeration — scanned ALL of src/, not just
+    db/audit.py, which is why ``style_distill_events`` (db/style.py) is here):
+    hipaa_access_events, hipaa_boundary_events, auth_events, user_status_events,
+    api_key_events, access_log, discover_runs, style_distill_events.
+
+    PRE-migration rows: ``prev_hash``/``row_hash`` default to '' so every
+    existing row lands as a "prechain" row that the verifier SKIPS via its
+    ``WHERE row_hash != ''`` filter (mirror ``get_last_log_row_hash``). There is
+    NO retroactive HMAC of immutable history — tamper-evidence is PROSPECTIVE
+    from this migration forward, and that bounded limitation is recorded in the
+    §164.316 register row that ships with this change. Without the
+    '' default the verifier would walk a NULL ``prev_hash`` and false-break the
+    chain at the migration boundary.
+
+    Option A (SME/DA design review wf_7af575de-5d8, unanimous): the canonical
+    row that feeds ``row_hash`` hashes only the IMMUTABLE creation fields per
+    table; mutable lifecycle fields — notably ``hipaa_access_events.outcome`` /
+    ``detail`` finalised in place by ``update_hipaa_access_event`` — are EXCLUDED
+    so the finalise UPDATE is chain-transparent (no re-chaining, which would
+    itself be the tamper vector). The canonical-tuple exclusion is pin-asserted.
+
+    Idempotent: each ALTER is guarded by ``PRAGMA table_info`` so re-runs skip
+    already-present columns (same shape as the v11 users style-column add). All
+    8 tables exist by this point — the 7 db/audit.py tables via ``_ALL_DDL`` and
+    ``style_distill_events`` via its earlier CREATE migration, both of which run
+    before the numbered framework (web/db.py:865-885).
+    """
+    chain_cols = [
+        ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("row_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("hash_alg", "TEXT"),
+        ("master_key_version", "INTEGER"),
+    ]
+    audit_tables = [
+        "hipaa_access_events",
+        "hipaa_boundary_events",
+        "auth_events",
+        "user_status_events",
+        "api_key_events",
+        "access_log",
+        "discover_runs",
+        "style_distill_events",
+    ]
+    for table in audit_tables:
+        # Table names are hard-coded literals (no injection surface). PRAGMA
+        # returns an empty set for a missing table; all 8 are guaranteed
+        # present by the ordering above, so an empty set would be a real bug
+        # surfaced by the ALTER below rather than silently skipped.
+        existing = {
+            row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for col, decl in chain_cols:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+@register(44, "triage_jobs_backscan_ceiling_and_cache_skipped")
+def _v44_triage_jobs_backscan_ceiling_and_cache_skipped(
+    conn: sqlite3.Connection,
+) -> None:
+    """ + -followup — surface the back-scan ceiling-hit + resume-
+    effectiveness on the ``triage_jobs`` row so the progress UI can banner them.
+
+    - ``ceiling_hit`` (INTEGER 0/1): set by the back-scan fetcher when window
+      enumeration hits ``BACKSCAN_SEARCH_CEILING`` (older mail past it was NOT
+      scanned this run). The status fragment reads it to show a "narrow the
+      window / re-run" banner — the USER-FACING surface for the cap (; the
+      WARNING log already covered the system level, and  makes the "re-run"
+      remedy honest by resuming into the dropped tail).
+    - ``total_cache_skipped`` (INTEGER): how many messages the run resolved from
+      the  ``study_match_cache`` (LLM skipped). Surfaces resume-effectiveness
+      on the job row, not just the finished-log (db-sme  review follow-up).
+
+    Idempotent: a ``PRAGMA table_info`` guard per ALTER (same shape as v43), so
+    re-runs skip already-present columns. NOT NULL DEFAULT 0 so existing job rows
+    read as "no ceiling, nothing skipped".
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(triage_jobs)").fetchall()
+    }
+    for col, decl in [
+        ("ceiling_hit", "INTEGER NOT NULL DEFAULT 0"),
+        ("total_cache_skipped", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE triage_jobs ADD COLUMN {col} {decl}")
+
+
+@register(45, "study_match_cache_match_fingerprint")
+def _v45_study_match_cache_match_fingerprint(
+    conn: sqlite3.Connection,
+) -> None:
+    """ — tag each ``study_match_cache`` row with a ``match_fingerprint`` over
+    the owner's CATEGORY taxonomy + the configured classifier model.
+
+    The  back-scan resume cache keyed only (topic_id, topic_version,
+    account_id, rfc822_message_id), so it did NOT invalidate on a category
+    delete/rename or a model swap (neither bumps topic_version) — a re-preview
+    could re-emit a now-stale cached matched=1 hit (db-sme  SCOPED CONTRACT).
+    The read now ALSO filters on this fingerprint, so a stale-fingerprint row is
+    skipped and re-scanned; the rfc_id-keyed UPSERT overwrites it to the current
+    fingerprint. The UNIQUE key is UNCHANGED (one row per message per version).
+
+    Idempotent: a ``PRAGMA table_info`` guard (same shape as v44). NOT NULL
+    DEFAULT '' so existing rows read as the empty fingerprint — a non-empty
+    current fingerprint never matches them, so they re-scan exactly once.
+    """
+    existing = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(study_match_cache)"
+        ).fetchall()
+    }
+    if "match_fingerprint" not in existing:
+        conn.execute(
+            "ALTER TABLE study_match_cache "
+            "ADD COLUMN match_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
+
+
+@register(46, "regulatory_clock_tables")
+def _v46_regulatory_clock_tables(conn: sqlite3.Connection) -> None:
+    """ — Regulatory clock awareness: 3 tables for deadline-stamped compliance
+    clocks on clinical-trial safety mail (DDL = the adversarially-reviewed design
+    `internal documentation` + the hipaa-sme planning
+    ruling, commit e098da7).
+
+    - ``regulatory_clock_def`` — seeded policy catalog: IRB/INTERNAL ESCALATING
+      clocks + FDA/EU sponsor INFORMATIONAL receipts. Per-account duration
+      override allowed ONLY for institutionally-variable IRB/INTERNAL regimes
+      (the table CHECK enforces it; FDA/EU durations are federally fixed).
+    - ``regulatory_clock_instance`` — one live clock. ``case_ref`` +
+      ``raw_deadline_phrase`` are PHI (encrypted at rest with the rest of the
+      SQLCipher DB; excluded from HIPAA-mode surfaces). ``account_id ON DELETE
+      RESTRICT`` — a live regulatory obligation must NOT be silently destroyed by
+      account deletion. Dedup key ``(account_id, case_ref)`` is scoped WITHIN an
+      account (closes the cross-account collision back-door). The three anchors
+      (``clock_start_at``/``awareness_at``/``determination_at``) are WRITE-ONCE
+      (set on transition, never UPDATEd — the legal Day-0 is the top tamper target).
+    - ``regulatory_clock_event`` — append-only projection of the HMAC
+      ``log_entries`` chain. The 4 legally-meaningful kinds (determined / acked /
+      submitted / breached) ALSO write a chain row (via ``record_clock_event``),
+      committed atomically with the table row; this table is a DERIVED projection,
+      not a second source of truth.
+
+    Additive + idempotent (``CREATE TABLE/INDEX IF NOT EXISTS``). The body is
+    frozen in ``tests/test_migrations_applied_body_immutable.py`` on first apply.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_clock_def (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            code                 TEXT NOT NULL UNIQUE,
+            regime               TEXT NOT NULL CHECK (regime IN ('IRB','INTERNAL','FDA','EU_CTR')),
+            citation             TEXT NOT NULL,
+            title                TEXT NOT NULL,
+            severity_class       TEXT NOT NULL CHECK (severity_class IN ('fatal_lt','other_serious','irb_up','internal')),
+            clock_kind           TEXT NOT NULL CHECK (clock_kind IN ('escalating','informational')) DEFAULT 'escalating',
+            duration_value       INTEGER NOT NULL,
+            duration_unit        TEXT NOT NULL CHECK (duration_unit IN ('calendar_day','working_day')) DEFAULT 'calendar_day',
+            calendar_tz          TEXT NOT NULL DEFAULT 'America/New_York',
+            clock_start_kind     TEXT NOT NULL CHECK (clock_start_kind IN ('on_receipt','on_determination','on_awareness')),
+            pausable             INTEGER NOT NULL DEFAULT 0,
+            duration_overridable INTEGER NOT NULL DEFAULT 0,
+            ack_required         INTEGER NOT NULL DEFAULT 1,
+            escalation_lead_pcts TEXT NOT NULL DEFAULT '[80]',
+            action_target        TEXT,
+            config_owner_account_id INTEGER REFERENCES email_accounts(id) ON DELETE CASCADE,
+            enabled              INTEGER NOT NULL DEFAULT 1,
+            created_at           TEXT NOT NULL,
+            CHECK (config_owner_account_id IS NULL OR regime IN ('IRB','INTERNAL'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_clock_instance (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            def_id                  INTEGER NOT NULL REFERENCES regulatory_clock_def(id),
+            account_id              INTEGER NOT NULL REFERENCES email_accounts(id) ON DELETE RESTRICT,
+            responsibility          TEXT NOT NULL CHECK (responsibility IN ('i_submit','sponsor_submits','unknown')) DEFAULT 'unknown',
+            trigger_message_id      TEXT,
+            case_ref                TEXT NOT NULL,
+            state                   TEXT NOT NULL CHECK (state IN
+                                      ('candidate','running','at_risk','breached','acked','submitted','dismissed')) DEFAULT 'candidate',
+            detection_confidence    REAL,
+            raw_deadline_phrase     TEXT,
+            clock_start_at          TEXT,
+            awareness_at            TEXT,
+            determination_at        TEXT,
+            deadline_at             TEXT,
+            at_risk_at              TEXT,
+            ack_required            INTEGER NOT NULL DEFAULT 1,
+            acked_at                TEXT,
+            acked_by                INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            submitted_at            TEXT,
+            submitted_by            INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            submission_evidence_ref TEXT,
+            parent_instance_id      INTEGER REFERENCES regulatory_clock_instance(id),
+            last_escalation_pct     INTEGER NOT NULL DEFAULT 0,
+            created_at              TEXT NOT NULL,
+            updated_at              TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rci_account ON regulatory_clock_instance(account_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rci_sweep ON regulatory_clock_instance(state, deadline_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rci_case ON regulatory_clock_instance(account_id, case_ref)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS regulatory_clock_event (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_id     INTEGER NOT NULL REFERENCES regulatory_clock_instance(id) ON DELETE RESTRICT,
+            event_kind      TEXT NOT NULL CHECK (event_kind IN
+                              ('detected','determined','awareness_set','escalated','acked','submitted',
+                               'dismissed','breached','determination_corrected')),
+            actor_user_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            from_state      TEXT,
+            to_state        TEXT,
+            escalation_rung INTEGER,
+            delivered_to_ref TEXT,
+            detail          TEXT,
+            created_at      TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rce_instance ON regulatory_clock_event(instance_id)")
+
+
+@register(47, "regulatory_clock_event_chain_columns")
+def _v47_regulatory_clock_event_chain_columns(conn: sqlite3.Connection) -> None:
+    """ — promote ``regulatory_clock_event`` to a dedicated HMAC-chained
+    audit-event table (the /N-15 pattern), adding the 4 chain columns so
+    every legally-meaningful clock transition is tamper-evident at rest.
+
+    SUPERSEDES the v46-docstring "projection of the HMAC log_entries chain"
+    model. The original design (``internal documentation`` §"Audit emitter") chained
+    clock events into ``log_entries`` with ``regulatory_clock_event`` a derived
+    projection. VERIFY-DON'T-ACCEPT (a prescribed mechanism is a probe, not a
+    fact): ``log_entries`` is PRUNED on boot + every 30 min
+    (``prune_log_entries_by_age_and_count`` — app.py:805/1600, retention_days +
+    max_rows), so a legal ``submitted``/``breached`` record chained THERE would
+    be deleted long before the §164.316(b)(2)(i) ~6-year retention window — the
+    chain row gone, any projection unverifiable. A dedicated chained table is
+    NOT pruned, is the single source of truth (no projection double-write), and
+    matches the established  audit-event-table architecture (Directive 3). So
+    ``regulatory_clock_event`` becomes the chain itself.
+
+    Columns added (mirrors v43's audit-chain shape exactly):
+      * ``prev_hash``          TEXT NOT NULL DEFAULT ''  — chain link
+      * ``row_hash``           TEXT NOT NULL DEFAULT ''  — HMAC-SHA256 of canon
+      * ``hash_alg``           TEXT (nullable)
+      * ``master_key_version`` INTEGER (nullable)
+
+    The table is append-only (every transition is a NEW row — no in-place
+    UPDATE; a correction is a new ``determination_corrected`` event), so ALL
+    written columns are immutable and ALL are hashed (canonical tuple in
+    ``db.audit._AUDIT_CHAIN_CANONICAL_FIELDS``) — no Option-A mutable-field
+    exclusion is needed here.
+
+    Idempotent: each ALTER is guarded by ``PRAGMA table_info``. The v46 table is
+    brand-new (zero rows in any real install), so the '' default lands no
+    "prechain" history — every clock event from feature-on is fully chained.
+    """
+    existing = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(regulatory_clock_event)"
+        ).fetchall()
+    }
+    chain_cols = [
+        ("prev_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("row_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("hash_alg", "TEXT"),
+        ("master_key_version", "INTEGER"),
+    ]
+    for col, decl in chain_cols:
+        if col not in existing:
+            conn.execute(
+                f"ALTER TABLE regulatory_clock_event ADD COLUMN {col} {decl}"
+            )
+
+
+@register(48, "regulatory_clock_instance_calendar_written_at")
+def _v48_regulatory_clock_instance_calendar_written_at(
+    conn: sqlite3.Connection,
+) -> None:
+    """ P4f — direct calendar-write idempotency stamp.
+
+    A nullable ``calendar_written_at`` on ``regulatory_clock_instance``: set when
+    the deadline has been written to the owner's connected calendar (gmail_api /
+    office365) as a LIVE event, in ADDITION to the always-on ``.ics``-in-email.
+    Guards one-event-per-clock — the sweeper skips a clock whose stamp is already
+    set, so a clock that escalates twice (at_risk then breach) lands exactly ONE
+    calendar event.
+
+    Deliberately a plain ``ALTER ADD COLUMN`` on the INSTANCE table — NOT a new
+    ``event_kind`` on the immutable HMAC-chained ``regulatory_clock_event`` (that
+    would need a CHECK-constraint rebuild on a tamper-evident audit table). The
+    direct calendar-write is a DELIVERY CHANNEL of the already-chained
+    ``escalated`` event — exactly like the ``.ics`` attachment, which is likewise
+    not separately chained — so the disclosure decision is already audited; this
+    column only provides idempotency + an operational write-stamp.
+
+    Idempotent: ``PRAGMA table_info`` guard (same shape as v44/v45). Nullable, no
+    default → existing rows read as "not yet written".
+    """
+    existing = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(regulatory_clock_instance)"
+        ).fetchall()
+    }
+    if "calendar_written_at" not in existing:
+        conn.execute(
+            "ALTER TABLE regulatory_clock_instance "
+            "ADD COLUMN calendar_written_at TEXT"
+        )
+
+
+@register(49, "topics_add_confidence_floor")
+def _v49_topics_add_confidence_floor(conn: sqlite3.Connection) -> None:
+    """ — per-Topic digest confidence floor.
+
+    A nullable ``confidence_floor`` on ``topics``: when set (a REAL in ``[0,1]``)
+    it overrides the install-wide ``ET_TOPIC_MATCH_CONFIDENCE_FLOOR`` /
+    ``TOPIC_MATCH_CONFIDENCE_FLOOR`` default for THIS Topic's digests, applied at
+    SURFACE time in ``gather_live_topic_hits`` (reversible — every match stays
+    persisted).
+
+    NULL is load-bearing and is the correct legacy/default state: NULL = "inherit
+    the global default", DISTINCT from 0.0 ("surface everything for this Topic").
+    So this is ``ADD COLUMN ... REAL`` with NO DEFAULT and NO backfill — existing
+    rows read NULL = inherit.
+
+    Idempotent: ``PRAGMA table_info`` guard (same shape as v44/v45/v48). The v40
+    topics-create body + the v41 ``digests_json`` ALTER are NOT touched (frozen /
+    checksum-guarded — incident_2026-06-11).
+    """
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(topics)").fetchall()
+    }
+    if "confidence_floor" not in existing:
+        conn.execute("ALTER TABLE topics ADD COLUMN confidence_floor REAL")
+
+
+@register(50, "gmail_watches_add_status_columns")
+def _v50_gmail_watches_add_status_columns(conn: sqlite3.Connection) -> None:
+    """N-256 R25 — gmail_watches lifecycle triple (sibling to N-69 O365).
+
+    Add ``status`` / ``error_count`` / ``error_last`` columns to
+    ``gmail_watches``, mirroring the shape at ``office365_subscriptions``:
+
+        status        TEXT    NOT NULL DEFAULT 'active'
+        error_count   INTEGER NOT NULL DEFAULT 0
+        error_last    TEXT
+
+    Rationale: at HEAD, a Gmail watch renewal failure (non-auth-token)
+    was invisible on /health. Only the account-level auth_stale chip
+    ever fires — a healthy account with a broken watch was silent.
+    Landing these columns enables the sibling
+    ``record_gmail_watch_outcome`` funnel (in ``web/db.py``) to track
+    the lifecycle identically to O365, so a stuck watch surfaces on
+    the operator dashboard.
+
+    Idempotent: ``PRAGMA table_info`` guard (same shape as v44/v45/
+    v48/v49). Additive schema-only — no backfill needed (default
+    values on ADD COLUMN handle existing rows). No wiring in this
+    migration; the funnel + call-site wiring lands in the same
+    change SHA per PD#1 (SSOT + pin + adoption in one change).
+    """
+    existing = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(gmail_watches)"
+        ).fetchall()
+    }
+    if "status" not in existing:
+        conn.execute(
+            "ALTER TABLE gmail_watches ADD COLUMN status TEXT "
+            "NOT NULL DEFAULT 'active'"
+        )
+    if "error_count" not in existing:
+        conn.execute(
+            "ALTER TABLE gmail_watches ADD COLUMN error_count "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    if "error_last" not in existing:
+        conn.execute("ALTER TABLE gmail_watches ADD COLUMN error_last TEXT")
+
+
+@register(51, "regulatory_clock_instance_uq_case_partial")
+def _v51_regulatory_clock_instance_uq_case_partial(
+    conn: sqlite3.Connection,
+) -> None:
+    """N-343 R31 (2026-07-04, Phase-4 DA finding on 9881b45c v46) —
+    partial-unique index on ``(account_id, case_ref)`` for non-terminal
+    regulatory_clock_instance rows.
+
+    v46 shipped a NON-UNIQUE ``idx_rci_case`` while the commit body +
+    design doc both promised ``(account_id, case_ref)`` dedup ("scoped
+    WITHIN an account (closes the cross-account collision back-door)").
+    ``create_clock_candidate`` has no SELECT-then-INSERT + no
+    ON CONFLICT — concurrent detection paths produce two live
+    ``candidate``/``running`` instances → duplicate breach events,
+    duplicate calendar writes, duplicate HMAC-chained
+    ``regulatory_clock_event`` rows corrupting the §164.312(b) audit
+    projection of a single legal clock.
+
+    v46 is IMMUTABLE per ``incident_2026-06-11_migration_body_immutability``;
+    fix-forward is this NEW migration. Partial: excludes terminal
+    states (``dismissed``/``breached``/``submitted``) so a legitimate
+    re-detection after a terminal state creates a fresh candidate.
+    Idempotent: ``CREATE UNIQUE INDEX IF NOT EXISTS``.
+
+    Companion defensive guard lands in ``create_clock_candidate`` in the
+    same change (SELECT for existing non-terminal (account_id, case_ref)
+    inside ``_clock_txn``; return existing id if found — the DDL
+    constraint would raise on a concurrent second insert).
+    """
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_rci_case "
+        "ON regulatory_clock_instance(account_id, case_ref) "
+        "WHERE state NOT IN ('dismissed','breached','submitted')"
+    )
+
+
+@register(52, "gmail_watches_lower_email_functional_index")
+def _v52_gmail_watches_lower_email_functional_index(
+    conn: sqlite3.Connection,
+) -> None:
+    """N-346c-tail-A R31 (2026-07-08 same-drive close-out per operator
+    correction "no more WAITING-ON-OP as a defer mechanism") — functional
+    index on ``LOWER(email_address)`` so
+    :func:`get_gmail_watch_by_email` can serve its case-insensitive
+    lookup via an INDEX SCAN instead of a full table scan.
+
+    Story: prior to N-346c the query used ``WHERE LOWER(email_address) =
+    ?`` for legacy mixed-case row compatibility (documented
+    ``test_webhooks.py::test_email_address_case_insensitive`` locks in
+    #post-#92 regression class — pre-normalization mixed-case rows in
+    production must remain findable). The unique index at v50
+    ``gmail_watches_add_status_columns`` is on the raw column, so
+    ``LOWER()`` on the LHS defeated it. N-346c doubled the probe (dual
+    -lookup shim) so the amplifier became visible; db-sme F1 at N-346c
+    SME panel 2026-07-08 named the fix path. Per operator directive
+    2026-07-08 "close remaining items for trust-repair", NOT filed as
+    a WAITING-ON-OP tail: landed inline as this migration.
+
+    Idempotent (``CREATE INDEX IF NOT EXISTS``). Fresh installs cover
+    the same class since v50's DDL is not affected. Migration body is
+    IMMUTABLE per ``incident_2026-06-11_migration_body_immutability``.
+    """
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gmail_watches_lower_email "
+        "ON gmail_watches(LOWER(email_address))"
+    )
+
+
+@register(53, "webauthn_challenges_add_require_uv")
+def _v53_webauthn_challenges_add_require_uv(conn: sqlite3.Connection) -> None:
+    """Punch  — persist the user-verification requirement WITH the challenge.
+
+    ``begin_*`` asks the authenticator for user verification (PIN / biometric)
+    and ``finish_*`` verifies the response. They are separate HTTP requests,
+    so before this column the finish step could not know what the begin step
+    asked for, and two of the three finish sites enforced nothing: py_webauthn's
+    ``require_user_verification`` defaults to False. The begin step now stores
+    its requirement here and the finish step passes it to the library.
+
+    Nullable, no default. A NULL is a challenge written by a pre-v53 image
+    (at most one 5-minute TTL across a deploy); ``finish_*`` REFUSES it rather
+    than read it as "not required". A ``DEFAULT 0`` would have been that
+    fail-open read. Additive at the SQL level only: a ``:previous`` image
+    that predates v53 still REFUSES TO START against this DB (the
+    max_applied > max_registered guard in ``run_migrations``), so a rollback
+    past this migration needs a manual reconcile, as for every migration.
+    Column-presence guarded via ``PRAGMA table_info``, so a re-run and a fresh
+    install (whose DDL already has the column) are no-ops.
+    """
+    cols = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(webauthn_challenges)"
+        ).fetchall()
+    }
+    if cols and "require_uv" not in cols:
+        conn.execute(
+            "ALTER TABLE webauthn_challenges ADD COLUMN require_uv INTEGER"
+        )
+
+
+@register(54, "api_key_events_add_actor_email")
+def _v54_api_key_events_add_actor_email(conn: sqlite3.Connection) -> None:
+    """Punch  — record WHO granted or revoked an API key.
+
+    ``api_key_events`` carried ``actor_user_id`` only, so a CLI grant or revoke
+    (no session, ``actor_user_id`` NULL) was chained with no actor at all; the
+    kernel principal ``_cli_actor()`` reached only a log line. The witness now
+    stores the actor's address or CLI principal in this column.
+
+    NOT in the row hash, for v0.2.0 only. Hashing it would not re-hash existing
+    rows (the verifier dispatches per row on ``hash_alg``, so a new keyed alg
+    label with a widened tuple covers new rows only); it waits for v0.2.x
+    because a chain-format change during the bug-fix freeze carries verifier
+    risk (panel AB MUST-C4). Nullable, no default: a NULL is a pre-v54 row, or a
+    web row whose actor is the hashed ``actor_user_id``; a row with neither actor
+    is refused (grant) or carries ``unattributed:<source>`` (revoke) at the
+    emitter. Column-presence guarded via ``PRAGMA table_info``, so a re-run
+    and a fresh install (whose DDL already has the column) are no-ops. A
+    ``:previous`` image that predates v54 refuses to start against this DB (the
+    max_applied > max_registered guard), as for every migration.
+    """
+    cols = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(api_key_events)"
+        ).fetchall()
+    }
+    if cols and "actor_email" not in cols:
+        conn.execute("ALTER TABLE api_key_events ADD COLUMN actor_email TEXT")
+
+
+@register(55, "api_keys_add_scope")
+def _v55_api_keys_add_scope(conn: sqlite3.Connection) -> None:
+    """Punch  — bound a credential to a ROUTE, not just a principal.
+
+    Before this column an api key authenticated a PRINCIPAL, so a key minted for
+    ``GET /health/build`` was accepted by every Bearer-authenticated route in the
+    app; the monitoring key was bounded only by its user owning zero accounts —
+    least privilege by OWNERSHIP (a property of today's rows) rather than by SCOPE
+    (a property of the credential).
+
+    Nullable, **no DEFAULT**. NULL means *unscoped* = exactly the pre-#420
+    full-principal behaviour, which is what lets every key already in the table
+    keep working with no migration of meaning. A ``DEFAULT '[]'`` would have
+    retro-fenced every existing key to nothing and locked the install out of its
+    own API on upgrade — the inverse error, and a far worse one than a key that
+    stays as wide as it was yesterday.
+
+    A non-NULL value is a JSON array of exact ``"<METHOD> </path>"`` strings,
+    parsed by ``web/_route_scope.parse_key_scope`` (fail-closed: corrupt or mixed
+    content grants NOTHING) and enforced at the single bearer seam.
+
+    Column-presence guarded via ``PRAGMA table_info``, so a re-run and a fresh
+    install (whose ``_API_KEYS_DDL`` already carries the column) are both no-ops.
+    """
+    cols = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(api_keys)"
+        ).fetchall()
+    }
+    if cols and "scope" not in cols:
+        conn.execute(
+            "ALTER TABLE api_keys ADD COLUMN scope TEXT"
+        )

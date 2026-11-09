@@ -1,0 +1,7 @@
+# Punch 457 / 773 ratchet record. EMPTY ON PURPOSE: the 27 production-closure names that sat in no reviewed
+# set when this record was frozen (2026-10-30) were reviewed on 2026-11-02 and now live in LOCK_KNOWN_SAFE
+# (tests/_privacy_dep_funnel.py). test_privacy_invariants_dep_review.py asserts that
+# set(unreviewed_closure_names()) <= this set AND that this set is empty, so a NEW unreviewed transitive goes
+# red and needs a real review entry (LOCK_KNOWN_SAFE, RUNTIME_KNOWN_SAFE, _KNOWN_SAFE, or an approved
+# exception in internal documentation), never a line here. One normalised name per line; # starts a
+# comment.

@@ -1,15 +1,32 @@
-"""UI routes for API key management on the Accounts page.
+"""UI routes for API key management.
 
-The HTML-rendering routes at ``/accounts/api-keys`` sit alongside the
-existing JSON ``/api/keys`` endpoints (which stay for programmatic
-access). Both share the same db helpers so behaviour is consistent."""
+API key management folded into the consolidated "Security" tab
+(/profile/security) on 2026-06-07 — the standalone /accounts/api-keys
+GET page now 303-redirects there. The token list now renders on the
+Security page. The mint (POST) / revoke (DELETE) action endpoints at
+``/accounts/api-keys`` stay put, alongside the JSON ``/api/keys``
+endpoints (which stay for programmatic access). All share the same db
+helpers so behaviour is consistent."""
 
 
 class TestApiKeysPage:
-    def test_requires_auth(self, client):
+    def test_legacy_url_requires_auth(self, client):
+        """Anonymous callers still bounce to /login on the legacy URL —
+        the auth gate runs before the redirect."""
         resp = client.get("/accounts/api-keys", follow_redirects=False)
         assert resp.status_code == 303
         assert "/login" in resp.headers["location"]
+
+    def test_legacy_url_redirects_to_security(self, client, admin_cookies):
+        """The standalone /accounts/api-keys page folded into the
+        Security tab; the legacy URL 303-redirects there so bookmarks
+        keep resolving."""
+        resp = client.get(
+            "/accounts/api-keys", cookies=admin_cookies,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/profile/security"
 
     def test_admin_sees_all_users_keys(
         self, client, db, admin_cookies, admin_user, regular_user,
@@ -19,11 +36,11 @@ class TestApiKeysPage:
         )
         # Key owned by the regular user.
         store_api_key(db, hash_api_key(generate_api_key()), "other-user-key",
-                      regular_user["id"])
+                      regular_user["id"], actor_user_id=regular_user["id"])
         # Key owned by the admin.
         store_api_key(db, hash_api_key(generate_api_key()), "admin-own-key",
-                      admin_user["id"])
-        resp = client.get("/accounts/api-keys", cookies=admin_cookies)
+                      admin_user["id"], actor_user_id=admin_user["id"])
+        resp = client.get("/profile/security", cookies=admin_cookies)
         assert resp.status_code == 200
         assert "other-user-key" in resp.text
         assert "admin-own-key" in resp.text
@@ -35,10 +52,10 @@ class TestApiKeysPage:
             generate_api_key, hash_api_key, store_api_key,
         )
         store_api_key(db, hash_api_key(generate_api_key()), "admin-only",
-                      admin_user["id"])
+                      admin_user["id"], actor_user_id=admin_user["id"])
         store_api_key(db, hash_api_key(generate_api_key()), "user-own",
-                      regular_user["id"])
-        resp = client.get("/accounts/api-keys", cookies=user_cookies)
+                      regular_user["id"], actor_user_id=regular_user["id"])
+        resp = client.get("/profile/security", cookies=user_cookies)
         assert resp.status_code == 200
         assert "user-own" in resp.text
         assert "admin-only" not in resp.text
@@ -72,12 +89,12 @@ class TestApiKeyCreateRoute:
         resp = client.post("/accounts/api-keys", data={
             "name": "for-agent",
             "user_email": admin_user["email"],
-            "alias": "alice",
+            "alias": "bob",
             "expires": "never",
         }, cookies=admin_cookies)
         assert resp.status_code == 200
         assert "email-triage-api register-me" in resp.text
-        assert "--as alice" in resp.text
+        assert "--as bob" in resp.text
         assert "--token et_" in resp.text
         # Paste-into-chat helper block is present.
         assert "word for word" in resp.text
@@ -104,7 +121,7 @@ class TestApiKeyCreateRoute:
         resp = client.post("/accounts/api-keys", data={
             "name": "bad-alias",
             "user_email": admin_user["email"],
-            "alias": "alice; rm -rf /",
+            "alias": "bob; rm -rf /",
             "expires": "never",
         }, cookies=admin_cookies)
         assert resp.status_code == 200
@@ -155,7 +172,7 @@ class TestApiKeyDeleteRoute:
             generate_api_key, hash_api_key, store_api_key, list_api_keys,
         )
         kid = store_api_key(
-            db, hash_api_key(generate_api_key()), "dead", admin_user["id"],
+            db, hash_api_key(generate_api_key()), "dead", admin_user["id"], actor_user_id=admin_user["id"],
         )
         resp = client.delete(f"/accounts/api-keys/{kid}", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -169,7 +186,7 @@ class TestApiKeyDeleteRoute:
             generate_api_key, hash_api_key, store_api_key,
         )
         kid = store_api_key(
-            db, hash_api_key(generate_api_key()), "admins", admin_user["id"],
+            db, hash_api_key(generate_api_key()), "admins", admin_user["id"], actor_user_id=admin_user["id"],
         )
         resp = client.delete(f"/accounts/api-keys/{kid}", cookies=user_cookies)
         assert resp.status_code == 403
@@ -180,24 +197,25 @@ class TestApiKeyDeleteRoute:
 
 
 class TestAccountsPageLinksToApiKeys:
-    def test_api_keys_tab_visible_on_accounts(self, client, admin_cookies):
-        """API Keys (Access Tokens) is reached via the My Settings tab
-        strip rendered on /accounts. The dedicated Access-Tokens
-        button on /accounts was removed when API Keys became a tab —
-        having both made the cluster nav inconsistent (per Alex's
-        2026-05-05 nav reorg ask: "API Keys belongs under My Settings
-        as a tab. Should NOT have a button on the account page")."""
+    def test_security_tab_visible_on_accounts(self, client, admin_cookies):
+        """API Keys (Access Tokens) is reached via the "Security" tab in
+        the My Settings tab strip rendered on /accounts. The standalone
+        API Keys + Passkeys tabs consolidated into Security on
+        2026-06-07, so the strip links to /profile/security now (the
+        dedicated Access-Tokens button on /accounts was already removed
+        per the operator's 2026-05-05 nav reorg ask)."""
         resp = client.get("/accounts", cookies=admin_cookies)
         assert resp.status_code == 200
-        assert 'href="/accounts/api-keys"' in resp.text
-        assert "API Keys" in resp.text
+        assert 'href="/profile/security"' in resp.text
+        assert "Security" in resp.text
 
     def test_api_keys_page_uses_plain_language(self, client, admin_cookies):
-        """The page is non-admin surface — no jargon (no /api/openclaw/*,
-        no 'bearer tokens', no HTTP references)."""
-        resp = client.get("/accounts/api-keys", cookies=admin_cookies)
+        """The token surface is non-admin — no jargon (no /api/v1/*,
+        no 'bearer tokens', no HTTP references). Now rendered on the
+        consolidated Security page."""
+        resp = client.get("/profile/security", cookies=admin_cookies)
         assert resp.status_code == 200
-        assert "/api/openclaw" not in resp.text
+        assert "/api/v1" not in resp.text
         assert "bearer token" not in resp.text.lower()
         # H3 reads "API Keys (Access Tokens)" so both terms surface.
         assert "Access Tokens" in resp.text

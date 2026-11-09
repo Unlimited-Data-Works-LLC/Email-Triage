@@ -15,7 +15,7 @@ from email_triage.web.routers.ui._shared import resolve_embedding_gate
 def test_gate_blocks_when_backend_unset():
     """Unset backend → required=True, ready=False, end-user copy."""
     g = resolve_embedding_gate(
-        live_backend_type=None, configured_backend_type="",
+        configured_backend_type="",
     )
     assert g["required"] is True
     assert g["ready"] is False
@@ -32,7 +32,6 @@ def test_gate_blocks_when_sentence_transformers_runtime_not_ready(monkeypatch):
         "email_triage.embedding_bits.is_runtime_ready", lambda: False,
     )
     g = resolve_embedding_gate(
-        live_backend_type=None,
         configured_backend_type="sentence_transformers",
     )
     assert g["required"] is True
@@ -42,11 +41,12 @@ def test_gate_blocks_when_sentence_transformers_runtime_not_ready(monkeypatch):
     assert "/config" not in g["reason"]
 
 
-def test_gate_passes_when_live_backend_already_sentence_transformers():
-    """If live backend is sentence_transformers, runtime is ready by
-    construction — no false negative on a stale cache."""
+def test_gate_ready_when_sentence_transformers_runtime_ready(monkeypatch):
+    """The runtime probe is the one source of readiness."""
+    monkeypatch.setattr(
+        "email_triage.embedding_bits.is_runtime_ready", lambda: True,
+    )
     g = resolve_embedding_gate(
-        live_backend_type="sentence_transformers",
         configured_backend_type="sentence_transformers",
     )
     assert g["ready"] is True
@@ -54,9 +54,9 @@ def test_gate_passes_when_live_backend_already_sentence_transformers():
 
 
 def test_gate_passes_for_ollama():
-    """Ollama backend → ready (live-call failures handled by fallback)."""
+    """Ollama backend → ready (live-call failures show on its metrics)."""
     g = resolve_embedding_gate(
-        live_backend_type="ollama", configured_backend_type="ollama",
+        configured_backend_type="ollama",
     )
     assert g["required"] is True
     assert g["ready"] is True
@@ -65,82 +65,38 @@ def test_gate_passes_for_ollama():
 
 def test_gate_unknown_backend_blocks():
     g = resolve_embedding_gate(
-        live_backend_type=None, configured_backend_type="anthropic-via-cloud",
+        configured_backend_type="anthropic-via-cloud",
     )
     assert g["required"] is True
     assert g["ready"] is False
     assert "not recognised" in g["reason"]
 
 
-def test_gate_passes_when_primary_not_ready_but_fallback_configured(monkeypatch):
-    """2026-05-18 regression — operator's prod config has
-    primary=sentence_transformers + fallback=ollama. The bits aren't
-    installed yet, so the local primary can't fire, but the
-    FallbackEmbeddingBackend wrapper routes embed_text calls to the
-    Ollama backup. Pre-fix the gate blocked despite the working
-    fallback chain. Post-fix the gate returns ready when a fallback
-    is configured.
+def test_gate_blocks_a_refused_runtime_whatever_the_yaml_still_says(monkeypatch):
+    """Punch 552 / N-555 — the failure must be VISIBLE.
+
+    Pre-fix a configured ``embedding.fallback`` made this gate read
+    "ready" while the local runtime was refused, and the wrapper then
+    embedded with a different model (on the deploy host, the chat model qwen3.6:35b),
+    whose vectors score zero against the index. The chain is gone, so the
+    gate takes no fallback input at all: the signature is the pin.
     """
+    import inspect
+
+    params = set(inspect.signature(resolve_embedding_gate).parameters)
+    assert params == {"configured_backend_type"}, (
+        "resolve_embedding_gate grew an input; a fallback or live-type "
+        f"argument re-opens the silent path. params={sorted(params)}"
+    )
     monkeypatch.setattr(
         "email_triage.embedding_bits.is_runtime_ready", lambda: False,
     )
     g = resolve_embedding_gate(
-        live_backend_type=None,
         configured_backend_type="sentence_transformers",
-        fallback_backend_type="ollama",
     )
-    assert g["required"] is True, "feature still needs a backend"
-    assert g["ready"] is True, (
-        "fallback chain absorbs the primary's ImportError; "
-        "subsystem is functionally available"
-    )
-    assert g["reason"] == ""
-
-
-def test_gate_still_blocks_when_no_fallback_and_no_runtime(monkeypatch):
-    """Primary unloadable + no fallback → block (the original case 1
-    behavior; fallback-aware fix did not regress the no-fallback path).
-    """
-    monkeypatch.setattr(
-        "email_triage.embedding_bits.is_runtime_ready", lambda: False,
-    )
-    g = resolve_embedding_gate(
-        live_backend_type=None,
-        configured_backend_type="sentence_transformers",
-        fallback_backend_type=None,
-    )
+    assert g["required"] is True
     assert g["ready"] is False
     assert "local embedding backend" in g["reason"]
-
-
-def test_gate_passes_when_live_is_fallback_wrapper():
-    """Live backend type ``fallback`` is the FallbackEmbeddingBackend
-    composite wrapper. If it loaded successfully, the subsystem is up
-    regardless of the runtime probe for the local primary.
-    """
-    g = resolve_embedding_gate(
-        live_backend_type="fallback",
-        configured_backend_type="sentence_transformers",
-        fallback_backend_type="ollama",
-    )
-    assert g["ready"] is True
-    assert g["reason"] == ""
-
-
-def test_gate_empty_fallback_string_treated_as_no_fallback(monkeypatch):
-    """Defensive: empty-string fallback_backend_type behaves the same
-    as None (no fallback). Guards against a config layer that
-    propagates "" instead of None for an unset fallback section.
-    """
-    monkeypatch.setattr(
-        "email_triage.embedding_bits.is_runtime_ready", lambda: False,
-    )
-    g = resolve_embedding_gate(
-        live_backend_type=None,
-        configured_backend_type="sentence_transformers",
-        fallback_backend_type="",
-    )
-    assert g["ready"] is False
 
 
 def test_gate_reason_avoids_protocol_jargon():
@@ -153,13 +109,13 @@ def test_gate_reason_avoids_protocol_jargon():
             eb.is_runtime_ready = lambda: False
             try:
                 g = resolve_embedding_gate(
-                    live_backend_type=None, configured_backend_type=cfg,
+                    configured_backend_type=cfg,
                 )
             finally:
                 eb.is_runtime_ready = orig
         else:
             g = resolve_embedding_gate(
-                live_backend_type=None, configured_backend_type=cfg,
+                configured_backend_type=cfg,
             )
         reason = g["reason"]
         for jargon in ("RFC", "OData", "language model", "LLM",

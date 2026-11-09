@@ -2,8 +2,18 @@
 
 The W2-β + W3 work shipped the DATA plane: the distill modules
 (:mod:`distill_hipaa`, :mod:`per_contact_hipaa`), the audit/queue
-tables, and the worker contract (existing queue worker drains the
-``style_distill_queue`` + ``style_distill_queue_contacts`` rows).
+tables, and a worker CONTRACT that was never implemented — no queue
+worker drains ``style_distill_queue`` / ``style_distill_queue_contacts``
+at HEAD (N-474).
+
+WIRING HAZARD for that worker (punch 629, panel F2a r4): ``distill_hipaa_account``
+and ``distill_hipaa_per_contact`` audit every attempt to ``style_distill_events``,
+whose ``account_id`` is a FOREIGN KEY. Called for a deleted account, the audit write
+fails (``audit_write_failed``) and the attempt has no audit row. A worker must
+re-check that the account exists before it calls them, and the incidental
+``audit_failure_expected`` marker on
+``tests/test_privacy_invariants_distill_hipaa.py::TestGating::test_missing_account``
+must come off when the worker lands.
 
 What was missing — and what this module ships — is the
 **trigger plane**: the logic that decides "this account / this
@@ -91,6 +101,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from email_triage.triage_logging import is_account_hipaa
+from email_triage._isotime import parse_iso_aware  # N-357b R31 (was N-269c R28 parse_iso)
 from email_triage.web.db import (
     HIPAA_PER_CONTACT_TRIGGER_MIN_MESSAGES,
     HIPAA_SEND_COUNTER_AGGREGATE_HASH,
@@ -106,7 +117,8 @@ from email_triage.web.db import (
     reset_hipaa_send_counter,
 )
 
-log = logging.getLogger("email_triage.style_learning.trigger_watcher")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.style_learning.trigger_watcher")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -184,16 +196,13 @@ def _now() -> datetime:
 
 def _parse_iso(ts: str | None) -> datetime | None:
     """Tolerant ISO8601 parse. Returns None on any error so a corrupt
-    timestamp on a single row doesn't blow up the whole sweep."""
+    timestamp on a single row doesn't blow up the whole sweep.
+
+    N-357b (2026-07-06 baseline shrink): the private wrapper's body IS
+    the parse_iso_aware SSOT — collapsed to a direct call."""
     if not ts:
         return None
-    try:
-        out = datetime.fromisoformat(ts)
-    except (TypeError, ValueError):
-        return None
-    if out.tzinfo is None:
-        out = out.replace(tzinfo=timezone.utc)
-    return out
+    return parse_iso_aware(ts)
 
 
 def _eligible_hipaa_accounts(

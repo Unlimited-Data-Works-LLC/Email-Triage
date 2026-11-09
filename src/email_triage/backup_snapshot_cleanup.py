@@ -36,16 +36,19 @@ alone (rollback safety net stays in place).
 from __future__ import annotations
 
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-logger = logging.getLogger("email_triage.backup_snapshot_cleanup")
+logger = get_logger("email_triage.backup_snapshot_cleanup")  # N-196b R21_4
 
 # Files matching this glob are treated as pre-upgrade snapshots. The
 # suffix encodes the commit_sha the deploy ran from; we don't parse
 # it -- mtime is the sort key, the suffix is for human inspection.
 _SNAPSHOT_GLOB = "triage.db.preupgrade-*"
+_COMPANION_SUFFIXES = ("-wal", "-shm")
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,11 @@ def _list_snapshots(data_dir: Path) -> list[Path]:
         return []
     candidates: list[tuple[float, Path]] = []
     for p in data_dir.glob(_SNAPSHOT_GLOB):
+        # Punch 636: ``<snapshot>-wal`` is the snapshot's companion (deploy.sh
+        # step 4c saves a non-empty -wal with it), not a snapshot of its own.
+        # It goes with its main file, never alone.
+        if p.name.endswith(_COMPANION_SUFFIXES):
+            continue
         # Defensive: skip non-files (a directory with that name would
         # be a misconfiguration).
         try:
@@ -164,10 +172,12 @@ def cleanup_preupgrade_snapshots(
             # state. Keep it; rollback safety net still in force.
             kept.append(snap)
             continue
-        # Older than the backup. Delete.
+        # Older than the backup. Delete (its -wal/-shm companions with it).
         try:
             snap.unlink()
             deleted.append(snap)
+            for suffix in _COMPANION_SUFFIXES:
+                snap.with_name(snap.name + suffix).unlink(missing_ok=True)
         except FileNotFoundError:
             # Race with another cleanup. Treat as success.
             deleted.append(snap)

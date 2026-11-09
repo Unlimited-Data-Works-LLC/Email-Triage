@@ -54,11 +54,14 @@ from __future__ import annotations
 
 import functools
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import sqlite3
 import threading
 from typing import Any, Callable, TypeVar
+from email_triage._dbapi_errors import DB_OPERATIONAL_ERRORS
 
-_log = logging.getLogger(__name__)
+_log = get_logger(__name__)  # N-196b R21_4
 
 # Module-level reentrant lock. One lock for the whole process — the
 # shared connection is a single resource, so a single mutex is the
@@ -67,6 +70,30 @@ _log = logging.getLogger(__name__)
 _write_lock = threading.RLock()
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+# Connection types the rollback path recognises. ``sqlcipher3`` (the
+# encrypted-at-rest driver, a pysqlite3 fork) ships its OWN ``Connection``
+# class that is NOT a stdlib ``sqlite3.Connection`` subclass, so a stdlib-only
+# isinstance check skipped the rollback on every encrypted install (punch 921,
+# panel r17 db-sme SHOULD-B4).
+_CONN_TYPES: tuple[type, ...] = (sqlite3.Connection,)
+try:  # optional: plaintext installs and the workstation lack it
+    import sqlcipher3.dbapi2 as _sqlcipher_dbapi2  # type: ignore[import-not-found]
+
+    _CONN_TYPES = (sqlite3.Connection, _sqlcipher_dbapi2.Connection)
+except ImportError:  # pragma: no cover - environment-dependent
+    # Plaintext install: no sqlcipher3 connection can exist.
+    _CONN_TYPES = (sqlite3.Connection,)
+except OSError as _e:  # pragma: no cover - environment-dependent
+    # The native SQLCipher library failed to load. Do not crash the web import
+    # over it (the encrypted engine fails closed on its own open), but record
+    # it: a failing @db_write would roll back stdlib connections only.
+    _CONN_TYPES = (sqlite3.Connection,)
+    _log.warning(
+        "sqlcipher3 native library failed to load; @db_write rollback "
+        "recognises stdlib connections only",
+        error_class=type(_e).__name__,
+    )
 
 
 def get_write_lock() -> "threading.RLock":
@@ -89,11 +116,11 @@ def _find_connection(args: tuple, kwargs: dict) -> sqlite3.Connection | None:
     release still happens).
     """
     for value in args:
-        if isinstance(value, sqlite3.Connection):
+        if isinstance(value, _CONN_TYPES):
             return value
     for key in ("conn", "connection", "db"):
         value = kwargs.get(key)
-        if isinstance(value, sqlite3.Connection):
+        if isinstance(value, _CONN_TYPES):
             return value
     return None
 
@@ -117,7 +144,18 @@ def db_write(fn: F) -> F:
         with _write_lock:
             try:
                 return fn(*args, **kwargs)
-            except Exception as exc:
+            except BaseException as exc:
+                # Punch 582 (DB-1, panel B7): the arm catches BaseException
+                # so a KeyboardInterrupt / SystemExit / a CancelledError
+                # raised into the helper also gets the step-1 and step-2
+                # rollback below. Before, such an exception left the
+                # helper's half-done transaction open, and the next commit
+                # on this connection (any writer, or the audit-loss sink)
+                # made it durable. The gap-event sentinel stays
+                # Exception-only (the ``isinstance`` gate below): a
+                # BaseException loss is recorded one layer out
+                # (``safe_audit_write``'s ``interrupted_sync``, L8).
+                #
                 # ``exc`` is bound for the  D3 gap-event sentinel
                 # below (so we can record the exception class + msg
                 # against the failed audit-emitter call). The existing
@@ -181,7 +219,7 @@ def db_write(fn: F) -> F:
                     # connection — swallow that one silently.
                     try:
                         conn.execute("ROLLBACK")
-                    except sqlite3.OperationalError:
+                    except DB_OPERATIONAL_ERRORS:
                         # Benign — clean conn / no pending tx. This
                         # is the SUCCESS case for Step 2; do not log.
                         pass
@@ -219,7 +257,9 @@ def db_write(fn: F) -> F:
                     # swallow — the original exception below is the
                     # one operators need to see, the gap-on-gap log
                     # is the secondary signal.
-                    if getattr(fn, "_is_audit_emitter", False):
+                    if isinstance(exc, Exception) and getattr(
+                        fn, "_is_audit_emitter", False,
+                    ):
                         try:
                             from email_triage.db.audit import (
                                 _write_audit_gap_event,
@@ -231,6 +271,12 @@ def db_write(fn: F) -> F:
                                 kwargs=kwargs,
                                 exc=exc,
                             )
+                            # Punch 582: tell the best-effort SSOT one layer
+                            # out that this loss already has its row.
+                            from email_triage.db.audit import (
+                                mark_audit_gap_recorded,
+                            )
+                            mark_audit_gap_recorded(exc)
                         except Exception as gap_exc:
                             #  HOTFIX-4 — embed helper + both
                             # exception types IN the message string

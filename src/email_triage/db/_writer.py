@@ -66,12 +66,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
+from email_triage._int_utils import parse_int_or_none  # N-219c/24 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import os
 import queue
 import threading
 from typing import Any, Callable, Protocol, runtime_checkable
 
-logger = logging.getLogger("email_triage.db._writer")
+logger = get_logger("email_triage.db._writer")  # N-196b R21_4
+
+# The ONE shutdown envelope for the writer join and the lifespan's final WAL
+# checkpoint (feedback_da_hedge_shutdown_timeout_desync: two literals for one
+# coupled budget drift apart). ``SqliteWriterThread.shutdown`` joins the worker
+# for this long; web/app.py's lifespan bounds the final checkpoint with it, and
+# runs that checkpoint only when the join succeeded (punch 636). Both run in
+# sequence, so the envelope costs twice this, inside the container StopTimeout
+# (tests/test_636_shutdown_envelope_pin.py).
+WAL_SHUTDOWN_ENVELOPE_SECS: float = 10.0
 
 # Default queue depth ≈ 5 min of steady-state writes at ~30/sec. Tunable
 # via env so an operator can widen it under a known burst profile.
@@ -82,17 +94,19 @@ def _resolve_queue_maxsize() -> int:
     raw = os.environ.get("EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE")
     if not raw:
         return _DEFAULT_QUEUE_MAXSIZE
-    try:
-        val = int(raw)
-        return val if val > 0 else _DEFAULT_QUEUE_MAXSIZE
-    except ValueError:
+    # N-219c/24 R23: parse_int_or_none SSOT; log a warning + fall back on
+    # non-integer input (operator-facing signal that the env-var is malformed).
+    val = parse_int_or_none(raw)
+    if val is None:
         logger.warning(
-            "Ignoring non-integer EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE=%r; "
-            "using default %d",
-            raw,
-            _DEFAULT_QUEUE_MAXSIZE,
+            "Ignoring non-integer EMAIL_TRIAGE_WRITER_QUEUE_MAXSIZE; using default",
+            extra={
+                "error_msg": str(raw),
+                "n": _DEFAULT_QUEUE_MAXSIZE,
+            },
         )
         return _DEFAULT_QUEUE_MAXSIZE
+    return val if val > 0 else _DEFAULT_QUEUE_MAXSIZE
 
 
 class WriterQueueFull(RuntimeError):
@@ -102,6 +116,15 @@ class WriterQueueFull(RuntimeError):
     the  ``eff501b`` healthcheck-503-tolerance contract. Fail-loud,
     never a silent write drop (§164.308(a)(7)(ii)(B)).
     """
+
+
+class WriterStopped(WriterQueueFull):
+    """Raised when a write is submitted after :meth:`shutdown` began (punch
+    582). The worker returns at its STOP sentinel, so a write queued behind it
+    would never run and its future would never resolve. A subclass of
+    :class:`WriterQueueFull` on purpose: ``db_call``'s existing shed handler
+    then records the gap row for an audit emitter, and the web layer maps it
+    to the same 503."""
 
 
 @runtime_checkable
@@ -121,8 +144,9 @@ class WriterBackend(Protocol):
         """Run ``fn(*args, **kwargs)`` on the writer + return its result."""
         ...
 
-    async def shutdown(self) -> None:
-        """Drain + stop the writer. Idempotent."""
+    async def shutdown(self) -> bool:
+        """Drain + stop the writer. Idempotent. True when nothing is still
+        running (punch 636: the final checkpoint runs only then)."""
         ...
 
 
@@ -144,6 +168,10 @@ class SqliteWriterThread:
     (not ``asyncio.Queue``) because the consumer is a plain thread, not
     a coroutine — the async side is bridged with a per-call Future.
     """
+
+    # How long shutdown() waits for the worker to drain (punch 582: what is
+    # still queued after this is recorded as abandoned).
+    _JOIN_TIMEOUT_SECS: float = WAL_SHUTDOWN_ENVELOPE_SECS
 
     # Sentinel pushed to wake the worker for a clean shutdown.
     _STOP = object()
@@ -193,23 +221,74 @@ class SqliteWriterThread:
             finally:
                 self._q.task_done()
 
-    async def shutdown(self) -> None:
-        """Signal the worker to drain + exit. Idempotent."""
-        if not self._started or self._stopping:
-            return
+    async def shutdown(
+        self, on_abandoned: "Callable[[int], Any] | None" = None,
+    ) -> bool:
+        """Signal the worker to drain + exit. Idempotent.
+
+        ``on_abandoned(count)`` (punch 582, panel B7 DB-2) is called at a join
+        timeout with writes still queued, before any lock wait. The web
+        lifespan passes ``web/_audit.record_writer_abandoned``, which writes the
+        next-boot sentinel and then tries the row. Without it (or if it
+        raises), the loss is recorded in process, with the same 1 s bound.
+
+        Returns True when the worker is no longer running, False when it
+        outlived the join bound (punch 636: a wedged worker still holds the
+        write lock, so the lifespan skips its final checkpoint)."""
+        if not self._started:
+            return True
+        if self._stopping:
+            return self._thread is None or not self._thread.is_alive()
         self._stopping = True
         # Best-effort enqueue of the stop sentinel; if the queue is
         # jammed, the daemon thread dies with the process anyway.
+        stop_queued = False
         try:
             self._q.put_nowait(self._STOP)
+            stop_queued = True
         except queue.Full:
             logger.warning(
                 "SqliteWriterThread shutdown: queue full, relying on "
                 "daemon-thread process-exit teardown"
             )
         if self._thread is not None:
-            await asyncio.to_thread(self._thread.join, 10.0)
+            await asyncio.to_thread(self._thread.join, self._JOIN_TIMEOUT_SECS)
+            if self._thread.is_alive():
+                # Punch 582 (L6): the worker did not finish within the join
+                # bound; the daemon thread dies with the process and takes
+                # every write still queued with it. Record how many (all
+                # writes, audit or not), through the loss recorder.
+                # The STOP sentinel is still queued behind them; it is not
+                # a write.
+                abandoned = max(0, self._q.qsize() - (1 if stop_queued else 0))
+                logger.error(
+                    f"SqliteWriterThread shutdown: worker still running after "
+                    f"the join bound; {abandoned} queued write(s) abandoned"
+                )
+                if abandoned:
+                    from email_triage.web._audit import (
+                        WRITER_ABANDONED_LOCK_TIMEOUT_SECS, record_audit_loss,
+                    )
+                    handled = False
+                    if on_abandoned is not None:
+                        try:
+                            on_abandoned(abandoned)
+                            handled = True
+                        except Exception as cb_exc:  # noqa: BLE001
+                            logger.error(
+                                f"SqliteWriterThread shutdown: on_abandoned "
+                                f"FAILED ({type(cb_exc).__name__}); recording "
+                                f"in process"
+                            )
+                    if not handled:
+                        record_audit_loss(
+                            "writer_queue_abandoned", table="db_writes",
+                            count=abandoned,
+                            lock_timeout=WRITER_ABANDONED_LOCK_TIMEOUT_SECS,
+                        )
+                return False
         logger.info("SqliteWriterThread stopped")
+        return True
 
     # -- submission ---------------------------------------------------
 
@@ -225,6 +304,11 @@ class SqliteWriterThread:
         if not self._started:
             raise RuntimeError(
                 "SqliteWriterThread.submit_write called before start()"
+            )
+        if self._stopping:
+            # Punch 582 (L5): never enqueue behind the STOP sentinel.
+            raise WriterStopped(
+                "DB writer is shutting down; write refused, never queued"
             )
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()

@@ -32,10 +32,6 @@ services:
       # Configuration: email-triage.yaml.
       - ./config:/app/config
 
-    environment:
-      # Tell the app where to find config when mounted.
-      - EMAIL_TRIAGE_CONFIG=/app/config/email-triage.yaml
-
     # Resource limits (adjust for your hardware).
     # deploy:
     #   resources:

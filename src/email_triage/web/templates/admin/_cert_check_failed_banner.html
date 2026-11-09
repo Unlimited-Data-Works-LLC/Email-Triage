@@ -1,0 +1,25 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). ``_shared._render`` sets
+                ``cert_check_failed_banner`` only for an admin render.
+   TECH-SKILL:  runs the install; knows which mail servers it connects to.
+   COPY RULES:  plain words: which server, when, what happened, how to make
+                it refuse. A warning only: it changes no setting.
+
+   Panel M M-DA-10 (2026-10-22): with certificate enforcement off, a failed
+   certificate check is logged (``tls_cert_check_failed``) and the connection
+   goes ahead. This surfaces the last 24 hours of those events on the admin
+   pages, a line for each server, read from the application log.
+#}
+{% if cert_check_failed_banner is defined and cert_check_failed_banner %}
+<aside class="cert-check-failed-banner" role="alert" data-banner="cert-check-failed"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+    {% for f in cert_check_failed_banner %}
+    <div>Certificate check failed for <code>{{ f.host }}{% if f.port %}:{{ f.port }}{% endif %}</code>
+        ({{ f.protocol }}) at {{ f.ts }}; connections continued because enforcement is off.</div>
+    {% endfor %}
+    <small>Turn certificate enforcement on (Configuration, General) to refuse these
+    connections, or fix the server's certificate.</small>
+</aside>
+{% endif %}

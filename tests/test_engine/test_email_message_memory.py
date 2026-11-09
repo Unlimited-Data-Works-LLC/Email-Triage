@@ -46,7 +46,9 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import parse_module
 from email_triage.engine.models import Attachment
+from _pin_harness import _FULL_DEV_TREE  # the one dev-tree detector (PD-5)
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +62,10 @@ _PROVIDER_FILES = (
 )
 
 
-def _attachment_constructor_calls(src: str) -> list[ast.Call]:
-    """Every ``Attachment(...)`` Call node in the given source."""
-    tree = ast.parse(src)
+def _attachment_constructor_calls(path: Path) -> list[ast.Call]:
+    """Every ``Attachment(...)`` Call node in the file at ``path``."""
+    tree = parse_module(path)
+    assert tree is not None, f"expected parseable source at {path}"
     return [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -92,8 +95,7 @@ def test_provider_attachment_constructor_passes_data_none(
     this guard to scope the exemption.
     """
     repo_root = Path(__file__).resolve().parents[2]
-    src = (repo_root / provider_path).read_text(encoding="utf-8")
-    calls = _attachment_constructor_calls(src)
+    calls = _attachment_constructor_calls(repo_root / provider_path)
     assert calls, (
         f"expected at least one Attachment(...) constructor in "
         f"{provider_path}; AST walk found none"
@@ -119,7 +121,7 @@ def test_provider_attachment_constructor_passes_data_none(
         pytest.fail(
             f"{len(offenders)} Attachment(...) constructor(s) pass a "
             f"non-None `data=` — extends in-memory PHI residency past "
-            f"the parse step(1)(ii)(B) Risk "
+            f"the parse step (#266 / N-03 §164.308(a)(1)(ii)(B) Risk "
             f"Management):\n  {joined}\n\n"
             "If a new consumer legitimately needs the raw bytes, add a "
             "paired §164.316 register entry documenting the residency-"
@@ -139,11 +141,15 @@ def test_attachment_docstring_documents_n03_constraint():
     rationale-travels-with-code).
     """
     doc = inspect.getdoc(Attachment) or ""
-    assert "" in doc or "N-03" in doc, (
-        "Attachment docstring must reference  / N-03 — the "
-        "residency-narrowing rationale is type-level, not a "
-        "commit-history detail"
-    )
+    # The publish sanitizer strips internal tracking ids from the public tree by design,
+    # so the id half holds on the full dev tree only; the regulatory anchor below is the
+    # rationale itself and holds on every tree.
+    if _FULL_DEV_TREE:
+        assert "#266" in doc or "N-03" in doc, (
+            "Attachment docstring must reference #266 / N-03 — the "
+            "residency-narrowing rationale is type-level, not a "
+            "commit-history detail"
+        )
     assert "§164.308(a)(1)(ii)(B)" in doc, (
         "Attachment docstring must name §164.308(a)(1)(ii)(B) Risk "
         "Management as the regulatory anchor — the constraint is a "

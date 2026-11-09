@@ -62,12 +62,12 @@ def _patch_httpx(mock_resp):
 class TestAdapterConstruction:
     def test_minimal_construction(self):
         a = AzureOpenAIAdapter(
-            endpoint="https://my-resource.openai.azure.com/",
+            endpoint="https://my-resource.openai.azure.invalid/",
             api_key="azkey",
             deployment="my-deployment",
         )
         # endpoint trailing-slash is normalised away.
-        assert a.endpoint == "https://my-resource.openai.azure.com"
+        assert a.endpoint == "https://my-resource.openai.azure.invalid"
         assert a.deployment == "my-deployment"
         assert a.api_version == DEFAULT_API_VERSION
         assert a.model == ""
@@ -85,14 +85,14 @@ class TestAdapterConstruction:
     def test_empty_deployment_rejected(self):
         with pytest.raises(ValueError, match="deployment"):
             AzureOpenAIAdapter(
-                endpoint="https://r.openai.azure.com",
+                endpoint="https://r.openai.azure.invalid",
                 api_key="azkey",
                 deployment="",
             )
 
     def test_explicit_api_version_overrides_default(self):
         a = AzureOpenAIAdapter(
-            endpoint="https://r.openai.azure.com",
+            endpoint="https://r.openai.azure.invalid",
             api_key="k",
             deployment="d",
             api_version="2024-08-01-preview",
@@ -122,7 +122,7 @@ class TestChatComplete:
     @pytest.fixture
     def adapter(self):
         return AzureOpenAIAdapter(
-            endpoint="https://my-resource.openai.azure.com",
+            endpoint="https://my-resource.openai.azure.invalid",
             api_key="azkey-test",
             deployment="my-deployment",
             model="gpt-4o",
@@ -151,7 +151,7 @@ class TestChatComplete:
         call = mock_client.post.call_args
         url = call.args[0] if call.args else call.kwargs.get("url", "")
         assert url == (
-            "https://my-resource.openai.azure.com/openai/deployments/"
+            "https://my-resource.openai.azure.invalid/openai/deployments/"
             "my-deployment/chat/completions"
         )
 
@@ -334,7 +334,7 @@ class TestChatComplete:
     async def test_empty_api_key_raises_before_http(self):
         """No api_key → fail closed, never make an unauthenticated call."""
         adapter = AzureOpenAIAdapter(
-            endpoint="https://r.openai.azure.com",
+            endpoint="https://r.openai.azure.invalid",
             api_key="",
             deployment="d",
         )
@@ -371,7 +371,7 @@ class TestErrorHandling:
     @pytest.fixture
     def adapter(self):
         return AzureOpenAIAdapter(
-            endpoint="https://my-resource.openai.azure.com",
+            endpoint="https://my-resource.openai.azure.invalid",
             api_key="azkey",
             deployment="d",
         )
@@ -508,7 +508,7 @@ class TestPrivacyInvariants:
             "token_type": "Bearer",
             "scope": "openai/all",
         }
-        err = AzureOpenAIError(500, body, "https://r.openai.azure.com/x")
+        err = AzureOpenAIError(500, body, "https://r.openai.azure.invalid/x")
         rendered = str(err)
         # Every sentinel must be absent.
         for sentinel in (
@@ -619,7 +619,7 @@ class TestPrivacyInvariants:
         """If a future refactor ever puts the api-key in the URL
         query string, the rendered exception must redact it."""
         leaked_url = (
-            "https://r.openai.azure.com/openai/deployments/d/"
+            "https://r.openai.azure.invalid/openai/deployments/d/"
             "chat/completions?api-key=SECRET_KEY_VALUE_NEVER_LOG&"
             "api-version=2024-10-21"
         )
@@ -632,7 +632,7 @@ class TestPrivacyInvariants:
 
     def test_strip_sensitive_query_params_handles_no_query(self):
         # Bare URL — no-op.
-        url = "https://r.openai.azure.com/x"
+        url = "https://r.openai.azure.invalid/x"
         assert _strip_sensitive_query_params(url) == url
 
     def test_strip_sensitive_query_params_handles_empty(self):
@@ -641,7 +641,7 @@ class TestPrivacyInvariants:
     def test_strip_sensitive_query_params_covers_alternates(self):
         """``api-key``, ``key``, ``token``, ``access_token``, ``code``
         all get redacted."""
-        url = "https://x/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
+        url = "https://x.invalid/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
         out = _strip_sensitive_query_params(url)
         assert "KKK" not in out
         assert "TTT" not in out
@@ -662,7 +662,7 @@ class TestClassifierShim:
     @pytest.fixture
     def classifier(self):
         return AzureOpenAIClassifier(
-            endpoint="https://r.openai.azure.com",
+            endpoint="https://r.openai.azure.invalid",
             api_key="azkey",
             deployment="my-deployment",
         )

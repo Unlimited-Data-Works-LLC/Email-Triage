@@ -152,7 +152,7 @@ class TestWritingTabHipaa:
             name="HIPAA Inbox",
             provider_type="imap",
             config={
-                "host": "mail.example.com",
+                "host": "mail.example.invalid",
                 "port": 993,
                 "username": "user@example.com",
                 "password": "secret",

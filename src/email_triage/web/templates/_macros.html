@@ -26,3 +26,774 @@
       role="img" aria-label="Help: {{ text|e }}" tabindex="0"
       style="cursor:help;margin-left:0.35rem;font-size:0.85em;color:var(--pico-muted-color);vertical-align:middle;">ℹ️</span>
 {%- endmacro %}
+
+
+{% macro help_details(summary, body) -%}
+{#
+    Expandable inline help — a native <details>/<summary> disclosure — for help
+    content too long or too structured for the help() TOOLTIP: multi-paragraph
+    prose, a copyable command block, a list. Companion to help() (the short ℹ️
+    tooltip); use this when the explanation won't fit in one line.
+
+    Native <details> = ZERO JS, keyboard-operable (Enter/Space on the summary),
+    and the expanded/collapsed state is exposed to assistive tech automatically
+    (UX design ruling for the #304 backup ℹ️ work — short hint = tooltip, long
+    help = disclosure). Styled by `.info-help` in static/style.css.
+
+    PLACEMENT: render this as a SIBLING of a field (AFTER the input/label), NOT
+    inside a <label> (a <details> nested in a <label> is invalid HTML).
+
+    SAFETY: ``body`` is emitted via ``|safe`` — author-written STATIC help copy
+    ONLY (HTML like <p>/<code>/<pre>/<ul>). NEVER pass request/user/PHI data
+    into it; it is an unescaped-HTML sink (same contract as combo_input's attrs).
+    ``summary`` is auto-escaped.
+
+    Args:
+        summary: the always-visible clickable line (e.g. "What is an X25519 key?").
+        body:    longer help as a SAFE static HTML string.
+-#}
+<details class="info-help">
+    <summary>{{ summary }}</summary>
+    <div class="info-help-body">{{ body|safe }}</div>
+</details>
+{%- endmacro %}
+
+
+{% macro combo_input(name, value, options, list_id=None, type="text", placeholder="", help_text=None, attrs="") -%}
+{#
+    "Preload rational values, still allow free-text" input.
+
+    Renders an ``<input list="...">`` bound to a ``<datalist>`` of
+    suggestions: the operator can PICK a suggestion OR type any other
+    value — the free-text is retained (unlike a closed ``<select>``).
+    Use whenever a rational set of common/known values exists but the
+    field must stay open (mail-server hosts/ports, endpoint URLs, …).
+    Use a plain ``<select>`` instead ONLY when the value set is truly
+    closed; leave a plain text input when there is no rational set
+    (secrets, opaque ids, freeform names).
+
+    SINGLE-VALUE ONLY. A ``<datalist>`` autocompletes the WHOLE input
+    value, so do NOT use this on a comma-separated / multi-value field
+    (folder lists, resolver IP lists): picking one suggestion would
+    clobber the whole list. Those stay plain ``<input>``.
+
+    Args:
+        name:        submitted input ``name=`` (the handler reads this).
+        value:       current value (may be "" / None).
+        options:     iterable of suggestion strings. STATIC sets are
+                     hardcoded at the call site; DYNAMIC sets (e.g.
+                     discovered IMAP folders, provider labels) are
+                     passed from the route handler's context.
+        list_id:     ``<datalist>`` id; defaults to "<name>-list".
+        type:        "text" (default) | "url" | "number" | "search".
+        placeholder: input placeholder text.
+        help_text:   if set, appends an m.help() tooltip after the input.
+        attrs:       extra raw attributes (e.g. "min=1 max=65535
+                     required") emitted verbatim via ``|safe``. MUST be
+                     a STATIC, server-constant literal at the call site —
+                     NEVER interpolate user/request data into it (it is
+                     unescaped HTML = an injection sink).
+-#}
+{% set lid = list_id or (name | replace('_', '-') ~ '-list') %}
+<input type="{{ type }}" name="{{ name }}" value="{{ value if value is not none else '' }}"
+       list="{{ lid }}" placeholder="{{ placeholder }}"{% if attrs %} {{ attrs|safe }}{% endif %}>
+{%- if help_text %}{{ help(help_text) }}{% endif %}
+<datalist id="{{ lid }}">
+    {% for o in options %}<option value="{{ o }}"></option>
+    {% endfor %}
+</datalist>
+{%- endmacro %}
+
+
+{% macro secret_input(name, has_stored=false, new_hint="", attrs="", readonly=true) -%}
+{#
+    AUDIENCE: admin (operator). A hardened password/secret input.
+
+    Why this exists — the 2026-06-08 save-clobber incident. A blank
+    ``type=password`` credential field is a browser-password-manager autofill
+    magnet, so saving one unrelated setting on a bundled form let an
+    autofilled LOGIN password silently overwrite a stored OAuth secret and
+    kill auth install-wide. Defenses, layered (strongest first):
+
+      * ``readonly`` at page load + ``onfocus`` removes it — password
+        managers skip readonly fields, so NOTHING is autofilled until the
+        operator deliberately focuses the field to type. This is the PRIMARY
+        block: browsers deliberately ignore ``autocomplete="off"`` on
+        password fields (MDN), so it cannot be the only defense.
+      * ``autocomplete="new-password"`` — the token managers mostly honor as
+        "this is not a saved-login slot; do not fill it".
+      * ``data-1p-ignore`` / ``data-lpignore`` / ``data-bwignore`` /
+        ``data-form-type="other"`` — explicit per-manager opt-out hints
+        (1Password / LastPass / Bitwarden / generic).
+
+    The server SSOT (``web/routers/_secret_write.py``) is the matching guard:
+    a blank submit PRESERVES the stored secret. Render the field BLANK (the
+    placeholder conveys the "leave blank to keep" hint) — never pre-fill a
+    secret value into the DOM. Programmatic ``el.value =`` assignment (e.g.
+    the OAuth-JSON import) still works on a readonly field, so import flows
+    are unaffected, and readonly inputs DO submit their value.
+
+    Args:
+        name:       submitted input name= (the handler reads this).
+        has_stored: true when a secret is already stored — switches the
+                    placeholder to the "stored — leave blank to keep" hint.
+        new_hint:   placeholder shown when nothing is stored yet
+                    (e.g. "GOCSPX-..." for a Google secret).
+        attrs:      extra STATIC raw attributes (style/required/maxlength) —
+                    server-constant only, never user data; emitted via |safe.
+        readonly:   true (default) → readonly-until-focus, the page-load
+                    autofill block, for EDIT/admin fields with a stored
+                    secret to protect. Pass false for a CREATION field that
+                    is ``required`` — HTML bars readonly fields from
+                    constraint validation, so a readonly required field would
+                    silently submit empty; a fresh-creation field has no
+                    stored secret to clobber, so the autocomplete +
+                    manager-ignore hints suffice there.
+-#}
+<input type="password" name="{{ name }}"
+       placeholder="{{ '•••••• (stored — leave blank to keep)' if has_stored else new_hint }}"
+       autocomplete="new-password"
+       {% if readonly %}readonly onfocus="this.removeAttribute('readonly')"{% endif %}
+       data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+       {% if attrs %}{{ attrs|safe }}{% endif %}>
+{%- endmacro %}
+
+
+{% macro cred_text_input(name, value, placeholder="", attrs="") -%}
+{#
+    AUDIENCE: admin. A plaintext credential id (OAuth client id, Azure
+    tenant) that sits next to a secret field — the "username slot" a
+    password-manager overwrites when it autofills the adjacent password.
+
+    Same readonly-until-focus + manager-ignore defense as secret_input so an
+    autofill or an accidental clear can't blank a stored id. Unlike
+    secret_input this DOES pre-fill its value (an id is not secret); the
+    server pairs it with set_id_preserve_blank so a blank submit PRESERVES
+    the stored id rather than the old unconditional write that destroyed it.
+
+    Args mirror combo_input's name/value/placeholder/attrs.
+-#}
+<input type="text" name="{{ name }}" value="{{ value if value is not none else '' }}"
+       placeholder="{{ placeholder }}"
+       autocomplete="off" readonly
+       onfocus="this.removeAttribute('readonly')"
+       data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other"
+       {% if attrs %}{{ attrs|safe }}{% endif %}>
+{%- endmacro %}
+
+
+{% macro model_picker(primary_field, backup_field, primary_value, backup_values, type_selector, endpoint_selector, show_backups=true) -%}
+{#
+    AUDIENCE: admin (system operator). Reusable across the AI-backends
+    edit form and the General config Classifier row.
+
+    Feature #44 — AI-model picker + per-model info + ordered backup
+    models. Probes the live backend's installed catalog, lets the
+    operator pick a primary classifier (embedding-only models are
+    shown DISABLED), surfaces a one-line badge strip + a collapsible
+    full-spec disclosure, and builds an ORDERED list of backup models.
+
+    Submission contract (the POST handlers read these EXACTLY):
+      - primary_field : name of the submitted primary-model input.
+                        Stays a single string whether picked from the
+                        <select> or hand-typed via the escape hatch.
+      - backup_field  : name of a hidden input carrying the backups as
+                        a COMMA-SEPARATED, ORDER-PRESERVED string of
+                        model names. Model tags never contain commas
+                        (e.g. "qwen3.6:8b"), so comma-join is lossless.
+
+    Args:
+      primary_field    : str  e.g. "model" or "classifier_model"
+      backup_field     : str  e.g. "backup_models" or "classifier_backup_models"
+      primary_value    : str  current primary model (may be "" / None)
+      backup_values    : list[str] current ordered backups (may be empty)
+      type_selector    : CSS selector for the host form's backend-type
+                         control, e.g. "[name=type]" — read LIVE so the
+                         probe targets the currently-chosen backend.
+      endpoint_selector: CSS selector for the host form's endpoint input,
+                         e.g. "[name=endpoint]".
+
+    The probe endpoint (built in parallel by the backend):
+      GET /config/ai-backends/probe-models?backend_type=<t>&endpoint=<url>
+      -> { ok, models:[{name, capabilities, chat_capable, embedding_only,
+           parameter_size, quantization, context_length, family,
+           size_bytes, resident}], error }
+    It is a plain admin-session-gated GET — no CSRF token needed.
+
+    Graceful degradation: the primary_field free-text input is ALWAYS
+    present (just hidden while the <select> mode is active), so the form
+    is submittable with a hand-typed model at every moment — required
+    for non-enumerable backends (Azure deployment names) and offline /
+    probe-failure. On { ok:false } the picker defaults to free-text and
+    shows the error.
+-#}
+{# A stable-ish id seed so multiple instances on one page don't collide.
+   The two real surfaces use distinct primary_field names, so keying on
+   that is unique in practice. #}
+{% set pid = "mp-" ~ primary_field|replace("_", "-") %}
+<div class="et-model-picker"
+     data-mp-root="1"
+     data-mp-primary-field="{{ primary_field|e }}"
+     data-mp-backup-field="{{ backup_field|e }}"
+     data-mp-type-selector="{{ type_selector|e }}"
+     data-mp-endpoint-selector="{{ endpoint_selector|e }}"
+     data-mp-id="{{ pid }}"
+     style="display:block;">
+
+    {# ── Mode toggle + fetch affordance ─────────────────────────── #}
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:0.4rem 0.6rem;margin-bottom:0.4rem;">
+        <button type="button" data-mp-fetch class="outline secondary"
+                style="margin:0;padding:0.2rem 0.7rem;font-size:0.85rem;">
+            Fetch models
+        </button>
+        <label style="margin:0;display:inline-flex;align-items:center;gap:0.35rem;font-size:0.85rem;color:var(--pico-muted-color);">
+            <input type="checkbox" data-mp-manual style="margin:0;"
+                   {% if not primary_value %}{% endif %}>
+            Enter manually
+            {{ help("Tick to type a model id by hand instead of picking from the probed list. Required for backends whose model names aren't discoverable — e.g. an Azure OpenAI deployment name — or when the endpoint is offline.") }}
+        </label>
+        <span data-mp-status role="status" aria-live="polite"
+              style="font-size:0.82rem;color:var(--pico-muted-color);"></span>
+    </div>
+
+    {# ── PRIMARY model ───────────────────────────────────────────
+       Two coexisting controls bound to the SAME submit name. Only ONE
+       is enabled at a time (disabled inputs are not submitted), so the
+       handler always receives exactly one ``primary_field`` value.    #}
+
+    {# Free-text escape hatch — the SSOT fallback. Enabled by default
+       (no probe has run yet); JS disables it when select-mode wins. #}
+    <input type="text" name="{{ primary_field }}" data-mp-text
+           maxlength="120"
+           value="{{ primary_value or '' }}"
+           placeholder="e.g. qwen3.6:8b"
+           style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;max-width:28rem;">
+
+    {# Select — populated on probe. Disabled (and so un-submitted) until
+       the operator fetches + the picker switches into select-mode. #}
+    <select data-mp-select disabled
+            aria-label="Primary classifier model"
+            style="display:none;margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;width:100%;max-width:28rem;">
+        <option value="">— fetch models, or type one above —</option>
+    </select>
+
+    {# Live one-line badge strip for the selected primary. #}
+    <div data-mp-badges
+         style="margin:0.35rem 0 0;font-size:0.8rem;line-height:1.5;color:var(--pico-muted-color);min-height:1.2em;"></div>
+
+    {# Collapsed full-spec disclosure. Collapsed by default — no jump. #}
+    <details data-mp-details
+             style="margin:0.3rem 0 0;font-size:0.82rem;">
+        <summary style="cursor:pointer;color:var(--pico-muted-color);">Model details</summary>
+        <dl data-mp-details-body
+            style="margin:0.4rem 0 0;display:grid;grid-template-columns:auto 1fr;gap:0.15rem 0.75rem;"></dl>
+    </details>
+
+    {# ── BACKUP models (ordered) ─────────────────────────────────── #}
+    {# #44/#45 — backups drive bounded capability/resource failover on BOTH the
+       install-default classifier path (config.classifier, classify) AND the
+       ai_backends style-learning complete() path (#45 wired the loader ->
+       OllamaAdapter -> OllamaClassifier thread). A surface MAY still pass
+       show_backups=false to hide the control where it would be inert; the
+       elements always render (display:none when hidden) so the picker JS init
+       is unaffected and an empty hidden field posts as no backups. #}
+    <fieldset style="{% if not show_backups %}display:none;{% endif %}margin:0.8rem 0 0;padding:0.5rem 0.7rem;
+                     background:var(--pico-card-background-color);
+                     border:1px solid var(--pico-muted-border-color);">
+        <legend style="font-weight:600;padding:0 0.3rem;font-size:0.85rem;">
+            Backup models <small style="font-weight:400;color:var(--pico-muted-color);">(ordered fallback)</small>
+            {{ help("Optional ordered list of fallback models, tried in order if the primary can't classify. On a single-GPU box these share the one GPU — a fallback is a capability/resource safety net, not a hot standby. Order matters: first listed is tried first.") }}
+        </legend>
+
+        {# Hidden submit field — comma-separated, order-preserved. #}
+        <input type="hidden" name="{{ backup_field }}" data-mp-backup-hidden
+               value="{{ (backup_values or []) | join(',') }}">
+
+        {# Add-a-backup control: a select of fetched models + Add button.
+           Populated from the same probe payload as the primary select.  #}
+        <div style="display:flex;flex-wrap:wrap;gap:0.4rem;align-items:center;margin-bottom:0.4rem;">
+            <select data-mp-backup-add
+                    aria-label="Add a backup model"
+                    style="margin:0;padding:0.2rem 0.45rem;font-size:0.85rem;width:auto;max-width:20rem;">
+                <option value="">— fetch models to add backups —</option>
+            </select>
+            <button type="button" data-mp-backup-add-btn class="outline secondary"
+                    style="margin:0;padding:0.15rem 0.6rem;font-size:0.8rem;">
+                Add backup
+            </button>
+            <small data-mp-backup-add-hint style="color:var(--pico-muted-color);font-size:0.78rem;"></small>
+        </div>
+
+        {# Rendered ordered list of chosen backups (chips + reorder/remove). #}
+        <ol data-mp-backup-list
+            style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0.3rem;"></ol>
+        <p data-mp-backup-empty
+           style="margin:0;font-size:0.8rem;color:var(--pico-muted-color);">
+            No backup models. The primary is used alone.
+        </p>
+    </fieldset>
+</div>
+
+{# Init-once script. Event-delegated + idempotent: renders fine even if
+   the macro is emitted twice on one page (each root carries its own
+   config in data-* attrs; the engine binds per-root once). Inline-script
+   precedent: admin/config_tabs/integrations.html oauth-json-import +
+   renew-btn blocks. Vanilla, dependency-free. #}
+<script>
+(function () {
+    "use strict";
+    if (window.__etModelPickerInit) {
+        // Engine already loaded by an earlier macro instance on this
+        // page; just (re)scan for any roots not yet wired.
+        window.__etModelPickerScan && window.__etModelPickerScan();
+        return;
+    }
+    window.__etModelPickerInit = true;
+
+    var PROBE_URL = "/config/ai-backends/probe-models";
+
+    function humanCtx(n) {
+        if (!n && n !== 0) return null;
+        n = Number(n);
+        if (!isFinite(n) || n <= 0) return null;
+        if (n >= 1000) {
+            var k = n / 1024;
+            // Round to a clean "k" — 32768 -> 32k, 131072 -> 128k.
+            return Math.round(k) + "k";
+        }
+        return String(n);
+    }
+
+    function humanBytes(n) {
+        if (!n && n !== 0) return null;
+        n = Number(n);
+        if (!isFinite(n) || n <= 0) return null;
+        var gb = n / (1024 * 1024 * 1024);
+        if (gb >= 1) return gb.toFixed(1) + " GB";
+        var mb = n / (1024 * 1024);
+        return mb.toFixed(0) + " MB";
+    }
+
+    function isEmbeddingOnly(m) {
+        // Contract: embedding_only true OR chat_capable false => not a
+        // valid primary classifier.
+        return m.embedding_only === true || m.chat_capable === false;
+    }
+
+    // Build the compact one-line badge string for a model object.
+    function badgeLine(m) {
+        var parts = [];
+        parts.push(m.resident ? "● resident" : "○ cold");
+        if (!isEmbeddingOnly(m)) {
+            parts.push("chat ✓");
+        } else {
+            parts.push("embedding-only");
+        }
+        if (m.parameter_size) parts.push(String(m.parameter_size));
+        if (m.quantization) parts.push(String(m.quantization));
+        var ctx = humanCtx(m.context_length);
+        if (ctx) parts.push(ctx + " ctx");
+        if (m.family) parts.push(String(m.family));
+        return parts.join(" · ");
+    }
+
+    function clearChildren(el) {
+        while (el.firstChild) el.removeChild(el.firstChild);
+    }
+
+    // ── Per-root controller ──────────────────────────────────────
+    function wireRoot(root) {
+        if (root.__mpWired) return;
+        root.__mpWired = true;
+
+        var typeSel = root.getAttribute("data-mp-type-selector");
+        var endpointSel = root.getAttribute("data-mp-endpoint-selector");
+
+        var fetchBtn = root.querySelector("[data-mp-fetch]");
+        var manualChk = root.querySelector("[data-mp-manual]");
+        var statusEl = root.querySelector("[data-mp-status]");
+        var textInput = root.querySelector("[data-mp-text]");
+        var select = root.querySelector("[data-mp-select]");
+        var badges = root.querySelector("[data-mp-badges]");
+        var details = root.querySelector("[data-mp-details]");
+        var detailsBody = root.querySelector("[data-mp-details-body]");
+        var backupHidden = root.querySelector("[data-mp-backup-hidden]");
+        var backupAdd = root.querySelector("[data-mp-backup-add]");
+        var backupAddBtn = root.querySelector("[data-mp-backup-add-btn]");
+        var backupAddHint = root.querySelector("[data-mp-backup-add-hint]");
+        var backupList = root.querySelector("[data-mp-backup-list]");
+        var backupEmpty = root.querySelector("[data-mp-backup-empty]");
+
+        // model name -> model object, from the most recent probe.
+        var catalog = {};
+        // Ordered list of backup model names (the source of truth for
+        // the comma-joined hidden field).
+        var backups = (backupHidden.value || "")
+            .split(",").map(function (s) { return s.trim(); })
+            .filter(function (s) { return s.length; });
+
+        function liveType() {
+            var el = document.querySelector(typeSel);
+            return el ? (el.value || "").trim() : "";
+        }
+        function liveEndpoint() {
+            var el = document.querySelector(endpointSel);
+            return el ? (el.value || "").trim() : "";
+        }
+
+        function setStatus(msg, kind) {
+            statusEl.textContent = msg || "";
+            statusEl.style.color = kind === "error"
+                ? "var(--pico-del-color)"
+                : (kind === "ok" ? "var(--pico-ins-color)" : "var(--pico-muted-color)");
+        }
+
+        // ── primary mode: select vs free-text ───────────────────
+        // Exactly one of the two inputs is enabled (disabled inputs are
+        // not POSTed), so the handler always sees one primary value.
+        function applyMode() {
+            var manual = manualChk.checked;
+            if (manual) {
+                textInput.style.display = "";
+                textInput.disabled = false;
+                select.style.display = "none";
+                select.disabled = true;
+            } else {
+                // select-mode: only valid once the select has real
+                // options; otherwise stay on free-text so the form is
+                // always submittable.
+                var hasOptions = select.options.length > 1
+                    || (select.options.length === 1 && select.options[0].value);
+                if (hasOptions) {
+                    select.style.display = "";
+                    select.disabled = false;
+                    textInput.style.display = "none";
+                    textInput.disabled = true;
+                } else {
+                    textInput.style.display = "";
+                    textInput.disabled = false;
+                    select.style.display = "none";
+                    select.disabled = true;
+                }
+            }
+            renderPrimaryBadges();
+        }
+
+        function currentPrimaryName() {
+            if (!manualChk.checked && !select.disabled && select.value) {
+                return select.value;
+            }
+            return (textInput.value || "").trim();
+        }
+
+        function renderPrimaryBadges() {
+            var name = currentPrimaryName();
+            var m = catalog[name];
+            if (!m) {
+                badges.textContent = "";
+                clearChildren(detailsBody);
+                return;
+            }
+            badges.textContent = badgeLine(m);
+            renderDetails(m);
+        }
+
+        function renderDetails(m) {
+            clearChildren(detailsBody);
+            var rows = [
+                ["Name", m.name],
+                ["Capabilities", (m.capabilities && m.capabilities.length)
+                    ? m.capabilities.join(", ") : "—"],
+                ["Chat-capable", isEmbeddingOnly(m) ? "no (embedding-only)" : "yes"],
+                ["Parameter size", m.parameter_size || "—"],
+                ["Quantization", m.quantization || "—"],
+                ["Context length", humanCtx(m.context_length) || "—"],
+                ["Family", m.family || "—"],
+                ["Size", humanBytes(m.size_bytes) || "—"],
+                ["Resident", m.resident ? "yes (loaded in VRAM)" : "no (cold)"]
+            ];
+            rows.forEach(function (r) {
+                var dt = document.createElement("dt");
+                dt.textContent = r[0];
+                dt.style.color = "var(--pico-muted-color)";
+                var dd = document.createElement("dd");
+                dd.style.margin = "0";
+                dd.textContent = r[1];
+                detailsBody.appendChild(dt);
+                detailsBody.appendChild(dd);
+            });
+        }
+
+        // ── populate the selects from a probe payload ───────────
+        function populateSelects(models) {
+            catalog = {};
+            clearChildren(select);
+            clearChildren(backupAdd);
+
+            var placeholder = document.createElement("option");
+            placeholder.value = "";
+            placeholder.textContent = "— select a model —";
+            select.appendChild(placeholder);
+
+            var addPlaceholder = document.createElement("option");
+            addPlaceholder.value = "";
+            addPlaceholder.textContent = "— choose a backup to add —";
+            backupAdd.appendChild(addPlaceholder);
+
+            var prev = (textInput.value || "").trim();
+            var matchedPrev = false;
+
+            models.forEach(function (m) {
+                catalog[m.name] = m;
+                var embedding = isEmbeddingOnly(m);
+
+                var opt = document.createElement("option");
+                opt.value = m.name;
+                opt.textContent = m.name + (embedding
+                    ? "  (embedding — can't classify)"
+                    : "  [" + badgeLine(m) + "]");
+                if (embedding) {
+                    opt.disabled = true;
+                }
+                if (m.name === prev && !embedding) {
+                    opt.selected = true;
+                    matchedPrev = true;
+                }
+                select.appendChild(opt);
+
+                // Backups: embedding-only models can't classify either,
+                // so they're disabled in the add-list too.
+                var aopt = document.createElement("option");
+                aopt.value = m.name;
+                aopt.textContent = m.name + (embedding ? "  (embedding — can't classify)" : "");
+                if (embedding) aopt.disabled = true;
+                backupAdd.appendChild(aopt);
+            });
+
+            // If the previously-typed primary matched a real chat model,
+            // flip into select-mode so the operator sees its badges.
+            if (matchedPrev && !manualChk.checked) {
+                applyMode();
+            } else {
+                applyMode();
+            }
+            renderBackups();
+        }
+
+        // ── backups ─────────────────────────────────────────────
+        function syncBackupHidden() {
+            backupHidden.value = backups.join(",");
+        }
+
+        function renderBackups() {
+            clearChildren(backupList);
+            if (!backups.length) {
+                backupEmpty.style.display = "";
+            } else {
+                backupEmpty.style.display = "none";
+            }
+            backups.forEach(function (name, idx) {
+                var li = document.createElement("li");
+                li.style.cssText = "display:flex;align-items:center;gap:0.4rem;"
+                    + "padding:0.25rem 0.4rem;background:var(--pico-background-color);"
+                    + "border:1px solid var(--pico-muted-border-color);border-radius:4px;";
+
+                var ord = document.createElement("span");
+                ord.textContent = (idx + 1) + ".";
+                ord.style.cssText = "color:var(--pico-muted-color);font-size:0.8rem;min-width:1.2em;";
+                li.appendChild(ord);
+
+                var label = document.createElement("span");
+                label.style.cssText = "flex:1;min-width:0;font-size:0.85rem;";
+                var m = catalog[name];
+                if (m) {
+                    var strong = document.createElement("strong");
+                    strong.textContent = name;
+                    label.appendChild(strong);
+                    var meta = document.createElement("small");
+                    meta.style.cssText = "display:block;color:var(--pico-muted-color);font-size:0.75rem;";
+                    meta.textContent = badgeLine(m);
+                    label.appendChild(meta);
+                } else {
+                    label.textContent = name;
+                }
+                li.appendChild(label);
+
+                li.appendChild(makeBtn("↑", "Move up", idx === 0, function () {
+                    swap(idx, idx - 1);
+                }));
+                li.appendChild(makeBtn("↓", "Move down", idx === backups.length - 1, function () {
+                    swap(idx, idx + 1);
+                }));
+                li.appendChild(makeBtn("✕", "Remove", false, function () {
+                    backups.splice(idx, 1);
+                    syncBackupHidden();
+                    renderBackups();
+                }));
+
+                backupList.appendChild(li);
+            });
+        }
+
+        function makeBtn(glyph, title, disabled, onClick) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = glyph;
+            b.title = title;
+            b.setAttribute("aria-label", title);
+            b.className = "outline secondary";
+            b.style.cssText = "margin:0;padding:0.05rem 0.45rem;font-size:0.8rem;line-height:1.4;";
+            if (disabled) b.disabled = true;
+            else b.addEventListener("click", onClick);
+            return b;
+        }
+
+        function swap(i, j) {
+            if (j < 0 || j >= backups.length) return;
+            var tmp = backups[i];
+            backups[i] = backups[j];
+            backups[j] = tmp;
+            syncBackupHidden();
+            renderBackups();
+        }
+
+        function addBackup() {
+            var name = backupAdd.value;
+            backupAddHint.textContent = "";
+            if (!name) return;
+            if (name === currentPrimaryName()) {
+                backupAddHint.textContent = "That's already the primary.";
+                return;
+            }
+            if (backups.indexOf(name) !== -1) {
+                backupAddHint.textContent = "Already in the list.";
+                return;
+            }
+            backups.push(name);
+            syncBackupHidden();
+            renderBackups();
+            backupAdd.value = "";
+        }
+
+        // ── the probe ────────────────────────────────────────────
+        function doProbe() {
+            var t = liveType();
+            var ep = liveEndpoint();
+            if (!ep) {
+                setStatus("Set the endpoint URL first, then fetch.", "error");
+                return;
+            }
+            setStatus("Fetching models…", null);
+            fetchBtn.setAttribute("aria-busy", "true");
+            fetchBtn.disabled = true;
+
+            var url = PROBE_URL
+                + "?backend_type=" + encodeURIComponent(t)
+                + "&endpoint=" + encodeURIComponent(ep);
+
+            fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } })
+                .then(function (resp) {
+                    return resp.json().catch(function () { return { ok: false, error: "Bad response (HTTP " + resp.status + ")", models: [] }; });
+                })
+                .then(function (body) {
+                    body = body || {};
+                    if (!body.ok) {
+                        // Probe failed / unsupported backend: fall back to
+                        // free-text so the form stays submittable.
+                        manualChk.checked = true;
+                        applyMode();
+                        setStatus(body.error || "Could not fetch models — type the model id manually.", "error");
+                        return;
+                    }
+                    var models = body.models || [];
+                    if (!models.length) {
+                        manualChk.checked = true;
+                        applyMode();
+                        setStatus("No models installed yet — pull one on the backend, or type the id.", null);
+                        return;
+                    }
+                    populateSelects(models);
+                    // A successful probe with real models flips into the
+                    // picker unless the operator explicitly chose manual.
+                    if (manualChk.checked) {
+                        // Respect an explicit manual choice; still keep
+                        // the badges live for whatever's typed.
+                        applyMode();
+                    } else {
+                        applyMode();
+                    }
+                    var chatCount = models.filter(function (m) { return !isEmbeddingOnly(m); }).length;
+                    setStatus(models.length + " model" + (models.length === 1 ? "" : "s")
+                        + " (" + chatCount + " chat-capable).", "ok");
+                })
+                .catch(function (e) {
+                    manualChk.checked = true;
+                    applyMode();
+                    setStatus("Network error reaching the backend — type the model id manually.", "error");
+                })
+                .then(function () {
+                    fetchBtn.removeAttribute("aria-busy");
+                    fetchBtn.disabled = false;
+                });
+        }
+
+        // ── events ───────────────────────────────────────────────
+        fetchBtn.addEventListener("click", doProbe);
+        manualChk.addEventListener("change", function () {
+            applyMode();
+            setStatus(manualChk.checked ? "Manual entry — type any model id." : "", null);
+        });
+        select.addEventListener("change", function () {
+            // Mirror the pick into the free-text field so the value
+            // survives a later switch to manual mode (and the handler
+            // reads a sensible value either way). Only on an explicit
+            // non-empty pick — never clobber with the blank placeholder.
+            if (select.value) textInput.value = select.value;
+            renderPrimaryBadges();
+        });
+        textInput.addEventListener("input", renderPrimaryBadges);
+        backupAddBtn.addEventListener("click", addBackup);
+
+        // Clear stale options if the operator switches the backend TYPE
+        // away — a probed Ollama catalog must not stay bound to a now-
+        // different backend.
+        var typeEl = document.querySelector(typeSel);
+        if (typeEl) {
+            typeEl.addEventListener("change", function () {
+                catalog = {};
+                clearChildren(select);
+                var ph = document.createElement("option");
+                ph.value = "";
+                ph.textContent = "— fetch models, or type one above —";
+                select.appendChild(ph);
+                clearChildren(backupAdd);
+                var aph = document.createElement("option");
+                aph.value = "";
+                aph.textContent = "— fetch models to add backups —";
+                backupAdd.appendChild(aph);
+                manualChk.checked = true;
+                applyMode();
+                renderBackups();
+                setStatus("Backend type changed — re-fetch models for the new type.", null);
+            });
+        }
+
+        // Initial render: free-text mode, any existing backups shown.
+        applyMode();
+        renderBackups();
+    }
+
+    function scan() {
+        var roots = document.querySelectorAll("[data-mp-root]");
+        for (var i = 0; i < roots.length; i++) wireRoot(roots[i]);
+    }
+    window.__etModelPickerScan = scan;
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", scan);
+    } else {
+        scan();
+    }
+})();
+</script>
+{%- endmacro %}

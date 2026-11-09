@@ -35,8 +35,21 @@ for "successfully completed" semantics.
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import Iterator
+
+
+# : mark_inflight() advertises "atomically claim the slot" in its
+# docstring but the pre-#147 body was a plain `if k in bag: return
+# False; bag.add(k)` sequence. On CPython that pair is effectively
+# atomic for a single-set-of-ints thanks to the GIL — but the contract
+# is what callers rely on, and a future runtime (no-GIL Python 3.13+ /
+# a run-loop that yields between bytecodes) would break it. This lock
+# closes the check-then-act to match the contract. Module-scope
+# because the bag lives on `app.state` and is process-singleton; a
+# lock keyed to that singleton is the correct scope.
+_MARK_LOCK: threading.Lock = threading.Lock()
 
 
 def _key(account_id: int, uid: str) -> tuple[int, str]:
@@ -69,20 +82,26 @@ def mark_inflight(state: object, account_id: int, uid: str) -> bool:
     on first use so the helper works even when the caller didn't
     pre-initialise the set.
     """
-    bag = getattr(state, "triage_inflight", None)
-    if bag is None:
-        bag = set()
-        try:
-            state.triage_inflight = bag  # type: ignore[attr-defined]
-        except AttributeError:
-            # State object refused attribute set (frozen dataclass etc.).
-            # Fall back to no-op semantics: report not-in-flight.
-            return True
     k = _key(account_id, uid)
-    if k in bag:
-        return False
-    bag.add(k)
-    return True
+    # : lock the check-then-add to make the docstring's
+    # "atomically claim" contract hold under no-GIL / bytecode-yield
+    # runtimes. The bag init is INSIDE the lock too, so two callers
+    # racing on a fresh state can't each `set() -> bag.add(k)` and
+    # both come back True.
+    with _MARK_LOCK:
+        bag = getattr(state, "triage_inflight", None)
+        if bag is None:
+            bag = set()
+            try:
+                state.triage_inflight = bag  # type: ignore[attr-defined]
+            except AttributeError:
+                # State object refused attribute set (frozen dataclass etc.).
+                # Fall back to no-op semantics: report not-in-flight.
+                return True
+        if k in bag:
+            return False
+        bag.add(k)
+        return True
 
 
 def release_inflight(state: object, account_id: int, uid: str) -> None:

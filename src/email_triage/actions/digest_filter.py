@@ -31,11 +31,13 @@ already gated by the ``since_iso`` query.
 
 from __future__ import annotations
 
+from email_triage._errfmt import fmt_exc
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from email_triage._isotime import parse_iso
+from email_triage._isotime import assume_utc_if_naive, parse_iso_aware, to_utc_iso  # N-357b R31
+from email_triage.triage_logging import get_logger
 from email_triage.actions.digest_configs import (
     DigestConfig, DigestFilter, DigestWindow,
 )
@@ -44,6 +46,9 @@ from email_triage.actions.digest_configs import (
 # ---------------------------------------------------------------------------
 # Time window resolution
 # ---------------------------------------------------------------------------
+
+
+log = get_logger("email_triage.actions.digest_filter")  # N-196b R21_4
 
 
 def _local_now(tz: str | None, now: datetime | None = None) -> datetime:
@@ -62,14 +67,17 @@ def _local_now(tz: str | None, now: datetime | None = None) -> datetime:
     which made today/yesterday tests fail the day after they were
     written.
     """
-    base = now if now is not None else datetime.now(timezone.utc)
-    if base.tzinfo is None:
-        base = base.replace(tzinfo=timezone.utc)
+    # N-357b (2026-07-06 baseline shrink): assume_utc_if_naive SSOT.
+    base = assume_utc_if_naive(now if now is not None else datetime.now(timezone.utc))
     if tz:
         try:
             return base.astimezone(ZoneInfo(tz))
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(
+                "digest: unrecognised timezone; falling back to UTC",
+                tz=tz,
+                error=fmt_exc(exc),
+            )
     return base
 
 
@@ -100,10 +108,10 @@ def resolve_window(
     missing start raises (the caller already validated this in
     :func:`actions.digest_configs.validate`).
     """
+    # N-357b (2026-07-06 baseline shrink): assume_utc_if_naive SSOT.
     if now is None:
         now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+    now = assume_utc_if_naive(now)
     local_now = _local_now(tz, now=now) if tz else now
 
     end = now
@@ -144,19 +152,22 @@ def resolve_window(
         # Unknown kind — degrade safely to 24h.
         start = now - timedelta(hours=24)
 
-    return start.isoformat(), end.isoformat()
+    # start/end are UTC-aware here — every path binds them from this module's
+    # local `_parse_iso` (which UTC-defaults a naive parse, no shift) or from
+    # `now ± delta` — so to_utc_iso is byte-identical (the astimezone no-op).
+    # Don't swap in the bare `_isotime.parse_iso` here without preserving that
+    # UTC guarantee, or a non-UTC-offset window string would shift the stored str.
+    return to_utc_iso(start), to_utc_iso(end)
 
 
 def _parse_iso(raw: str | None) -> datetime | None:
     """Parse an ISO timestamp, defaulting a naive result to UTC.
 
-    Thin wrapper over :func:`email_triage._isotime.parse_iso` — adds
-    only the UTC default this module's time-window math relies on.
+    N-357b (2026-07-06 baseline shrink): the wrapper's body IS the
+    `parse_iso_aware` SSOT — collapsed to a direct call. Callers
+    (this module's window math) get the identical UTC-default guarantee.
     """
-    dt = parse_iso(raw)
-    if dt is not None and dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return parse_iso_aware(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +313,14 @@ def row_matches_filter(
 # ---------------------------------------------------------------------------
 
 
-#: Refuse to re-send a single digest within this window. Same as the
-#: legacy ``MIN_RESEND_INTERVAL_HOURS`` so behaviour parity with the
-#: pre-Phase-4 sender survives the cutover.
-MIN_RESEND_INTERVAL_HOURS = 23
+#: Refuse to re-send a single digest within this window. The single definition +
+#: the elapsed-window check live in the digest_resend SSOT (census run15 #1
+#: converged the duplicated constant + the opposite-operand tz-norm crash);
+#: re-exported here for back-compat with importers.
+from email_triage.actions.digest_resend import (  # noqa: E402
+    MIN_RESEND_INTERVAL_HOURS,
+    resend_too_soon,
+)
 
 
 def digest_should_fire(
@@ -352,15 +367,10 @@ def digest_should_fire(
         if now_local.day != 1:
             return False
 
-    if last_sent_iso:
-        last_dt = _parse_iso(last_sent_iso)
-        if last_dt is not None:
-            if now_local.tzinfo is None:
-                _now = now_local.replace(tzinfo=timezone.utc)
-            else:
-                _now = now_local
-            elapsed = (_now - last_dt).total_seconds() / 3600.0
-            if elapsed < MIN_RESEND_INTERVAL_HOURS:
-                return False
+    # Idempotence window — route through the digest_resend SSOT (both operands
+    # normalized to aware-UTC; was a parse_iso + now-only tz-norm that crashed on
+    # a naive `last_sent` — census run15 #1).
+    if resend_too_soon(last_sent_iso, now_local):
+        return False
 
     return True

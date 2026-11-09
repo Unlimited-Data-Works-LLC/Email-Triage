@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import available_timezones
 
-from fastapi import APIRouter, Depends, Form, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
+
+from email_triage.web._flash import scrub_exc  # N-179 R21_2 sub-3 SSOT
+from email_triage.web.error_html import error_article
 
 from email_triage.engine.models import Classification, EmailMessage, UserRole
 from email_triage.web.db import can_manage_account
@@ -39,6 +42,7 @@ from email_triage.web.auth import (
 )
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import (
+    is_admin as _is_admin,  # N-222h R22 SSOT alias (local `is_admin` shadows callable)
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
@@ -48,32 +52,17 @@ from email_triage.web.dependencies import (
     require_auth,
     require_role,
 )
-from email_triage.triage_logging import get_logger
-from email_triage._errfmt import fmt_exc
+from email_triage.triage_logging import REDACTED_PLACEHOLDER, get_logger
+from email_triage._errfmt import fmt_exc, scrub_class_error_for_persist, scrub_error_for_persist
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.triage_classify")
 
 router = APIRouter()
 
-
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
+# / — Bulk-runs index page size. Module-level so tests can
+# monkeypatch it small to exercise the pager without seeding 50+ jobs.
+_JOBS_CAP = 50
 
 
 from . import _shared
@@ -86,13 +75,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -117,7 +125,6 @@ async def classify_page(request: Request, user: RequireUser):
 @router.post("/classify/run", response_class=HTMLResponse)
 async def classify_run(
     request: Request, user: RequireUserFragment,
-    raw_email: str = Form(...),
 ):
     """Parse a raw email and classify it via the configured LLM.
 
@@ -129,13 +136,27 @@ async def classify_run(
     db = get_db(request)
     config = get_config(request)
 
+    # Read the pasted raw email via parse_form so a large message (HTML +
+    # inline base64 images) isn't rejected by Starlette 1.3.1's 1 MiB per-field
+    # default (CVE-2026-54283 enforcement). See web/form_limits.
+    from email_triage.web.form_limits import parse_form
+    raw_email = str((await parse_form(request)).get("raw_email") or "")
+    if not raw_email.strip():
+        # Preserve the old required-field contract (was Form(...) → 422) now
+        # that we parse the form manually — render a friendly HTML article
+        # instead of FastAPI's raw JSON 422.
+        return HTMLResponse(
+            error_article(ValueError("Paste a raw email to classify."),
+                          heading="No input"),
+            status_code=422,
+        )
+
     # Parse the raw email.
     try:
         parsed = _parse_raw_email(raw_email)
     except Exception as exc:
         return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-color-red-500);padding:0.5rem 1rem;">'
-            f'<p><strong>Parse error:</strong> {exc}</p></article>'
+            error_article(exc, heading='Parse error')
         )
 
     # Get categories from DB (user-scoped: system + current user's personal).
@@ -163,7 +184,6 @@ async def classify_run(
     from email_triage.classify.hints import find_skip_ai_hint
     skip_hint = find_skip_ai_hint(list_hints or [])
     if skip_hint is not None:
-        from email_triage.engine.models import Classification
         classification = Classification(
             category=skip_hint.category,
             confidence=1.0,
@@ -197,6 +217,19 @@ async def classify_run(
                 base_url=config.classifier.ollama_url,
                 prefer_loaded=config.classifier.prefer_loaded,
                 local_url_suffixes=_local_suffixes,
+                prefer_loaded_skip_embeddings=(
+                    config.classifier.prefer_loaded_skip_embeddings
+                ),
+                embedding_name_markers=(
+                    config.classifier.embedding_name_markers
+                ),
+                backup_models=config.classifier.backup_models,
+                num_ctx=config.classifier.num_ctx,
+                ollama_think=config.classifier.ollama_think,
+                ollama_no_think_marker=(
+                    config.classifier.ollama_no_think_marker
+                ),
+                ollama_keep_alive=config.classifier.ollama_keep_alive,
             )
         elif backend == "openai":
             from email_triage.classify.openai_compat import (
@@ -213,12 +246,36 @@ async def classify_run(
                 model=config.classifier.gemini_model,
             )
         else:
+            import html as _html
+            # N-83: backend is a config-stored string; escape before HTML interpolation.
             return HTMLResponse(
                 f'<article style="border-left:3px solid var(--pico-color-red-500);padding:0.5rem 1rem;">'
-                f'<p>Unknown classifier backend: {backend}</p></article>'
+                f'<p>Unknown classifier backend: {_html.escape(str(backend))}</p></article>'
             )
 
         try:
+            # Punch 616 (panel B3 hipaa-sme F1a): the pasted text belongs to no
+            # account, but with the system HIPAA flag on every message is HIPAA,
+            # so the BAA gate decides before it can egress (§164.308(b)(1)).
+            # Refuse, never degrade; the finally below still drains the pool.
+            from email_triage.classify.baa_gate import baa_block_status
+            from email_triage.triage_logging import account_hipaa_effective
+            if account_hipaa_effective(message=parsed):
+                _baa_block = await db_call(baa_block_status, db, classifier, True)
+                if _baa_block is not None:
+                    import html as _html
+                    _target = (f"{_baa_block.get('backend') or backend} @ "
+                               f"{_baa_block.get('host') or '?'}")
+                    _log.warning(
+                        "Test Classify refused: HIPAA mode is on and classifier "
+                        f"{_target} has no BAA on file; nothing was sent (punch 616).",
+                    )
+                    return HTMLResponse(
+                        '<article style="border-left:3px solid var(--pico-color-red-500);padding:0.5rem 1rem;">'
+                        '<p>Classification refused: HIPAA mode is on and the configured '
+                        f'classifier ({_html.escape(_target)}) has no BAA on file. '
+                        'Nothing was sent.</p></article>'
+                    )
             classification = await classifier.classify(parsed, categories, list_hints or None)
         finally:
             #  — drain the long-lived httpx pool the classifier
@@ -234,8 +291,7 @@ async def classify_run(
     except Exception as exc:
         elapsed = time.time() - t0
         return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-color-red-500);padding:0.5rem 1rem;">'
-            f'<p><strong>Classification error ({elapsed:.1f}s):</strong> {exc}</p></article>'
+            error_article(exc, heading=f'Classification error ({elapsed:.1f}s)')
         )
 
     model_label = config.classifier.model if backend == "ollama" else backend
@@ -303,7 +359,7 @@ async def triage_run(request: Request, user: RequireUserFragment):
     secrets = get_secrets(request)
     config = get_config(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     form = await request.form()
     account_id = _safe_int(form.get("account_id"), 0)
@@ -397,7 +453,7 @@ async def triage_run(request: Request, user: RequireUserFragment):
         # header and triggers window.location — same effect as a
         # plain 303 for non-HTMX clients (we still set status 200
         # so HTMX honours the header rather than chasing redirect).
-        is_htmx = request.headers.get("HX-Request") == "true"
+        is_htmx = _shared.is_htmx(request)
         target = f"/triage/jobs/{job_id}"
         if is_htmx:
             return HTMLResponse(
@@ -451,16 +507,14 @@ async def triage_run(request: Request, user: RequireUserFragment):
         )
     if run.get("error") == "provider_error":
         msg = (run["errors"] or ["Provider error"])[0]
-        return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
-            f'<p>{msg}</p></article>'
-        )
+        # N-83: msg is a provider/classifier error string (attacker-reachable via
+        # a crafted server banner or LLM-echo); route through error_article so
+        # the dynamic value is html.escape()'d before reaching the response.
+        return HTMLResponse(error_article(msg, heading="Provider error"))
     if run.get("error") == "classifier_error":
         msg = (run["errors"] or ["Classifier error"])[0]
-        return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
-            f'<p>{msg}</p></article>'
-        )
+        # N-83: same class — classifier error string may echo provider content.
+        return HTMLResponse(error_article(msg, heading="Classifier error"))
 
     # Best-effort outbound webhook emit. Never blocks the response.
     dispatcher = getattr(request.app.state, "event_dispatcher", None)
@@ -560,22 +614,15 @@ async def triage_preview(request: Request, user: RequireUserFragment):
             return "cooldown", {"wait": wait}
         set_setting(db, rl_key, now)
 
-        # HIPAA audit row — actor != owner on HIPAA account.
-        if (
-            is_account_hipaa(acct)
-            and user.get("id") != acct.get("user_id")
-        ):
-            try:
-                from email_triage.web.db import record_hipaa_access_event
-                record_hipaa_access_event(
-                    db, user["id"], account_id, "triage_preview",
-                    outcome="success",
-                )
-            except Exception as e:
-                _log.warning(
-                    "HIPAA preview audit row write failed",
-                    error=fmt_exc(e),
-                )
+        # HIPAA audit row — actor != owner on HIPAA account (PD#14 SSOT).
+        # Owner self-access exempt; gate lives in audit_phi_access.
+        audit_phi_access(
+            db,
+            actor_user_id=user["id"],
+            account=acct,
+            operation="triage_preview",
+            outcome="success",
+        )
         return "ok", {}
 
     kind, payload = await db_call(_preview_gate_db_work)
@@ -595,8 +642,10 @@ async def triage_preview(request: Request, user: RequireUserFragment):
         )
     except Exception as e:
         return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
-            f'<p>Provider error: {type(e).__name__}: {e}</p></article>'
+            error_article(
+                scrub_class_error_for_persist(e),
+                heading='Provider error',
+            )
         )
 
     PREVIEW_LIMIT = 20
@@ -618,8 +667,11 @@ async def triage_preview(request: Request, user: RequireUserFragment):
                 try:
                     if msg.date:
                         row["date_iso"] = msg.date.isoformat()
-                except Exception:
-                    pass
+                except Exception as date_exc:
+                    _log.warning(
+                        "Preview row date not ISO-formatted; date left blank",
+                        message_id=msg_id, error=fmt_exc(date_exc),
+                    )
                 rows.append(row)
             except Exception as fe:
                 rows.append({
@@ -627,12 +679,15 @@ async def triage_preview(request: Request, user: RequireUserFragment):
                     "subject": str(fe), "date_iso": "",
                 })
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        err = scrub_class_error_for_persist(e)
     finally:
         try:
             await provider.close()
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            _log.debug(
+                "provider/probe close failed (best-effort teardown)",
+                error=fmt_exc(_swallow_exc),
+            )
 
     return await _render(templates, request, "triage/_preview.html", {
         "rows": rows,
@@ -667,8 +722,12 @@ async def triage_jobs_index(request: Request, user: RequireUser):
     templates = get_templates(request)
 
     from email_triage.web.db import (
-        list_email_accounts, list_triage_jobs,
+        list_email_accounts, list_triage_jobs, count_triage_jobs,
     )
+    from email_triage.web._pagination import page_window, clamp_offset
+
+    JOBS_CAP = _JOBS_CAP
+    raw_offset = request.query_params.get("offset")
 
     def _jobs_index_reads(db, user_id):
         # Pull all accounts the user owns / delegates so we can
@@ -677,14 +736,22 @@ async def triage_jobs_index(request: Request, user: RequireUser):
         accts = list_email_accounts(db, user_id=user_id)
         acct_ids = {int(a["id"]) for a in accts}
         accts_by_id = {int(a["id"]): a for a in accts}
-        # No per-user filter on triage_jobs today; we filter
-        # client-side via the account_id set above. 50 is the cap;
-        # paging not implemented (no operator pressure yet).
-        jobs = list_triage_jobs(db, limit=50)
-        jobs = [j for j in jobs if int(j["account_id"]) in acct_ids]
-        return jobs, accts_by_id
+        #  — push the account scope INTO the query so the cap applies
+        # AFTER the per-user filter (a user's own jobs were vanishing
+        # behind other users' newer ones).  reachability — page via
+        # ?offset= so the full history past the cap is reachable. Active
+        # jobs are the newest, so they always sit on page 1.
+        total = count_triage_jobs(db, account_ids=acct_ids)
+        off = clamp_offset(raw_offset, JOBS_CAP, total)
+        jobs = list_triage_jobs(
+            db, account_ids=acct_ids, limit=JOBS_CAP, offset=off,
+        )
+        win = page_window(
+            total=total, offset=off, limit=JOBS_CAP, shown=len(jobs),
+        )
+        return jobs, accts_by_id, win
 
-    jobs, accts_by_id = await db_call(
+    jobs, accts_by_id, jobs_win = await db_call(
         _jobs_index_reads, db, user.get("id"),
     )
 
@@ -698,8 +765,42 @@ async def triage_jobs_index(request: Request, user: RequireUser):
         "user": user,
         "active_jobs": active,
         "done_jobs": done,
+        "jobs_win": jobs_win,
         "accts_by_id": accts_by_id,
     })
+
+
+# NOTE: this STATIC path must be registered BEFORE ``/triage/jobs/{job_id}``
+# below, or Starlette matches "reindex-progress" as a job_id.
+@router.get(
+    "/triage/jobs/reindex-progress", response_class=HTMLResponse,
+)
+async def triage_reindex_aggregate_fragment(request: Request, user: RequireUser):
+    """HTMX fragment — rolled-up cross-account embedding-reindex progress.
+
+    Renders the wave (one bar + per-account rows) ONLY while a reindex is active
+    in the user's account scope; returns empty otherwise so the self-poll on the
+    fragment stops. Scoped to the user's manageable accounts — same surface the
+    jobs index uses; no cross-user leak.
+    """
+    db = get_db(request)
+    templates = get_templates(request)
+
+    from email_triage.web.db import list_email_accounts
+    from email_triage.jobs.embedding_reindex import aggregate_reindex_progress
+
+    def _reads(db, user_id):
+        accts = list_email_accounts(db, user_id=user_id)
+        acct_ids = {int(a["id"]) for a in accts}
+        accts_by_id = {int(a["id"]): a for a in accts}
+        agg = aggregate_reindex_progress(db, account_ids=acct_ids)
+        return agg, accts_by_id
+
+    agg, accts_by_id = await db_call(_reads, db, user.get("id"))
+    return await _render(
+        templates, request, "triage/_reindex_aggregate.html",
+        {"user": user, "agg": agg, "accts_by_id": accts_by_id},
+    )
 
 
 @router.get(
@@ -880,7 +981,7 @@ async def discover_folders(request: Request, user: RequireUserFragment):
     db = get_db(request)
     secrets = get_secrets(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     account_id = _safe_int(request.query_params.get("account_id"), 0)
 
@@ -907,11 +1008,12 @@ async def discover_folders(request: Request, user: RequireUserFragment):
         provider = await db_call(
             _create_provider_from_account, acct, secrets,
         )
-        folders = await provider.list_folders()
-        await provider.close()
+        async with probe_session(provider):
+            folders = await render_probe(provider, account_id=account_id)
     except Exception as e:
         return await _render(templates, request, "triage/_discover_folders.html", {
-            "folders": [], "visible": set(), "error": f"Could not load folders: {e}",
+            "folders": [], "visible": set(),
+            "error": f"Could not load folders: {scrub_exc(e, purpose='provider')}",  # N-179 R21_2
         })
 
     # Default checkboxes to the visible (included) folders from the routes
@@ -926,6 +1028,54 @@ async def discover_folders(request: Request, user: RequireUserFragment):
     })
 
 
+def _redact_folders_if_hipaa(
+    msg: str, folders: list[str], *, account_hipaa: bool,
+) -> str:
+    """HIPAA-redact every (relative) mailbox-folder name from an already-
+    scrubbed, operator-facing error string (run18 #3 — §164.502(b) minimum-
+    necessary / §164.514(d)(1)).
+
+    THE one folder-redaction idiom (PD#5/#1) — shared by the per-folder funnel
+    :func:`_scrub_folder_scan_error` AND the ``discover_run`` OUTER ``except``,
+    so the two cannot drift. The scrub SSOT
+    (:func:`email_triage._errfmt.scrub_error_for_persist` → ``redact_exc``)
+    strips address- and PATH-shaped PHI, but a *relative* IMAP mailbox name
+    ("INBOX.Smith-Labs") is NOT path-shaped, so it provably escapes the scrubber
+    (the N-42 documented residual). On a HIPAA account we therefore redact each
+    folder string wherever it survives in the (already-scrubbed) message —
+    mirroring the sender/subject HIPAA redaction already in ``discover_run``.
+    Non-HIPAA accounts keep readable folder names (fail-closed only for HIPAA);
+    the address/path/secret scrub already ran UNCONDITIONALLY upstream.
+
+    Each ``f`` truthiness guard avoids the empty-string ``replace`` trap
+    (``"".replace("", x)`` would splice ``[redacted]`` between every char)."""
+    if account_hipaa:
+        for f in folders:
+            if f:
+                msg = msg.replace(f, REDACTED_PLACEHOLDER)  # N-217c R23
+    return msg
+
+
+def _scrub_folder_scan_error(
+    prefix: str, folder: str, exc: BaseException, *, account_hipaa: bool,
+) -> str:
+    """Build a scrubbed, operator-facing folder-scan error for the discover
+    ``errors`` list (run18 #3 — §164.502(b) minimum-necessary / §164.514(d)(1)).
+
+    ONE funnel for BOTH discover folder-scan error sites (peek + select) so the
+    two cannot drift (PD#5). The exception text routes through the scrub SSOT
+    (:func:`email_triage._errfmt.scrub_error_for_persist`) — identical to the
+    sibling ``triage_preview`` — which strips PHI-shaped substrings (email
+    addresses, filesystem/mailbox PATHS) AND token-shaped secrets; the relative
+    MAILBOX FOLDER NAME (a patient-named "INBOX.Smith-Labs") then routes through
+    the shared :func:`_redact_folders_if_hipaa` HIPAA leg (the N-42 residual the
+    scrub SSOT can't catch — both the explicit interpolation AND any echo inside
+    the exception text). Non-HIPAA accounts keep the readable folder name
+    (fail-closed only for HIPAA, per the sibling)."""
+    msg = scrub_error_for_persist(f"{prefix} {folder}: {exc}") or ""
+    return _redact_folders_if_hipaa(msg, [folder], account_hipaa=account_hipaa)
+
+
 @router.post("/triage/discover/run", response_class=HTMLResponse)
 async def discover_run(request: Request, user: RequireUserFragment):
     """Execute a category discovery scan on the selected account."""
@@ -933,7 +1083,7 @@ async def discover_run(request: Request, user: RequireUserFragment):
     secrets = get_secrets(request)
     config = get_config(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     form = await request.form()
     account_id = _safe_int(form.get("account_id"), 0)
@@ -959,20 +1109,34 @@ async def discover_run(request: Request, user: RequireUserFragment):
             return None, False, None
         if not can_manage_account(db, user, acct_):
             return acct_, False, None
-        # HIPAA access-audit event (§164.312(b)).
+        # HIPAA access-audit event (§164.312(b)). N-80: owner-self is EXEMPT
+        # (§164.502(a) self-disclosure carve-out) — gate through the PD#14
+        # predicate SSOT so discover matches the consolidated bookend
+        # (audit_phi_access) + the other start→finalise bracket sites
+        # (run_triage / topic_backscan / triage_runner_bulk). Before this,
+        # discover audited on is_account_hipaa ALONE → an owner discovering
+        # their OWN HIPAA mailbox over-audited (fail-safe, but divergent).
         audit_id: int | None = None
-        if is_account_hipaa(acct_):
+        from email_triage.db.audit import phi_access_audit_required
+        if phi_access_audit_required(
+            account_hipaa=is_account_hipaa(acct_),
+            actor_user_id=user["id"],
+            owner_id=acct_.get("user_id"),
+        ):
             from email_triage.web.db import record_hipaa_access_event
-            try:
-                audit_id = record_hipaa_access_event(
+            from email_triage.web._audit import safe_audit_write
+            audit_id = safe_audit_write(
+                lambda: record_hipaa_access_event(
                     db, user["id"], account_id, "discover",
                     outcome="in_progress",
-                )
-            except Exception as e:
-                _log.warning(
-                    "Failed to record HIPAA access event",
-                    error=fmt_exc(e),
-                )
+                ),
+                description=(
+                    f"discover hipaa_access in_progress "
+                    f"account_id={account_id} user_id={user['id']}"
+                ),
+                table="hipaa_access_events",
+                emitter="record_hipaa_access_event",
+            )
         return acct_, True, audit_id
 
     acct, _can_manage, _audit_event_id = await db_call(
@@ -1003,9 +1167,13 @@ async def discover_run(request: Request, user: RequireUserFragment):
         folders: list[str] | None = None,
     ) -> None:
         def _work() -> None:
-            try:
-                from email_triage.web.db import record_discover_run
-                record_discover_run(
+            from email_triage.web.db import record_discover_run
+            from email_triage.web._audit import safe_audit_write
+            # run18 #2 — route the best-effort discover-run audit through the
+            # SSOT (never-raise + uniform audit_write_failed WARNING for
+            # /health drift), not a hand-rolled swallowing try/except.
+            safe_audit_write(
+                lambda: record_discover_run(
                     db,
                     account_id=account_id,
                     account_name=acct.get("name", ""),
@@ -1014,12 +1182,12 @@ async def discover_run(request: Request, user: RequireUserFragment):
                     errors_count=err_count,
                     folders=folders or [],
                     elapsed_secs=elapsed,
-                )
-            except Exception as audit_err:
-                _log.warning(
-                    "Failed to record discover_run audit",
-                    error=str(audit_err),
-                )
+                ),
+                description=(
+                    f"discover_run account={account_id} "
+                    f"scanned={scanned} errors={err_count}"
+                ),
+            )
 
         await db_call(_work)
 
@@ -1045,8 +1213,7 @@ async def discover_run(request: Request, user: RequireUserFragment):
         )
         await _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
         return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
-            f'<p>Provider error: {e}</p></article>'
+            error_article(e, heading='Provider error')
         )
 
     try:
@@ -1057,9 +1224,35 @@ async def discover_run(request: Request, user: RequireUserFragment):
         )
         await _record_discover_audit(scanned=0, err_count=1, elapsed=0.0)
         return HTMLResponse(
-            f'<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;">'
-            f'<p>Classifier error: {e}</p></article>'
+            error_article(e, heading='Classifier error')
         )
+
+    # N-113 — HIPAA + BAA egress gate (§164.308(b)(1), shared SSOT). discover
+    # scans the account's mail and completes it on `classifier` (the
+    # classifier.complete() calls below); for a HIPAA account on an external
+    # non-BAA'd classifier that PHI must NOT egress. Refuse BEFORE any complete()
+    # — fail closed (audit "blocked" + a clear UI error). No-op for the common
+    # local / BAA-acked classifier (baa_block_status → None). (audit alone is NOT
+    # a gate — the N-113 lesson.)
+    if isinstance(acct, dict) and is_account_hipaa(acct):
+        from email_triage.ai_backends.base import BackendBAARequiredError
+        from email_triage.classify.baa_gate import baa_block_status
+        _baa_blk = await db_call(baa_block_status, db, classifier, True)
+        if _baa_blk is not None:
+            await _update_discover_hipaa_audit(
+                "blocked",
+                f"baa_gate: backend={_baa_blk['backend']} host={_baa_blk['host']}",
+            )
+            await _record_discover_audit(scanned=0, err_count=0, elapsed=0.0)
+            return HTMLResponse(error_article(
+                BackendBAARequiredError(
+                    "HIPAA account: the configured classifier "
+                    f"({_baa_blk['backend']} @ {_baa_blk['host'] or '?'}) is not "
+                    "BAA-acked — discover skipped (no PHI egress). Acknowledge a "
+                    "BAA on /config or switch to a local Ollama."
+                ),
+                heading='BAA required',
+            ))
 
     # Get existing categories for comparison (account-scoped when an
     # account is bound to this discovery run, else user-scoped).
@@ -1076,23 +1269,39 @@ async def discover_run(request: Request, user: RequireUserFragment):
     raw_results = []
     errors = []
     t0 = time.time()
+    # run18 #3 (§164.502(b)) — resolve the HIPAA flag ONCE up front so every
+    # folder-scan error built into `errors` below can redact a patient-named
+    # mailbox folder out of the operator-facing page (the scrub SSOT can't
+    # catch a *relative* mailbox name — the N-42 residual). is_account_hipaa
+    # is already imported in this function scope (above).
+    _account_hipaa = is_account_hipaa(acct)
 
-    # Determine which folders to scan.
-    folders_to_scan: list[str] = ["INBOX"]  # Default.
-    if scan_scope == "all":
-        try:
-            all_folders = await provider.list_folders()
-            folders_to_scan = all_folders if all_folders else ["INBOX"]
-        except Exception as e:
-            _log.warning("Could not list folders, falling back to INBOX", error=fmt_exc(e))
-            errors.append(f"Could not list folders ({e}), scanning INBOX only.")
-    elif scan_scope == "selected" and selected_folders:
-        folders_to_scan = selected_folders
-
-    multi_folder = len(folders_to_scan) > 1
-    can_peek = hasattr(provider, "peek_recent_uids") and hasattr(provider, "select_folder")
-
+    # Punch 694: the folder probe sits INSIDE the try whose finally owns the provider's close,
+    # so a probe that dies outside ``Exception`` still releases the session.
     try:
+        # Determine which folders to scan.
+        folders_to_scan: list[str] = ["INBOX"]  # Default.
+        if scan_scope == "all":
+            try:
+                # Punch 693: a scan the user started gets the provider's own 10 s budget, not
+                # the 3 s page-render bound (a slow server showed the INBOX-only fallback as
+                # an error on a scan the user asked for).
+                all_folders = await render_probe(
+                    provider, account_id=account_id,
+                    timeout_s=USER_SCAN_PROBE_TIMEOUT_S,
+                )
+                folders_to_scan = all_folders if all_folders else ["INBOX"]
+            except Exception as e:
+                _log.warning("Could not list folders, falling back to INBOX", error=fmt_exc(e))
+                errors.append(scrub_error_for_persist(
+                    f"Could not list folders ({e}), scanning INBOX only."
+                ))
+        elif scan_scope == "selected" and selected_folders:
+            folders_to_scan = selected_folders
+
+        multi_folder = len(folders_to_scan) > 1
+        can_peek = hasattr(provider, "peek_recent_uids") and hasattr(provider, "select_folder")
+
         # ── Build the list of (folder, uid) to classify ──
         # For multi-folder scans with IMAP: peek dates from each folder
         # (lightweight UID + INTERNALDATE fetch), pool them, pick the
@@ -1127,7 +1336,10 @@ async def discover_run(request: Request, user: RequireUserFragment):
                         candidates.append((folder, uid, dt))
                 except Exception as e:
                     _log.warning("Discover peek failed", folder=folder, error=fmt_exc(e))
-                    errors.append(f"Could not peek {folder}: {e}")
+                    errors.append(_scrub_folder_scan_error(
+                        "Could not peek", folder, e,
+                        account_hipaa=_account_hipaa,
+                    ))
                     continue
 
             # Sort by date descending, pick the newest `limit`.
@@ -1190,8 +1402,6 @@ async def discover_run(request: Request, user: RequireUserFragment):
         for folder, uid in targets:
             by_folder[folder].append(uid)
 
-        from email_triage.triage_logging import is_account_hipaa
-        _account_hipaa = is_account_hipaa(acct)
         current_folder = None
         for folder, uids in by_folder.items():
             if can_peek and folder != current_folder:
@@ -1200,7 +1410,10 @@ async def discover_run(request: Request, user: RequireUserFragment):
                     current_folder = folder
                 except Exception as e:
                     _log.warning("Discover: could not select folder", folder=folder, error=fmt_exc(e))
-                    errors.append(f"Error selecting {folder}: {e}")
+                    errors.append(_scrub_folder_scan_error(
+                        "Error selecting", folder, e,
+                        account_hipaa=_account_hipaa,
+                    ))
                     continue
 
             for msg_id in uids:
@@ -1234,11 +1447,11 @@ async def discover_run(request: Request, user: RequireUserFragment):
                     # classifier's free-form output — same PHI risk as
                     # the triage classifier's `reason` field.
                     raw_results.append({
-                        "sender": "[redacted]" if _account_hipaa else message.sender,
-                        "subject": "[redacted]" if _account_hipaa else message.subject,
+                        "sender": REDACTED_PLACEHOLDER if _account_hipaa else message.sender,
+                        "subject": REDACTED_PLACEHOLDER if _account_hipaa else message.subject,
                         "raw_category": parsed.get("category", "unknown"),
                         "raw_description": (
-                            "[redacted]" if _account_hipaa
+                            REDACTED_PLACEHOLDER if _account_hipaa
                             else parsed.get("description", "")
                         ),
                         "folder": folder,
@@ -1251,7 +1464,19 @@ async def discover_run(request: Request, user: RequireUserFragment):
                     continue
 
     except Exception as e:
-        errors.append(str(e))
+        # run18 #3 (DA, §164.502(b)) — the single-folder ``select_folder`` (:~1293)
+        # and the unguarded ``provider.search`` (:~1307) bubble HERE carrying the
+        # relative mailbox name, which the scrub SSOT can't catch (the N-42
+        # residual). Redact EVERY scanned folder on a HIPAA account so a patient-
+        # named folder can't reach the operator page — the SAME §164.502(b)
+        # control the peek/select funnel sites already apply, closing the CLASS
+        # (PD#1) rather than the two redacted sites + one un-redacted (PD#5).
+        msg = scrub_error_for_persist(e) or ""
+        errors.append(
+            _redact_folders_if_hipaa(
+                msg, folders_to_scan, account_hipaa=_account_hipaa,
+            )
+        )
         _log.error("Discover scan error", error=fmt_exc(e))
     finally:
         try:
@@ -1275,15 +1500,19 @@ async def discover_run(request: Request, user: RequireUserFragment):
             def _finalize_hipaa_audit() -> None:
                 """/ — finalize the HIPAA row off the loop."""
                 from email_triage.web.db import update_hipaa_access_event
-                try:
-                    update_hipaa_access_event(
+                from email_triage.web._audit import safe_audit_write
+                # Allow-list step 2 (B1): the finalise routes through the SSOT.
+                safe_audit_write(
+                    lambda: update_hipaa_access_event(
                         db, _audit_event_id, outcome, detail,
-                    )
-                except Exception as e:
-                    _log.warning(
-                        "Failed to finalize HIPAA access event",
-                        error=fmt_exc(e),
-                    )
+                    ),
+                    description=(
+                        f"classify_preview_finalise "
+                        f"audit_event_id={_audit_event_id} outcome={outcome}"
+                    ),
+                    table="hipaa_access_events",
+                    emitter="update_hipaa_access_event",
+                )
 
             await db_call(_finalize_hipaa_audit)
 
@@ -1325,7 +1554,7 @@ async def discover_run(request: Request, user: RequireUserFragment):
                 if not consolidated:
                     consolidated = [parsed_consolidated]
         except Exception as e:
-            errors.append(f"Consolidation failed: {e}")
+            errors.append(scrub_error_for_persist(f"Consolidation failed: {e}"))
             _log.error("Discover consolidation error", error=fmt_exc(e))
 
     # Ensure consolidated entries have expected keys.

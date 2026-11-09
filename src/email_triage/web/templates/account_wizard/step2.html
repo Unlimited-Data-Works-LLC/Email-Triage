@@ -42,14 +42,21 @@
     <div class="grid">
         <label>
             Mail server (host){{ m.help("The hostname your mail provider gave you. Example: imap.gmail.com, outlook.office365.com, mail.fastmail.com. Look in your provider's 'IMAP settings' help page if you're not sure.") }}
-            <input type="text" name="host" required
-                   value="{{ acct.config.get('host', '') }}"
-                   placeholder="e.g. imap.example.com">
+            {{ m.combo_input(
+                "host",
+                acct.config.get('host', ''),
+                ["imap.gmail.com", "outlook.office365.com", "mail.fastmail.com", "imap.aol.com", "imap.mail.yahoo.com"],
+                placeholder="e.g. imap.example.com",
+                attrs="required") }}
         </label>
         <label>
             Port{{ m.help("The number your mail provider gave you. 993 is the standard secure port — leave it as-is unless your provider's docs say otherwise.") }}
-            <input type="number" name="port" min="1" max="65535"
-                   value="{{ acct.config.get('port', 993) }}">
+            {{ m.combo_input(
+                "port",
+                acct.config.get('port', 993),
+                ["993", "143"],
+                type="number",
+                attrs="min=1 max=65535") }}
             <small>993 is the usual default.</small>
         </label>
     </div>
@@ -62,8 +69,7 @@
         </label>
         <label>
             Password{{ m.help("Your mailbox password. For Gmail or Outlook over IMAP this often needs to be an 'app password' — your provider's help page will say so.") }}
-            <input type="password" name="password" required
-                   placeholder="••••••••">
+            {{ m.secret_input("password", false, "••••••••", "required", readonly=false) }}
             <small>Stored encrypted; never sent anywhere except your mail server.</small>
         </label>
     </div>

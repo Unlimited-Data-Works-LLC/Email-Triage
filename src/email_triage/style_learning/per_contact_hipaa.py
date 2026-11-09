@@ -78,16 +78,23 @@ overlay does NOT pause the account-level descriptor or other contacts.
 
 from __future__ import annotations
 
+from email_triage._errfmt import fmt_exc
+from email_triage.secrets import read_secret
+
 import hashlib
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+
+from email_triage._int_utils import parse_int_or_none  # N-219c/11 R23
+from email_triage._isotime import to_utc_iso, now_utc_iso, parse_iso, parse_iso_aware  # N-203 R22 + N-283 R29 + N-357b R31
 from typing import Any, Iterable
 
 from email_triage.ai_backends import (
     BackendAdapter,
+    BackendBAARequiredError,
     BackendError,
     load_backend,
 )
@@ -95,6 +102,7 @@ from email_triage.engine.models import EmailMessage
 from email_triage.style_learning.distill_hipaa import (
     DESCRIPTOR_VERSION,
     DISTILL_JSON_SCHEMA,
+    OUTCOME_BAA_REQUIRED,
     OUTCOME_BACKEND_FAIL,
     OUTCOME_CADENCE_SKIP,
     OUTCOME_DISABLED,
@@ -113,6 +121,7 @@ from email_triage.style_learning.phi_scrubber import (
     ScrubResult,
     scrub_descriptor,
 )
+from email_triage.mail_headers import canonical_email
 from email_triage.triage_logging import is_account_hipaa
 from email_triage.web.db import (
     HIPAA_PER_CONTACT_FRESHNESS_DAYS,
@@ -128,8 +137,13 @@ from email_triage.web.db import (
     record_style_distill_event,
     set_per_contact_style_hipaa,
 )
+# run18 #2 — route the best-effort §164.502(e) egress-accounting emits through
+# the audit-write SSOT (sync + async-seam siblings): run it, never raise, log a
+# uniform audit_write_failed WARNING (/health drift) on failure.
+from email_triage.web._audit import safe_audit_write, safe_audit_write_async
 
-log = logging.getLogger("email_triage.style_learning.per_contact_hipaa")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.style_learning.per_contact_hipaa")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +190,7 @@ def get_or_init_recipient_salt(secrets: Any) -> bytes:
         )
 
     try:
-        existing = secrets.get(HIPAA_RECIPIENT_SALT_SECRET_KEY)
+        existing = read_secret(secrets, HIPAA_RECIPIENT_SALT_SECRET_KEY)
     except Exception as exc:
         raise SaltUnavailableError(
             f"failed to read style-salt: {type(exc).__name__}"
@@ -208,8 +222,61 @@ def get_or_init_recipient_salt(secrets: Any) -> bytes:
     return salt
 
 
+# N-346c (2026-07-08) — dual-lookup shim (WAITING-ON-OP default LANDED).
+# Hash-shape enum: which pre-image normalization to use before HMAC.
+#
+# 'legacy'   — bare.strip().lower(); the pre-image shape every persisted
+#              row currently uses. Preserves the current hash of every
+#              existing recipient row; no orphaning class.
+# 'canonical' — canonical_email(recipient_address); adds IDNA domain
+#              normalization (München → xn--mnchen-3ya) on top of
+#              strip().lower(). For all-ASCII installs (the common case)
+#              this yields the SAME hash as 'legacy'; for IDN addresses
+#              it differs — a person whose envelope arrives as an
+#              A-label variant will hash-match a U-label persisted row.
+#
+# The migration story (§164.316(b)(2)(i) documentation-integrity): every
+# WRITE stays 'legacy' at v0.2.0 (no orphaning risk). Every READ tries
+# BOTH shapes via `hash_recipient_for_install_all_shapes()` — the
+# canonical-shape probe is a no-op cost for ASCII installs and closes the
+# IDN-envelope collision class for IDN installs, without touching any
+# persisted row. Flipping WRITE to 'canonical' later is a one-line
+# operator decision when he chooses to migrate; existing rows stay
+# addressable via the same dual-lookup shim. This is the "MOST-COMPLETE
+# / MOST-FUTURE-PROOF" shape the WAITING-ON-OP default named.
+_HASH_SHAPES: tuple[str, ...] = ("canonical", "legacy")
+
+
+def _normalize_recipient_for_hash(
+    recipient_address: str, shape: str,
+) -> str:
+    """N-346c pre-image normalizer per shape. Extracted so a single
+    functional-testable helper covers the difference between the two
+    shapes; the HMAC construction downstream is identical.
+    """
+    from email_triage.mail_headers import _extract_addr
+    bare = _extract_addr(recipient_address)
+    if not bare or "@" not in bare:
+        raise ValueError(
+            "recipient_address did not parse to a bare local@host"
+        )
+    if shape == "canonical":
+        # Re-use the canonical_email SSOT (§4.312(a)(1) allow-list gate
+        # already routes through it) — the shared truth for
+        # display-name-strip + strip().lower() + IDNA encode. Import
+        # lives at module scope (hoisted at the backlog  fold).
+        canonical = canonical_email(recipient_address)
+        # canonical_email may return "" on an unparseable domain; on that
+        # path, fall back to the bare form so the caller doesn't hash the
+        # empty string (which would collide across bad inputs).
+        return canonical or bare.strip().lower()
+    if shape == "legacy":
+        return bare.strip().lower()
+    raise ValueError(f"unknown hash shape: {shape!r}")
+
+
 def hash_recipient_for_install(
-    recipient_address: str, *, secrets: Any,
+    recipient_address: str, *, secrets: Any, shape: str = "legacy",
 ) -> str:
     """Return the install-stable salted-SHA-256 hash of an address.
 
@@ -225,6 +292,15 @@ def hash_recipient_for_install(
 
     Returns a 64-char lowercase hex string.
 
+    N-346c (2026-07-08): the ``shape`` kwarg selects the pre-image
+    normalization. ``'legacy'`` (default) is ``bare.strip().lower()`` —
+    the pre-image every persisted row currently uses; safe for WRITE
+    callers. ``'canonical'`` adds ``canonical_email()``'s IDNA domain
+    normalization; use it for a FUTURE migration where existing rows
+    are backfilled or the operator has opted into the canonical shape.
+    READ callers should use :func:`hash_recipient_for_install_all_shapes`
+    which returns every shape's hash for a dual-lookup probe.
+
     Raises
     ------
     ValueError
@@ -235,16 +311,7 @@ def hash_recipient_for_install(
     if not recipient_address or not isinstance(recipient_address, str):
         raise ValueError("recipient_address must be a non-empty string")
 
-    # Lazy import — avoid a hard dep on mail_headers at module import
-    # time of style_learning.
-    from email_triage.mail_headers import _extract_addr
-
-    bare = _extract_addr(recipient_address)
-    if not bare or "@" not in bare:
-        raise ValueError(
-            "recipient_address did not parse to a bare local@host"
-        )
-    normalised = bare.strip().lower()
+    normalised = _normalize_recipient_for_hash(recipient_address, shape)
 
     salt = get_or_init_recipient_salt(secrets)
     # NIST guidance: HMAC-SHA-256 is a stronger construction than
@@ -256,6 +323,54 @@ def hash_recipient_for_install(
         salt, normalised.encode("utf-8"), hashlib.sha256,
     ).hexdigest()
     return digest
+
+
+def hash_recipient_for_install_all_shapes(
+    recipient_address: str, *, secrets: Any,
+) -> list[str]:
+    """N-346c dual-lookup SSOT — return the hash under EVERY known shape.
+
+    Callers doing a READ (looking up an existing row by address) SHOULD
+    route through this — try each hash in order until one matches. For
+    ASCII installs both shapes hash-collide so the list is effectively
+    one item's cost; for IDN installs the canonical-shape probe closes
+    the A-label / U-label envelope collision class without touching any
+    persisted row.
+
+    Order: ``'canonical'`` first (the future-target shape) then
+    ``'legacy'`` (the currently-persisted shape). Both are deterministic;
+    a caller that hits a match on the canonical probe MAY choose to
+    incrementally rewrite the row's hash on the next natural
+    persistence event, migrating without a downtime backfill window.
+
+    Duplicates ARE de-duplicated (order-preserving) — the ASCII fast-
+    path collides both shapes to the same hash, so returning a 2-element
+    list would issue two identical DB round-trips per lookup. `dict`-
+    based dedup keeps Python 3.7+ insertion order (canonical first). The
+    correctness contract is unchanged — every declared shape's hash is
+    still covered — and the hot READ path avoids the redundant probe
+    (db-sme H2 fold at N-346c SME panel 2026-07-08).
+
+    Raises
+    ------
+    ValueError
+        ``recipient_address`` is empty or unparseable as an address.
+    SaltUnavailableError
+        no install salt is available.
+    """
+    hashes = [
+        hash_recipient_for_install(
+            recipient_address, secrets=secrets, shape=s,
+        )
+        for s in _HASH_SHAPES
+    ]
+    # N-346c db-sme H2 fold — dedup collapsed shapes on the ASCII fast-
+    # path via `dict.fromkeys` (order-preserving in Python 3.7+, canonical
+    # first). Correctness is unchanged: every declared shape's hash is
+    # still covered by the returned list; the hot READ path avoids the
+    # 50% redundant DB round-trip on ASCII installs. IDN installs (rare)
+    # still see 2 distinct hashes as expected.
+    return list(dict.fromkeys(hashes))
 
 
 def hash_message_id_for_install(
@@ -376,12 +491,10 @@ def _is_within_per_contact_cadence(
     rebuilt_at = row.get("last_distilled_at")
     if not rebuilt_at:
         return False
-    try:
-        ts = datetime.fromisoformat(rebuilt_at)
-    except ValueError:
+    # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+    ts = parse_iso_aware(rebuilt_at)
+    if ts is None:
         return False
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     age = now - ts
     interval = timedelta(
@@ -453,8 +566,10 @@ async def distill_hipaa_per_contact(
         # function is wired onto an event-loop task the write must hop
         # to the threadpool. db_call is the canonical dispatch helper.
         from email_triage.web.db_threadpool import db_call
-        try:
-            await db_call(
+        # run18 #2 — route through the SSOT (never-raise + uniform
+        # audit_write_failed WARNING for /health drift), not a swallowing try.
+        await safe_audit_write_async(
+            lambda: db_call(
                 record_style_distill_event,
                 db_conn,
                 account_id=account_id,
@@ -467,9 +582,12 @@ async def distill_hipaa_per_contact(
                 error_class="SaltUnavailableError",
                 kind="per_contact",
                 recipient_hash=None,
-            )
-        except Exception:
-            log.exception("audit row failed for SaltUnavailableError")
+            ),
+            description=(
+                f"per_contact_style_distill account={account_id} "
+                f"outcome={OUTCOME_BACKEND_FAIL}"
+            ),
+        )
         return result
     except ValueError as exc:
         result = PerContactDistillResult(
@@ -550,7 +668,31 @@ async def distill_hipaa_per_contact(
             db_conn=db_conn,
             secrets=secrets,
             config=config,
+            # Census N-63 — HIPAA per-contact distill: demand a BAA-certified,
+            # non-expired backend at the load chokepoint (§164.502(a)(1)).
+            require_baa_certified=is_account_hipaa(account_dict),
         )
+    except BackendBAARequiredError as exc:
+        # BAA lapsed/de-certified after selection — refuse + audit the BAA
+        # cause; no backoff retry (won't self-heal). PAUSE any pre-existing due
+        # per-contact row so a retry worker could not re-select + re-fire it in
+        # a tight loop (db-sme PD#18) — no such worker exists at HEAD (N-474),
+        # so this is a guard for a future one; pause parks a row if none exists.
+        # No PHI egressed (gate precedes any chat_complete).
+        result.status = OUTCOME_BAA_REQUIRED
+        result.backend_id = backend_id
+        result.error_class = type(exc).__name__
+        await db_call(
+            pause_style_distill_contact,
+            db_conn,
+            account_id=account_id,
+            recipient_hash=recipient_hash,
+            last_error=f"baa_required:{result.error_class}",
+        )
+        await db_call(
+            _audit_per_contact, db_conn, account_id, actor_user_id, result,
+        )
+        return result
     except BackendError as exc:
         result.status = OUTCOME_BACKEND_FAIL
         result.backend_id = backend_id
@@ -616,8 +758,11 @@ async def distill_hipaa_per_contact(
         )
         try:
             await adapter.close()
-        except Exception:
-            pass
+        except Exception as close_exc:
+            log.warning(
+                "per_contact_hipaa: adapter close failed on backend-fail path",
+                error=fmt_exc(close_exc),
+            )
         return result
     finally:
         prompt = ""
@@ -626,8 +771,11 @@ async def distill_hipaa_per_contact(
 
     try:
         await adapter.close()
-    except Exception:
-        pass
+    except Exception as close_exc:
+        log.warning(
+            "per_contact_hipaa: adapter close failed after chat_complete",
+            error=fmt_exc(close_exc),
+        )
 
     # ---- Parse + scrub -------------------------------------------------
 
@@ -740,8 +888,10 @@ def _audit_per_contact(
     else:
         layer3 = scrub.layer3_entity_count
         degraded = False
-    try:
-        record_style_distill_event(
+    # Never let an audit-row failure bubble up; the SSOT logs a uniform
+    # audit_write_failed WARNING (/health drift) on failure (run18 #2).
+    safe_audit_write(
+        lambda: record_style_distill_event(
             conn,
             account_id=account_id,
             actor_user_id=actor_user_id,
@@ -757,14 +907,142 @@ def _audit_per_contact(
             error_class=result.error_class,
             kind="per_contact",
             recipient_hash=result.recipient_hash or None,
-        )
-    except Exception:
-        log.exception("per_contact distill: audit-row write failed")
+        ),
+        description=(
+            f"per_contact_style_distill account={account_id} "
+            f"outcome={result.status}"
+        ),
+    )
+    # N-241b R31 (2026-07-07 census r24 close-out — mirror sibling in
+    # ``distill_hipaa._audit_and_return``): on any TERMINAL per-contact
+    # outcome, clear the pre-existing ``style_distill_contact_queue``
+    # row so a leftover retry doesn't re-fire the same terminal path
+    # forever. Same set-selection rationale as the account-scope
+    # sibling — CADENCE_SKIP re-fires, BACKEND_FAIL uses its retry
+    # queue, BAA_REQUIRED calls the pause helper.
+    #
+    # Guard on ``result.recipient_hash`` truthiness: the salt-unavailable
+    # and bad-address early-fail leaves use ``recipient_hash=""`` as a
+    # sentinel (no valid hash yet) — those outcomes are BACKEND_FAIL
+    # (not in the terminal set), so this guard is defensive-only.
+    if (
+        result.status in _TERMINAL_OUTCOMES_PER_CONTACT
+        and result.recipient_hash
+    ):
+        try:
+            clear_style_distill_contact_queue_entry(
+                conn,
+                account_id=account_id,
+                recipient_hash=result.recipient_hash,
+            )
+        except Exception as _n241b_e:
+            # Mirror N-304 R30 (silent-swallow → debug) on the account-
+            # sibling: a transient DB error on terminal-outcome clear
+            # silently persists the row → a retry worker (none exists at
+            # HEAD — N-474) would re-select it and re-fire the terminal
+            # path forever, defeating the
+            # N-241b fix. Log at debug so /health isn't spammed but
+            # forensics can find the miss on next incident.
+            log.debug(
+                "style_distill_contact_queue clear failed on terminal outcome",
+                account_id=account_id,
+                outcome=result.status,
+                error=type(_n241b_e).__name__,
+            )
+
+
+# N-241b R31 (2026-07-07 census r24 close-out): outcomes that end the
+# per-contact queue entry's life. Mirrors the sibling
+# ``distill_hipaa._TERMINAL_OUTCOMES``. NOT the transient outcomes
+# (CADENCE_SKIP is expected to re-fire; BACKEND_FAIL uses its own
+# retry queue; BAA_REQUIRED calls pause_style_distill_account). Kept
+# as a separate frozenset (not an import from sibling) so a future
+# per-contact-only extension (e.g. treating a specific salt/address
+# failure as terminal after N attempts) doesn't have to widen the
+# sibling.
+# SCRUBBED_PARTIAL is intentionally NOT in this set: the sibling
+# ``distill_hipaa._TERMINAL_OUTCOMES`` also excludes it, and the
+# explicit success-path clear at the caller site (mirrored here at
+# line ~759 in the ``distill_hipaa_per_contact`` orchestrator body)
+# owns the SCRUBBED_PARTIAL clear. Keeps the SSOT scope 1:1 with
+# the sibling.
+_TERMINAL_OUTCOMES_PER_CONTACT = frozenset({
+    OUTCOME_SUCCESS,
+    OUTCOME_NOT_HIPAA,
+    OUTCOME_DISABLED,
+    OUTCOME_NOT_OPTED_IN,
+    OUTCOME_NO_MESSAGES,
+})
 
 
 # ---------------------------------------------------------------------------
 # Draft-time look-up — overlay helper
 # ---------------------------------------------------------------------------
+
+def get_contact_style_overlay_with_hash(
+    conn: sqlite3.Connection,
+    *,
+    account_id: int,
+    recipient_address: str,
+    secrets: Any,
+    freshness_days: int | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    """N-346c-tail-B (hipaa-sme H1 same-commit fold per
+    `feedback_dont_over_defer`) — same contract as
+    :func:`get_contact_style_overlay` but returns the ``(descriptor,
+    matched_hash)`` tuple so the audit-trail caller can record the
+    EXACT hash under which the row was matched (§164.312(b) audit-
+    trail cross-reference). Existing callers who only need the
+    descriptor route through :func:`get_contact_style_overlay` which
+    is now a thin ``(_, tuple[0])`` wrapper — no test signature drift.
+
+    Returns ``None`` on any of the failure modes documented for
+    :func:`get_contact_style_overlay`.
+    """
+    if not recipient_address:
+        return None
+    try:
+        # N-346c dual-lookup — try every shape until a row matches. For
+        # ASCII installs both shapes collide, one probe hits; for IDN
+        # installs the canonical shape closes the A-label/U-label
+        # collision without a persisted-hash migration.
+        rhs = hash_recipient_for_install_all_shapes(
+            recipient_address, secrets=secrets,
+        )
+    except (ValueError, SaltUnavailableError):
+        return None
+
+    row = None
+    matched_hash: str | None = None
+    for rh in rhs:
+        row = get_per_contact_style_hipaa(
+            conn, account_id=account_id, recipient_hash=rh,
+        )
+        if row is not None:
+            matched_hash = rh
+            break
+    if row is None or matched_hash is None:
+        return None
+
+    # Freshness gate (identical semantics to the pre-N-346c-tail-B
+    # `get_contact_style_overlay` body — kept inline here so both entry
+    # points share ONE implementation of the freshness contract).
+    fresh = (
+        HIPAA_PER_CONTACT_FRESHNESS_DAYS
+        if freshness_days is None
+        else int(freshness_days)
+    )
+    rebuilt_at = row.get("last_distilled_at")
+    if not rebuilt_at:
+        return None
+    ts = parse_iso_aware(rebuilt_at)
+    if ts is None:
+        return None
+    age = datetime.now(timezone.utc) - ts
+    if age > timedelta(days=fresh):
+        return None
+    return dict(row.get("descriptor") or {}), matched_hash
+
 
 def get_contact_style_overlay(
     conn: sqlite3.Connection,
@@ -788,6 +1066,11 @@ def get_contact_style_overlay(
     prompt prefix). This helper is the lookup layer; the merge
     semantics live in the draft path.
 
+    N-346c-tail-B: this function is now a thin wrapper on
+    :func:`get_contact_style_overlay_with_hash` which returns the
+    matched-hash tuple for audit-trail-integrity callers. Existing
+    callers who only need the descriptor keep this signature.
+
     Failure modes (return None, never raise):
       * ``recipient_address`` empty / unparseable
       * salt unavailable
@@ -795,39 +1078,18 @@ def get_contact_style_overlay(
       * row exists but is older than ``freshness_days``
       * stored descriptor JSON is corrupt
     """
-    if not recipient_address:
-        return None
-    try:
-        rh = hash_recipient_for_install(recipient_address, secrets=secrets)
-    except (ValueError, SaltUnavailableError):
-        return None
-
-    row = get_per_contact_style_hipaa(
-        conn, account_id=account_id, recipient_hash=rh,
+    got = get_contact_style_overlay_with_hash(
+        conn,
+        account_id=account_id,
+        recipient_address=recipient_address,
+        secrets=secrets,
+        freshness_days=freshness_days,
     )
-    if row is None:
+    if got is None:
         return None
-
-    # Freshness gate.
-    fresh = (
-        HIPAA_PER_CONTACT_FRESHNESS_DAYS
-        if freshness_days is None
-        else int(freshness_days)
-    )
-    rebuilt_at = row.get("last_distilled_at")
-    if not rebuilt_at:
-        return None
-    try:
-        ts = datetime.fromisoformat(rebuilt_at)
-    except ValueError:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    age = datetime.now(timezone.utc) - ts
-    if age > timedelta(days=fresh):
-        return None
-
-    return dict(row.get("descriptor") or {})
+    # `_with_hash` already applied the freshness gate; return the
+    # descriptor (first tuple element).
+    return got[0]
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +1119,12 @@ def per_contact_gc_daily_sweep(
     )
     return {
         "removed": int(removed),
-        "swept_at": (now or datetime.now(timezone.utc)).isoformat(),
+        # N-203 R22 (2026-07-02): route through the A10 stored-ISO SSOT
+        # (`_isotime.to_utc_iso` for a supplied `now`, else `now_utc_iso()`).
+        # The pre-N-203 `(now or datetime.now(tz)).isoformat()` BoolOp shape
+        # bypassed the pin's Name/BinOp/Call/UnaryOp coverage — A10 pin has
+        # been widened to walk BoolOp too (see test_now_iso_utc_pin_a10.py).
+        "swept_at": to_utc_iso(now) if now is not None else now_utc_iso(),
         "gc_days": days,
     }
 
@@ -958,15 +1225,11 @@ def apply_contact_overlay(
         ov_val = overlay.get(field_name)
         if ov_val is None:
             continue
-        try:
-            ov_int = int(ov_val)
-        except (TypeError, ValueError):
+        ov_int = parse_int_or_none(ov_val)  # N-219c/11 R23: SSOT
+        if ov_int is None:
             continue
         base_val = merged.get(field_name)
-        try:
-            base_int = int(base_val) if base_val is not None else None
-        except (TypeError, ValueError):
-            base_int = None
+        base_int = parse_int_or_none(base_val)  # N-219c/42 R23: SSOT
         if ov_int != base_int:
             merged[field_name] = ov_int
             overridden.append(field_name)
@@ -1067,25 +1330,52 @@ def merge_overlays_for_recipients(
     cache_dict = cache if cache is not None else {}
 
     for addr in addresses_list:
-        # Per-address memoization keyed on the normalised input. The
-        # plaintext address NEVER leaves this function on the audit
-        # path; the cache key is internal-only.
-        cache_key = ("overlay", account_id, str(addr).strip().lower())
+        # the backlog  sub-finding (DA panel F1 same-drive closure —
+        # feedback_dont_over_defer): per-address memoization keyed on
+        # the CANONICAL address, not raw ``.strip().lower()``. Under
+        # display-name-wrap divergence (``"Name <a@b>"`` vs ``"a@b"``)
+        # or IDNA divergence (U-label vs A-label), the raw form would
+        # allocate TWO cache slots for the same real recipient — a
+        # miss on the second slot degraded the per-contact HIPAA
+        # overlay to the global scrubber (§164.312(c)(1) integrity
+        # gap). The plaintext address NEVER leaves this function on
+        # the audit path; the cache key is internal-only.
+        cache_key = ("overlay", account_id, canonical_email(addr))
         if cache_key in cache_dict:
             entry = cache_dict[cache_key]
             overlay = entry.get("overlay")
-            rh = entry.get("hash")
+            # N-346c-tail-B (fold — hipaa-sme H1): cache carries the
+            # SINGLE matched hash (post-fold from the earlier "hashes"
+            # list). Accept legacy single-"hash" AND legacy list-"hashes"
+            # cache entries opportunistically to avoid a hard cache-
+            # invalidation on hot-reload; new entries always use "hash".
+            matched_hash = entry.get("hash")
+            if matched_hash is None:
+                _legacy_hashes = entry.get("hashes")
+                if _legacy_hashes:
+                    matched_hash = _legacy_hashes[0]
         else:
             overlay = None
-            rh = None
+            matched_hash: str | None = None
             try:
-                overlay = get_contact_style_overlay(
+                # N-346c-tail-B (fold — hipaa-sme H1 + DA F1 combined
+                # per operator directive 2026-07-08 "no more WAITING-ON-
+                # OP as a defer mechanism"): use the _with_hash entry
+                # point so the audit-trail records the EXACT shape hash
+                # under which the row was matched. Records ONE hash per
+                # row (not all shapes), so `contributing_hashes` stays
+                # a minimal audit surface + closes the §164.312(b)
+                # cross-reference class post-backfill without a size
+                # bloat + without a downtime backfill window.
+                got = get_contact_style_overlay_with_hash(
                     conn,
                     account_id=account_id,
                     recipient_address=addr,
                     secrets=secrets,
                     freshness_days=freshness_days,
                 )
+                if got is not None:
+                    overlay, matched_hash = got
             except Exception:
                 # Lookup failure-safe — never let a draft fail because
                 # the overlay layer threw. Log + skip.
@@ -1094,24 +1384,15 @@ def merge_overlays_for_recipients(
                     extra={"_extra": {"account_id": account_id}},
                 )
                 overlay = None
-            if overlay is not None:
-                try:
-                    rh = hash_recipient_for_install(addr, secrets=secrets)
-                except (ValueError, SaltUnavailableError):
-                    # We have an overlay but can't audit — drop the
-                    # overlay rather than logging a row with a
-                    # missing hash. The draft falls back to the
-                    # account-level descriptor.
-                    overlay = None
-                    rh = None
-            cache_dict[cache_key] = {"overlay": overlay, "hash": rh}
+                matched_hash = None
+            cache_dict[cache_key] = {"overlay": overlay, "hash": matched_hash}
 
         if overlay is None:
             continue
         merged, _overridden = apply_contact_overlay(merged, overlay)
-        if rh and rh not in seen_hashes:
-            seen_hashes.add(rh)
-            contributing_hashes.append(rh)
+        if matched_hash and matched_hash not in seen_hashes:
+            seen_hashes.add(matched_hash)
+            contributing_hashes.append(matched_hash)
 
     return merged, contributing_hashes
 

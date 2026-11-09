@@ -64,6 +64,7 @@ Two layers of coverage:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import ast
 import sqlite3
@@ -87,9 +88,9 @@ from email_triage.web.watcher_retry import enqueue_watcher_retry
 # Per pattern_count_agnostic_structural_drift_catch.md.
 # ---------------------------------------------------------------------------
 
-_WEB_DIR = (
-    Path(__file__).resolve().parent.parent / "src" / "email_triage" / "web"
-)
+from _pin_harness import SRC_ROOT, iter_src_files, parse_module  # N-350 R31
+
+_WEB_DIR = SRC_ROOT / "web"  # harness-rooted (R5b)
 
 
 def _ingestion_modules() -> list[Path]:
@@ -118,8 +119,8 @@ def _ingestion_modules() -> list[Path]:
     auto-covered with nothing to update.
     """
     mods: list[Path] = []
-    for path in sorted(_WEB_DIR.glob("**/*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in iter_src_files("web"):  # R5b harness walk
+        tree = parse_module(path); assert tree is not None, f"parse failed: {path}"  # N-350 R31
         if any(
             isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             and n.name == "enqueue_watcher_retry"
@@ -145,9 +146,9 @@ def _enqueue_watcher_retry_calls() -> list[tuple[Path, ast.Call]]:
     """
     calls: list[tuple[Path, ast.Call]] = []
     for module in _ingestion_modules():
-        tree = ast.parse(
-            module.read_text(encoding="utf-8"), filename=str(module)
-        )
+        tree = parse_module(module)
+        if tree is None:
+            continue  # skip unparseable modules (N-178 sweep)
 
         aliases: set[str] = set()
         for node in ast.walk(tree):
@@ -207,7 +208,7 @@ class TestIngestionEnqueueSitesStampFailureKind:
             "found ZERO enqueue_watcher_retry call sites across the "
             f"glob-discovered web/ surface ({[m.name for m in _ingestion_modules()]}) "
             "— the glob or the enqueue-call matcher has drifted; the "
-            " LLM-breaker stamp guard is now vacuous. Re-anchor the "
+            "#242 LLM-breaker stamp guard is now vacuous. Re-anchor the "
             "discovery."
         )
 
@@ -221,7 +222,7 @@ class TestIngestionEnqueueSitesStampFailureKind:
         assert not missing, (
             "enqueue_watcher_retry call(s) missing the failure_kind "
             f"keyword at {missing} — the retry drainer's LLM-breaker "
-            "gate will never engage for that ingestion path."
+            "gate will never engage for that ingestion path (#242)."
         )
 
     def test_every_enqueue_site_derives_kind_from_llm_down_check(self):
@@ -254,7 +255,7 @@ class TestIngestionEnqueueSitesStampFailureKind:
 
 @pytest.fixture
 def conn() -> sqlite3.Connection:
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     yield c
     c.close()
 
@@ -307,7 +308,7 @@ class TestEnqueuePathStampsLlmUnreachable:
     def test_imap_idle_watcher_llm_unreachable(self, conn, account_id):
         """Path 1 — reference path (already correct before )."""
         err = LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,
@@ -318,7 +319,7 @@ class TestEnqueuePathStampsLlmUnreachable:
     def test_gmail_push_consumer_llm_unreachable(self, conn, account_id):
         """Path 2 — Gmail push consumer (_process_push_item)."""
         err = LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,
@@ -341,7 +342,7 @@ class TestEnqueuePathStampsLlmUnreachable:
     def test_o365_push_consumer_llm_unreachable(self, conn, account_id):
         """Path 3 — O365 push consumer (_process_office365_push_item)."""
         err = LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,
@@ -362,7 +363,7 @@ class TestEnqueuePathStampsLlmUnreachable:
     def test_o365_unified_poll_llm_unreachable(self, conn, account_id):
         """Path 4 — O365 unified-poll (_poll_once, Graph branch)."""
         err = LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,
@@ -373,7 +374,7 @@ class TestEnqueuePathStampsLlmUnreachable:
     def test_imap_unified_poll_llm_unreachable(self, conn, account_id):
         """Path 5 — IMAP unified-poll (_poll_once_imap)."""
         err = LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,
@@ -403,7 +404,7 @@ class TestEnqueuePathStampsLlmUnreachable:
             pass
 
         err = _DerivedUnreachable(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
         rid = _enqueue_like_call_site(
             conn, account_id=account_id, error=err,

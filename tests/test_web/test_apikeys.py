@@ -43,7 +43,7 @@ class TestApiKeyStorage:
     def test_store_and_verify(self, db, admin_user):
         raw_key = generate_api_key()
         key_hash = hash_api_key(raw_key)
-        key_id = store_api_key(db, key_hash, "test-key", admin_user["id"])
+        key_id = store_api_key(db, key_hash, "test-key", admin_user["id"], actor_user_id=admin_user["id"])
 
         assert key_id > 0
         user = verify_api_key(db, raw_key)
@@ -55,7 +55,7 @@ class TestApiKeyStorage:
 
     def test_verify_wrong_key(self, db, admin_user):
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "key", admin_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "key", admin_user["id"], actor_user_id=admin_user["id"])
 
         user = verify_api_key(db, "et_wrong-key-totally-invalid")
         assert user is None
@@ -63,14 +63,24 @@ class TestApiKeyStorage:
     def test_verify_expired_key(self, db, admin_user):
         raw_key = generate_api_key()
         expired = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-        store_api_key(db, hash_api_key(raw_key), "expired", admin_user["id"], expires_at=expired)
+        store_api_key(db, hash_api_key(raw_key), "expired", admin_user["id"], expires_at=expired, actor_user_id=admin_user["id"])
 
         user = verify_api_key(db, raw_key)
         assert user is None
 
+    def test_verify_corrupt_expiry_fails_closed_not_500(self, db, admin_user):
+        """Census N-65 — a corrupt expires_at on a key must NOT raise (raw
+        fromisoformat used to 500 every bearer-token check); parse_iso → None
+        → key rejected (FAIL CLOSED)."""
+        raw_key = generate_api_key()
+        store_api_key(db, hash_api_key(raw_key), "corrupt", admin_user["id"],
+                      expires_at="garbage-not-iso", actor_user_id=admin_user["id"])
+        # No exception, and the key does not authenticate.
+        assert verify_api_key(db, raw_key) is None
+
     def test_verify_updates_last_used(self, db, admin_user):
         raw_key = generate_api_key()
-        key_id = store_api_key(db, hash_api_key(raw_key), "key", admin_user["id"])
+        key_id = store_api_key(db, hash_api_key(raw_key), "key", admin_user["id"], actor_user_id=admin_user["id"])
 
         # Initially last_used_at is NULL.
         row = db.execute("SELECT last_used_at FROM api_keys WHERE id = ?", (key_id,)).fetchone()
@@ -81,15 +91,15 @@ class TestApiKeyStorage:
         assert row["last_used_at"] is not None
 
     def test_list_keys_all(self, db, admin_user, regular_user):
-        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"])
-        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"])
+        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"], actor_user_id=admin_user["id"])
+        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"], actor_user_id=regular_user["id"])
 
         all_keys = list_api_keys(db)
         assert len(all_keys) == 2
 
     def test_list_keys_by_user(self, db, admin_user, regular_user):
-        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"])
-        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"])
+        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"], actor_user_id=admin_user["id"])
+        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"], actor_user_id=regular_user["id"])
 
         admin_keys = list_api_keys(db, user_id=admin_user["id"])
         assert len(admin_keys) == 1
@@ -97,7 +107,7 @@ class TestApiKeyStorage:
 
     def test_delete_key(self, db, admin_user):
         raw_key = generate_api_key()
-        key_id = store_api_key(db, hash_api_key(raw_key), "to-delete", admin_user["id"])
+        key_id = store_api_key(db, hash_api_key(raw_key), "to-delete", admin_user["id"], actor_user_id=admin_user["id"])
 
         assert delete_api_key(db, key_id) is True
         assert verify_api_key(db, raw_key) is None
@@ -111,7 +121,7 @@ class TestBearerAuth:
 
     def test_api_with_bearer_token(self, client, db, admin_user):
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "test-bearer", admin_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "test-bearer", admin_user["id"], actor_user_id=admin_user["id"])
 
         resp = client.get(
             "/api/status",
@@ -142,7 +152,7 @@ class TestBearerAuth:
     def test_bearer_takes_precedence_over_cookie(self, client, db, admin_user, admin_cookies):
         """Bearer token should work even if cookie is also present."""
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "bearer-key", admin_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "bearer-key", admin_user["id"], actor_user_id=admin_user["id"])
 
         resp = client.get(
             "/api/status",
@@ -154,7 +164,7 @@ class TestBearerAuth:
     def test_bearer_respects_roles(self, client, db, regular_user):
         """API key inherits user's role — regular user can't access admin endpoints."""
         raw_key = generate_api_key()
-        store_api_key(db, hash_api_key(raw_key), "user-key", regular_user["id"])
+        store_api_key(db, hash_api_key(raw_key), "user-key", regular_user["id"], actor_user_id=regular_user["id"])
 
         resp = client.get(
             "/api/users",
@@ -198,16 +208,16 @@ class TestApiKeyEndpoints:
         assert resp.status_code == 403
 
     def test_list_keys_admin_sees_all(self, client, db, admin_user, regular_user, admin_cookies):
-        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"])
-        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"])
+        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"], actor_user_id=admin_user["id"])
+        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"], actor_user_id=regular_user["id"])
 
         resp = client.get("/api/keys", cookies=admin_cookies)
         assert resp.status_code == 200
         assert len(resp.json()["keys"]) == 2
 
     def test_list_keys_user_sees_own(self, client, db, admin_user, regular_user, user_cookies):
-        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"])
-        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"])
+        store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"], actor_user_id=admin_user["id"])
+        store_api_key(db, hash_api_key("k2"), "user-key", regular_user["id"], actor_user_id=regular_user["id"])
 
         resp = client.get("/api/keys", cookies=user_cookies)
         assert resp.status_code == 200
@@ -216,7 +226,7 @@ class TestApiKeyEndpoints:
         assert keys[0]["name"] == "user-key"
 
     def test_delete_key(self, client, db, admin_user, admin_cookies):
-        key_id = store_api_key(db, hash_api_key("k1"), "to-delete", admin_user["id"])
+        key_id = store_api_key(db, hash_api_key("k1"), "to-delete", admin_user["id"], actor_user_id=admin_user["id"])
 
         resp = client.delete(f"/api/keys/{key_id}", cookies=admin_cookies)
         assert resp.status_code == 204
@@ -226,7 +236,7 @@ class TestApiKeyEndpoints:
         assert resp.status_code == 404
 
     def test_user_cannot_delete_others_key(self, client, db, admin_user, regular_user, user_cookies):
-        key_id = store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"])
+        key_id = store_api_key(db, hash_api_key("k1"), "admin-key", admin_user["id"], actor_user_id=admin_user["id"])
 
         resp = client.delete(f"/api/keys/{key_id}", cookies=user_cookies)
         assert resp.status_code == 403
@@ -406,38 +416,33 @@ class TestApiKeyLifecycleAudit:
                     assert raw_key not in v
                     assert key_hash not in v
 
-    def test_audit_insert_failure_does_not_block_creation(
+    def test_audit_insert_failure_refuses_the_mint(
         self, db, admin_user, monkeypatch,
     ):
-        """If the audit-table insert raises, the key MUST still be
-        minted and verifiable. We swallow the audit error so admins
-        never lose access because of a bug in the audit path."""
-        from email_triage.web import db as db_mod
+        """Punch 627 (N-611): the key and its ``api_key_created`` witness commit
+        in ONE transaction, so a failed witness refuses the mint and rolls the
+        key back: no key exists that the audit chain cannot show was granted
+        (fail CLOSED). This test used to pin the opposite (the key survived an
+        audit failure), which was the N-611 defect itself."""
+        import email_triage.db.audit as audit_mod
 
         def boom(*args, **kwargs):
             raise RuntimeError("audit storage exploded")
 
-        monkeypatch.setattr(db_mod, "record_api_key_event", boom)
+        monkeypatch.setattr(audit_mod, "record_api_key_event_txn", boom)
 
         raw_key = generate_api_key()
-        key_id = store_api_key(
-            db, hash_api_key(raw_key), "resilient", admin_user["id"],
-            actor_user_id=admin_user["id"],
-            actor_email=admin_user["email"],
-            source="ui",
-        )
-        # Key really exists and verifies.
-        assert key_id > 0
-        user = verify_api_key(db, raw_key)
-        assert user is not None
-        assert user["email"] == admin_user["email"]
-
-        # Audit row was NOT written (because the insert raised) but
-        # the mint succeeded — that's the whole point.
-        rows = db.execute(
-            "SELECT * FROM api_key_events WHERE key_id = ?", (key_id,),
-        ).fetchall()
-        assert rows == []
+        with pytest.raises(RuntimeError, match="audit storage exploded"):
+            store_api_key(
+                db, hash_api_key(raw_key), "resilient", admin_user["id"],
+                actor_user_id=admin_user["id"],
+                actor_email=admin_user["email"],
+                source="ui",
+            )
+        assert verify_api_key(db, raw_key) is None
+        assert db.execute(
+            "SELECT COUNT(*) FROM api_keys WHERE name = 'resilient'",
+        ).fetchone()[0] == 0
 
 
 class TestCLIApiKeyParser:

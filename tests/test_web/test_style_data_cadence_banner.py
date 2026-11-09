@@ -30,7 +30,7 @@ from email_triage.web.db import (
 
 def _make_acct(db, owner_id: int, name: str = "Acct") -> int:
     return create_email_account(
-        db, owner_id, name, "imap", {"host": "mail.example.com"},
+        db, owner_id, name, "imap", {"host": "mail.example.invalid"},
     )
 
 

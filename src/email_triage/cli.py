@@ -29,7 +29,8 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from email_triage._isotime import now_utc_iso
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +40,34 @@ from email_triage.config import (
     validate_config,
 )
 from email_triage.triage_logging import get_logger, setup_logging
+from email_triage.web.task_supervisor import next_backoff_delay  # N-228 R22 SSOT
 from email_triage._errfmt import fmt_exc
-from email_triage.db._helpers import apply_compatible_row_factory
+from email_triage.providers.render_probe import close_provider
+from email_triage.db._helpers import apply_compatible_row_factory, dump_json_col
+from email_triage._dbapi_errors import DB_ERRORS
+from email_triage.engine.models import UserRole  #  — role SSOT for --role choices
 
 log = get_logger("cli")
+
+
+class CliAuditGateClosed(RuntimeError):
+    """N-157 (2026-07-09) — CLI audit auto-emit at handler ENTRY failed
+    AND ``--allow-unaudited`` is NOT set.
+
+    The wrapping ``@_cli_audit`` decorator lets this propagate out of
+    the handler so the CLI exits nonzero with a specific error message
+    naming ``--allow-unaudited`` as the recovery lever.  Prime Directive
+    #8 (controls fail CLOSED) is anchored here: the operator MUST make
+    an explicit decision to run an unaudited op instead of silently
+    getting fail-soft.  operator-directed 2026-07-08 (AskUserQuestion N-157
+    answer: 'Fail-loud with recovery flag').
+    """
+
+
+# Punch 820: the CLI's provider close is ``render_probe.close_provider(p, loud=True)`` -- the
+# ONE best-effort provider close. Every CLI command that
+# builds a provider wraps its ``_run`` so the close is awaited in-loop (N-131), enforced by
+# ``tests/test_cli_provider_close_in_loop_pin.py``.
 
 
 # ---------------------------------------------------------------------------
@@ -89,24 +114,34 @@ log = get_logger("cli")
 #   accept only a KEY NAME (the value is read via getpass, never on argv).
 #   No PHI surfaces in CLI args by design. Sensitive shapes (passphrase
 #   file paths) are recorded as PATHS not contents. The actor field
-#   captures the OS user via $USER/$USERNAME, matching the existing
-#   cmd_apikey pattern at cli.py:606.
-
-_CLI_ACTOR_ENV_KEYS = ("USER", "USERNAME", "LOGNAME")
-
+#   is the KERNEL identity from :func:`_cli_actor` — never $USER /
+#   $USERNAME (punch 547: an audit identity is not read from env).
 
 def _cli_actor() -> str:
-    """Resolve the OS-level actor for CLI audit attribution.
+    """The OS-level actor for CLI audit attribution, from the KERNEL.
 
-    Matches the existing pattern at ``cmd_apikey`` / ``cmd_apikey delete``
-    (cli.py:606,644) so CLI-driven api_key_events rows and CLI-driven
-    log_entries auto-emit rows attribute to the same identifier shape.
+    Punch 547 (operator directive 2026-09-29): an audit identity is never read
+    from the environment. ``USER=alice email-triage ...`` used to attribute the
+    row to alice. The effective uid is what the kernel says ran the process;
+    inside ``podman exec`` that is the container user (``cli:triage``), and the
+    human who ran the exec is on the host's own trail (sudo / journald). NOT
+    ``getpass.getuser()``: it reads LOGNAME / USER / LNAME / USERNAME first.
+
+    The ONE resolver for every CLI audit row: ``log_entries`` (via
+    ``_emit_cli_audit_event``) and ``api_key_events`` (``cmd_apikey``).
     """
-    for env_key in _CLI_ACTOR_ENV_KEYS:
-        val = os.environ.get(env_key)
-        if val:
-            return f"cli:{val}"
-    return "cli:unknown"
+    try:
+        import pwd
+    except ImportError:  # Windows dev box: GetUserNameW, not the environment
+        try:
+            return f"cli:{os.getlogin()}"
+        except OSError:
+            return "cli:unknown"
+    uid = os.geteuid()
+    try:
+        return f"cli:{pwd.getpwuid(uid).pw_name}"
+    except KeyError:
+        return f"cli:uid={uid}"
 
 
 def _emit_cli_audit_event(
@@ -151,18 +186,29 @@ def _emit_cli_audit_event(
         # to a non-existent file → catch and exit silently (no DB to
         # write to anyway).
         config = load_config(getattr(args, "config", None))
-    except Exception:
+    except Exception as _load_exc:
+        # Expected for cmd_init (no config yet). Debug-level so a missing
+        # start-row audit on any OTHER command is still discoverable.
+        log.debug("CLI audit event skipped: config did not load", error=fmt_exc(_load_exc))
         return
     if not getattr(config.logging, "hipaa", False):
         return
+    # N-157 / punch 709: ``--allow-unaudited`` and ``--emergency`` are the explicit
+    # break-glass for the start gate; every failure that loses the start row below
+    # refuses without one (punch 844 panel: the bootstrap and wiring failures too).
+    allow_unaudited = (
+        bool(getattr(args, "allow_unaudited", False))
+        or bool(getattr(args, "emergency", False))
+    )
     try:
-        from email_triage.db.audit import insert_log_entry
-        from email_triage.web.db import init_db
-        from email_triage.secrets import (
-            bootstrap_secrets_from_config,
-            wire_audit_chain_hmac_keys,
-        )
-        from datetime import datetime, timezone
+        # N-157 (2026-07-09): route through `record_cli_admin_op` — the
+        # @db_write + @audit_emitter SSOT — so a write failure fires the
+        # audit_gap_events sentinel per  D3.  The chain-primitive
+        # `insert_log_entry` at db/audit.py is still the underlying
+        # writer (via the emitter body); this indirection buys the
+        # gap-event row on failure that the direct call lacked.
+        from email_triage.db.audit import record_cli_admin_op
+        from email_triage.secrets import bootstrap_secrets_from_config
 
         # Extract non-sensitive args for the audit row. Allowlist
         # approach: we KNOW these arg names are safe (paths, ids, flags,
@@ -181,6 +227,25 @@ def _emit_cli_audit_event(
             "save_old_key_to", "passphrase_file", "master_key_out",
             "target_dir", "source_dir", "manifest", "bundle",
             "since", "db", "list",
+            # N-157 (2026-07-09) — audit-gate bypass flag. Recording
+            # this in the row makes any bypass visible to forensic
+            # review + register-row audit; the value is a bounded bool
+            # (Safe-Harbor IN).
+            "allow_unaudited",
+            # N-535 — the route scope + lifetime a key was
+            # minted with. These ARE the credential's security parameters, so a
+            # trail that records "an api key was created" without them cannot
+            # answer "what could that key reach?" — the §164.312(a)(1) question
+            # the row exists to support. Adding them here is what puts the scope
+            # into the HMAC-chained `log_entries` row through the EXISTING
+            # `record_cli_admin_op` emitter SSOT: no raw INSERT, no new table,
+            # and crucially NOT a field appended to `api_key_events`' canonical
+            # hash tuple (which would change every historical row's recomputed
+            # row_hash and break §164.312(c) re-verification). `scope` arrives as
+            # a list and is `str()`-rendered by the loop below; both values are
+            # code-shaped route strings and an integer — no PHI, no Safe-Harbor
+            # identifier, so both are IN rather than hash-only.
+            "scope", "expires_days",
         })
         safe_args: dict[str, Any] = {}
         for k, v in vars(args).items():
@@ -227,7 +292,7 @@ def _emit_cli_audit_event(
                 cli_command=command, cli_phase=phase,
             )
             return
-        conn = init_db(db_path)
+        conn = _cli_open_config_db(config)
         try:
             try:
                 provider = bootstrap_secrets_from_config(conn, config)
@@ -236,6 +301,8 @@ def _emit_cli_audit_event(
                 # a HIPAA finding — surface and skip emit. enforce_*
                 # below would RuntimeError anyway; catch here to keep
                 # the warning specific to the audit path.
+                if phase == "start" and not allow_unaudited:
+                    raise _cli_start_gate_closed(command, ": secrets bootstrap failed") from e
                 log.warning(
                     "H-03-auto: secrets bootstrap failed; CLI audit "
                     "auto-emit skipped",
@@ -253,25 +320,96 @@ def _emit_cli_audit_event(
             # 'start' emit runs before setup_logging and would see HIPAA
             # mode off, the 'end' emit sees it on. The auto-emit's job
             # is to land the audit row, not to re-enforce the boot gate.
-            wire_audit_chain_hmac_keys(provider, config)
+            _cli_wire_audit_keys(conn, config, provider)
 
-            ts = datetime.now(timezone.utc).isoformat()
-            insert_log_entry(
-                conn,
-                ts=ts,
-                level="INFO",
-                logger="email_triage.cli.audit",
-                message=f"cli admin op: {command} ({phase})",
-                extra=extra,
+            # N-182 R20_7: route the log_entries chain write through
+            # safe_audit_write. The chain-primitive insert_log_entry is a
+            # /health-visible emitter surface: routing here lands a specific
+            # `audit_write_failed` WARNING (the drift-detector observability
+            # convergence) instead of the generic fail-soft below, which
+            # was invisible to /health.
+            from email_triage.web._audit import safe_audit_write
+
+            # db-sme N-182 must-fix M3: `conn.commit()` is OUTSIDE the lambda
+            # so a commit failure surfaces to the outer H-03-auto handler
+            # rather than being silently swallowed by safe_audit_write (a
+            # swallowed commit after a successful INSERT would leave the
+            # log_entries HMAC chain in an ambiguous state — PD#12 fail-closed
+            # violation). A commit exception falls through to the outer
+            # try/except which logs a H-03-auto WARNING w/ chain_commit_failed
+            # context. safe_audit_write returns whatever the lambda yielded
+            # (an int row id from insert_log_entry) on success, None on emit
+            # failure — the `is None` gate discriminates emit-failure from
+            # commit-failure (a distinction PD#12 requires).
+            ts = now_utc_iso()
+            # `record_cli_admin_op` returns None on both success + swallow
+            # (its type is `-> None`); the trailing `True` in the tuple
+            # returned by the lambda gives safe_audit_write a non-None
+            # success sentinel to discriminate from its own None-on-
+            # failure return semantics.
+            # DA fold N-157 Fix #2 (hipaa-sme calibrated 2026-07-09):
+            # pass `allow_unaudited` as a dedicated top-level IN kwarg
+            # so it appears verbatim on the gap-row when the emit fails.
+            # `_SAFE_ARG_KEYS` extension already lands it inside `extra`
+            # on the SUCCESS path — the top-level pass is redundant then
+            # but LOAD-BEARING on the failure path (investigator sees
+            # the bypass bit without shell-history cross-match).
+            # Punch 709: ``--emergency`` (which carries a mandatory reason
+            # code) is itself the explicit break-glass for this gate: on a
+            # broken chain the start row cannot be written, and the gate
+            # would refuse the very command that revokes the compromised
+            # credential. The bypass bit is recorded like any other
+            # (``allow_unaudited`` is set at the top of this function).
+            _emit_result = safe_audit_write(
+                lambda: (record_cli_admin_op(
+                    conn,
+                    ts=ts,
+                    command=command,
+                    phase=phase,
+                    extra=extra,
+                    allow_unaudited=allow_unaudited,
+                ), True)[1],
+                description=f"cli_admin_op:{command}:{phase}",
             )
-            conn.commit()
+            if _emit_result is None:
+                # N-157 (2026-07-09) fail-loud gate — operator-directed close per
+                # AskUserQuestion 2026-07-08 ("Fail-loud with recovery flag").
+                # DEFAULT (allow_unaudited=False): raise at phase='start' so
+                # the wrapping @_cli_audit decorator lets it bubble out and
+                # the CLI exits nonzero with a specific error message —
+                # operator sees an obvious audit-gate error instead of a
+                # silent WARN + successful op.  At phase='end' the underlying
+                # op has already run + been observed by the operator; fail-
+                # loud here can't recover anything, so it stays fail-soft.
+                # ``--allow-unaudited`` reverts to the pre-N-157 fail-soft
+                # posture the H-03-auto docstring at cli.py:104-112
+                # rationalizes for break-glass incident use.
+                if phase == "start" and not allow_unaudited:
+                    raise _cli_start_gate_closed(command)
+                log.warning(
+                    "H-03-auto: CLI audit auto-emit failed; procedural "
+                    "fallback (break-glass actions_taken) remains in force",
+                    cli_command=command, cli_phase=phase,
+                    allow_unaudited=allow_unaudited,
+                )
+            else:
+                conn.commit()  # only commit after the chain-write succeeded
         finally:
             conn.close()
+    except CliAuditGateClosed:
+        # N-157 fail-loud path: propagate to the wrapping @_cli_audit
+        # decorator so the CLI exits non-zero.  Do NOT log a WARN — the
+        # exception message names --allow-unaudited as the recovery
+        # lever and will surface via the top-level entry point's stderr.
+        raise
     except Exception as e:
-        # Fail-soft: emission errors do NOT propagate. The procedural
+        # A start row lost to any other failure (key wiring, DB open) refuses
+        # like the emit failure above (N-157); otherwise fail-soft: the procedural
         # H-03 closure (break-glass actions_taken in INCIDENT_RESPONSE.md)
         # remains the compliance fallback per §164.312(b)'s "and/or
         # procedural" reading.
+        if phase == "start" and not allow_unaudited:
+            raise _cli_start_gate_closed(command, f": {type(e).__name__}") from e
         log.warning(
             "H-03-auto: CLI audit auto-emit failed; procedural "
             "fallback (break-glass actions_taken) remains in force",
@@ -343,6 +481,7 @@ def _build_engine(config: TriageConfig) -> Any:
     from email_triage.actions.add_label import AddLabelAction
     from email_triage.actions.draft_reply import DraftReplyAction
     from email_triage.actions.escalate import EscalateAction
+    from email_triage.actions.mute import MuteAction
     from email_triage.actions.invite import (
         AcceptInviteAction, DeclineInviteAction, TentativeInviteAction,
     )
@@ -351,6 +490,7 @@ def _build_engine(config: TriageConfig) -> Any:
     from email_triage.actions.notify import NotifyAction
     from email_triage.actions.registry import ActionRegistry
     from email_triage.actions.suggest_meeting_times import SuggestMeetingTimesAction
+    from email_triage.actions.regulatory_clock import RegulatoryClockAction
     from email_triage.engine.flow import FlowEngine
     from email_triage.engine.store import FlowStore
 
@@ -375,11 +515,13 @@ def _build_engine(config: TriageConfig) -> Any:
     registry.register(LabelAction())
     registry.register(AddLabelAction())
     registry.register(EscalateAction())
+    registry.register(MuteAction())
     registry.register(MoveAction())
     registry.register(AcceptInviteAction())
     registry.register(DeclineInviteAction())
     registry.register(TentativeInviteAction())
     registry.register(SuggestMeetingTimesAction())
+    registry.register(RegulatoryClockAction())
 
     return FlowEngine(
         store=store,
@@ -413,16 +555,37 @@ def _create_provider(config: TriageConfig) -> Any:
             mailbox=imap_cfg.get("mailbox", "INBOX"),
             email_address=imap_cfg.get("email_address", ""),
             drafts_folder=imap_cfg.get("drafts_folder", ""),
+            cert_check=imap_cfg.get("cert_check"),
+            cert_enforce=imap_cfg.get("cert_enforce"),
         )
     elif ptype == "office365":
         from email_triage.providers.office365 import Office365Provider
         o365_cfg = config.provider.office365
+        # N-209 R23 (2026-07-02): CLI-scoped msal-cache path via SSOT sibling
+        # `providers.factory.msal_cache_path_for_cli(username)` — the
+        # `test_no_forked_per_account_msal_cache_literal` pin bans f-strings
+        # for these paths so both variants (per-account + per-CLI-username)
+        # own their derivation in the ONE module.
+        from email_triage.providers.factory import msal_cache_path_for_cli
+        _cli_user = o365_cfg.get("account", "") or o365_cfg.get("username", "")
+        # N-316 R30 (CI-red fix-forward on N-307): only compute the
+        # SSOT-derived default when the config didn't already supply an
+        # explicit `token_cache_path`. N-307 tightened
+        # `msal_cache_path_for_cli` to fail-CLOSED on an empty username
+        # (§164.310(d)(2)(i) cross-account credential-pool defect the
+        # `cli_default` bucket represented) — this call was
+        # unconditional and would raise ValueError on tests / configs
+        # that supply `token_cache_path` explicitly but leave username
+        # blank (a legitimate arrangement).
+        _token_cache_path = o365_cfg.get("token_cache_path")
+        if not _token_cache_path:
+            _token_cache_path = str(msal_cache_path_for_cli(_cli_user))
         return Office365Provider(
             client_id=o365_cfg.get("client_id", ""),
             tenant_id=o365_cfg.get("tenant_id", "common"),
             client_secret=o365_cfg.get("client_secret", ""),
-            token_cache_path=o365_cfg.get("token_cache_path", "./data/msal_cache.json"),
-            username=o365_cfg.get("account", "") or o365_cfg.get("username", ""),
+            token_cache_path=_token_cache_path,
+            username=_cli_user,
         )
     else:
         raise ValueError(f"Unknown provider type: {ptype}")
@@ -438,6 +601,17 @@ def _create_classifier(config: TriageConfig) -> Any:
             base_url=config.classifier.ollama_url,
             prefer_loaded=config.classifier.prefer_loaded,
             local_url_suffixes=local_suffixes,
+            prefer_loaded_skip_embeddings=(
+                config.classifier.prefer_loaded_skip_embeddings
+            ),
+            embedding_name_markers=config.classifier.embedding_name_markers,
+            backup_models=config.classifier.backup_models,
+            num_ctx=config.classifier.num_ctx,
+            ollama_think=config.classifier.ollama_think,
+            ollama_no_think_marker=config.classifier.ollama_no_think_marker,
+            ollama_probe_timeout_secs=config.classifier.ollama_probe_timeout_secs,
+            ollama_admin_timeout_secs=config.classifier.ollama_admin_timeout_secs,
+            ollama_keep_alive=config.classifier.ollama_keep_alive,
         )
     elif backend == "openai":
         from email_triage.classify.openai_compat import OpenAICompatClassifier
@@ -470,7 +644,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     engine = _build_engine(config)
 
     async def _run() -> list[Any]:
-        return await engine.run_cycle(args.query, args.limit)
+        try:
+            return await engine.run_cycle(args.query, args.limit)
+        finally:
+            await engine.aclose()  # N-132: close the engine's provider+classifier in-loop
 
     results = asyncio.run(_run())
 
@@ -514,8 +691,17 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 print(f"  Error: {e}\n")
             await asyncio.sleep(interval)
 
+    async def _watch_and_close() -> None:
+        # N-132: close the engine's provider+classifier IN-LOOP (the work loop they
+        # were created in). Ctrl-C re-raises inside _watch -> this finally runs
+        # before KeyboardInterrupt escapes to the outer except (cf. N-131).
+        try:
+            await _watch()
+        finally:
+            await engine.aclose()
+
     try:
-        asyncio.run(_watch())
+        asyncio.run(_watch_and_close())
     except KeyboardInterrupt:
         print("\nStopped.")
     return 0
@@ -568,14 +754,23 @@ def _cmd_watch_push(config, args) -> int:
                             error=fmt_exc(e), backoff=backoff)
                 print(f"  Connection lost: {e}. Reconnecting in {backoff}s...")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                backoff = next_backoff_delay(backoff, factor=2.0, max_delay=max_backoff)  # N-228 R22 SSOT
+
+    async def _watch_push_and_close() -> None:
+        # N-131 — close in-loop (see close_provider). The old bare
+        # asyncio.run(provider.close()) ran in a 2nd loop AND had no 
+        # wrapper, so the cross-loop 'Event loop is closed' RAISED out of the
+        # finally on every Ctrl-C exit.
+        try:
+            await _watch_push()
+        finally:
+            await close_provider(provider, loud=True)  # N-131: the watched provider
+            await engine.aclose()  # N-132: the engine's SEPARATE provider + classifier
 
     try:
-        asyncio.run(_watch_push())
+        asyncio.run(_watch_push_and_close())
     except KeyboardInterrupt:
         print("\nStopped.")
-    finally:
-        asyncio.run(provider.close())
     return 0
 
 
@@ -622,7 +817,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"\nRecent {args.status} flows:")
             for f in flows:
                 cat = f.classification.category if f.classification else "-"
-                print(f"  {f.flow_id[:8]}  {cat:<20} {f.updated_at.strftime('%Y-%m-%d %H:%M')}")
+                print(f"  {f.flow_id[:8]}  {cat:<20} {f.updated_at.strftime('%Y-%m-%d %H:%M UTC')}")
 
     store.close()
     return 0
@@ -647,7 +842,22 @@ def cmd_config_validate(args: argparse.Namespace) -> int:
     print(f"  Provider: {config.provider.type}")
     print(f"  Classifier: {config.classifier.backend} ({config.classifier.model})")
     print(f"  Categories: {len(config.classifier.categories)}")
-    print(f"  HIPAA mode: {config.logging.hipaa}")
+    # `config.logging.hipaa` is the config-FILE value used to SEED HIPAA mode at
+    # boot. The EFFECTIVE runtime value lives in the DB (runtime_settings.hipaa,
+    # toggled via the admin Security page) and OVERRIDES this seed —
+    # `triage_logging.is_hipaa_mode()` is the runtime source of truth. An offline
+    # config validator cannot read the (possibly-encrypted) runtime DB, so label
+    # this clearly rather than print a bare value an auditor could misread as the
+    # live posture (divergence census 2026-06-09 #4 — verify-don't-accept REFUTED
+    # the "dual-write" framing: the admin toggle writes only the settings table,
+    # never the YAML, so the YAML is a boot seed, not a divergent second writer).
+    print(f"  HIPAA mode (config-file boot seed): {config.logging.hipaa}")
+    print(
+        "    NOTE: the EFFECTIVE runtime HIPAA mode is stored in the DB "
+        "(runtime_settings.hipaa), is toggled via the admin Security page, and "
+        "overrides this seed — check the running install's admin UI for the live "
+        "value; this offline validator reports the config-file seed only."
+    )
     print(f"  Secrets backend: {config.secrets.backend}")
     return 0
 
@@ -666,8 +876,8 @@ def cmd_secrets(args: argparse.Namespace) -> int:
         DbSecrets,
         bootstrap_secrets_from_config,
         create_secrets_provider,
+        read_secret,
     )
-    from email_triage.web.db import init_db
 
     # init-master-key works at the bootstrap layer — before DbSecrets exists.
     if args.secrets_cmd == "init-master-key":
@@ -678,7 +888,7 @@ def cmd_secrets(args: argparse.Namespace) -> int:
             master_key_name=config.secrets.master_key_name,
         )
         key_name = config.secrets.master_key_name
-        existing = bootstrap.get(key_name)
+        existing = read_secret(bootstrap, key_name)
         if existing and not args.force:
             print(
                 f"Master key '{key_name}' already exists in the "
@@ -703,7 +913,7 @@ def cmd_secrets(args: argparse.Namespace) -> int:
         return 0
 
     # All other subcommands need the runtime DbSecrets store.
-    conn = init_db(config.persistence.db_path)
+    conn = _cli_open_config_db(config)
     try:
         provider = bootstrap_secrets_from_config(conn, config)
     except Exception as e:
@@ -721,12 +931,9 @@ def cmd_secrets(args: argparse.Namespace) -> int:
     # registry. enforce_master_key_at_rest_for_hipaa is a no-op outside
     # HIPAA mode; wire_audit_chain_hmac_keys populates the version
     # registry.
-    from email_triage.secrets import (
-        enforce_master_key_at_rest_for_hipaa,
-        wire_audit_chain_hmac_keys,
-    )
+    from email_triage.secrets import enforce_master_key_at_rest_for_hipaa
     enforce_master_key_at_rest_for_hipaa(config)
-    wire_audit_chain_hmac_keys(provider, config)
+    _cli_wire_audit_keys(conn, config, provider)
 
     if args.secrets_cmd == "list":
         keys = provider.list_keys()
@@ -741,6 +948,16 @@ def cmd_secrets(args: argparse.Namespace) -> int:
     elif args.secrets_cmd == "set":
         import getpass
         value = getpass.getpass(f"Enter value for {args.key}: ")
+        if not value.strip():
+            # A blank entry (an accidental Enter) must never overwrite the
+            # stored secret with "": refuse, and leave the stored value as it is.
+            print(
+                f"Secret '{args.key}' NOT saved: the value was empty. The "
+                f"stored value is unchanged. To remove the secret, use "
+                f"'secrets delete {args.key}'.",
+                file=sys.stderr,
+            )
+            return 1
         provider.set(args.key, value)
         print(f"Secret '{args.key}' saved.")
         return 0
@@ -765,12 +982,17 @@ def cmd_secrets(args: argparse.Namespace) -> int:
         key_name = config.secrets.master_key_name
 
         # Save the outgoing key before anything else — disaster recovery.
-        old_key = bootstrap.require(key_name)
+        from email_triage.secrets import read_secret_required
+        old_key = read_secret_required(bootstrap, key_name)
         new_key = DbSecrets.generate_master_key()
 
         if args.save_old_key_to:
-            Path(args.save_old_key_to).write_text(old_key)
-            os.chmod(args.save_old_key_to, 0o600)
+            # census  — atomic + owner-only write of the PLAINTEXT old
+            # master key (was a bare write_text + chmod → a power-loss could
+            # truncate the disaster-recovery key, and the pre-chmod window
+            # left it world-readable).
+            from email_triage._atomicio import atomic_write_text
+            atomic_write_text(args.save_old_key_to, old_key, mode=0o600)
             print(f"Old master key saved to {args.save_old_key_to} (mode 600)")
 
         if args.dry_run:
@@ -847,7 +1069,7 @@ def cmd_secrets(args: argparse.Namespace) -> int:
         for key in bootstrap.list_keys():
             if key == master_key_name:
                 continue
-            val = bootstrap.get(key)
+            val = read_secret(bootstrap, key)
             if val is None:
                 skipped += 1
                 continue
@@ -855,6 +1077,135 @@ def cmd_secrets(args: argparse.Namespace) -> int:
             migrated += 1
             print(f"  migrated: {key}")
         print(f"Migrated {migrated} secret(s); skipped {skipped}.")
+        return 0
+
+    elif args.secrets_cmd == "purge-msal-cache":
+        # N-267 R27: CLI-user MSAL cache purge. Routes through the
+        # per-user artifact registry (`dispose_all_per_user_artifacts`)
+        # — closes the V_B orphan gap census R27 flagged
+        # (§164.310(d)(2)(i) plaintext OAuth refresh_token had no
+        # production disposer). The registry funnel disposes every
+        # registered per-user artifact family; today that's just
+        # `msal_cache_cli_<user>.json` but the pattern extends
+        # transparently if a new per-user artifact ships.
+        from email_triage.providers._ondisk_artifacts import (
+            dispose_all_per_user_artifacts,
+        )
+        username = args.username
+        deleted = dispose_all_per_user_artifacts(username)
+        print(f"Purged {deleted} MSAL cache artifact(s) for user '{username}'.")
+        return 0
+
+    elif args.secrets_cmd == "allow-hmac-clobber-once":
+        # N-349 hybrid (2026-07-05, operator directive): arm the one-shot
+        # HMAC clobber bypass in the settings table. The NEXT unreadable-
+        # read triggered by a watch-HMAC hydration path in agent_api /
+        # profile will consume the flag + log the bypass + mint a fresh
+        # replacement. Env-flag DELIBERATELY NOT supported — the CLI's
+        # `@_cli_audit("secrets")` wrapper emits the phase='start' +
+        # phase='end' audit rows that are the compensating control.
+        #
+        # N-364 R31 (2026-07-05 SME F6 follow-up + the backlog N-349b
+        # items 4+5): TTL + actor_id metadata are now stamped on the
+        # arm — default 15-minute expiry closes the "operator arms +
+        # forgets" observability gap; the arm row carries `armed_at`
+        # + optional `armed_by_actor_id` for §164.308(a)(4)(ii)(C)
+        # traceability that ties CONSUMPTION back to ESTABLISHMENT.
+        from email_triage.web.db import (
+            HMAC_CLOBBER_BYPASS_DEFAULT_TTL_SEC,
+            arm_hmac_clobber_bypass,
+            hmac_clobber_bypass_status,
+        )
+        config = load_config(args.config)
+        conn = _cli_open_config_db(config)
+        ttl_sec = getattr(args, "ttl_min", None)
+        if ttl_sec is not None:
+            ttl_sec = int(ttl_sec) * 60
+        status = hmac_clobber_bypass_status(conn)
+        if status["armed"]:
+            print(
+                "HMAC clobber bypass is ALREADY armed. Next admin watch-"
+                f"save on an unreadable row will consume it. Expires at "
+                f"{status['expires_at']!r}."
+            )
+            return 0
+        arm_hmac_clobber_bypass(conn, ttl_sec=ttl_sec)
+        effective_ttl_min = (
+            ttl_sec // 60 if ttl_sec else HMAC_CLOBBER_BYPASS_DEFAULT_TTL_SEC // 60
+        )
+        new_status = hmac_clobber_bypass_status(conn)
+        print(
+            "HMAC clobber bypass ARMED (one-shot). SCOPE: the NEXT "
+            "unreadable-row read triggered by an ADMIN watch SAVE "
+            "(create-new or edit-existing via profile UI / agent API) "
+            "will mint a fresh replacement + clear the flag. The "
+            "receiver-side webhook signature-verify path is NOT "
+            "covered by this bypass — it stays fail-CLOSED and drops "
+            "the webhook; recovery for that path is an admin re-save "
+            "(which triggers this bypass). No env-flag equivalent by "
+            "operator directive."
+        )
+        print(
+            f"TTL: {effective_ttl_min} minute(s). Expires at "
+            f"{new_status['expires_at']!r}. Use `secrets show-hmac-"
+            "clobber-bypass` to check status; re-arm to extend."
+        )
+        return 0
+
+    elif args.secrets_cmd == "show-hmac-clobber-bypass":
+        # N-364 R31 (2026-07-05 SME F6 + the backlog N-349b item 4) —
+        # read-only observability verb. Reports the current arm state
+        # so an operator who forgot whether they armed can check + so
+        # a scheduled audit sweep can grep the output.
+        from email_triage.web.db import hmac_clobber_bypass_status
+        config = load_config(args.config)
+        conn = _cli_open_config_db(config)
+        status = hmac_clobber_bypass_status(conn)
+        if status["armed"]:
+            print(
+                "HMAC clobber bypass: ARMED (one-shot). "
+                f"armed_at={status['armed_at']!r} "
+                f"expires_at={status['expires_at']!r} "
+            )
+        elif status["expired"]:
+            print(
+                "HMAC clobber bypass: EXPIRED (still in settings row but "
+                f"past TTL). armed_at={status['armed_at']!r} "
+                f"expires_at={status['expires_at']!r} "
+                "(consume-a-secret path removes the row on next unreadable read)."
+            )
+        else:
+            print("HMAC clobber bypass: NOT armed.")
+        return 0
+
+    elif args.secrets_cmd == "purge-retired-keys":
+        # N-320 R30 (task  tranche  DA follow-up — CLI-verb
+        # delivery per operator ruling 2026-07-03).
+        # §164.308(a)(4)(ii)(A) rollback re-arms compromised creds.
+        # Iterate every retired name in `_secret_keys.KEY_HISTORY`
+        # and DELETE from the secrets store — idempotent
+        # (delete-missing = no-op). @_cli_audit("secrets") wrapper
+        # emits the audit event (phase='start' + phase='end').
+        # `provider` is the SecretsProvider already wired above via
+        # `_cli_wire_audit_keys(conn, config, provider)`.
+        from email_triage._secret_keys import retired_names
+
+        retired = retired_names()
+        if not retired:
+            print("KEY_HISTORY is empty; nothing to purge.")
+            return 0
+        deleted_count = 0
+        preserved_count = 0
+        for name in retired:
+            if provider.delete(name):
+                deleted_count += 1
+                print(f"  deleted retired secret: {name}")
+            else:
+                preserved_count += 1
+        print(
+            f"Purged {deleted_count} retired secret-key row(s); "
+            f"{preserved_count} already absent."
+        )
         return 0
 
     return 1
@@ -866,10 +1217,11 @@ def cmd_apikey(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     setup_logging(config.logging)
 
-    from email_triage.web.db import init_db
     from email_triage.web.auth import (
         generate_api_key,
         hash_api_key,
+        ApiKeyGrantError,
+        ApiKeyRevokeError,
         store_api_key,
         list_api_keys,
         delete_api_key,
@@ -881,7 +1233,10 @@ def cmd_apikey(args: argparse.Namespace) -> int:
         print("No database found. Run 'email-triage serve' first to create the schema.")
         return 1
 
-    db = init_db(db_path)
+    db = _cli_open_config_db(config)
+    if not _cli_wire_audit_keys_or_refuse(
+            db, config, emergency=bool(getattr(args, "emergency", False))):
+        return 1
 
     if args.apikey_cmd == "create":
         user = get_user_by_email(db, args.user)
@@ -890,24 +1245,65 @@ def cmd_apikey(args: argparse.Namespace) -> int:
             db.close()
             return 1
 
+        #  — validate the scope BEFORE minting. A typo'd entry must refuse
+        # here, with no key created: the request-time matcher is fail-closed, so a
+        # bad entry would otherwise produce a credential that silently reaches
+        # nothing and a monitor that 403s in production with no clue why.
+        scope_json: str | None = None
+        expires_at: str | None = None
+        if getattr(args, "scope", None):
+            from email_triage.web._route_scope import validate_scope_entry
+            try:
+                entries = [validate_scope_entry(s) for s in args.scope]
+            except ValueError as exc:
+                print(f"Invalid --scope: {exc}")
+                print('Each --scope is one exact "<METHOD> </path>", e.g. '
+                      '--scope "GET /health/build". No globs.')
+                db.close()
+                return 1
+            # Sorted + de-duplicated so the stored JSON is canonical and two
+            # equivalent invocations produce the same column value.
+            scope_json = dump_json_col(sorted(set(entries)))
+        if getattr(args, "expires_days", None) is not None:
+            days = int(args.expires_days)
+            if days <= 0:
+                print("--expires-days must be a positive number of days.")
+                db.close()
+                return 1
+            # Formatted through the `to_utc_iso` SSOT (R9/A10) so the stored value
+            # is in the one spelling `parse_iso_aware` reads back in
+            # `verify_api_key`'s expiry check.
+            from datetime import timedelta, timezone
+            from email_triage._isotime import to_utc_iso
+            expires_at = to_utc_iso(
+                datetime.now(timezone.utc) + timedelta(days=days)
+            )
+
         raw_key = generate_api_key()
         key_hash = hash_api_key(raw_key)
-        # CLI actor: there's no authenticated session, so identify by
-        # the OS-level user (or USERNAME on Windows) for the audit
-        # trail. ``actor_user_id`` is left None — CLI runs are usually
-        # by an operator who isn't a registered triage user.
-        import os as _os
-        cli_actor = (
-            _os.environ.get("USER")
-            or _os.environ.get("USERNAME")
-            or "cli"
-        )
-        key_id = store_api_key(
-            db, key_hash, args.name, user["id"],
-            actor_user_id=None,
-            actor_email=f"cli:{cli_actor}",
-            source="cli",
-        )
+        # CLI actor: no authenticated session, so the kernel identity via
+        # the one resolver (``_cli_actor``, punch 547). ``actor_user_id`` is
+        # left None — CLI runs are usually by an operator who isn't a
+        # registered triage user.
+        try:
+            key_id = store_api_key(
+                db, key_hash, args.name, user["id"], expires_at,
+                scope=scope_json,
+                actor_user_id=None,
+                actor_email=_cli_actor(),
+                source="cli",
+            )
+        except ApiKeyGrantError as e:
+            # Panel P F5: rolled back, no key exists, and store_api_key left the
+            # gap row when the witness was the failure. Fail closed: a clean
+            # message and exit 1 (SystemExit: no traceback), never the raw key.
+            db.close()
+            print(
+                f"API key NOT created: the grant or its audit record could not "
+                f"be written, so nothing was granted ({fmt_exc(e, with_class=True)}).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
         db.close()
 
         print(f"API key created:")
@@ -915,6 +1311,10 @@ def cmd_apikey(args: argparse.Namespace) -> int:
         print(f"  Name: {args.name}")
         print(f"  User: {args.user}")
         print(f"  Key:  {raw_key}")
+        # Echo the fences back so the operator sees what they actually issued,
+        # not what they meant to type.
+        print(f"  Scope:   {scope_json or 'unscoped (every Bearer route)'}")
+        print(f"  Expires: {expires_at or 'never'}")
         print(f"\nStore this key securely — it cannot be retrieved again.")
         return 0
 
@@ -922,29 +1322,60 @@ def cmd_apikey(args: argparse.Namespace) -> int:
         keys = list_api_keys(db)
         db.close()
         if keys:
+            #  — show the scope, or an operator cannot audit what they
+            # issued. Rendered from the SAME parser the request path uses, so a
+            # corrupt column reads here exactly as it is ENFORCED there
+            # (fail-closed = "grants nothing") instead of printing raw JSON that
+            # looks like a working fence.
+            from email_triage.web._route_scope import parse_key_scope
             print("API keys:")
             for k in keys:
                 used = k.get("last_used_at") or "never"
                 expires = k.get("expires_at") or "never"
+                parsed = parse_key_scope(k.get("scope"))
+                if parsed is None:
+                    scope_txt = "unscoped (every Bearer route)"
+                elif not parsed:
+                    scope_txt = "GRANTS NOTHING (empty or unparseable scope)"
+                else:
+                    scope_txt = ", ".join(sorted(parsed))
                 print(f"  [{k['id']}] {k['name']} — user: {k['email']}, "
                       f"last used: {used}, expires: {expires}")
+                print(f"        scope: {scope_txt}")
         else:
             print("No API keys found.")
         return 0
 
     elif args.apikey_cmd == "delete":
-        import os as _os
-        cli_actor = (
-            _os.environ.get("USER")
-            or _os.environ.get("USERNAME")
-            or "cli"
-        )
-        if delete_api_key(
-            db, args.key_id,
-            actor_user_id=None,
-            actor_email=f"cli:{cli_actor}",
-            source="cli",
-        ):
+        emergency_reason = _emergency_reason_from_args(args)
+        try:
+            deleted = delete_api_key(
+                db, args.key_id,
+                actor_user_id=None,
+                actor_email=_cli_actor(),
+                source="cli",
+                emergency_reason=emergency_reason,
+                cli_principal=_cli_principal(),
+            )
+        except ApiKeyRevokeError as e:
+            # Punch 689: rolled back, so the key still exists and still
+            # authenticates; delete_api_key left the gap row when the witness
+            # was the failure. Fail closed: a clean message and exit 1.
+            db.close()
+            print(
+                f"API key {args.key_id} NOT revoked: the delete or its audit "
+                f"record could not be written, so the key is still live "
+                f"({fmt_exc(e, with_class=True)}). To contain it now, "
+                f"disable the owning user in the web UI (Users, Disable). If "
+                f"the audit chain is broken, retry with --emergency --reason "
+                f"CODE (the revoke then commits without its chained "
+                f"record, leaves an alarmed gap row and flags /health), or "
+                f"run `user disable --email OWNER_EMAIL --emergency --reason "
+                f"CODE`; if that also fails, stop the service. Then retry.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+        if deleted:
             print(f"API key {args.key_id} deleted.")
         else:
             print(f"API key {args.key_id} not found.")
@@ -956,42 +1387,333 @@ def cmd_apikey(args: argparse.Namespace) -> int:
     return 1
 
 
+def _add_emergency_args(parser: argparse.ArgumentParser, *, required: bool = False) -> None:
+    """Punch 709: the explicit emergency flag and its mandatory reason code on
+    one CLI revoke command. The code list is the SSOT in ``db.audit``."""
+    from email_triage.db.audit import EMERGENCY_REVOKE_REASONS
+    parser.add_argument(
+        "--emergency", action="store_true", required=required,
+        help="EMERGENCY: revoke even though the audit chain is broken. The "
+             "revoke commits WITHOUT its chained record, leaves an alarmed "
+             "audit_gap_events row and flags /health until the chain is "
+             "repaired. Needs --reason.",
+    )
+    parser.add_argument(
+        "--reason", choices=sorted(EMERGENCY_REVOKE_REASONS), required=required,
+        help="Reason code for --emergency (a fixed list: no free text)",
+    )
+
+
+def _emergency_reason_from_args(args: argparse.Namespace) -> str | None:
+    """The emergency reason code, or None when --emergency was not given.
+    ``--reason`` without ``--emergency`` and ``--emergency`` without a reason
+    both exit 2: the flag is explicit and the reason is mandatory."""
+    emergency = bool(getattr(args, "emergency", False))
+    reason = getattr(args, "reason", None)
+    if emergency and reason:
+        return reason
+    if emergency or reason:
+        print("--emergency and --reason must be given together.", file=sys.stderr)
+        raise SystemExit(2)
+    return None
+
+
+def _cli_principal() -> str:
+    """The kernel principal for the punch-709 gap rows. The funnel builds the
+    actor (``cli:<principal>``) itself from this, and only when no user id is
+    given (cycle P hipaa S2: never a caller-built label)."""
+    return _cli_actor().removeprefix("cli:")
+
+
+def _cli_emergency_disable_user(db, *, email: str, args: argparse.Namespace) -> int:
+    """``user disable --emergency --reason <code>``: the break-glass account stop.
+
+    Punch 709: with the audit chain broken the web UI cannot stop an account.
+    This runs ``set_user_disabled`` with the explicit emergency flag; on a healthy
+    chain it takes the normal witnessed path and writes no gap row. Closes
+    ``db``."""
+    from email_triage.db.audit import set_user_disabled
+    from email_triage.mail_headers import canonical_email
+    from email_triage.web.auth import get_user_by_email
+
+    reason = _emergency_reason_from_args(args)
+    user_ = get_user_by_email(db, canonical_email(email))
+    if user_ is None:
+        print("User not found.", file=sys.stderr)
+        db.close()
+        return 1
+    try:
+        changed = set_user_disabled(
+            db, int(user_["id"]), True, None, "cli emergency disable",
+            emergency_reason=reason, cli_principal=_cli_principal(),
+            source="cli",
+        )
+    except Exception as e:
+        db.close()
+        print(
+            f"User {user_['id']} NOT disabled: {fmt_exc(e, with_class=True)}. "
+            f"If the user is still live, stop the service.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    db.close()
+    print(f"User {user_['id']} disabled." if changed
+          else f"User {user_['id']} was already disabled.")
+    return 0
+
+
+def _cli_create_user(db, *, email: str, name: str, role: str) -> int:
+    """``user create``: the witnessed grant, in a function of its own.
+
+    Punch 668: creating a user is the root access grant (§164.312(b)). The row
+    and its ``user_created`` witness commit together in ``record_user_creation``.
+    Fail closed: if the witness cannot be written the user is rolled back and the
+    command exits 1. The ``@_cli_audit`` start/end rows stay; they are fail-soft
+    and not bound to the new id, so they are NOT the witness. The actor is the
+    kernel-resolved CLI principal (``_cli_actor``).
+
+    Its own function so the witness is the first durable call in its body:
+    ``cmd_user`` opens the config DB (``_cli_open_config_db``, which transitively
+    commits) before any branch runs, and that open is not the state change this
+    witness describes (the N-520 resolver-precision case that ``cli.py::
+    _emit_cli_audit_event`` is cleared for). Closes ``db``.
+    """
+    from email_triage.db.audit import GrantRefused, record_user_creation
+    try:
+        created = record_user_creation(
+            db, email=email, name=name, role=role,
+            actor_user_id=None, actor_email=_cli_actor(), source="cli",
+        )
+    except Exception as e:
+        db.close()
+        print(
+            f"User NOT created: the grant or its audit record could not be "
+            f"written, so nothing was granted ({fmt_exc(e, with_class=True)}).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    if isinstance(created, GrantRefused):
+        # A duplicate address: the funnel refused it and already witnessed it
+        # (``denied:duplicate_email``); there is no pre-check before the funnel.
+        print(f"User already exists: {email}")
+        db.close()
+        return 1
+    print(f"User created:")
+    print(f"  Email: {email}")
+    print(f"  Name:  {name}")
+    print(f"  Role:  {role}")
+    db.close()
+    return 0
+
+
+def _cmd_user_renormalize_emails(config, args: argparse.Namespace) -> int:
+    """`email-triage user re-normalize-emails`, called from cmd_user.
+
+    Panel Z MUST-Z1-R4: its own function, dispatched before cmd_user's shared
+    config-DB opener, so the N-520 CLEARED entry for this branch's opener keys on
+    this helper alone and cmd_user stays fail-closed for every other subcommand.
+    """
+    # N-322 R30 (task  N-317 half-2). Persisted-key re-normalize
+    # sweep. Scans every stored email column, compares against
+    # `canonical_email(raw)`, reports + optionally UPDATEs.
+    # Idempotent — a row already in canonical form is a no-op.
+    # Live-DB migration when --apply is set; @_cli_audit("user")
+    # gives us the phase='start'/'end' audit-emit for free.
+    import json as _json
+    from email_triage.db._helpers import row_get  # N-329 R30 (N-234 SSOT — fix-forward)
+    from email_triage.mail_headers import canonical_email
+    # N-336: was `_init_db(config.persistence.database_path)` — attribute
+    # `database_path` does not exist on PersistenceConfig (real name is
+    # `db_path`), so this raised AttributeError on first invocation
+    # (LIVE showstopper — DB-SME Phase 2). Route through the SSOT
+    # `_cli_open_config_db` (PD#11) — the encryption-aware opener that
+    # every other CLI handler uses.
+    db = _cli_open_config_db(config)
+    if not _cli_wire_audit_keys_or_refuse(db, config):
+        return 1
+    try:
+        # ---- users.email + users.notify_email ----
+        users_rows = db.execute(
+            "SELECT id, email, notify_email FROM users"
+        ).fetchall()
+        users_divergent: list[tuple[int, str, str, str, str]] = []
+        for r in users_rows:
+            uid = row_get(r, "id", 0)
+            email = row_get(r, "email", 1)
+            notify = row_get(r, "notify_email", 2)
+            new_email = canonical_email(email) if email else email
+            new_notify = canonical_email(notify) if notify else notify
+            if (email or "") != (new_email or "") or \
+               (notify or "") != (new_notify or ""):
+                users_divergent.append(
+                    (uid, email or "", new_email or "",
+                     notify or "", new_notify or "")
+                )
+
+        # Punch 703: users.email is UNIQUE, so two users whose addresses
+        # canonicalise to ONE target (two divergent rows, or a divergent row and
+        # one already canonical) cannot both be rewritten. --apply used to hit
+        # the constraint partway: the users before that row stayed committed,
+        # aliases_json was never written, and every re-run stopped at the same
+        # row. Detect every duplicate target up front; --apply refuses them all.
+        email_targets: dict[str, list[int]] = {}
+        for r in users_rows:
+            email = row_get(r, "email", 1)
+            target = canonical_email(email) if email else ""
+            if target:
+                email_targets.setdefault(target, []).append(row_get(r, "id", 0))
+        duplicate_targets = {
+            t: ids for t, ids in sorted(email_targets.items()) if len(ids) > 1
+        }
+
+        # ---- email_accounts.aliases_json ----
+        acct_rows = db.execute(
+            "SELECT id, aliases_json FROM email_accounts"
+        ).fetchall()
+        acct_divergent: list[tuple[int, list, list]] = []
+        for r in acct_rows:
+            aid = row_get(r, "id", 0)
+            aj = row_get(r, "aliases_json", 1)
+            if not aj:
+                continue
+            # N-324 R30 (CI-red fix-forward on N-322 — census 
+            # bare-json.loads pin). Route through the load_json_col
+            # SSOT — corrupt column degrades to [] (fail-CLOSED
+            # sweep skips this row), consistent with the pin's
+            # "corrupt column → 500" surface.
+            from email_triage.db._helpers import load_json_col
+            aliases = load_json_col(aj, default=[])
+            if not isinstance(aliases, list) or not aliases:
+                continue
+            new_aliases = [
+                canonical_email(a) if isinstance(a, str) else a
+                for a in aliases
+            ]
+            if aliases != new_aliases:
+                acct_divergent.append((aid, aliases, new_aliases))
+
+        # ---- Report ----
+        print(f"Users needing re-normalize: {len(users_divergent)}")
+        for uid, e_old, e_new, n_old, n_new in users_divergent[:20]:
+            if e_old != e_new:
+                print(f"  user#{uid} email: {e_old!r} -> {e_new!r}")
+            if n_old != n_new:
+                print(f"  user#{uid} notify: {n_old!r} -> {n_new!r}")
+        if len(users_divergent) > 20:
+            print(f"  ... and {len(users_divergent) - 20} more")
+        print(
+            f"Accounts with aliases needing re-normalize: "
+            f"{len(acct_divergent)}"
+        )
+        for aid, old, new in acct_divergent[:20]:
+            print(f"  account#{aid} aliases: {old!r} -> {new!r}")
+        if len(acct_divergent) > 20:
+            print(f"  ... and {len(acct_divergent) - 20} more")
+        if duplicate_targets:
+            print(
+                f"Duplicate login-address targets (users.email is unique): "
+                f"{len(duplicate_targets)}"
+            )
+            for target, ids in duplicate_targets.items():
+                print(f"  {target!r} <- " + ", ".join(f"user#{i}" for i in ids))
+            print(
+                "  Resolve each (change or disable all but one of those users' "
+                "addresses) before --apply; --apply refuses while any remain."
+            )
+
+        if not args.apply:
+            print("[dry-run] No writes. Re-run with --apply to rewrite.")
+            return 0
+
+        if duplicate_targets:
+            # Fail closed BEFORE any write: a partial sweep is worse than none.
+            print(
+                f"re-normalize-emails --apply REFUSED: {len(duplicate_targets)} "
+                f"duplicate login-address target(s) listed above; nothing was "
+                f"written.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # ---- Apply ----
+        # N-329 R30 (§164.312(a)(2)(iii) session_epoch pin fix-
+        # forward): touching `users.email` requires bumping
+        # `session_epoch` in the same statement so any live cookie
+        # authority tied to the OLD identity is invalidated at the
+        # next request.
+        #  R32 DA-fold R1 — canonicalise the target email so the
+        # updated row matches the read-side lookup (canonical_email SSOT).
+        # Panel Z MUST-Z1-1: the login address is a credential (OTP codes
+        # go to it), so the rewrite goes through the one user-update
+        # funnel, which writes the chained `user_email_changed` witness in
+        # the same transaction when the stored address changes, and still
+        # bumps `session_epoch` when it does not. The actor is the kernel
+        # CLI principal (`_cli_actor`, punch 547). One commit per user: a
+        # failed witness leaves that user unwritten (fail closed) and stops
+        # the sweep; a re-run picks up the rest (the sweep is idempotent).
+        from email_triage.db.audit import record_user_update
+        from email_triage.mail_headers import canonical_email
+        for uid, _, e_new, _, n_new in users_divergent:
+            record_user_update(
+                db, user_id=uid,
+                email=canonical_email(e_new) if e_new else None,
+                notify_email=n_new,
+                actor_user_id=None, actor_email=_cli_actor(), source="cli",
+            )
+        # N-324 R30 (CI-red fix-forward on N-322 — census 
+        # write-side bare-json.dumps pin). Route through the
+        # dump_json_col SSOT so ensure_ascii / serialization
+        # semantics stay uniform with every other *_json write.
+        for aid, _, new in acct_divergent:
+            db.execute(
+                "UPDATE email_accounts SET aliases_json = ? "
+                "WHERE id = ?",
+                (dump_json_col(new), aid),
+            )
+        db.commit()
+        print(
+            f"Applied re-normalize on {len(users_divergent)} users + "
+            f"{len(acct_divergent)} account aliases_json rows."
+        )
+        return 0
+    finally:
+        db.close()
+
+
 @_cli_audit("user")
 def cmd_user(args: argparse.Namespace) -> int:
     """Manage users."""
     config = load_config(args.config)
     setup_logging(config.logging)
 
-    from email_triage.web.db import init_db
     from email_triage.web.auth import get_user_by_email
 
     db_path = Path(config.persistence.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = init_db(db_path)
+    if args.user_cmd == "re-normalize-emails":
+        # Before the shared opener (panel Z MUST-Z1-R4); the helper opens its own handle.
+        return _cmd_user_renormalize_emails(config, args)
+    db = _cli_open_config_db(config)
+    if not _cli_wire_audit_keys_or_refuse(
+            db, config, emergency=bool(getattr(args, "emergency", False))):
+        return 1
 
     if args.user_cmd == "create":
-        existing = get_user_by_email(db, args.email)
-        if existing:
-            print(f"User already exists: {args.email} (role: {existing['role']})")
-            db.close()
-            return 1
-
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
+        #  R32 DA-fold R1 — canonicalise the email at ingest so the
+        # stored form matches the read-side lookup ([[canonical_email]]
+        # SSOT). Idempotent for ASCII; A-label form for IDN.
+        from email_triage.mail_headers import canonical_email
+        args.email = canonical_email(args.email)
+        # Punch 668: no pre-check here. The users.email UNIQUE is the one
+        # duplicate detector; the funnel witnesses a duplicate
+        # (``denied:duplicate_email``) and ``_cli_create_user`` reports it.
         role = args.role or "user"
         name = args.name or args.email.split("@")[0]
 
-        db.execute(
-            "INSERT INTO users (email, name, role, created_at) VALUES (?, ?, ?, ?)",
-            (args.email, name, role, now),
-        )
-        db.commit()
-        print(f"User created:")
-        print(f"  Email: {args.email}")
-        print(f"  Name:  {name}")
-        print(f"  Role:  {role}")
-        db.close()
-        return 0
+        return _cli_create_user(db, email=args.email, name=name, role=role)
+
+    elif args.user_cmd == "disable":
+        return _cli_emergency_disable_user(db, email=args.email, args=args)
 
     elif args.user_cmd == "list":
         rows = db.execute(
@@ -1021,11 +1743,28 @@ def cmd_user(args: argparse.Namespace) -> int:
             db.close()
             return 1
         from email_triage.web.mfa import (
+            RecoveryIssueError,
             issue_recovery_codes,
             RECOVERY_CODE_COUNT_DEFAULT,
         )
         count = int(getattr(args, "count", 0) or RECOVERY_CODE_COUNT_DEFAULT)
-        codes = issue_recovery_codes(db, user_id=user_["id"], count=count)
+        # Punch 668: the codes and their recovery_codes_issued witness commit
+        # together; if the witness fails the codes are rolled back and none is
+        # printed (fail closed). The @_cli_audit rows are not the witness.
+        try:
+            codes = issue_recovery_codes(
+                db, user_id=user_["id"], count=count,
+                actor_email=_cli_actor(), source="cli",
+            )
+        except RecoveryIssueError as e:
+            db.close()
+            print(
+                f"Recovery codes NOT issued: the grant or its audit record could "
+                f"not be written, so nothing was granted "
+                f"({fmt_exc(e, with_class=True)}).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
         db.close()
         print(f"Issued {len(codes)} recovery code(s) for {args.email}:")
         print()
@@ -1056,6 +1795,7 @@ def cmd_user(args: argparse.Namespace) -> int:
             db.close()
             return 1
         from email_triage.web.mfa import (
+            RecoveryIssueError,
             issue_operator_recovery_token,
             OPERATOR_RECOVERY_TOKEN_TTL_SECS_DEFAULT,
         )
@@ -1063,12 +1803,28 @@ def cmd_user(args: argparse.Namespace) -> int:
             getattr(args, "ttl_secs", 0)
             or OPERATOR_RECOVERY_TOKEN_TTL_SECS_DEFAULT
         )
-        token = issue_operator_recovery_token(
-            db,
-            target_user_id=user_["id"],
-            operator_user_id=None,  # CLI actor is captured via H-03-auto
-            ttl_secs=ttl,
-        )
+        # Punch 668: a break-glass token is a credential grant. The key row and
+        # its operator_recovery_key_issued witness commit together; if the
+        # witness fails the key is rolled back and NO token is printed (fail
+        # closed). The @_cli_audit rows are not the witness.
+        try:
+            token = issue_operator_recovery_token(
+                db,
+                target_user_id=user_["id"],
+                operator_user_id=None,  # CLI actor: actor_email below + H-03-auto
+                ttl_secs=ttl,
+                actor_email=_cli_actor(),
+                source="cli",
+            )
+        except RecoveryIssueError as e:
+            db.close()
+            print(
+                f"Operator-recovery token NOT issued: the grant or its audit "
+                f"record could not be written, so nothing was granted "
+                f"({fmt_exc(e, with_class=True)}).",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
         db.close()
         print(f"Operator-recovery token issued for {args.email}:")
         print()
@@ -1084,6 +1840,24 @@ def cmd_user(args: argparse.Namespace) -> int:
         return 0
 
     return 1
+
+
+# Punch 636: how long uvicorn waits for in-flight requests on a stop before it
+# cancels them and runs the lifespan shutdown. Unset, it waited without limit,
+# and a slow request could run the container into its StopTimeout SIGKILL,
+# which skips the lifespan shutdown entirely: no audit drain, no loss rows, no
+# final checkpoint, every in-flight audit write lost unrecorded.
+# The trade, bounded: a request still running at this bound is cancelled. The
+# access-audit middleware writes its row only AFTER the response, so a PHI
+# request cancelled mid-handler leaves no access_log row; the middleware
+# records that as a ``cancelled_before_launch`` loss row instead (its handler
+# may already have read PHI). Audit writes already launched are not uvicorn's
+# tasks; the lifespan drain waits for them and records what is still running
+# as ``shutdown_undrained``. Recorded beats a SIGKILL that skips the lifespan
+# shutdown and records nothing. One term of the shutdown envelope
+# (tests/test_636_shutdown_envelope_pin.py sums every term against the
+# container's StopTimeout).
+UVICORN_GRACEFUL_SHUTDOWN_SECS: float = 10.0
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -1157,6 +1931,28 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # host, not the in-config default (host isn't config-stored
     # today; it's a CLI arg).
     app.state.bind_host = args.host
+    # N-344 R31 (2026-07-04, Phase-4 DA finding): when the operator has
+    # declared a reverse-proxy front by populating
+    # ``config.audit.trusted_proxies`` (the same trust boundary
+    # ``request_forwarded_for`` uses for §164.312(b) audit-identity),
+    # ALSO tell uvicorn to honour ``X-Forwarded-Proto``/``X-Forwarded-
+    # For`` from those peers so ``request.url.scheme`` resolves to
+    # 'https' and the ``is_request_https`` cookie-Secure SSOT
+    # (``web/_cookies.py``) fires branch (a) correctly. Without this,
+    # uvicorn's default ``forwarded_allow_ips='127.0.0.1'`` rejects
+    # XFP from an nginx sidecar/host and the Secure-cookie flag drops
+    # silently under HTTPS-via-reverse-proxy — N-200's promised branch
+    # (a) was inoperative pre-N-344.
+    _trusted_proxies = list(getattr(config.audit, "trusted_proxies", []) or [])
+    # Punch 636: bound uvicorn's connection drain (both start paths below).
+    _uvicorn_proxy_kwargs: dict[str, Any] = {
+        "timeout_graceful_shutdown": UVICORN_GRACEFUL_SHUTDOWN_SECS,
+    }
+    if _trusted_proxies:
+        _uvicorn_proxy_kwargs.update({
+            "proxy_headers": True,
+            "forwarded_allow_ips": ",".join(_trusted_proxies),
+        })
     if ssl_certfile and ssl_keyfile:
         log.info(
             "Starting web UI (HTTPS)", host=args.host, port=args.port,
@@ -1172,6 +1968,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         uv_config = uvicorn.Config(
             app, host=args.host, port=args.port,
             ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile,
+            **_uvicorn_proxy_kwargs,
         )
         uv_config.load()  # populates uv_config.ssl
 
@@ -1217,7 +2014,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                                 print(
                                     f"[tls] cert reload failed; "
                                     f"keeping old context: "
-                                    f"{type(exc).__name__}: {exc}",
+                                    f"{fmt_exc(exc, with_class=True)}",
                                     flush=True,
                                 )
                                 # Don't update last_mtime so we retry
@@ -1226,14 +2023,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
                                 _time.sleep(30)
                                 continue
                         last_mtime = m
-                    except FileNotFoundError:
+                    except FileNotFoundError as exc:
                         # Cert temporarily missing (atomic swap in
                         # flight). Wait + retry.
-                        pass
-                    except Exception:
+                        log.debug("cert watch: cert file missing; retrying next tick", error=fmt_exc(exc))
+                    except Exception as exc:
                         # Any other transient error -- swallow and
                         # retry next tick. Keep the old SSLContext.
-                        pass
+                        log.warning(
+                            "cert watch: reload check failed; keeping old SSLContext",
+                            error=fmt_exc(exc),
+                        )
                     _time.sleep(30)
 
             threading.Thread(
@@ -1249,7 +2049,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             "Run `email-triage tls bootstrap` to enable HTTPS.",
             host=args.host, port=args.port,
         )
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, **_uvicorn_proxy_kwargs)
     return 0
 
 
@@ -1360,14 +2160,42 @@ def cmd_restore(args: argparse.Namespace) -> int:
         return 1
 
     bundle_bytes = bundle_path.read_bytes()
+
+    #  public-key (ETBKP02) bundles: unwrap with the OFF-BOX private key
+    # first — recovering the inner .etbk + its random passphrase — then fall
+    # through to the normal symmetric restore path.
+    recovered_passphrase = None
+    if backup_mod.is_pubkey_sealed(bundle_bytes):
+        pk_path = (getattr(args, "private_key", "") or "").strip()
+        if not pk_path:
+            print(
+                "This is a public-key-sealed backup; pass "
+                "--private-key <path> (the off-box X25519 private key)."
+            )
+            return 1
+        pkp = Path(pk_path).expanduser()
+        if not pkp.is_file():
+            print(f"Private key file not found: {pkp}")
+            return 1
+        try:
+            bundle_bytes, recovered_passphrase = (
+                backup_mod.unwrap_pubkey_sealed_etbk(bundle_bytes, pkp.read_bytes())
+            )
+        except backup_mod.BackupError as e:
+            print(f"Public-key unwrap failed: {e}")
+            return 1
+        print("Public-key bundle unwrapped with the private key.")
+
     try:
         sniffed_type = backup_mod._sniff_bundle_type(bundle_bytes)
     except backup_mod.BundleFormatError as e:
         print(f"Not a valid email-triage bundle: {e}")
         return 1
 
-    # Passphrase: file > getpass prompt. Never accept via flag.
-    if args.passphrase_file:
+    # Passphrase: recovered (public-key) > file > getpass prompt. Never via flag.
+    if recovered_passphrase is not None:
+        passphrase = recovered_passphrase
+    elif args.passphrase_file:
         pf = Path(args.passphrase_file).expanduser()
         if not pf.is_file():
             print(f"Passphrase file not found: {pf}")
@@ -1464,10 +2292,21 @@ def cmd_restore(args: argparse.Namespace) -> int:
     for name, path in written.items():
         print(f"  {name:30s}  {path}")
 
+    # Punch 711: the swap-in below moves the live DB (which holds this
+    # command's @_cli_audit start/end rows) aside, so leave a witness marker in
+    # the live data dir that the next server boot records into the kept chain.
+    witness = (
+        _write_restore_witness(args, bundle_path, m, target_dir)
+        if sniffed_type == "full" else None
+    )
+
     # Print swap-in instructions appropriate to the bundle type.
     print()
     print("To complete the restore:")
     if sniffed_type == "full":
+        if witness is not None:
+            print(f"  (restore witness {witness.name} is recorded into the audit "
+                  "chain at the next start; leave it in place)")
         print("  1. sudo systemctl stop email-triage")
         print(f"  2. mv triage.db triage.db.preexisting && \\")
         print(f"     mv {target_dir / 'triage.db'} triage.db")
@@ -1491,6 +2330,81 @@ def cmd_restore(args: argparse.Namespace) -> int:
         print(f"  3. shred -u {master_key_out}    # don't leave the raw key on disk")
 
     return 0
+
+
+def _write_restore_witness(
+    args: argparse.Namespace, bundle_path: Path, manifest: dict, target_dir: Path,
+) -> Path | None:
+    """Punch 711: write the restore-witness marker into the LIVE data dir.
+
+    ``@_cli_audit("restore")`` writes its start/end rows into the live database
+    (``_emit_cli_audit_event`` -> ``config.persistence.db_path``). The swap-in
+    this command prints moves that file to ``triage.db.preexisting``, so those
+    rows never reach the chain the operator keeps. The marker sits in the data
+    dir, which the swap leaves alone; the server boot records it into the
+    restored chain (``backup.ingest_restore_witness_markers``) and removes it.
+
+    Same gate as ``_emit_cli_audit_event``: HIPAA mode on and a live DB to be
+    swapped. A failure to write it is printed to stderr (the extraction has
+    already happened, so the operator must know the restore is unwitnessed);
+    it returns None.
+    """
+    from email_triage import backup as backup_mod
+    import socket
+    try:
+        config = load_config(getattr(args, "config", None))
+    except Exception:
+        return None
+    if not getattr(config.logging, "hipaa", False):
+        return None
+    db_path = Path(config.persistence.db_path)
+    if not db_path.exists():
+        return None
+    # Panel AB (MUST C2-711): the newest chain row of the database this command
+    # ran against (its own @_cli_audit start row is already there). The boot
+    # records the marker only into a database that does NOT hold it, i.e. after
+    # the swap. Unreadable here: the marker is still written, and the boot
+    # records it as ``swap-unverified``, never ``swapped-in``.
+    live_chain_head = None
+    live_chain_head_ts = None  # punch 720: the boot's proof the head was not merely pruned
+    try:
+        conn = _cli_open_config_db(config)
+        try:
+            row = conn.execute(
+                "SELECT row_hash, ts FROM log_entries WHERE row_hash != '' "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+            live_chain_head = row[0] if row else None
+            live_chain_head_ts = row[1] if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"WARNING: the live audit chain could not be read ({fmt_exc(e)}); "
+              "the restore witness will be recorded as swap-unverified.",
+              file=sys.stderr)
+    try:
+        return backup_mod.write_restore_witness_marker(db_path.parent, {
+            "live_chain_head": live_chain_head,
+            "live_chain_head_ts": live_chain_head_ts,
+            "cli_hostname": socket.gethostname(),
+            "bundle_name": bundle_path.name,
+            "bundle_type": manifest.get("bundle_type"),
+            "source_hostname": manifest.get("hostname"),
+            "exported_at": manifest.get("exported_at"),
+            "exported_by": manifest.get("operator_email"),
+            "schema_version": manifest.get("schema_version"),
+            "commit_sha": manifest.get("commit_sha"),
+            "target_dir": str(target_dir),
+            "extracted_at": now_utc_iso(),
+            "actor": _cli_actor(),
+        }, owner_of=db_path)
+    except OSError as e:
+        print(
+            f"WARNING: the restore witness could not be written ({fmt_exc(e)}); "
+            "this restore will have NO record in the kept audit chain. Record it "
+            "by hand (INCIDENT_RESPONSE.md break-glass actions_taken).",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _cmd_db_dispatch(args: argparse.Namespace) -> int:
@@ -1581,7 +2495,7 @@ def cmd_db_encrypt(args: argparse.Namespace) -> int:
         f"is confirmed healthy, securely delete it (shred -u) per the runbook "
         f"disposal step (§164.310(d)(2)(i))."
     )
-    print("Next: deploy the v0.1.2 image with EMAIL_TRIAGE_DB_ENCRYPTION=true.")
+    print("Next: set persistence.encryption_enabled: true in the config file, then redeploy.")
     return 0
 
 
@@ -1647,9 +2561,11 @@ def _cmd_embedding_bits_dispatch(args: argparse.Namespace) -> int:
         return cmd_embedding_bits_verify(args)
     if sub == "status":
         return cmd_embedding_bits_status(args)
+    if sub == "remove":
+        return cmd_embedding_bits_remove(args)
     print(
         "Usage: email-triage embedding-bits {install|sideload|"
-        "verify|status}",
+        "verify|status|remove}",
         file=sys.stderr,
     )
     return 1
@@ -1690,40 +2606,153 @@ def _cli_stamp_db_encryption(config: Any) -> bool:
     return encrypted
 
 
+def _cli_open_config_db(config: Any) -> Any:
+    """SSOT — open the live *configured* DB encryption-aware for a CLI handler.
+
+    The CLI runs OUTSIDE the server boot, so nothing stamps the dedicated-conn
+    encryption context. Raw ``init_db(config.persistence.db_path)`` is the
+    PLAINTEXT opener (``web.db.init_db`` -> bare ``sqlite3.connect``) and raises
+    ``sqlite3.DatabaseError: file is not a database`` on an encrypted install
+    (the default / HIPAA-class posture). This stamps encryption from config
+    (:func:`_cli_stamp_db_encryption`, fail-closed via the boot contract), then
+    opens via the shared encrypted-aware opener + applies migrations — mirroring
+    the server boot at ``web/app.py`` (``init_db_encrypted`` branch).
+
+    EVERY CLI handler that opens the configured DB MUST use this — never raw
+    ``init_db(config.persistence.db_path)``. (N-129: 6 handlers — style-profile,
+    sent-mail-index, apikey, user, secrets, the audit auto-emit — opened raw and
+    were silently broken on encrypted installs; the bug surfaced LIVE mining a
+    profile on prod. On a FRESH encryption-required install raw ``init_db`` would
+    also silently create a sibling PLAINTEXT ``triage.db`` a later encrypted
+    ``serve`` can't open. The unit tests MOCKED ``init_db`` so they never
+    exercised the real encrypted open — the mock-the-boundary miss.)
+
+    PIN SCOPE (do not over-read — layered defense): the pin
+    ``tests/test_cli_db_open_encryption_pin.py`` bans an ``init_db`` /
+    ``init_db_encrypted`` call on ``<x>.persistence.<attr>`` outside this funnel,
+    under any import binding (``init_db as _init_db``, ``wdb.init_db``: punch
+    597 — the N-336 site was the alias shape and the pre-597 pin could not see
+    it). It does not follow a path through a dict, an attribute or another
+    function. A raw ``sqlite3.connect`` or an UNSTAMPED ``open_dedicated_conn``
+    on the config path is a SEPARATE, currently-uncovered shape (no such
+    offender today) — a pin existing is not proof of full coverage. A behavioural test
+    (``test_cli_open_config_db_bootstraps_fresh_db``) covers the fresh-DB schema.
+    """
+    from email_triage.secrets import read_bootstrap_master_key
+    from email_triage.web.db import init_db, init_db_encrypted
+
+    # N-17/N-129: stamp the dedicated-conn encryption context from config (the
+    # CLI runs outside the server boot, so nothing else stamps it; fail-CLOSED
+    # via the boot contract), then mirror the server boot's open branch EXACTLY
+    # (web/app.py) — both `init_db_encrypted` and `init_db` run `_bootstrap_schema`
+    # (full DDL + migrations + PRAGMAs + the N-16 row factory), so a FRESH DB (the
+    # `cmd_user` first-admin bootstrap) gets its base tables. (db-sme MUST-FIX: the
+    # earlier `open_dedicated_conn` + bare `run_migrations` shape dropped `_ALL_DDL`
+    # and crashed 'no such table: settings' on a fresh DB.)
+    encrypted = _cli_stamp_db_encryption(config)
+    db_path = str(config.persistence.db_path)
+    if encrypted:
+        return init_db_encrypted(db_path, read_bootstrap_master_key(config))
+    return init_db(db_path)
+
+
+def _cli_wire_audit_keys(conn: Any, config: Any, provider: Any = None) -> Any:
+    """SSOT: load the audit-chain HMAC keys into THIS process's key registry.
+
+    Every ``email-triage`` invocation is its own process, and the registry is
+    per process, so a CLI handler that opens the configured DB and then writes a
+    chained audit row (a grant, a key mint, an audit emit) has no keys unless it
+    wires them itself. The server boot does this once; the CLI must do it per
+    handler. ``provider`` is an already-bootstrapped secrets store when the
+    handler holds one; otherwise this bootstraps it from ``conn``.
+
+    Fail-CLOSED (PD-8): any error propagates. A caller that wants a printed
+    refusal instead of a traceback uses :func:`_cli_wire_audit_keys_or_refuse`.
+
+    Found 2026-11-03: ``user create`` and ``apikey create`` opened the DB and
+    never wired, so in a HIPAA-off process (where the auto-emit's own wiring
+    does not run) the grant refused with H-02a "no HMAC key has been
+    provisioned". The pin ``tests/test_cli_audit_hmac_wiring_pin.py`` requires
+    every function here that calls :func:`_cli_open_config_db` to reach this
+    funnel, and bans ``wire_audit_chain_hmac_keys`` anywhere else in this module.
+    """
+    from email_triage.secrets import (
+        bootstrap_secrets_from_config,
+        wire_audit_chain_hmac_keys,
+    )
+
+    if provider is None:
+        provider = bootstrap_secrets_from_config(conn, config)
+    wire_audit_chain_hmac_keys(provider, config)
+    return provider
+
+
+def _cli_wire_audit_keys_or_refuse(conn: Any, config: Any, *, emergency: bool = False) -> bool:
+    """Wire via :func:`_cli_wire_audit_keys`; on failure print why, close
+    ``conn`` and return False so the handler refuses before it changes anything.
+
+    ``emergency`` (punch 709 break-glass) warns and carries on instead: those
+    revokes exist for a broken chain, commit without their chained record and
+    raise the alarm, so refusing here would leave the credential live."""
+    try:
+        _cli_wire_audit_keys(conn, config)
+    except Exception as e:
+        if emergency:
+            print(
+                f"WARNING: could not wire the audit-chain HMAC keys "
+                f"({fmt_exc(e, with_class=True)}); proceeding with the EMERGENCY revoke.",
+                file=sys.stderr,
+            )
+            return True
+        conn.close()
+        print(
+            f"Could not wire the audit-chain HMAC keys ({fmt_exc(e, with_class=True)}); "
+            "nothing was changed.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _cli_start_gate_closed(command: str, why: str = "") -> CliAuditGateClosed:
+    """The N-157 start-gate refusal: one message for every failure that loses the start row."""
+    return CliAuditGateClosed(
+        f"CLI audit emit failed for {command} (phase=start{why}); "
+        "pass --allow-unaudited to bypass (procedural break-"
+        "glass fallback per INCIDENT_RESPONSE.md)."
+    )
+
+
 def _embedding_bits_open_db(args: argparse.Namespace) -> Any:
     """Open the configured DB + apply migrations. Used by every
     embedding-bits subcommand so install_state row reads are always
-    against an up-to-date schema."""
+    against an up-to-date schema. Routes through the :func:`_cli_open_config_db`
+    SSOT (N-129) so the encrypted-aware open can't drift per-command."""
     config = load_config(args.config)
-    db_path = Path(config.persistence.db_path)
-    # N-17: resolve + stamp encryption from config (CLI runs outside the
-    # server's boot, so nothing else stamps it), then open via the shared
-    # encrypted-aware opener so an encrypted install is read correctly.
-    _cli_stamp_db_encryption(config)
-    from email_triage.db._engine import open_dedicated_conn
-    conn = open_dedicated_conn(str(db_path), check_same_thread=False)
-    # N-16: factory from the conn's own dbapi module (sqlite3.Row vs
-    # sqlcipher3.dbapi2.Row) — open_dedicated_conn may return either.
-    apply_compatible_row_factory(conn)
-    # Run migrations so the install_state row exists even on a fresh
-    # DB. Cheap on already-migrated installs.
-    from email_triage.web.migrations import run_migrations
-    run_migrations(conn)
-    return conn
+    return _cli_open_config_db(config)
 
 
 def _embedding_bits_paths(args: argparse.Namespace) -> tuple[Path, Path]:
-    """Resolve (manifest_path, target_dir) from CLI args + env + defaults."""
+    """Resolve (manifest_path, target_dir): a typed CLI argument, else the SSOT.
+
+    The defaults come from ``embedding_bits.resolve_manifest_path`` and
+    ``get_runtime_deps_path``, the ONE resolvers the web routes and the drift gate
+    use (PD-5). This function used to read the manifest env override itself — a
+    second copy of the resolver that the SSOT's docstring said was gone (punch
+    539 fold-check, hipaa H539FC-8 / db DB-539FC-7). The typed ``--manifest`` /
+    ``--target-dir`` stay: an operator at the keyboard chose them for one run, and
+    ``remove_install`` refuses a target it cannot identify as a runtime prefix
+    (N-549).
+    """
     from email_triage.embedding_bits import (
-        DEFAULT_MANIFEST_PATH, get_runtime_deps_path,
+        get_runtime_deps_path, resolve_manifest_path,
     )
-    manifest_raw = (
-        getattr(args, "manifest", "") or
-        os.environ.get("EMBEDDING_BITS_MANIFEST", "") or
-        DEFAULT_MANIFEST_PATH
-    )
+    manifest_raw = getattr(args, "manifest", "") or ""
     target_raw = getattr(args, "target_dir", "") or ""
-    manifest_path = Path(manifest_raw).expanduser().resolve()
+    manifest_path = (
+        Path(manifest_raw).expanduser().resolve()
+        if manifest_raw else resolve_manifest_path()
+    )
     target_dir = (
         Path(target_raw).expanduser().resolve()
         if target_raw else get_runtime_deps_path()
@@ -1822,16 +2851,96 @@ def cmd_embedding_bits_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_embedding_bits_status(args: argparse.Namespace) -> int:
-    """Print the install_state row + runtime-ready probe."""
+    """Print the install_state row + what is actually installed on the volume.
+
+    N-524: the runtime probe here is the NON-mutating one. ``is_runtime_ready()``
+    would have added the volume's site-packages to this process's ``sys.path``
+    as a side effect of asking a question — harmless in a short-lived CLI, but
+    the point of the split is that a probe is a probe everywhere, so a future
+    long-running caller of this code path cannot inherit the mutation.
+
+    The ``_installed`` block is the disk, not the row: the row says what the
+    installer intended, the scan says what would import.
+    """
     import json
     conn = _embedding_bits_open_db(args)
     from email_triage.embedding_bits import (
-        get_install_status, is_runtime_ready,
+        get_install_status, runtime_importable_probe, runtime_install_record,
     )
+    manifest_path, target_dir = _embedding_bits_paths(args)
     state = get_install_status(conn)
-    state["_runtime_ready"] = is_runtime_ready()
+    state["_runtime_ready"] = runtime_importable_probe(target_dir)
+    state["_installed"] = runtime_install_record(
+        target_dir=target_dir, manifest_path=manifest_path,
+    )
     print(json.dumps(state, indent=2, default=str))
     return 0
+
+
+@_cli_audit("embedding-bits.remove")
+def cmd_embedding_bits_remove(args: argparse.Namespace) -> int:
+    """Delete the runtime prefix and reset the install-state row. One step.
+
+    The CLI half of the ONE removal funnel (N-526 / punch 541) — the admin
+    ``POST /config/ai-backends/embedding-remove`` is the other, and both call
+    ``embedding_bits.remove_install`` so neither can do half the job. Carries
+    ``@_cli_audit`` like every other state-changing subcommand, so the operation
+    lands in the audit trail through the emitter rather than as an unrecorded
+    filesystem change.
+
+    Exit codes: 0 removed (or nothing was there), 1 refused because an install
+    is in flight, because the target is or contains the database or the data
+    volume root, OR the delete was only partial, 2 could not open the DB.
+    """
+    conn = _embedding_bits_open_db(args)
+    _manifest_path, target_dir = _embedding_bits_paths(args)
+    from email_triage.embedding_bits import (
+        RemoveInFlight, RemoveTargetRefused, purge_removal_tombstones,
+        removal_tombstones, remove_install,
+    )
+    try:
+        summary = remove_install(conn=conn, target_dir=target_dir)
+    except (RemoveInFlight, RemoveTargetRefused) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    # remove_install RENAMED the prefix to a tombstone; delete it now. This CLI
+    # process is not the web app's DB writer, so the delete holds nothing (N-543).
+    purge_removal_tombstones(target_dir)
+    if removal_tombstones(target_dir):
+        print(
+            f"NOTE: part of the removed runtime could not be deleted yet (a file "
+            f"is held open); it sits beside {target_dir} as a *.removing-* "
+            f"directory and the next install or remove deletes it.",
+            file=sys.stderr,
+        )
+    if summary["residual_tree"]:
+        print(
+            f"PARTIALLY removed: files remain under {target_dir}. The "
+            f"install-state row is reset, so the app will not load the runtime, "
+            f"but the volume still holds packages — check permissions and open "
+            f"file handles, then run this again.",
+            file=sys.stderr,
+        )
+    elif summary["removed"]:
+        print(f"removed the runtime install at {target_dir}")
+    else:
+        print(
+            f"nothing to remove at {target_dir}; the install-state row is "
+            f"reset either way",
+        )
+    if summary["sys_path_entries"]:
+        print(
+            f"dropped {len(summary['sys_path_entries'])} entr"
+            f"{'y' if len(summary['sys_path_entries']) == 1 else 'ies'} "
+            f"from this process's sys.path",
+        )
+    if summary["restart_required"]:
+        print(
+            "NOTE: modules were already imported from the removed runtime in "
+            "this process (" + ", ".join(summary["loaded_modules"]) + "). "
+            "Restart the service to stop running that code.",
+        )
+    return 1 if summary["residual_tree"] else 0
 
 
 def _cmd_audit_dispatch(args: argparse.Namespace) -> int:
@@ -1841,8 +2950,51 @@ def _cmd_audit_dispatch(args: argparse.Namespace) -> int:
         return cmd_audit_verify(args)
     if sub == "reconcile":
         return cmd_audit_reconcile(args)
+    if sub == "clear-emergency-flag":
+        return cmd_audit_clear_emergency_flag(args)
     print(
-        "Usage: email-triage audit {verify,reconcile} [...]",
+        "Usage: email-triage audit {verify,reconcile,clear-emergency-flag} [...]",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_audit_clear_emergency_flag(args: argparse.Namespace) -> int:
+    """``audit clear-emergency-flag``: the ONE clear edge of the punch-709
+    emergency marker (``db.audit.clear_emergency_revoke``). It clears only when
+    every chained table verifies intact, the ``log_entries`` verdict is
+    ``pass`` and an HMAC key is provisioned, so the flag outlives the broken
+    chain and a lone verify run never hides it.
+
+    Exit codes: 0 cleared, 1 not cleared (blockers on stderr), 2 could not open
+    the DB or wire the keys."""
+    from email_triage.db.audit import clear_emergency_revoke
+
+    try:
+        config = load_config(args.config)
+        conn = _cli_open_config_db(config)
+    except Exception as e:
+        print(f"Could not open the database: {fmt_exc(e, with_class=True)}", file=sys.stderr)
+        return 2
+    try:
+        try:
+            _cli_wire_audit_keys(conn, config)
+        except Exception as e:
+            print(
+                f"Could not wire the audit-chain HMAC keys "
+                f"({fmt_exc(e, with_class=True)}); the flag stays set.",
+                file=sys.stderr,
+            )
+            return 2
+        result = clear_emergency_revoke(
+            conn, actor_user_id=None, source="cli", cli_principal=_cli_principal())
+    finally:
+        conn.close()
+    if result["cleared"]:
+        print("Emergency-revoke flag cleared: every audit chain verifies.")
+        return 0
+    print(
+        "Emergency-revoke flag NOT cleared: " + "; ".join(result["blockers"]),
         file=sys.stderr,
     )
     return 1
@@ -1857,14 +3009,31 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
     :func:`verify_log_chain` in a CLI surface so external compliance
     reviewers can run the check post-suite without writing Python.
 
+    ``--all-chains`` (punch ) also walks every other chained audit table
+    through :func:`verify_all_audit_chains`, the same set /compliance shows
+    (the audit-event tables and, since punch , ``audit_gap_events``), and
+    fails on any break. It also fails on a keyless (``sha256``) row in any
+    table outside ``KEYLESS_PERMITTED_TABLES`` (N-507: no current writer of
+    those tables produces one). ``--since`` applies to ``log_entries`` only.
+    The Path-3 deploy bake runs with this flag, so a broken chain blocks a
+    swap. With ``--db`` no master key is wired, so every keyed row in the
+    other chains reads "hash recompute failed"; the command says so on stderr.
+
+    Punch 625 (N-609), a fixed rule with no setting (operator 2026-10-22): a
+    ``log_entries`` keyless row with no keyed boundary after it is
+    UNVERIFIABLE, since a pre-H-02a legacy row and a substitution look the
+    same until a keyed legacy seal vouches for the prefix (punch 669): exit 3.
+    ``--db`` follows the same rule.
+
     Exit codes:
         0  chain verified end-to-end (or to the ``--since`` cutoff)
         1  chain break detected; stderr names the broken row
         2  could not open the DB
+        3  UNVERIFIABLE: keyless log rows with no keyed boundary after them
+           (the bake refuses)
     """
-    import sqlite3
-
-    from email_triage.web.db import verify_log_chain
+    from email_triage.db.audit import KEYLESS_PERMITTED_TABLES
+    from email_triage.web.db import verify_all_audit_chains, verify_log_chain
 
     # Resolve DB path: --db override wins (explicit plaintext target — does
     # NOT touch config, a long-standing contract), else load from config.
@@ -1894,28 +3063,25 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 2
 
-    # Open the verifier connection. Plaintext: read-only ``mode=ro`` keeps
-    # the verifier from creating/mutating the live DB. Encrypted: route
-    # through the SQLCipher opener (no mode=ro URI equivalent — read-write
-    # handle, SELECT-only use).
+    # the backlog  (Census v3 #8) — route through the SSOT
+    # ``open_dedicated_conn_readish`` (boot-encryption-aware RO opener).
+    # Both arms open ``mode=ro`` (encrypted: SQLCipher ``mode=ro`` since
+    # punch 556 / N-559; it was a RW handle before). Plaintext:
+    # ``mode=ro`` URI + full init_db arg set (timeout=30 for WAL busy
+    # overlap on a live DB, cached_statements=0 for CPython #118172
+    # hardening).
     try:
-        if encrypted:
-            from email_triage.db._engine import open_dedicated_conn
-            conn = open_dedicated_conn(str(db_path), check_same_thread=False)
-        else:
-            conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True,
-                check_same_thread=False,
-            )
+        from email_triage.db._engine import open_dedicated_conn_readish
+        conn = open_dedicated_conn_readish(str(db_path))
         # N-16: factory from the conn's own dbapi module (sqlite3.Row vs
         # sqlcipher3.dbapi2.Row).
         apply_compatible_row_factory(conn)
-    except sqlite3.Error as e:
+    except DB_ERRORS as e:
         print(f"Could not open {db_path}: {e}", file=sys.stderr)
         return 2
     except Exception as e:
-        # sqlcipher3 raises its own DBAPI Error subclass on bad key /
-        # unreadable file — same "could not open" exit as sqlite3.Error.
+        # A non-DB open failure (DB_ERRORS above covers both drivers,
+        # punch 560) — same "could not open" exit.
         print(f"Could not open {db_path}: {e}", file=sys.stderr)
         return 2
 
@@ -1930,35 +3096,187 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
     # break landed at the first post-cutover row. Proven 2026-05-31: prod's
     # chain verifies clean (34213 rows) once keys are wired. The ``--db``
     # plaintext escape hatch has no config/master key and verifies legacy
-    # 'sha256' rows only (documented limitation; warns + continues).
+    # 'sha256' rows only (documented limitation; the stderr note below says so).
     if not args.db:
         try:
-            from email_triage.secrets import (
-                bootstrap_secrets_from_config,
-                wire_audit_chain_hmac_keys,
-            )
-            _provider = bootstrap_secrets_from_config(conn, config)
-            wire_audit_chain_hmac_keys(_provider, config)
+            _cli_wire_audit_keys(conn, config)
         except Exception as e:
             print(
                 f"Warning: could not wire audit-chain HMAC keys "
-                f"({type(e).__name__}: {e}); any hmac-sha256-v1 rows will "
+                f"({fmt_exc(e, with_class=True)}); any keyed (hmac-sha256-v1/v2) rows will "
                 f"report as a chain break.",
                 file=sys.stderr,
             )
 
+    all_chains = bool(getattr(args, "all_chains", False))
     try:
         result = verify_log_chain(conn, since=args.since)
+        chains = verify_all_audit_chains(conn) if all_chains else {}
     finally:
         conn.close()
 
+    def _keyless_is_signal(table: str, c: dict) -> bool:
+        # N-507: a keyless row FAILS where no current writer produces one and
+        # passes, counted, where one does (the gap writer's N-467 degrade).
+        return bool(c["keyless_count"]) and table not in KEYLESS_PERMITTED_TABLES
+
+    def _downgrade_is_signal(c: dict) -> bool:
+        # N-507 option A: every writer stamps hmac-sha256-v2, so a v1 row
+        # after a chain's first v2 row has no current producer.
+        return bool(c.get("downgrade_count"))
+
+    broken = {
+        t: c for t, c in chains.items()
+        if not c["intact"] or _keyless_is_signal(t, c) or _downgrade_is_signal(c)
+    }
+    if args.db and not args.quiet and (broken or result["first_break_id"] is not None):
+        # Punch  (F2) and da NEW-A: the --db path wires no master key
+        # (above), so every keyed row in every chain walked, log_entries
+        # included, fails its recompute. Printed before the FAIL lines it
+        # explains, so they are not read as tampering; a clean run and
+        # --quiet stay as they were.
+        print(
+            "audit verify: note — --db wires no master key, so every keyed "
+            "(hmac-sha256-v1/v2) row in the chains walked reads \"hash recompute "
+            "failed\"; verify keyed rows against the live install without --db.",
+            file=sys.stderr,
+        )
+    for table, c in chains.items():
+        if args.quiet or table in broken:
+            continue
+        keyless = f", {c['keyless_count']} keyless" if c["keyless_count"] else ""
+        # Punch : a signal, not a FAIL (N-510).
+        missing = c.get("missing_id_count")
+        gap = f", {missing} issued id(s) missing" if missing else ""
+        print(f"audit verify: {table}: PASS — {c['rows_checked']} rows checked{keyless}{gap}")
+    # Punch 709 (cycle P hipaa Q3): a PASS above is about integrity. A revoke the
+    # emergency flag committed without its witness is a KNOWN completeness gap in
+    # that table, so it is reported on its own line, --quiet and the bake log
+    # included, and never changes the exit code.
+    for table, c in chains.items():
+        known = c.get("known_emergency_gap_count")
+        if known:
+            print(
+                f"KNOWN-GAPS {table} emergency_revoke={known}" if args.quiet else
+                f"audit verify: {table}: {known} known emergency-revoke gap(s): revoke(s) "
+                f"committed without their chained witness (punch 709; audit_gap_events "
+                f"helper emergency_revoke); the verdict above is integrity, not completeness"
+            )
+        elif c.get("known_emergency_gaps_error"):
+            print(
+                f"audit verify: {table}: known emergency-revoke gaps unreadable "
+                f"({c['known_emergency_gaps_error']})",
+                file=sys.stderr,
+            )
+    for table, c in broken.items():
+        if not c["intact"]:
+            bid = c["first_break_id"]
+            where = []
+            if bid is not None:
+                where.append(f"first break id={bid}")
+                # F1: print the count only when the verifier measured one. A
+                # missing key must not render as a measured zero.
+                if "break_count" in c:
+                    where.append(f"{c['break_count']} rows do not verify")
+            detail = f" ({', '.join(where)})" if where else ""
+            if args.quiet:
+                print(f"FAIL {table} {bid if bid is not None else 'table'}", file=sys.stderr)
+            else:
+                print(
+                    f"audit verify: FAIL — {table} chain: {c['first_break_reason']}{detail}",
+                    file=sys.stderr,
+                )
+        if _keyless_is_signal(table, c):
+            if args.quiet:
+                print(f"FAIL {table} keyless={c['keyless_count']}", file=sys.stderr)
+            else:
+                print(
+                    f"audit verify: FAIL — {table} chain: {c['keyless_count']} keyless "
+                    f"(sha256) row(s); no current writer of this table produces one, "
+                    f"so each is a tamper signal (N-507)",
+                    file=sys.stderr,
+                )
+        if _downgrade_is_signal(c):
+            if args.quiet:
+                print(f"FAIL {table} downgrade={c['downgrade_count']}", file=sys.stderr)
+            else:
+                print(
+                    f"audit verify: FAIL — {table} chain: {c['downgrade_count']} "
+                    f"hmac-sha256-v1 row(s) after the first hmac-sha256-v2 row "
+                    f"(id={c.get('current_alg_from_id')}); no current writer "
+                    f"produces one, so each is a downgrade signal (N-507)",
+                    file=sys.stderr,
+                )
+
     if result["first_break_id"] is None:
         rows = result["rows_checked"]
-        if args.quiet:
-            print(f"PASS {rows}")
-        else:
-            print(f"audit verify: PASS — {rows} rows checked")
-        return 0
+        # The log_entries verdict is verify_log_chain's own ``verdict`` field
+        # (panel P G2), never re-derived here. N-507 option D (operator
+        # 2026-10-12): a keyless row AFTER the first keyed row FAILS, and so
+        # does a v1 row after the first v2 row (option A). Punch 625 (N-609):
+        # every other row not authenticated by the key (a sha256 row, or a
+        # non-sentinel blank row below the first hashed row) is UNVERIFIABLE,
+        # exit 3. This is step 2 of the deploy bake gate.
+        post = result.get("post_boundary_keyless_count") or 0
+        down = result.get("downgrade_count") or 0
+        # Panel P G1b: gap sentinels are a DISCLOSED audit-record loss, so the
+        # count is on every verdict line, --quiet and the bake log included.
+        sentinels = f"gap_sentinels={result.get('gap_sentinel_count') or 0}"
+        if result["verdict"] == "unverifiable":
+            unverifiable = result.get("unverifiable_keyless_count") or 0
+            blank = result.get("unverifiable_blank_count") or 0
+            if args.quiet:
+                print(f"UNVERIFIABLE log_entries keyless={unverifiable} "
+                      f"blank={blank} {sentinels}", file=sys.stderr)
+            else:
+                if unverifiable:
+                    print(
+                        f"audit verify: UNVERIFIABLE — log_entries chain: {unverifiable} "
+                        f"sha256 row(s) with no keyed boundary after them: pre-H-02a "
+                        f"legacy rows or a substitution (N-609) cannot be told apart; "
+                        f"see punch 669 (legacy seal)",
+                        file=sys.stderr,
+                    )
+                if blank:
+                    print(
+                        f"audit verify: UNVERIFIABLE — log_entries chain: {blank} "
+                        f"blank-hash row(s) that are not the gap sentinel, below the "
+                        f"first hashed row or with no hashed row at all: pre-chain "
+                        f"history or a fabrication (N-609) cannot be told apart",
+                        file=sys.stderr,
+                    )
+                print(f"audit verify: log_entries {sentinels}", file=sys.stderr)
+            # A break or tamper signal elsewhere outranks UNVERIFIABLE.
+            return 1 if broken else 3
+        if result["verdict"] == "pass":
+            if args.quiet:
+                print(f"PASS {rows} {sentinels}")
+            else:
+                print(f"audit verify: PASS — {rows} rows checked, {sentinels}")
+            return 1 if broken else 0
+        if post:
+            if args.quiet:
+                print(f"FAIL log_entries keyless={post}", file=sys.stderr)
+            else:
+                print(
+                    f"audit verify: FAIL — log_entries chain: {post} keyless "
+                    f"(sha256) row(s) after the first keyed row (id="
+                    f"{result.get('hash_alg_boundary_id')}); no current writer "
+                    f"produces one, so each is a tamper signal (N-507)",
+                    file=sys.stderr,
+                )
+        if down:
+            if args.quiet:
+                print(f"FAIL log_entries downgrade={down}", file=sys.stderr)
+            else:
+                print(
+                    f"audit verify: FAIL — log_entries chain: {down} "
+                    f"hmac-sha256-v1 row(s) after the first hmac-sha256-v2 row "
+                    f"(id={result.get('current_alg_from_id')}); no current writer "
+                    f"produces one, so each is a downgrade signal (N-507)",
+                    file=sys.stderr,
+                )
+        return 1
 
     # FAIL path — surface the break for the operator.
     bid = result["first_break_id"]
@@ -2005,8 +3323,6 @@ def cmd_audit_reconcile(args: argparse.Namespace) -> int:
         1  divergence detected (counts in stdout / JSON output)
         2  could not open the DB
     """
-    import sqlite3
-
     from email_triage.db.reconciliation import (
         emit_divergence_event,
         verify_phi_table_against_audit_log,
@@ -2038,44 +3354,45 @@ def cmd_audit_reconcile(args: argparse.Namespace) -> int:
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 2
 
-    # The audit-event emit (when HIPAA + divergence) needs WRITE
-    # access. Default to read-write; that path is no-op when
-    # divergence is zero. If the operator wants a guaranteed
-    # read-only run (against a backup snapshot), --read-only opens
-    # mode=ro and suppresses the emit even on HIPAA+divergence.
-    # N-17: under encryption there is no mode=ro URI form — the SQLCipher
-    # opener returns a read-write handle; --read-only's no-mutation intent
-    # then relies on the caller's emit-suppression logic, not the OS.
+    # the backlog  (Census v3 #8) — route through the SSOT openers
+    # (boot-encryption-aware). Default = RW (audit-event emit on
+    # HIPAA+divergence needs write); --read-only = RO SSOT, a ``mode=ro``
+    # handle on both arms (encrypted since punch 556 / N-559; before that
+    # the caller's emit-suppression was the only no-mutation gate). The SSOTs carry
+    # the full init_db argument set uniformly (timeout=30.0 for the
+    # WAL busy overlap that reconcile can race, cached_statements=0).
     try:
-        if encrypted:
-            from email_triage.db._engine import open_dedicated_conn
-            conn = open_dedicated_conn(str(db_path), check_same_thread=False)
-        elif args.read_only:
-            conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True,
-                check_same_thread=False,
-            )
+        from email_triage.db._engine import (
+            open_dedicated_conn, open_dedicated_conn_readish,
+        )
+        if args.read_only:
+            conn = open_dedicated_conn_readish(str(db_path))
         else:
-            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            conn = open_dedicated_conn(str(db_path), check_same_thread=False)
         # N-16: factory from the conn's own dbapi module (sqlite3.Row vs
         # sqlcipher3.dbapi2.Row).
         apply_compatible_row_factory(conn)
-    except sqlite3.Error as e:
+    except DB_ERRORS as e:
         print(f"Could not open {db_path}: {e}", file=sys.stderr)
         return 2
     except Exception as e:
-        # sqlcipher3 raises its own DBAPI Error subclass on bad key.
+        # A non-DB open failure (DB_ERRORS above covers both drivers,
+        # punch 560) — same "could not open" exit.
         print(f"Could not open {db_path}: {e}", file=sys.stderr)
         return 2
 
     # Parse --since (ISO-8601) into a datetime, or None.
+    # N-263b R31 fromisoformat sweep — route through `_isotime.parse_iso`
+    # SSOT (returns None on unparseable). User-facing error message
+    # preserved verbatim; the SSOT swallows the underlying ValueError so
+    # we surface a generic message without the parse detail.
+    from email_triage._isotime import parse_iso
     since_dt = None
     if args.since:
-        try:
-            since_dt = datetime.fromisoformat(args.since)
-        except ValueError as e:
+        since_dt = parse_iso(args.since)
+        if since_dt is None:
             print(
-                f"Invalid --since timestamp {args.since!r}: {e}",
+                f"Invalid --since timestamp {args.since!r}",
                 file=sys.stderr,
             )
             conn.close()
@@ -2097,11 +3414,17 @@ def cmd_audit_reconcile(args: argparse.Namespace) -> int:
             try:
                 config = load_config(args.config)
                 if getattr(config.logging, "hipaa", False):
+                    # A fresh process has an empty key registry (punch 844).
+                    _cli_wire_audit_keys(conn, config)
                     emit_divergence_event(conn, report=report)
-            except Exception:
-                # Audit-emit failure does not poison the report.
-                # Operator still gets the divergence counts in stdout.
-                pass
+            except Exception as e:
+                # Audit-emit failure does not poison the report: the operator
+                # still gets the divergence counts in stdout. Never silent.
+                print(
+                    "WARNING: the divergence audit event was NOT recorded "
+                    f"({fmt_exc(e, with_class=True)}).",
+                    file=sys.stderr,
+                )
     finally:
         conn.close()
 
@@ -2144,6 +3467,115 @@ def _print_reconcile_human(report: Any) -> None:
         )
 
 
+#: Exit code: the new image would REFUSE the live DB on boot (a migration
+#: tamper-guard / DDL failure). scripts/deploy.sh ABORTS the swap on this.
+_VERIFY_MIGRATIONS_FAILED = 3
+#: Exit code: the smoke could not RUN (config/key/copy infra error). The deploy
+#: degrades to the boot + /health auto-rollback safety net — never blocks a
+#: good deploy on a smoke-infra hiccup.
+_VERIFY_MIGRATIONS_INFRA = 2
+#: Exit code: ``version-check`` (the schema read, not --verify-migrations) found
+#: the DB file but could not open or read it (status ``db_unreadable``).
+#: scripts/deploy.sh REFUSES the deploy on it, ``--force`` included: with no
+#: schema version there is nothing for the rollback/downgrade gates to compare.
+#: 2026-10-18: the read failed (CANTOPEN on the ``:ro`` mount, no ``-shm``) and
+#: was reported as schema 0 with exit 1, so the deploy proceeded (PD-8).
+_VERSION_CHECK_DB_UNREADABLE = 5
+
+
+def _verify_migrations_on_copy(
+    live_db: Path, *, encrypted: bool, master_key: object,
+) -> tuple[int, str]:
+    """Open a COPY of ``live_db`` through this image's boot migration path
+    (``init_db_encrypted`` → ``run_migrations``, or plaintext ``init_db``) so an
+    edited already-applied migration body (the N-85 checksum-guard break) — or
+    any DDL break against the real data shape — surfaces HERE.
+
+    NON-DESTRUCTIVE: copies ``live_db`` (+ any ``-wal`` / ``-shm`` sidecar) to a
+    throwaway temp file and only ever migrates the copy. Returns
+    ``(exit_code, message)``: ``0`` clean, ``_VERIFY_MIGRATIONS_FAILED`` the new
+    image would refuse the DB, ``_VERIFY_MIGRATIONS_INFRA`` could-not-copy.
+
+    Factored out of the CLI wrapper so the migration-checksum catch is unit-
+    testable without a live container (see tests/test_cli_verify_migrations.py).
+    """
+    import shutil
+    import tempfile
+
+    from email_triage.web.db import init_db, init_db_encrypted
+
+    tmpdir = tempfile.mkdtemp(prefix="et-verify-mig-")
+    smoke = Path(tmpdir) / "smoke.db"
+    try:
+        try:
+            shutil.copy(live_db, smoke)
+            for suffix in ("-wal", "-shm"):
+                side = Path(str(live_db) + suffix)
+                if side.exists():
+                    shutil.copy(side, str(smoke) + suffix)
+        except Exception as e:  # noqa: BLE001
+            return _VERIFY_MIGRATIONS_INFRA, f"could not copy live DB (infra): {e}"
+        try:
+            conn = (
+                init_db_encrypted(str(smoke), master_key)  # type: ignore[arg-type]
+                if encrypted else init_db(str(smoke))
+            )
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001 — MigrationError + any DDL break
+            return (
+                _VERIFY_MIGRATIONS_FAILED,
+                f"the new image would REFUSE the live DB on boot: "
+                f"{fmt_exc(e, with_class=True)}",
+            )
+        return 0, "OK — the new image migrates the live DB cleanly"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _verify_migrations_smoke(args: argparse.Namespace) -> int:
+    """``version-check --verify-migrations`` — /N-85 deploy pre-flight.
+
+    Loads config + (on an encrypted install) the master key the SAME way the
+    app boot does, then runs :func:`_verify_migrations_on_copy` so a shipped-
+    migration-body edit (the checksum tamper-guard, §164.312(c)(1)) is caught
+    PRE-SWAP rather than at the new container's boot (post-swap → the slower
+    auto-rollback). Replaces the plaintext-only ``init_db`` smoke + ``--db``
+    version-check that scripts/deploy.sh had to SKIP on encrypted installs
+    ("F6"), because ``--db`` opens plaintext-only and silently fails on a
+    SQLCipher DB. The config path here is encryption-aware (N-17 stamping).
+    """
+    try:
+        config = load_config(args.config)
+        encrypted = _cli_stamp_db_encryption(config)
+    except Exception as e:  # noqa: BLE001
+        print(f"verify-migrations: could not load config (infra): {e}",
+              file=sys.stderr)
+        return _VERIFY_MIGRATIONS_INFRA
+    live = Path(config.persistence.db_path)
+    if not live.exists():
+        # Fresh install (no DB yet) — nothing to upgrade; not a failure.
+        print("verify-migrations: no live DB on disk yet — nothing to verify")
+        return 0
+    master_key: object = None
+    if encrypted:
+        try:
+            from email_triage.secrets import read_bootstrap_master_key
+            master_key = read_bootstrap_master_key(config)
+        except Exception as e:  # noqa: BLE001
+            print(f"verify-migrations: could not read master key (infra): {e}",
+                  file=sys.stderr)
+            return _VERIFY_MIGRATIONS_INFRA
+    rc, msg = _verify_migrations_on_copy(
+        live, encrypted=encrypted, master_key=master_key,
+    )
+    stream = sys.stderr if rc else sys.stdout
+    print(f"verify-migrations: {msg}", file=stream)
+    return rc
+
+
 def cmd_version_check(args: argparse.Namespace) -> int:
     """``email-triage version-check`` — schema-compat status.
 
@@ -2162,17 +3594,25 @@ def cmd_version_check(args: argparse.Namespace) -> int:
                                     Snapshot DB before applying.
         2  downgrade_not_supported -- live DB is newer than this binary;
                                     refuse-to-load enforced by migrations.
+        5  db_unreadable         -- the DB file exists but could not be
+                                    opened or read; no schema version.
 
     Status 2 is shared between the two "DO NOT APPLY without thinking
     first" cases on purpose: a the monitoring system check can fire on >= 2 and treat
-    both as "needs operator hands."
+    both as "needs operator hands." 5 is >= 2 too. It is its own code
+    because ``scripts/deploy.sh`` lets ``--force`` through a 2 and must
+    not let it through an unread DB.
     """
     from email_triage.version import (
+        APP_VERSION,
+        STATUS_DB_UNREADABLE,
         STATUS_DOWNGRADE_NOT_SUPPORTED,
         STATUS_INCOMPATIBLE_ROLLBACK,
         STATUS_UPDATE_AVAILABLE,
         STATUS_UP_TO_DATE,
+        DbSchemaUnreadableError,
         gather_version_status,
+        parse_previous_schema_caps,
         read_target_schema_caps,
     )
 
@@ -2180,19 +3620,35 @@ def cmd_version_check(args: argparse.Namespace) -> int:
     # binary's target-schema-caps as a single integer on stdout and
     # exits 0. No DB read, no config load, no other output. This is
     # the hook ``scripts/deploy.sh`` uses to extract the cap from a
-    # `:previous` image before swapping (lets the live container's
-    # EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS env var be auto-populated
-    # with the cap of whatever image will be retagged to :previous
-    # on the next deploy).
+    # `:previous` image before swapping; deploy.sh then hands that cap to
+    # the new image's ``version-check --previous-schema-caps`` (punch 547 —
+    # it used to travel as an env var the running container also read).
     if getattr(args, "print_target_schema_only", False):
         print(read_target_schema_caps())
         return 0
+
+    # --verify-migrations: not a schema-version read — it OPENS a
+    # copy of the live DB through the boot migration path so an edited applied
+    # migration (checksum-guard break) is caught pre-swap. Encryption-aware
+    # (config path only); does not honour --db (the plaintext escape hatch
+    # carries no master key).
+    if getattr(args, "verify_migrations", False):
+        return _verify_migrations_smoke(args)
+
+    # --require-db (panel F, F2): the caller knows a live DB exists, so a DB
+    # this process cannot see is a mount or db_path mismatch, never a fresh
+    # install. scripts/deploy.sh passes it at both sites only after the deploy
+    # host confirmed the DB file: the encrypted arm tests the file itself, the
+    # plaintext arm asks the host first and, on a first install with no DB,
+    # skips the check instead (panel F r2, G5). Without the flag the config path
+    # keeps reporting a missing DB as schema 0 (the pre-first-serve contract).
+    require_db = bool(getattr(args, "require_db", False))
 
     # Resolve DB path: --db override wins, else load from config.
     db_path: Path | None
     if args.db:
         db_path = Path(args.db).expanduser().resolve()
-        if not db_path.exists():
+        if not db_path.exists() and not require_db:
             print(f"Database not found: {db_path}", file=sys.stderr)
             return 2
     else:
@@ -2215,10 +3671,51 @@ def cmd_version_check(args: argparse.Namespace) -> int:
         db_path = Path(config.persistence.db_path)
         # An install before its first /serve run has no DB on disk.
         # Don't fail — report what we know (target caps + unknown DB).
-        if not db_path.exists():
+        # Under --require-db the path is kept, and the strict read below
+        # raises DbSchemaUnreadableError for the missing file (exit 5).
+        if not db_path.exists() and not require_db:
             db_path = None
 
-    status = gather_version_status(db_path)
+    previous_caps = parse_previous_schema_caps(
+        getattr(args, "previous_schema_caps", ""),
+    )
+    def _unreadable(why: str, explanation: str) -> int:
+        print(f"version-check: {STATUS_DB_UNREADABLE} -- {why}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({
+                "app_version": APP_VERSION,
+                "db_schema_version": None,
+                "explanation": explanation,
+                "previous_schema_caps": previous_caps,
+                "status": STATUS_DB_UNREADABLE,
+                "target_schema_caps": read_target_schema_caps(),
+            }, indent=2, sort_keys=True))
+        else:
+            print(f"version-check: {STATUS_DB_UNREADABLE} -- {explanation}")
+        return _VERSION_CHECK_DB_UNREADABLE
+
+    try:
+        # strict: an existing DB this process cannot open or read raises
+        # instead of reading as schema 0 (2026-10-18, PD-8).
+        status = gather_version_status(
+            db_path, previous_schema_caps=previous_caps, strict=True,
+        )
+    except DbSchemaUnreadableError as e:
+        return _unreadable(str(e), (
+            "The database file exists but could not be opened or read, so its "
+            "schema version is unknown. Do not apply the update until the read "
+            "works."
+        ))
+    # --require-db: the caller knows a live, migrated DB is there, so a file
+    # that opens but has no applied migration (schema 0: an empty, truncated or
+    # wrong file) is not that DB, and schema 0 must not read as a fresh install
+    # that proceeds (panel F r2, DA-4; the 638 shape).
+    if require_db and not status.db_schema_version:
+        return _unreadable(f"{db_path} opened but has no applied migration (schema 0)", (
+            "The database file opened but has no applied migration, so it is not "
+            "the migrated live database the caller said is there. Do not apply "
+            "the update until the right file is mounted."
+        ))
 
     if args.json:
         print(json.dumps(status.to_dict(), indent=2, sort_keys=True))
@@ -2262,7 +3759,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     target.mkdir(parents=True, exist_ok=True)
     (target / "data").mkdir(exist_ok=True)
 
-    config_file.write_text("""\
+    # N-263c R31 (census r26 close-out): route through the atomic_write
+    # SSOT so `et init` interrupted mid-write leaves either the empty
+    # slot or the fully-written scaffold, never a torn half-config that
+    # a subsequent bootstrap-config-read might mis-parse. The
+    # exist-guard at line 2822 makes the base scenario bootstrap-fresh,
+    # but atomic_write is the correct default posture for every
+    # config-file writer per the A11 pin's intent.
+    from email_triage._atomicio import atomic_write_text
+    atomic_write_text(config_file, """\
 # Email Triage Configuration
 # See the project README for documentation.
 
@@ -2291,11 +3796,24 @@ logging:
   hipaa: false                 # true = strip PHI from logs
 
 secrets:
-  backend: auto                # auto (recommended) | container | keyfile | keyring | env (deprecated; dev/CI only — set EMAIL_TRIAGE_ALLOW_ENV_MASTER_KEY=1 to silence warning, see H-07)
+  backend: auto                # auto (recommended) | container | keyfile | keyring | env (deprecated; dev/CI only, see H-07)
 
 persistence:
   db_path: ./data/triage.db
   encryption_enabled: true     # SQLCipher AES-256 encryption at rest — ON by default for new installs. Requires the master key (set up below) + the `encryption` extra (bundled in the container image). Set to false only for an explicitly-plaintext install.
+
+backup:                        # Automated DB backup (also configurable in the UI: Admin -> Config -> Backup).
+  enabled: false               # Master switch. Leave OFF until you have a restore path (see encryption below).
+  cadence: manual              # manual (CLI/host-cron only, no in-app timer) | daily | weekly
+  format: etbk                 # etbk (full bundle: DB + config + certs) | db (raw SQLCipher snapshot)
+  retention: "14"              # keep-count, or "14d" = 14 days, "2w" = 2 weeks
+  dir: ""                      # output dir; blank -> <data_dir>/backups (a host job relocates these off-box)
+  encryption: master-key       # master-key (restore needs the master-key-only export) |
+                               # public-key (seal each snapshot to an off-box X25519 public key;
+                               #   a compromised container cannot READ its own backups)
+  public_key: ""               # public-key mode ONLY: X25519 public-key PEM text, or a path to it.
+                               # Generate the keypair OFF this host (email-triage backup gen-keypair) and
+                               # paste only the PUBLIC key — the private key must never touch the server.
 """)
 
     print(f"Created {config_file}")
@@ -2347,10 +3865,10 @@ def cmd_style_profile(args: argparse.Namespace) -> int:
     )
     from email_triage.secrets import bootstrap_secrets_from_config
     from email_triage.web.db import (
-        get_email_account, init_db, set_style_profile,
+        get_email_account, set_style_profile,
     )
 
-    db = init_db(config.persistence.db_path)
+    db = _cli_open_config_db(config)
     try:
         secrets = bootstrap_secrets_from_config(db, config)
     except Exception as e:
@@ -2358,12 +3876,17 @@ def cmd_style_profile(args: argparse.Namespace) -> int:
         return 1
 
     # H-02a (Cycle 6): see note at the secrets-CLI bootstrap above.
-    from email_triage.secrets import (
-        enforce_master_key_at_rest_for_hipaa,
-        wire_audit_chain_hmac_keys,
-    )
+    from email_triage.secrets import enforce_master_key_at_rest_for_hipaa
     enforce_master_key_at_rest_for_hipaa(config)
-    wire_audit_chain_hmac_keys(secrets, config)
+    _cli_wire_audit_keys(db, config, secrets)
+
+    # N-130: register the install-level OAuth creds with the provider factory —
+    # the SAME wiring the server boot does — so build_provider can construct a
+    # Gmail / O365 provider with the install client_id (else the build fails
+    # "client_id not configured"). The CLI runs OUTSIDE the boot, so nothing
+    # else registers it. Sibling of N-129's CLI-vs-boot divergence.
+    from email_triage.providers.factory import hydrate_and_register_install_oauth
+    hydrate_and_register_install_oauth(config, secrets, db)
 
     acct = get_email_account(db, args.account)
     if acct is None:
@@ -2435,9 +3958,11 @@ def cmd_style_profile(args: argparse.Namespace) -> int:
             # Pre-M-6 install (sent_mail_index table missing) -- fall
             # through with an empty set.
             captured_ids = set()
+        from email_triage.triage_logging import is_account_hipaa as _iah_style
         profile = await extract_style_profile(
             messages, classifier,
             captured_message_ids=captured_ids,
+            account_hipaa=_iah_style(acct), conn=db,  # N-114 BAA egress gate
         )
         # async-db-ok — CLI-only path, no web event loop.
         set_style_profile(db, args.account, profile.to_dict())
@@ -2450,21 +3975,20 @@ def cmd_style_profile(args: argparse.Namespace) -> int:
         )
         return 0
 
-    try:
-        return asyncio.run(_run())
-    finally:
-        #  (Cycle 6, 2026-05-23) — log + preserve exit code on
-        # provider.close() failure. Pre-fix this was `except Exception: pass`,
-        # which made connection-leak diagnosis impossible (operator saw a
-        # successful exit code AND no log line even when close failed).
-        # The exit code is INTENTIONALLY preserved — _run() already
-        # produced it; provider.close() running in finally is cleanup
-        # noise that shouldn't mask the work's outcome. db-sme second-pass
-        # [269] verified this is the right shape.
+    async def _run_and_close() -> int:
+        # /N-131 — close the provider in the SAME loop _run used (its
+        # httpx.AsyncClient lives there). The old asyncio.run(provider.close())
+        # ran in a 2nd loop after asyncio.run(_run()) closed the 1st, so close
+        # failed 'Event loop is closed' on EVERY mine — the  warning fired
+        # constantly, masking a real leak. The exit code is still INTENTIONALLY
+        # preserved (the finally never returns) and a genuine close failure is
+        # logged, not swallowed/raised. db-sme [269].
         try:
-            asyncio.run(provider.close())
-        except Exception:
-            log.warning("provider.close failed", exc_info=True)
+            return await _run()
+        finally:
+            await close_provider(provider, loud=True)
+
+    return asyncio.run(_run_and_close())
 
 
 @_cli_audit("sent-mail-index")
@@ -2496,9 +4020,9 @@ def cmd_sent_mail_index(args: argparse.Namespace) -> int:
     )
     from email_triage.secrets import bootstrap_secrets_from_config
     from email_triage.triage_logging import is_account_hipaa
-    from email_triage.web.db import get_email_account, init_db
+    from email_triage.web.db import get_email_account
 
-    db = init_db(config.persistence.db_path)
+    db = _cli_open_config_db(config)
     try:
         secrets = bootstrap_secrets_from_config(db, config)
     except Exception as e:
@@ -2506,12 +4030,17 @@ def cmd_sent_mail_index(args: argparse.Namespace) -> int:
         return 1
 
     # H-02a (Cycle 6): see note at the secrets-CLI bootstrap above.
-    from email_triage.secrets import (
-        enforce_master_key_at_rest_for_hipaa,
-        wire_audit_chain_hmac_keys,
-    )
+    from email_triage.secrets import enforce_master_key_at_rest_for_hipaa
     enforce_master_key_at_rest_for_hipaa(config)
-    wire_audit_chain_hmac_keys(secrets, config)
+    _cli_wire_audit_keys(db, config, secrets)
+
+    # N-130: register the install-level OAuth creds with the provider factory —
+    # the SAME wiring the server boot does — so build_provider can construct a
+    # Gmail / O365 provider with the install client_id (else the build fails
+    # "client_id not configured"). The CLI runs OUTSIDE the boot, so nothing
+    # else registers it. Sibling of N-129's CLI-vs-boot divergence.
+    from email_triage.providers.factory import hydrate_and_register_install_oauth
+    hydrate_and_register_install_oauth(config, secrets, db)
 
     acct = get_email_account(db, args.account)
     if acct is None:
@@ -2552,6 +4081,8 @@ def cmd_sent_mail_index(args: argparse.Namespace) -> int:
     # job; this shim makes the CLI usable for index seeding today.
     import httpx
 
+    from email_triage._egress import Intent, egress_async_client
+
     embed_model = (
         getattr(config.classifier, "embedding_model", None)
         or "nomic-embed-text"
@@ -2561,19 +4092,81 @@ def cmd_sent_mail_index(args: argparse.Namespace) -> int:
         or "http://localhost:11434"
     ).rstrip("/")
 
+    # A4b (census 2026-06-09, DA Finding 2 — verify-don't-accept on my own
+    # refute). The M-series privacy invariant is "the embedding backend speaks
+    # ONLY to a local Ollama." SentMailIndex's NonLocalBackendError guards the
+    # backend_type LABEL ("ollama"), which this inline shim hardcodes — so
+    # without an explicit base_url locality check a misconfigured
+    # config.classifier.base_url would egress sent-mail content (subject/body
+    # excerpt) to a non-local embedder. Gate it explicitly, like
+    # embedding_backend.py:245 does for the production backend.
+    from email_triage.classify.base import _is_local_host
+    _local_suffixes = getattr(
+        getattr(config, "tls", None), "local_url_suffixes", (),
+    ) or ()
+    if not _is_local_host(base_url, extra_suffixes=_local_suffixes):
+        print(
+            "M-4 sent-mail index requires a LOCAL embedding endpoint — "
+            f"config.classifier.base_url={base_url!r} is not local. Sent-mail "
+            "content must not egress to a remote embedder. Aborting.",
+        )
+        return 1
+
     class _OllamaEmbedShim:
         backend_type = "ollama"
 
         async def embed_text(self, text: str) -> list[float]:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    f"{base_url}/api/embeddings",
-                    json={"model": embed_model, "prompt": text},
-                )
-                resp.raise_for_status()
-                body = resp.json() or {}
-            vec = body.get("embedding") or []
-            return [float(x) for x in vec]
+            # N-220 R22 (2026-07-02): wrap POST /api/embeddings in the
+            # breaker + timer so a dead local Ollama on the M-4 sent-mail-
+            # index CLI path (a) trips the `ollama` circuit and (b)
+            # emits an `et_llm_embed_seconds{backend="ollama"}` sample
+            # on /metrics.
+            # N-384 (2026-07-10 wf_69674c7e-c67, HIGH): emit the outcome-
+            # counter twin — the timer records latency but was blind to
+            # the failure edge.
+            from email_triage import metrics as _metrics
+            from email_triage.llm_health import translate_unreachable
+            outcome = "transport_error"
+            try:
+                # -d: config-driven LLM_PHI embed timeout. Reads
+                # ``config.classifier.embed_timeout_secs`` (default 60.0
+                # preserves prior hardcoded value).
+                _embed_timeout = float(getattr(
+                    config.classifier, "embed_timeout_secs", 60.0,
+                ))
+                async with egress_async_client(
+                    intent=Intent.LLM_PHI, timeout=_embed_timeout
+                ) as client:
+                    with _metrics.timer("et_llm_embed_seconds", backend="ollama"), \
+                            translate_unreachable(
+                                "ollama", base_url, default_port=11434,
+                            ):
+                        # N-431 (2026-07-19) — SSOT injects ``keep_alive``.
+                        # M-4 sent-mail index seeding fires N embeds
+                        # back-to-back; without a pinned TTL Ollama's
+                        # default "5m" evicts the embedding model between
+                        # cold-start batches. Read the same ``ollama_
+                        # keep_alive`` knob the classifier reads.
+                        from email_triage._ollama_reuse import merge_reuse_options
+                        payload = {"model": embed_model, "prompt": text}
+                        _cli_keep_alive = str(getattr(
+                            config.classifier, "ollama_keep_alive", "10m",
+                        ) or "10m")
+                        await merge_reuse_options(
+                            payload, base_url, embed_model, client,
+                            default_keep_alive=_cli_keep_alive,
+                        )
+                        resp = await client.post(
+                            f"{base_url}/api/embeddings",
+                            json=payload,
+                        )
+                        resp.raise_for_status()
+                        body = resp.json() or {}
+                vec = body.get("embedding") or []
+                outcome = "success"
+                return [float(x) for x in vec]
+            finally:
+                _metrics.emit_llm_outcome("embed", "ollama", outcome)
 
     backend = _OllamaEmbedShim()
 
@@ -2601,16 +4194,16 @@ def cmd_sent_mail_index(args: argparse.Namespace) -> int:
         )
         return 0
 
-    try:
-        return asyncio.run(_run())
-    finally:
-        #  — see cmd_style_profile for the rationale block. Same pattern,
-        # same fix. Per §4 principle 2 (fix all sites of one root cause)
-        # both surfaces land in one commit.
+    async def _run_and_close() -> int:
+        # /N-131 — see cmd_style_profile: close in-loop. Per §4 principle 2
+        # (fix all sites of one root cause) all three CLI provider-close surfaces
+        # (here, cmd_style_profile, cmd_watch_push) land in one commit.
         try:
-            asyncio.run(provider.close())
-        except Exception:
-            log.warning("provider.close failed", exc_info=True)
+            return await _run()
+        finally:
+            await close_provider(provider, loud=True)
+
+    return asyncio.run(_run_and_close())
 
 
 @_cli_audit("auth.dev-login")
@@ -2627,10 +4220,10 @@ def cmd_auth_dev_login(args: argparse.Namespace) -> int:
     """
     import base64
     import os
-    from pathlib import Path
 
     import httpx
 
+    from email_triage._egress import Intent, egress_client
     from email_triage.web import dev_keypair as dk_mod
 
     key_path = Path(os.path.expanduser(args.key))
@@ -2680,7 +4273,9 @@ def cmd_auth_dev_login(args: argparse.Namespace) -> int:
     server = args.server.rstrip("/")
     verify = not args.insecure
 
-    with httpx.Client(verify=verify, follow_redirects=False) as client:
+    with egress_client(
+        intent=Intent.PUBLIC_FETCH, verify=verify, follow_redirects=False
+    ) as client:
         # Step 1: fetch the login page to get the challenge cookie.
         r1 = client.get(server + "/login/dev-keypair")
         if r1.status_code != 200:
@@ -2694,10 +4289,15 @@ def cmd_auth_dev_login(args: argparse.Namespace) -> int:
             return 1
 
         # Step 2: decode challenge, sign it.
-        pad = "=" * (-len(challenge_b64) % 4)
-        challenge = base64.urlsafe_b64decode(challenge_b64 + pad)
+        #  tail — route the hand-rolled URL-safe base64 pair through
+        # the `_base64url` SSOT so the pad-restore + pad-strip shape
+        # cannot silently drift.
+        from email_triage._base64url import (
+            b64decode_permissive, b64encode_urlsafe,
+        )
+        challenge = b64decode_permissive(challenge_b64, urlsafe=True)
         signature = priv.sign(challenge)
-        sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+        sig_b64 = b64encode_urlsafe(signature, strip_padding=True).decode("ascii")
 
         # Step 3: post back.
         r2 = client.post(
@@ -2729,6 +4329,167 @@ def cmd_auth_dev_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_backup_gen_keypair() -> int:
+    """Generate an X25519 keypair for  public-key backup mode.
+
+    The PUBLIC key goes in the config (``backup.public_key``, stays on-box). The
+    PRIVATE key goes OFF-BOX (the operator's password DB) and is needed ONLY for
+    restore — never on the container."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    priv = X25519PrivateKey.generate()
+    priv_pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("utf-8")
+    pub_pem = priv.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    # ASCII-only guidance: this is the safety-critical key-handling output and
+    # must render correctly + never crash on ANY console encoding (a `→` here
+    # was a UnicodeEncodeError on Windows cp1252 — ). The main() UTF-8
+    # reconfigure covers the rest of the CLI; this command stays ASCII so the
+    # operator can always read which key goes where.
+    print("# X25519 backup keypair (#304 public-key mode).")
+    print("# PUBLIC KEY -> config backup.public_key (stays on-box):")
+    print(pub_pem.rstrip())
+    print("# PRIVATE KEY -> store OFF-BOX (your password DB); needed ONLY for")
+    print("# restore. Do NOT leave it on the container.")
+    print(priv_pem.rstrip())
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """``email-triage backup now`` — trigger an on-demand backup.
+
+    Runs INSIDE the container (a host cron/systemd does
+    ``podman exec <ctr> email-triage backup now``); POSTs the LOOPBACK ops
+    endpoint, prints "request received: outputting to <dir>" and exits 0. With
+    ``--wait`` it polls the per-run status (``_LAST_RUN.json``) for the real
+    outcome + a matching exit code. App offline (connection refused) →
+    ``FATAL: unavailable, app offline`` + exit 2."""
+    import json as _json
+    import time as _time
+
+    import httpx
+
+    from email_triage._egress import EgressBlocked, Intent, egress_client
+
+    sub = getattr(args, "backup_cmd", None)
+    if sub == "gen-keypair":
+        return _cmd_backup_gen_keypair()
+    if sub != "now":
+        print(
+            "usage: email-triage backup {now [--format etbk|db] [--wait] "
+            "| gen-keypair}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Punch 547: the target is FIXED, never read from env. The request carries
+    # the ops token, and ET_BACKUP_TRIGGER_URL could point it at any host the
+    # LOCAL_ONLY funnel admits (private LAN included) with verify=False. The
+    # port is the container CMD's (`serve --port 8080`, Containerfile); no
+    # config field declares it (PushConfig.listen_port is a different, dead
+    # knob — config-surface audit 2026-09-11 #8).
+    base = _OPS_TRIGGER_BASE_URL
+    # run18 #6 — route the ops-token env read through the single reader SSOT
+    # (behaviour-identical: ``_read_ops_token() or ""`` == the old
+    # ``os.environ.get("ET_HEALTH_OPS_TOKEN", "")`` for unset / set / empty).
+    from email_triage.web.routers.health import _read_ops_token
+
+    token = _read_ops_token() or ""
+    if not token:
+        print(
+            "FATAL: ET_HEALTH_OPS_TOKEN is not set (the ops trigger requires it)",
+            file=sys.stderr,
+        )
+        return 2
+
+    url = base + "/ops/db-backup"
+    if getattr(args, "format", None):
+        url += f"?format={args.format}"
+
+    # Route the loopback trigger through the egress funnel (run17 #5 — was a raw
+    # urllib.request.urlopen). Intent.LOCAL_ONLY: the ops endpoint is the app's
+    # own loopback listener (``_OPS_TRIGGER_BASE_URL``); the funnel fails CLOSED
+    # on a non-local host. verify=False is justified + preserved — a loopback
+    # self-signed cert (was ssl.CERT_NONE; httpx verify=False is the exact
+    # equivalent, covering check_hostname=False too).
+    out_dir = None
+    # -d: env-tunable ops-backup trigger timeout. One-shot CLI
+    # admin action against loopback — no persistent config surface
+    # needed; env var lets an operator raise it for a slow container
+    # cold-boot. Default 10s preserves prior hardcoded behavior.
+    try:
+        _ops_timeout = float(
+            os.environ.get("ET_BACKUP_TRIGGER_TIMEOUT_SECS", "") or 10.0
+        )
+    except (TypeError, ValueError):
+        _ops_timeout = 10.0
+    try:
+        with egress_client(intent=Intent.LOCAL_ONLY, verify=False) as c:
+            resp = c.post(
+                url, headers={"X-Ops-Token": token}, timeout=_ops_timeout,
+            )
+        resp.raise_for_status()
+        body = _json.loads(resp.text)
+        print(body.get("detail", "request received"))
+        out_dir = body.get("dir")
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = _json.loads(e.response.text).get("detail", "")
+        except Exception:
+            detail = ""
+        code = e.response.status_code
+        if code == 409:
+            print("a backup is already in flight", file=sys.stderr)
+            return 1
+        if code == 503:
+            print(f"FATAL: backup disabled ({detail})", file=sys.stderr)
+            return 2
+        if code == 403:
+            print("FATAL: ops trigger denied (token / not loopback)", file=sys.stderr)
+            return 2
+        print(f"FATAL: trigger failed: HTTP {code} {detail}", file=sys.stderr)
+        return 2
+    except EgressBlocked as e:
+        # The trigger resolved to a non-local host — the LOCAL_ONLY funnel
+        # refused the send (fail-closed; X-Ops-Token never
+        # left the box). Surface it as the same clean FATAL/exit-2 contract the
+        # other failure paths use, not an uncaught traceback (run17 #5 3-SME).
+        print(f"FATAL: backup trigger URL is not local ({e})", file=sys.stderr)
+        return 2
+    except (httpx.RequestError, ConnectionError, OSError):
+        # Connection refused / unreachable = the app isn't serving.
+        print("FATAL: unavailable, app offline", file=sys.stderr)
+        return 2
+
+    if not getattr(args, "wait", False) or not out_dir:
+        return 0
+
+    # --wait: poll _LAST_RUN.json until a NEW run (ts changed) reaches a
+    # terminal outcome — so we report THIS run, not a stale prior one.
+    from email_triage import backup as _backup
+    prior = _backup.read_run_status(out_dir)
+    prior_ts = prior.get("ts") if prior else None
+    deadline = _time.time() + 600
+    while _time.time() < deadline:
+        st = _backup.read_run_status(out_dir)
+        if st and st.get("ts") != prior_ts and st.get("outcome") in ("success", "failure"):
+            if st["outcome"] == "success":
+                print(f"backup complete: {st.get('file')}")
+                return 0
+            print(f"FATAL: backup failed: {st.get('error')}", file=sys.stderr)
+            return 1
+        _time.sleep(3)
+    print("WARN: timed out waiting for the backup to complete", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="email-triage",
@@ -2737,6 +4498,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", "-c",
         help="Path to config file (default: search standard paths)",
+    )
+    # N-157 (2026-07-09) — CLI audit gate.  Default OFF (fail-CLOSED): an
+    # H-03-auto emit failure at handler ENTRY blocks the handler from
+    # running and exits non-zero, so an operator sees an obvious audit-
+    # gate error instead of a silent WARN + successful op.  Set (fail-
+    # SOFT) preserves the pre-N-157 defense-in-depth-on-top-of-procedural
+    # posture the H-03-auto docstring at cli.py:104-112 rationalizes for
+    # break-glass incident use.  The recovery lever is the same
+    # documented `actions_taken` field in INCIDENT_RESPONSE.md the
+    # original H-03 closure named.
+    parser.add_argument(
+        "--allow-unaudited",
+        dest="allow_unaudited",
+        action="store_true",
+        default=False,
+        help=(
+            "Continue a CLI admin op even when the audit-chain emit "
+            "fails (procedural break-glass fallback per "
+            "INCIDENT_RESPONSE.md).  Default OFF (fail-CLOSED): audit "
+            "emit failure at handler entry blocks the handler."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -2781,6 +4563,67 @@ def build_parser() -> argparse.ArgumentParser:
         "migrate-from-bootstrap",
         help="Copy all keys from the bootstrap backend into the runtime "
              "DbSecrets store (one-shot migration from pre-DbSecrets setups)",
+    )
+    # N-267 R27 — CLI-user MSAL cache purge. Closes V_B orphan gap.
+    purge_msal_p = secrets_sub.add_parser(
+        "purge-msal-cache",
+        help="Delete on-disk MSAL cache artifacts for a CLI username "
+             "(§164.310(d)(2)(i) disposal). Routes through the "
+             "per-user artifact registry so a NEW artifact family ships"
+             " covered automatically.",
+    )
+    purge_msal_p.add_argument(
+        "--username", required=True,
+        help="The CLI OAuth username whose msal_cache_cli_<user>.json"
+             " should be deleted.",
+    )
+    # N-349 hybrid (2026-07-05, operator directive): CLI-only one-shot
+    # HMAC clobber bypass. See `web/db.py::HMAC_CLOBBER_BYPASS_KEY` for
+    # the recovery contract. Env-flag DELIBERATELY NOT supported.
+    _allow_hmac = secrets_sub.add_parser(
+        "allow-hmac-clobber-once",
+        help="Arm a ONE-SHOT bypass of the fail-CLOSED HMAC read policy "
+             "on the ADMIN watch-SAVE flow (agent_api create + profile "
+             "create/edit). The NEXT unreadable-row read triggered by "
+             "an admin re-save mints a fresh HMAC secret + clears the "
+             "flag. Receiver-side webhook signature-verify path is NOT "
+             "covered; it stays fail-CLOSED (drops the webhook) — "
+             "recovery for that path IS the admin re-save. Batch save: "
+             "the FIRST unreadable watch in the batch consumes the "
+             "flag; remaining unreadable watches in the same batch "
+             "stay fail-CLOSED. Default TTL 15 minutes — use `--ttl-min` "
+             "to override; use `secrets show-hmac-clobber-bypass` to "
+             "check status. Recovery lever ONLY; NEVER used in "
+             "steady state. Env-flag deliberately not supported.",
+    )
+    _allow_hmac.add_argument(
+        "--ttl-min",
+        type=int,
+        default=None,
+        help="TTL in minutes for the arm (default 15). Pass 0 for no "
+             "expiry (operator explicit break-glass — accept until "
+             "manually cleared or consumed).",
+    )
+    # N-364 R31 (2026-07-05 SME F6 + the backlog N-349b item 4):
+    # observability sibling. Read-only status of the arm — supports the
+    # "did I remember to arm / has it expired" audit sweep.
+    secrets_sub.add_parser(
+        "show-hmac-clobber-bypass",
+        help="Report the current arm state of the HMAC clobber bypass. "
+             "Prints ARMED / EXPIRED / NOT-armed + armed_at + expires_at "
+             "when present. Read-only: never mutates the row.",
+    )
+    # N-320 R30 (task  tranche  DA follow-up; CLI-verb delivery
+    # per operator ruling 2026-07-03). §164.308(a)(4)(ii)(A) rollback-
+    # resurrection close.
+    secrets_sub.add_parser(
+        "purge-retired-keys",
+        help="Delete every secret-key row named in `_secret_keys."
+             "KEY_HISTORY` retired-tuples. Run this as part of the "
+             "secret-rotation ceremony so a subsequent rollback can "
+             "NOT silently resume reading a retired/compromised name "
+             "(§164.308(a)(4)(ii)(A)). Idempotent — delete-missing = "
+             "no-op. Emits an audit event via @_cli_audit(\"secrets\").",
     )
     rotate_p = secrets_sub.add_parser(
         "rotate-master-key",
@@ -2839,9 +4682,35 @@ def build_parser() -> argparse.ArgumentParser:
     create_p = apikey_sub.add_parser("create", help="Create an API key")
     create_p.add_argument("--name", required=True, help="Key label (e.g. 'openclaw-host')")
     create_p.add_argument("--user", required=True, help="User email to associate key with")
+    #  — bound the CREDENTIAL to a route set, not just to a principal.
+    create_p.add_argument(
+        "--scope",
+        action="append",
+        metavar='"<METHOD> </path>"',
+        help="Restrict this key to ONE exact route. Repeat for several: "
+             '--scope "GET /health/build" --scope "GET /health/runtime-deps". '
+             "Matching is exact — NO globs, because \"GET /health/*\" would "
+             "re-admit /health/detail. Omit the flag for an unscoped key that "
+             "reaches every Bearer route (the pre-#420 behaviour, which every "
+             "existing key keeps). A malformed entry refuses the whole command "
+             "and creates no key; at request time an unreadable stored scope "
+             "grants NOTHING.",
+    )
+    create_p.add_argument(
+        "--expires-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Expire this key N days from now. `verify_api_key` already REFUSES "
+             "an expired key (and fail-closed on an unparseable expiry) — this "
+             "flag is the missing WRITER: without it every key ever minted from "
+             "the CLI had expires_at = NULL, i.e. immortal. A machine "
+             "credential should carry a finite lifetime + a documented rotation.",
+    )
     apikey_sub.add_parser("list", help="List all API keys")
     del_p = apikey_sub.add_parser("delete", help="Delete an API key")
     del_p.add_argument("key_id", type=int, help="API key ID to delete")
+    _add_emergency_args(del_p)
 
     # user
     user_p = subparsers.add_parser("user", help="Manage users")
@@ -2849,8 +4718,30 @@ def build_parser() -> argparse.ArgumentParser:
     ucreate_p = user_sub.add_parser("create", help="Create a user")
     ucreate_p.add_argument("--email", required=True, help="User email address")
     ucreate_p.add_argument("--name", help="Display name (default: email prefix)")
-    ucreate_p.add_argument("--role", choices=["admin", "power_user", "user"], default="user", help="User role")
+    #  — derived from the `UserRole` SSOT, not restated. This was the ONE
+    # hardcoded copy of a list the enum owns (R1/PD-5), and it was already a live
+    # gap: a role added to the enum was silently unreachable from the CLI. The
+    # `health_ro` monitoring principal has to be creatable here, since the CLI is
+    # the operator's mint path.
+    ucreate_p.add_argument(
+        "--role",
+        choices=[r.value for r in UserRole],
+        default=UserRole.USER.value,
+        help="User role. `health_ro` is a read-only MACHINE role: it reaches only "
+             "the health-read allowlist and can NOT sign in to the web interface "
+             "— never assign it to a person.",
+    )
     user_sub.add_parser("list", help="List all users")
+    # Punch 709: break-glass account stop for when the audit chain is broken. The
+    # normal route is the web UI (Users page); this command exists only for the
+    # emergency path, so --emergency and --reason are both required.
+    udisable_p = user_sub.add_parser(
+        "disable",
+        help="EMERGENCY stop of a user account when the audit chain is broken "
+             "(punch 709; the web UI is the normal route)",
+    )
+    udisable_p.add_argument("--email", required=True, help="User email to disable")
+    _add_emergency_args(udisable_p, required=True)
 
     # H-05 (Cycle 7) — MFA enrollment + recovery operator commands.
     # `enroll-mfa` issues a fresh code-set (operator drives first-admin
@@ -2882,6 +4773,24 @@ def build_parser() -> argparse.ArgumentParser:
     reset_mfa_p.add_argument(
         "--ttl-secs", type=int, default=0, dest="ttl_secs",
         help="Token TTL in seconds (default: 86400 = 24h; cap 604800 = 7d)",
+    )
+    # N-322 R30 (task  N-317 half-2 — persisted-key re-normalize
+    # sweep). Approved by operator 2026-07-03.
+    renorm_p = user_sub.add_parser(
+        "re-normalize-emails",
+        help="One-shot re-normalize persisted email columns "
+             "(users.email, users.notify_email, "
+             "email_accounts.aliases_json) through "
+             "`canonical_email()`. Reports divergences; --apply "
+             "actually rewrites. Idempotent. Runs post-N-317 IDN "
+             "normalize to close persisted-key silent-invalidation "
+             "surface DA flagged on tranche #63.",
+    )
+    renorm_p.add_argument(
+        "--apply", action="store_true",
+        help="Actually apply the rewrites. Default is dry-run (report "
+             "only). Live-DB migration — recommend running against a "
+             "backup restore FIRST to confirm the diff.",
     )
 
     # serve
@@ -2926,6 +4835,27 @@ def build_parser() -> argparse.ArgumentParser:
     # Decrypts a bundle (full or key-only) and writes the contents
     # to side-by-side .restore files. Operator does the swap-in
     # manually; CLI never starts/stops the service.
+    backup_p = subparsers.add_parser(
+        "backup", help="On-demand backup trigger (#304)",
+    )
+    backup_sub = backup_p.add_subparsers(dest="backup_cmd")
+    backup_now_p = backup_sub.add_parser(
+        "now", help="Trigger a backup now (via the loopback ops endpoint)",
+    )
+    backup_now_p.add_argument(
+        "--format", choices=["etbk", "db"], default=None,
+        help="Backup format (default: the server's backup.format config)",
+    )
+    backup_now_p.add_argument(
+        "--wait", action="store_true",
+        help="Block until the backup completes; exit non-zero on failure",
+    )
+    backup_sub.add_parser(
+        "gen-keypair",
+        help="Generate an X25519 keypair for public-key backup mode "
+             "(public → config, private → off-box)",
+    )
+
     restore_p = subparsers.add_parser(
         "restore",
         help="Restore an encrypted backup bundle",
@@ -2952,6 +4882,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Read the passphrase from this file instead of prompting "
              "via getpass (intended for scripted disaster-recovery).",
+    )
+    restore_p.add_argument(
+        "--private-key",
+        default="",
+        help="Path to the off-box X25519 private key (PEM) for a "
+             "public-key-sealed (ETBKP02) backup. Required to restore those; "
+             "the passphrase is recovered from the unwrap, not prompted.",
     )
     restore_p.add_argument(
         "--list",
@@ -3012,7 +4949,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--db",
         default="",
         help="Path to triage.db (default: load from config). Use to "
-             "verify a backup snapshot without flipping the live install.",
+             "verify a backup snapshot without flipping the live install. "
+             "No master key is wired on this path: keyed (hmac-sha256-v1/v2) "
+             "rows read as breaks (\"hash recompute failed\").",
+    )
+    av_p.add_argument(
+        "--all-chains",
+        action="store_true",
+        help="Also verify every other chained audit table (the set /compliance "
+             "shows, including audit_gap_events) and fail on any break, or "
+             "on a keyless row in any of them except audit_gap_events. "
+             "--since applies to log_entries only.",
     )
     av_p.add_argument(
         "--since",
@@ -3024,7 +4971,13 @@ def build_parser() -> argparse.ArgumentParser:
     av_p.add_argument(
         "--quiet",
         action="store_true",
-        help="Print only PASS/FAIL + count/id; no per-row detail.",
+        help="Print only PASS/FAIL/UNVERIFIABLE + count/id; no per-row detail.",
+    )
+    # Punch 709: the clear edge of the emergency-revoke /health flag.
+    audit_sub.add_parser(
+        "clear-emergency-flag",
+        help="Clear the emergency-revoke /health flag once every audit chain "
+             "verifies and an HMAC key is provisioned (punch 709)",
     )
 
     # audit reconcile — H-11 EQM-04 PHI-tables-vs-audit-chain integrity
@@ -3056,7 +5009,7 @@ def build_parser() -> argparse.ArgumentParser:
     ar_p.add_argument(
         "--json",
         action="store_true",
-        help="Emit the report as a JSON object on stdout (for the monitoring system "
+        help="Emit the report as a JSON object on stdout (for Nagios "
              "/ scripted callers). Default is a one-screen human summary.",
     )
 
@@ -3084,12 +5037,12 @@ def build_parser() -> argparse.ArgumentParser:
     eb_install_p.add_argument(
         "--target-dir", default="",
         help="Override the runtime-deps install dir (default: "
-             "EMBEDDING_BITS_RUNTIME_DEPS env or /app/data/runtime-deps)",
+             "/app/data/runtime-deps; never an environment variable, punch 547)",
     )
     eb_install_p.add_argument(
         "--manifest", default="",
         help="Override the manifest path (default: "
-             "EMBEDDING_BITS_MANIFEST env or "
+             "the image manifest, "
              "/app/scripts/embedding-bits-manifest.json)",
     )
     eb_sideload_p = eb_sub.add_parser(
@@ -3107,7 +5060,7 @@ def build_parser() -> argparse.ArgumentParser:
     eb_sideload_p.add_argument(
         "--target-dir", default="",
         help="Override the runtime-deps install dir (default: "
-             "EMBEDDING_BITS_RUNTIME_DEPS env or /app/data/runtime-deps)",
+             "/app/data/runtime-deps; never an environment variable, punch 547)",
     )
     eb_sideload_p.add_argument(
         "--manifest", default="",
@@ -3118,10 +5071,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-hash on-disk files against the manifest. No "
              "download. Exits 0 on match, 1 on mismatch.",
     )
-    eb_sub.add_parser(
+    eb_status_p = eb_sub.add_parser(
         "status",
-        help="Print the embedding_bits_install_state row + whether "
-             "the runtime imports.",
+        help="Print the embedding_bits_install_state row + what is "
+             "actually installed on the volume (a dist-info scan) + "
+             "whether it matches this image's pinned manifest.",
+    )
+    eb_status_p.add_argument(
+        "--target-dir", default="",
+        help="Override the runtime-deps install dir (default: "
+             "/app/data/runtime-deps; never an environment variable, punch 547)",
+    )
+    eb_status_p.add_argument(
+        "--manifest", default="",
+        help="Override the manifest path",
+    )
+    eb_remove_p = eb_sub.add_parser(
+        "remove",
+        help="Delete the installed runtime from the data volume and "
+             "reset the install-state row, in one step. Keeps the "
+             "AI-backends config, so 'install' reproduces it.",
+    )
+    eb_remove_p.add_argument(
+        "--target-dir", default="",
+        help="Override the runtime-deps install dir (default: "
+             "/app/data/runtime-deps; never an environment variable, punch 547)",
+    )
+    eb_remove_p.add_argument(
+        "--manifest", default="",
+        help="Override the manifest path (unused by remove; accepted "
+             "so the subcommands share one argument shape)",
     )
 
     # sent-mail-index — M-4 retrieval-augmented few-shot examples
@@ -3186,7 +5165,7 @@ def build_parser() -> argparse.ArgumentParser:
     vc_p.add_argument(
         "--json",
         action="store_true",
-        help="Emit the status as a JSON object on stdout (for the monitoring system "
+        help="Emit the status as a JSON object on stdout (for Nagios "
              "/ scripted callers). Default is a one-line human "
              "summary.",
     )
@@ -3199,19 +5178,133 @@ def build_parser() -> argparse.ArgumentParser:
              "config load. Used by scripts/deploy.sh to extract the "
              "schema cap from the :previous image before swapping.",
     )
+    vc_p.add_argument(
+        "--previous-schema-caps",
+        default="",
+        dest="previous_schema_caps",
+        help="The :previous image's target schema cap (scripts/deploy.sh "
+             "reads it from that image). When given, a live DB already past "
+             "it escalates to incompatible_rollback (exit 2). Punch 547: "
+             "this used to be the EMAIL_TRIAGE_PREVIOUS_SCHEMA_CAPS env var.",
+    )
+    vc_p.add_argument(
+        "--require-db",
+        action="store_true",
+        dest="require_db",
+        help="A missing or invisible DB file is db_unreadable (exit 5), not "
+             "a fresh install (schema 0). Pass it only when the DB is known "
+             "to exist: scripts/deploy.sh passes it after the deploy host "
+             "confirmed the DB file, so not finding it means a mount "
+             "mismatch. On a first install with no DB the deploy skips "
+             "the check instead.",
+    )
+    vc_p.add_argument(
+        "--verify-migrations",
+        action="store_true",
+        dest="verify_migrations",
+        help="#292/N-85 deploy pre-flight: open a COPY of the live DB "
+             "through THIS image's boot migration path (encryption-aware via "
+             "the config + ET_MASTER_KEY secret) so an edited already-applied "
+             "migration body (a checksum tamper-guard break) is caught "
+             "PRE-SWAP. Exit 0 OK / 3 verify-failed (caller aborts) / 2 "
+             "could-not-run (caller falls back to boot + /health rollback). "
+             "Non-destructive: migrates a temp copy only, never the live DB.",
+    )
+
+    pf_p = subparsers.add_parser(
+        "preflight",
+        help="Deploy pre-swap check: exit 78 if this image would refuse to "
+             "start (a retired env override is set, or the config says "
+             "plaintext over an encrypted DB file). Never opens the DB.",
+    )
+    pf_p.add_argument("-c", "--config", default=None,
+                      help="Path to config file")
 
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+#: The backup trigger's target: the app's own in-container listener (punch 547).
+_OPS_TRIGGER_BASE_URL = "https://localhost:8080"
 
-    if not args.command:
-        parser.print_help()
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """``email-triage preflight`` — the deploy's pre-swap refusal check.
+
+    TOTAL (punch 568, db-b1): it returns 0, ``RETIRED_ENV_EXIT_CODE`` (78) or
+    ``PREFLIGHT_INFRA_EXIT_CODE`` (75) and nothing else, so deploy.sh can read
+    any other rc as "the check did not run". 0 = this image can start against
+    this config + DB file. 78 = it would refuse. 75 = it ran but could not
+    decide: ANY exception other than the two refusals, with a one-line reason
+    on stderr. Four refusals: a retired
+    env key (already enforced by :func:`main` before any command runs), a
+    main DB file shorter than one header beside a non-empty ``-wal`` in either
+    mode (:func:`~email_triage.db._engine.refuse_orphan_wal`, panel B3 db-sme
+    F1), a config that resolves encryption OFF over an encrypted DB file
+    (:func:`~email_triage.db._engine.refuse_plaintext_open_of_encrypted_file`),
+    and its mirror, encryption ON over a plaintext DB file
+    (:func:`~email_triage.db._engine.refuse_encrypted_open_of_plaintext_file`, punch 614).
+    Reads the DB file header only; never opens the database.
+    """
+    from email_triage._env_registry import (
+        PREFLIGHT_INFRA_EXIT_CODE, RETIRED_ENV_EXIT_CODE,
+    )
+    stage = "import the preflight checks"
+    try:
+        from email_triage.config import ConfigError
+        from email_triage.db._engine import (
+            refuse_encrypted_open_of_plaintext_file,
+            refuse_orphan_wal,
+            refuse_plaintext_open_of_encrypted_file,
+            resolve_db_encryption,
+        )
+        stage = "load the config"
+        try:
+            config = load_config(args.config)
+        except ConfigError as e:
+            # db-sme F3 (547 panel): a config this image deterministically rejects
+            # (the strict encryption_enabled parse, a missing file, any schema
+            # error) is a REFUSAL, not infrastructure. As an infra code the deploy
+            # only WARNed and carried on to stop/smoke/start, so the bad config was
+            # caught late, by the step-8 /health rollback. 78 aborts at 5a'.
+            print(f"REFUSED: config rejected: {e}", file=sys.stderr)
+            return RETIRED_ENV_EXIT_CODE
+        # Panel B3 hipaa-sme (N-596): the strict bool parse refuses null, "" and
+        # unknown tokens, but a VALID token can flip meaning (a quoted
+        # `logging.hipaa: "false"` read as ON before punch 598 and reads as OFF
+        # now). Print the two resolved values so the deploy log and the 6a'
+        # record show what this image will run with, before the swap.
+        stage = "resolve the HIPAA and encryption settings"
+        print(f"preflight: resolved logging.hipaa={bool(config.logging.hipaa)}")
+        print("preflight: resolved persistence.encryption_enabled="
+              f"{bool(resolve_db_encryption(config))}")
+        stage = "read the DB header"
+        try:
+            refuse_orphan_wal(config)  # both modes, first (panel B3 db-sme F1)
+            refuse_plaintext_open_of_encrypted_file(config)
+            refuse_encrypted_open_of_plaintext_file(config)  # punch 614, the mirror
+        except RuntimeError as e:
+            print(f"REFUSED: {e}", file=sys.stderr)
+            return RETIRED_ENV_EXIT_CODE
+        print("preflight: OK")
         return 0
+    except Exception as e:  # noqa: BLE001 — infra, not a refusal
+        # Without this, an OSError (say) escapes as a traceback and rc 1, which
+        # the deploy reads as "did not run". It did run; report it as infra.
+        reason = " ".join(str(e).split()) or "no message"
+        print(f"preflight: could not {stage} (infra, {type(e).__name__}): {reason}",
+              file=sys.stderr)
+        return PREFLIGHT_INFRA_EXIT_CODE
 
-    handlers = {
+
+def _command_handlers() -> dict:
+    """Map each top-level subcommand name to its handler.
+
+    Module-level so tests can compare it with ``build_parser()``'s subcommands
+    (punch 568). A subcommand that is registered but missing here prints the
+    help text and exits 1. For ``preflight`` that rc 1 used to read as "could
+    not run" (WARN) in deploy.sh; the deploy now aborts on it.
+    """
+    return {
         "run": cmd_run,
         "watch": cmd_watch,
         "status": cmd_status,
@@ -3222,6 +5315,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": cmd_init,
         "serve": cmd_serve,
         "tls": _cmd_tls_dispatch,
+        "backup": cmd_backup,
         "restore": cmd_restore,
         "db": _cmd_db_dispatch,
         "auth": _cmd_auth_dispatch,
@@ -3230,14 +5324,60 @@ def main(argv: list[str] | None = None) -> int:
         "sent-mail-index": cmd_sent_mail_index,
         "version-check": cmd_version_check,
         "embedding-bits": _cmd_embedding_bits_dispatch,
+        "preflight": cmd_preflight,
     }
 
-    handler = handlers.get(args.command)
+
+def main(argv: list[str] | None = None) -> int:
+    # Windows-safe console output (SSOT for the whole CLI). The default Windows
+    # console encoding is cp1252, which CANNOT encode common non-ASCII output
+    # (e.g. a `→` arrow, ✓/✗ marks) → a bare print() raises UnicodeEncodeError
+    # and crashes the command MID-OUTPUT. `backup gen-keypair` did exactly this
+    # on Windows: it printed its first ASCII line, then died on the `→` in its
+    # guidance — before emitting the keys. Force stdout/stderr
+    # to UTF-8 so non-ASCII output never crashes, regardless of host locale.
+    # Guarded: a captured/redirected stream may not be a reconfigurable TextIO.
+    import sys as _sys
+    for _stream in (_sys.stdout, _sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    # Punch 547: refuse a process whose environment still carries a removed
+    # control override, before ANY command runs (fail-closed, loud).
+    from email_triage._env_registry import (
+        RETIRED_ENV_EXIT_CODE, RetiredEnvError, refuse_retired_env,
+    )
+    try:
+        refuse_retired_env()
+    except RetiredEnvError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        return RETIRED_ENV_EXIT_CODE
+
+    handler = _command_handlers().get(args.command)
     if handler is None:
         parser.print_help()
         return 1
 
-    return handler(args)
+    try:
+        return handler(args)
+    except CliAuditGateClosed as e:
+        # N-157 (2026-07-09) — DA fold Fix #1.  Surface the fail-loud gate
+        # as a CLEAN CLI error on stderr — NOT a Python traceback.  The
+        # exception message names `--allow-unaudited` as the recovery
+        # lever verbatim (per the raise-site in _emit_cli_audit_event);
+        # exit code 3 is dedicated to this class so an operator's shell
+        # script can discriminate (rc=0 success, rc=1 usage, rc=2 handler
+        # error, rc=3 audit-gate closed).
+        print(f"error: {e}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

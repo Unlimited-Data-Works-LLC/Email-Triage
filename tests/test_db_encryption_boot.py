@@ -25,6 +25,7 @@ What IS exercised on dev:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 import types
@@ -67,24 +68,12 @@ def test_resolve_yaml_field_on(monkeypatch):
     assert resolve_db_encryption(_cfg(encryption_enabled=True)) is True
 
 
-@pytest.mark.parametrize("val", ["1", "true", "TRUE", "yes", "on", " On "])
-def test_resolve_env_override_true(monkeypatch, val):
+@pytest.mark.parametrize("val", ["1", "true", "0", "false", " trueish-typo "])
+def test_env_var_no_longer_decides_encryption(monkeypatch, val):
+    """Punch 547 (operator directive 2026-09-29): the EMAIL_TRIAGE_DB_ENCRYPTION
+    override is gone — the YAML field alone decides, whatever the env says. (A
+    process that still sets it is refused at start: _env_registry.RETIRED.)"""
     monkeypatch.setenv(_ENV_VAR, val)
-    # Env override wins even when YAML says off.
-    assert resolve_db_encryption(_cfg(encryption_enabled=False)) is True
-
-
-@pytest.mark.parametrize("val", ["0", "false", "no", "off", "OFF"])
-def test_resolve_env_override_false(monkeypatch, val):
-    monkeypatch.setenv(_ENV_VAR, val)
-    # Env override wins even when YAML says on.
-    assert resolve_db_encryption(_cfg(encryption_enabled=True)) is False
-
-
-def test_resolve_env_unrecognized_defers_to_yaml(monkeypatch):
-    """A typo'd env value must NOT silently disable encryption — it
-    falls through to the YAML field instead of being treated as falsy."""
-    monkeypatch.setenv(_ENV_VAR, " trueish-typo ")
     assert resolve_db_encryption(_cfg(encryption_enabled=True)) is True
     assert resolve_db_encryption(_cfg(encryption_enabled=False)) is False
 
@@ -94,15 +83,23 @@ def test_resolve_env_unrecognized_defers_to_yaml(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_contract_plain_when_flag_off_non_hipaa(monkeypatch):
-    """Flag off + non-HIPAA = plaintext, no raise (the common case)."""
+def test_contract_plain_when_flag_off_non_hipaa(monkeypatch, caplog):
+    """Flag off + non-HIPAA = plaintext, no raise (the common case) — but a loud
+    general PLAINTEXT advisory now fires (operator 2026-06-11: "the default
+    should be encrypted anyway; warn on NOT encrypted"). Not fatal."""
     monkeypatch.delenv(_ENV_VAR, raising=False)
     _triage_logging._hipaa_mode = False  # autouse fixture restores
-    assert (
-        enforce_db_encryption_boot_contract(
+    with caplog.at_level("WARNING"):
+        result = enforce_db_encryption_boot_contract(
             _cfg(encryption_enabled=False), master_key_available=True
         )
-        is False
+    assert result is False
+    assert any(
+        "opening in PLAINTEXT" in r.message for r in caplog.records
+    ), "expected the general plaintext advisory on a non-HIPAA plaintext boot"
+    # ...and NOT the HIPAA-specific advisory (this isn't HIPAA mode).
+    assert not any(
+        "HIPAA mode is ON" in r.message for r in caplog.records
     )
 
 
@@ -128,7 +125,7 @@ def test_contract_plain_when_flag_off_hipaa_is_advisory_not_fatal(
 def test_contract_fail_closed_when_sqlcipher_absent(monkeypatch):
     """Encryption requested but sqlcipher3 not importable -> RuntimeError,
     NEVER a silent plaintext fallback. This is the dev-box reality
-    (sqlcipher3-binary is not installed here)."""
+    (sqlcipher3 is not installed on the Windows workstation)."""
     monkeypatch.delenv(_ENV_VAR, raising=False)
     _triage_logging._hipaa_mode = True
     monkeypatch.setattr(_engine, "sqlcipher3_available", lambda: False)
@@ -164,16 +161,44 @@ def test_contract_fail_closed_non_hipaa_when_requested(monkeypatch):
         )
 
 
-def test_contract_env_override_drives_fail_closed(monkeypatch):
-    """The env override alone (YAML off) is enough to demand encryption,
-    so the same fail-closed gate fires when the binary is absent."""
+def test_env_var_can_no_longer_turn_encryption_off_or_on(monkeypatch):
+    """The env var used to be able to demand (or DROP) encryption over the
+    YAML. Now YAML-off + env '1' is simply the plaintext decision."""
     monkeypatch.setenv(_ENV_VAR, "1")
-    _triage_logging._hipaa_mode = True
+    _triage_logging._hipaa_mode = False
     monkeypatch.setattr(_engine, "sqlcipher3_available", lambda: False)
-    with pytest.raises(RuntimeError, match="sqlcipher3"):
+    assert enforce_db_encryption_boot_contract(
+        _cfg(encryption_enabled=False), master_key_available=True
+    ) is False
+
+
+def _cfg_at(path, *, encryption_enabled):
+    return types.SimpleNamespace(persistence=types.SimpleNamespace(
+        encryption_enabled=encryption_enabled, db_path=str(path)))
+
+
+def test_plaintext_config_over_an_encrypted_file_refuses(tmp_path):
+    """Punch 547: with the env override gone, an install whose encryption was
+    on ONLY via the env var (prod: YAML false + drop-in true) must refuse to
+    open ciphertext as plaintext — fail CLOSED with the fix, at boot and in
+    the ``preflight`` deploy check."""
+    enc = tmp_path / "enc.db"
+    enc.write_bytes(b"\x8f" * 4096)  # not the plaintext SQLite magic
+    with pytest.raises(RuntimeError, match="encryption_enabled: true"):
+        _engine.refuse_plaintext_open_of_encrypted_file(
+            _cfg_at(enc, encryption_enabled=False))
+    with pytest.raises(RuntimeError, match="encryption_enabled: true"):
         enforce_db_encryption_boot_contract(
-            _cfg(encryption_enabled=False), master_key_available=True
-        )
+            _cfg_at(enc, encryption_enabled=False), master_key_available=True)
+    # Teeth / no false positive: a real plaintext file, a missing file, an
+    # empty file and encryption ON all pass.
+    plain = tmp_path / "plain.db"
+    track(sqlite3.connect(str(plain))).execute("CREATE TABLE t (x)").connection.commit()
+    _engine.refuse_plaintext_open_of_encrypted_file(_cfg_at(plain, encryption_enabled=False))
+    _engine.refuse_plaintext_open_of_encrypted_file(_cfg_at(tmp_path / "none.db", encryption_enabled=False))
+    (tmp_path / "empty.db").write_bytes(b"")
+    _engine.refuse_plaintext_open_of_encrypted_file(_cfg_at(tmp_path / "empty.db", encryption_enabled=False))
+    _engine.refuse_plaintext_open_of_encrypted_file(_cfg_at(enc, encryption_enabled=True))
 
 
 def test_contract_succeeds_when_everything_present(monkeypatch):
@@ -311,7 +336,7 @@ def test_init_db_plaintext_still_works(tmp_path):
     from email_triage.web.db import init_db
 
     db_file = tmp_path / "plain.db"
-    conn = init_db(str(db_file))
+    conn = track(init_db(str(db_file)))
     try:
         # WAL + foreign_keys set by _bootstrap_schema.
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -336,7 +361,7 @@ def test_init_db_memory_default_unchanged():
     """init_db() with no args still opens an in-memory DB + bootstraps."""
     from email_triage.web.db import init_db
 
-    conn = init_db()
+    conn = track(init_db())
     try:
         names = {
             r[0]
@@ -350,14 +375,15 @@ def test_init_db_memory_default_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Real encrypted-open — DEFERRED to Phase 6 the deploy host-bake (needs the binary)
+# Real encrypted-open — needs sqlcipher3 (CI installs the PyPI wheel; the image builds SQLCipher from source)
 # ---------------------------------------------------------------------------
 
 
 def test_real_encrypted_open_roundtrip(tmp_path):
-    """Container-only: open an encrypted DB, write+read, confirm the
-    on-disk file is NOT a plaintext SQLite header. Skipped on dev where
-    sqlcipher3-binary is absent; runs in the Phase 6 the deploy host bake."""
+    """Needs sqlcipher3: open an encrypted DB, write+read, confirm the
+    on-disk file is NOT a plaintext SQLite header. Skipped where sqlcipher3
+    is absent (the Windows workstation); runs in CI on the sqlcipher3 wheel
+    and in the image."""
     pytest.importorskip("sqlcipher3")
     from email_triage.web.db import init_db_encrypted
 
@@ -451,8 +477,8 @@ def test_open_dedicated_conn_plaintext_pragmas(
 def test_open_dedicated_conn_selects_encrypted_when_stamped(
     tmp_path, _reset_dedicated_conn_ctx
 ):
-    """ENCRYPTED PATH (container-only — needs sqlcipher3-binary; runs in
-    the Phase 6 the deploy host bake). After the boot stamps encrypted=True, every
+    """ENCRYPTED PATH (needs sqlcipher3; runs in CI on the sqlcipher3
+    wheel and in the image). After the boot stamps encrypted=True, every
     open_dedicated_conn returns a sqlcipher3 connection on the SAME file
     the main encrypted conn created — proving the  dedicated conns
     self-select encryption like the main conn (N-17)."""
@@ -495,8 +521,8 @@ def test_open_dedicated_conn_selects_encrypted_when_stamped(
 def test_audit_chain_handler_writes_through_encrypted_conn(
     tmp_path, _reset_dedicated_conn_ctx, monkeypatch
 ):
-    """THE bake-gap test (container-only — needs sqlcipher3-binary; runs
-    in the Phase 6 the deploy host bake).
+    """THE bake-gap test (needs sqlcipher3; runs in CI on the sqlcipher3
+    wheel and in the image).
 
     Wires the §164.312(b) audit-chain log handler against an ENCRYPTED DB
     via the real add_sqlite_handler path, emits a log record, flushes, and
@@ -544,7 +570,7 @@ def test_audit_chain_handler_writes_through_encrypted_conn(
 
         # (1) the handler's conn opened encrypted, not plaintext-crash.
         assert type(handler._conn).__module__ == "sqlcipher3.dbapi2", (
-            "audit-chain handler conn is not sqlcipher3 — the  "
+            "audit-chain handler conn is not sqlcipher3 — the #211 "
             "dedicated-conn encryption bypass (N-17) is still present"
         )
 

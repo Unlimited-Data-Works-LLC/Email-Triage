@@ -78,7 +78,7 @@ def _make_full_bundle(tmp_path: Path) -> Path:
         master_key_name="ET_MASTER_KEY",
         passphrase=_PASSPHRASE,
         operator_email="cli@test",
-        hostname="testhost",
+        hostname="testhost.invalid",
     )
     conn.close()
     bp = tmp_path / "test.etbk"
@@ -92,7 +92,7 @@ def _make_key_bundle(tmp_path: Path, mkey: str = "real-key-32-bytes-pad") -> Pat
         master_key_name="ET_MASTER_KEY",
         passphrase=_PASSPHRASE,
         operator_email="cli@test",
-        hostname="testhost",
+        hostname="testhost.invalid",
     )
     bp = tmp_path / "test.etbkkey"
     bp.write_bytes(bundle)

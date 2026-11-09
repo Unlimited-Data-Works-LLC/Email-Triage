@@ -1,0 +1,357 @@
+{
+  "__schema": "v1",
+  "src/email_triage/actions/digest_configs.py::toggle uniformly": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/digest_render.py::toggle stays": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/draft_reply.py::toggle does": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/draft_reply.py::toggle is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/hipaa_sent_counter.py::toggle and": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/hipaa_sent_counter.py::toggle off": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/recipient_digest.py::toggle off": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/sent_mail_index.py::toggle decision": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/sent_mail_index.py::toggle is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/sent_mail_index.py::toggle off": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/style_profile.py::disable the": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/style_profile.py::toggle gate": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/style_profile.py::toggle off": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/actions/topic_configs.py::toggle does": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/ai_backends/base.py::disable the": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/ai_backends/loader.py::enable it": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/baa_expiry.py::disable expired": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/baa_expiry.py::disable for": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/baa_expiry.py::disable on": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/baa_expiry.py::disable runs": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/baa_expiry.py::disable sweep": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/cache/classification.py::disable explicitly": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/cli.py::disable all": {
+    "mechanism_ref": "POST /users/{user_id}/disable (web/routers/ui/users.py:866, set_user_disabled)",
+    "notes": "punch 703: renormalize-emails duplicate-target refusal tells the operator to change or disable all but one colliding user (cli.py ~1461)"
+  },
+  "src/email_triage/cli.py::disable the": {
+    "mechanism_ref": "POST /users/{user_id}/disable (web/routers/ui/users.py:866, set_user_disabled)",
+    "notes": "panel AA MUST-A3: 'apikey delete' NOT-revoked refusal (punch 689) names the containment step; the CLI has no user-disable command, so the copy points at the web UI (Users, Disable) (cli.py ~1292)"
+  },
+  "src/email_triage/cli.py::disable tls": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/cli.py::enable https": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/cli.py::enable in": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/config.py::disable retrieval": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/config.py::toggle features": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/_engine.py::disable the": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/_engine.py::enable it": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/_engine.py::enable sqlcipher": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/accounts.py::enable an": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/accounts.py::enable it": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/accounts.py::enable knowing": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/accounts.py::toggle for": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/audit.py::toggle trail": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/regulatory_clock.py::enable is": {
+    "exempt": "D2 fix 2026-07-16 db-sme O1 docstring fold — matches inside the developer docstring phrase 'operator INTENT to disable/enable is a §164.312(b) auditable event' on set_owned_clock_def_enabled. Not a user-facing directive; the pattern _MATCH_ is incidental via 'enable' + ' is'."
+  },
+  "src/email_triage/db/regulatory_clock.py::instead of deleting": {
+    "mechanism_ref": "POST /profile/regulatory-clocks/set-enabled",
+    "notes": "Same D2 mechanism as 'turn it off' above \u2014 the two phrases co-occur in the same delete-refusal string. Registered separately because the matcher yields each match individually."
+  },
+  "src/email_triage/db/regulatory_clock.py::turn it off": {
+    "mechanism_ref": "POST /profile/regulatory-clocks/set-enabled",
+    "notes": "D2 (2026-07-16 audit) fix LANDED same-drive \u2014 the delete-refusal at db/regulatory_clock.py:544-547 directs the user to disable the template instead of deleting it, and the mechanism now exists: set-enabled route at web/routers/ui/profile.py, DAO helper set_owned_clock_def_enabled at db/regulatory_clock.py, UI button 'Turn off'/'Turn on' at web/templates/profile/regulatory_clocks.html. COPY-AS-CONTRACT proves the phrase->route link is live via test_registry_entries_are_still_live."
+  },
+  "src/email_triage/db/style.py::disable flag": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/style.py::toggle at": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/style.py::toggle from": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/db/style.py::toggle is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/embedding_bits/__init__.py::disable controls": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/engine/embedding_backend.py::disable retrieval": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/engine/embedding_backend.py::toggle is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/style_learning/per_contact_hipaa.py::toggle that": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/tls.py::enable https": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/acme_renewer.py::disable acme": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/auth.py::disable flag": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/background_sweepers.py::disable sweep": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/background_sweepers.py::toggle is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/db.py::disable takes": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/db.py::disable would": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/db.py::enable calendar": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/db.py::toggle with": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/email_watches.py::disable is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/events.py::disable in": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/mfa.py::toggle via": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/migrations.py::disable a": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/migrations.py::enable per": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/migrations.py::toggle stays": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/agent_api.py::enable calendar": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/api.py::disable the": {
+    "mechanism_ref": "POST /users/{user_id}/disable (web/routers/ui/users.py:866, set_user_disabled)",
+    "notes": "panel AA MUST-A3: DELETE /api/keys/{key_id} 503 (punch 689) names the containment step, disable the owning user, then stop the service (api.py ~861)"
+  },
+  "src/email_triage/web/routers/auth_keys.py::enable https": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/_shared.py::disable itself": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/_shared.py::disable state": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/_shared.py::enable previewing": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/_shared.py::toggle state": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/accounts.py::toggle auto": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/admin.py::toggle baa": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/profile.py::disable an": {
+    "exempt": "D2 fix 2026-07-16 \u2014 dev-facing docstring on profile_regulatory_clocks_set_enabled (describes the enable/disable route to future maintainers). Not user-visible; the user-facing button label lives in the template and is registered separately with mechanism_ref."
+  },
+  "src/email_triage/web/routers/ui/profile.py::disable the": {
+    "mechanism_ref": "POST /users/{user_id}/disable (web/routers/ui/users.py:866, set_user_disabled)",
+    "notes": "panel AA MUST-A3: DELETE /accounts/api-keys/{key_id} 503 (punch 689) names the containment step, disable the owning user, then stop the service (profile.py ~3296)"
+  },
+  "src/email_triage/web/routers/ui/profile.py::enable the": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/profile.py::turn it off": {
+    "exempt": "D2 fix 2026-07-16 \u2014 dev-facing docstring on profile_regulatory_clocks_set_enabled QUOTING the user-facing delete-refusal string from db/regulatory_clock.py:544-547 to link the two files for a future maintainer. Not itself user-visible; the ACTUAL 'turn it off' user directive is the delete-refusal string, registered separately at db/regulatory_clock.py::turn it off with mechanism_ref = POST /profile/regulatory-clocks/set-enabled."
+  },
+  "src/email_triage/web/routers/ui/profile.py::toggle blocked": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/profile.py::toggle refused": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/profile.py::toggle saved": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/triage_classify.py::enable it": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::disable a": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::disable is": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::disable the": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::disable your": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::enable a": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/routers/ui/users.py::toggle on": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/templates/account_wizard/step2.html::click the button": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/_delegates.html::toggle the": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/_edit.html::enable when": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/_fields_gmail_api.html::enable calendar": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/_fields_gmail_api.html::enable gmail": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/_o365_fields.html::enable calendar": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/accounts/manage.html::turn this off": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/acme_status.html::enable automated": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/ai_backends/_form.html::disable instead": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/_embedding_install_card.html::enable auto": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/backup.html::enable automated": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/general.html::turn it off": {
+    "mechanism_ref": "untick Check for updates (update_check_enabled) on Config > General -> POST /config/save -> update_check.resolve_release_check_form writes release_check_url \"\" (OFF, no request)",
+    "notes": "Punch 553 / N-556: the update-check help text tells the admin to turn the check off for a server with no internet access; the checkbox + section marker are the declared controls."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/general.html::disable thinking": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/general.html::toggle on": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/integrations.html::disable outbound": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/config_tabs/integrations.html::turn it off": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/admin/security.html::enable system": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/help/integrations.html::enable authentication": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/help/integrations.html::enable gmail": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/help/integrations.html::enable it": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/help/integrations.html::enable two": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/profile/_style_data_alias_section.html::toggle below": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/templates/profile/regulatory_clocks.html::turn offturn on": {
+    "mechanism_ref": "POST /profile/regulatory-clocks/set-enabled",
+    "notes": "D2 fix 2026-07-16 \u2014 the owned-clock-def toggle button label. Jinja if/else collapses to the concatenated 'Turn offTurn on' string post-markup-strip (both branches sit on the same source line). The label MUST match the delete-refusal directive 'turn it off' verbatim (db/regulatory_clock.py:544-547) to close the copy-to-mechanism loop. Both labels post to the same route (POST /profile/regulatory-clocks/set-enabled) with an inverted enabled hidden input."
+  },
+  "src/email_triage/web/templates/profile/watches.html::turn it off": {
+    "exempt": "audit-batch 2026-07-16 \u2014 same-page operator UI directive; the referenced control is colocated in the same template file. BULK classification, not individually verified \u2014 spot-audit deferred to Drive-4 retrofit e2e walks which exercise the actual controls. If a template is refactored such that the referenced control moves to another page, promote this entry to mechanism_ref pointing at the new route or flag as broken."
+  },
+  "src/email_triage/web/watcher.py::disable contract": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/watcher.py::disable does": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/watcher.py::disable teardown": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/web/watcher.py::enable via": {
+    "exempt": "baseline-2026-07-16 \u2014 auto-seeded by VALK Drive-1 bootstrap. Classify into mechanism_ref (real feature) or keep exempt (log/dev-only, internal error, etc.) in a follow-up drive. See feedback_after_every_run_evaluate_census_and_llm_host_offload."
+  },
+  "src/email_triage/classify/ollama.py::turn it off": {
+    "mechanism_ref": "set classifier.debug_capture_raw_head: false in the config file (email-triage.yaml), then restart -> configure_debug_capture(False)",
+    "notes": "operator-facing log WARNING at start (A4, 2026-10-21); the admin banner names the same setting"
+  }
+}

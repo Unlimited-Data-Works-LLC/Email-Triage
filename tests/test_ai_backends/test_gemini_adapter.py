@@ -69,10 +69,10 @@ def _patch_httpx(mock_resp):
 class TestAdapterConstruction:
     def test_minimal_construction(self):
         a = GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             api_key="gemini-key",
         )
-        assert a.endpoint == "https://generativelanguage.googleapis.com/v1beta"
+        assert a.endpoint == "https://generativelanguage.googleapis.invalid/v1beta"
         assert a.model == DEFAULT_GEMINI_MODEL
         # Gemini is always external; HIPAA gate stays closed pre-BAA.
         assert a.is_local is False
@@ -80,10 +80,10 @@ class TestAdapterConstruction:
 
     def test_endpoint_trailing_slash_normalised(self):
         a = GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta/",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta/",
             api_key="gemini-key",
         )
-        assert a.endpoint == "https://generativelanguage.googleapis.com/v1beta"
+        assert a.endpoint == "https://generativelanguage.googleapis.invalid/v1beta"
 
     def test_empty_endpoint_falls_back_to_default(self):
         a = GeminiAdapter(endpoint="", api_key="k")
@@ -106,7 +106,7 @@ class TestAdapterConstruction:
         ``local_url_suffixes`` / ``backend_type`` — pin they're all
         accepted."""
         a = GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             model="gemini-2.0-flash",
             api_key="k",
             local_url_suffixes=[],
@@ -227,7 +227,7 @@ class TestChatComplete:
     @pytest.fixture
     def adapter(self):
         return GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             api_key="gemini-test-key",
             model="gemini-2.0-flash",
         )
@@ -413,7 +413,7 @@ class TestChatComplete:
 
     async def test_empty_api_key_raises_before_http(self):
         adapter = GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             api_key="",
             model="gemini-2.0-flash",
         )
@@ -450,7 +450,7 @@ class TestErrorHandling:
     @pytest.fixture
     def adapter(self):
         return GeminiAdapter(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             api_key="gemini-k",
             model="gemini-2.0-flash",
         )
@@ -608,7 +608,7 @@ class TestPrivacyInvariants:
         }
         err = GeminiError(
             500, body,
-            "https://generativelanguage.googleapis.com/v1beta/x",
+            "https://generativelanguage.googleapis.invalid/v1beta/x",
         )
         rendered = str(err)
         for sentinel in (
@@ -652,7 +652,7 @@ class TestPrivacyInvariants:
         scrub it; this is not defence-in-depth, it's the primary
         protection."""
         leaked_url = (
-            "https://generativelanguage.googleapis.com/v1beta/"
+            "https://generativelanguage.googleapis.invalid/v1beta/"
             "models/gemini-2.0-flash:generateContent?"
             "key=SECRET_GEMINI_KEY_VALUE_NEVER_LOG"
         )
@@ -695,14 +695,14 @@ class TestPrivacyInvariants:
             assert sentinel not in rendered
 
     def test_strip_sensitive_query_params_handles_no_query(self):
-        url = "https://x/y"
+        url = "https://x.invalid/y"
         assert _strip_sensitive_query_params(url) == url
 
     def test_strip_sensitive_query_params_handles_empty(self):
         assert _strip_sensitive_query_params("") == ""
 
     def test_strip_sensitive_query_params_covers_alternates(self):
-        url = "https://x/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
+        url = "https://x.invalid/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
         out = _strip_sensitive_query_params(url)
         assert "KKK" not in out
         assert "TTT" not in out
@@ -720,7 +720,7 @@ class TestClassifierShim:
     @pytest.fixture
     def classifier(self):
         return GeminiClassifierShim(
-            endpoint="https://generativelanguage.googleapis.com/v1beta",
+            endpoint="https://generativelanguage.googleapis.invalid/v1beta",
             api_key="gem-k",
             model="gemini-2.0-flash",
         )

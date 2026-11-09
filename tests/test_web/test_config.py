@@ -35,6 +35,14 @@ class TestConfigPage:
         assert 'name="classifier_backend"' in resp.text
         assert 'name="classifier_model"' in resp.text
 
+    def test_config_shows_num_ctx_field(self, client, admin_cookies):
+        """ — the pinnable Ollama context-window field renders on the
+        general config tab (rule 17: assert the rendered view). StrictUndefined
+        would 500 here if config.classifier.num_ctx didn't exist."""
+        resp = client.get("/config", cookies=admin_cookies)
+        assert resp.status_code == 200
+        assert 'name="classifier_num_ctx"' in resp.text
+
     def test_config_shows_smtp_fields(self, client, admin_cookies):
         resp = client.get("/config", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -293,19 +301,41 @@ class TestConfigSave:
         assert app.state.config.classifier.backend == "openai"
         assert app.state.config.classifier.model == "gpt-4o"
 
+    def test_save_classifier_num_ctx(self, client, app, admin_cookies):
+        """ — a numeric num_ctx posts through to config; blank clears it to
+        None (inherit). YAML FULL-REBUILD persistence is covered by
+        test_config_roundtrip.test_classifier_num_ctx_roundtrip."""
+        base = {"log_level": "INFO", "classifier_backend": "ollama",
+                "classifier_model": "qwen3.6:35b",
+                "classifier_ollama_url": "http://localhost:11434",
+                "smtp_port": "587", "logging_format": "text"}
+        resp = client.post(
+            "/config/save", data={**base, "classifier_num_ctx": "98304"},
+            cookies=admin_cookies,
+        )
+        assert resp.status_code == 200
+        assert app.state.config.classifier.num_ctx == 98304
+        # Blank clears it back to inherit (None).
+        resp2 = client.post(
+            "/config/save", data={**base, "classifier_num_ctx": ""},
+            cookies=admin_cookies,
+        )
+        assert resp2.status_code == 200
+        assert app.state.config.classifier.num_ctx is None
+
     def test_save_smtp_settings(self, client, app, admin_cookies):
         resp = client.post(
             "/config/save",
             data={"log_level": "INFO", "classifier_backend": "ollama",
                   "classifier_model": "qwen3.5:35b", "classifier_ollama_url": "http://localhost:11434",
-                  "smtp_host": "mail.example.com", "smtp_port": "465",
+                  "smtp_host": "mail.example.invalid", "smtp_port": "465",
                   "smtp_username": "user@example.com", "smtp_from_addr": "noreply@example.com",
                   "smtp_use_tls": "1",
                   "logging_format": "text"},
             cookies=admin_cookies,
         )
         assert resp.status_code == 200
-        assert app.state.config.smtp.host == "mail.example.com"
+        assert app.state.config.smtp.host == "mail.example.invalid"
         assert app.state.config.smtp.port == 465
         assert app.state.config.smtp.from_addr == "noreply@example.com"
         assert app.state.config.smtp.use_tls is True
@@ -362,13 +392,34 @@ class TestConfigSave:
 class TestDryRunBehavior:
     """Verify dry-run mode skips action execution."""
 
-    def test_runtime_settings_defaults(self, db):
+    def test_runtime_settings_defaults(self, db, monkeypatch):
+        """N-464: with no row, `log_level` and `hipaa` must PRESERVE the LIVE
+        process state — they are not flat dataclass defaults.
+
+        This assertion used to read `settings["log_level"] == "INFO"`. That
+        passed on a workstation whose root logger happened to sit at INFO and
+        FAILED in CI, which configures DEBUG — a literal that was testing the
+        ambient environment, not the contract. Pin the live value explicitly
+        and assert the fallback tracks it, in BOTH directions, so neither
+        value can be green by coincidence.
+        """
+        from email_triage import triage_logging
         from email_triage.web.routers.ui import _get_runtime_settings, _is_dry_run
+
+        monkeypatch.setattr(triage_logging, "effective_level_name", lambda: "WARNING")
         settings = _get_runtime_settings(db)
         assert settings["dry_run"] is False
-        assert settings["log_level"] == "INFO"
+        assert settings["log_level"] == "WARNING", (
+            "absence must preserve the live effective level, not revert to a "
+            "flat default"
+        )
         assert settings["hipaa"] is False
         assert _is_dry_run(db) is False
+
+        # Opposite direction — a fallback hardcoded to WARNING would pass the
+        # assertion above and is the same defect one value over.
+        monkeypatch.setattr(triage_logging, "effective_level_name", lambda: "ERROR")
+        assert _get_runtime_settings(db)["log_level"] == "ERROR"
 
     def test_dry_run_flag_reads_from_db(self, db):
         from email_triage.web.routers.ui import _is_dry_run

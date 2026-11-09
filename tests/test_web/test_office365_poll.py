@@ -110,6 +110,16 @@ def _fake_message(mid="msg-fixture-1"):
     )
 
 
+def _resync_pages(provider, *pages):
+    """Fake ``search_iter`` for the resync probe (punch 854): yields each page
+    with a nextLink on every page but the last. Returns the recording mock."""
+    async def _walk(query, *, batch_size=500, **_kw):
+        for i, page in enumerate(pages):
+            yield list(page), (f"https://graph/next-{i}" if i < len(pages) - 1 else None)
+    provider.search_iter = MagicMock(side_effect=_walk)
+    return provider.search_iter
+
+
 # ---------------------------------------------------------------------------
 # _poll_once_office365
 # ---------------------------------------------------------------------------
@@ -226,3 +236,79 @@ class TestPollOnceOffice365:
         # No cursor written, provider closed.
         assert get_setting(db, office365_poll_cursor(acct["id"])) is None
         non_o365.close.assert_awaited_once()
+
+
+class TestPollResyncChip:
+    """Punch 854 (db-sme S2) — the POLL site's clear runs after the walked
+    messages are processed, and only when no failure went unqueued (the push
+    mirror is in test_office365_push_consumer.py)."""
+
+    async def _resync_tick(self, poll_app, db, fake_provider, fake_classifier,
+                           *extra_patches):
+        from contextlib import ExitStack
+        from email_triage.providers.office365 import (
+            GraphDeltaResyncRequiredError,
+        )
+        from email_triage.web._backfill_chip import (
+            BACKFILL_CAP, mark_backfill_capped,
+        )
+        from email_triage.web.db import set_setting
+
+        acct = _make_account(db)
+        set_setting(
+            db, office365_poll_cursor(acct["id"]),
+            {"delta_link": "https://graph/dead-cursor"},
+        )
+        mark_backfill_capped(
+            db, acct["id"], kind="o365_resync", window="most recent",
+            recovered=BACKFILL_CAP, source_mailbox="INBOX",
+        )
+        fake_provider.poll_delta.side_effect = [
+            GraphDeltaResyncRequiredError(
+                410, {"error": {"message": "resyncRequired"}}, "/delta",
+            ),
+            ([], "https://graph/fresh-cursor"),
+        ]
+        walk = _resync_pages(fake_provider, ["msg-recent-1"])
+        with ExitStack() as stack:
+            stack.enter_context(patch(
+                "email_triage.web.routers.ui._create_provider_from_account",
+                return_value=fake_provider,
+            ))
+            stack.enter_context(patch(
+                "email_triage.web.routers.ui._build_classifier_from_config",
+                return_value=fake_classifier,
+            ))
+            for p in extra_patches:
+                stack.enter_context(p)
+            await _poll_once_office365(poll_app, acct)
+        walk.assert_called_once()
+        fake_provider.search.assert_not_awaited()
+        return acct
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_resync_clears_a_stored_inbox_chip(
+        self, poll_app, db, fake_provider, fake_classifier,
+    ):
+        from email_triage.web._backfill_chip import get_backfill_capped
+        fake_provider.fetch_message.return_value = _fake_message("msg-recent-1")
+        acct = await self._resync_tick(poll_app, db, fake_provider, fake_classifier)
+        assert fake_classifier.classify.await_count == 1
+        assert get_backfill_capped(db, acct["id"]) is None
+
+    @pytest.mark.asyncio
+    async def test_unsaturated_resync_keeps_the_chip_when_a_failure_is_not_queued(
+        self, poll_app, db, fake_provider, fake_classifier,
+    ):
+        from email_triage.web._backfill_chip import get_backfill_capped
+        fake_provider.fetch_message.side_effect = RuntimeError("fetch failed")
+        acct = await self._resync_tick(
+            poll_app, db, fake_provider, fake_classifier,
+            patch(
+                "email_triage.web.watcher_retry.enqueue_watcher_retry",
+                side_effect=RuntimeError("retry queue unavailable"),
+            ),
+        )
+        chip = get_backfill_capped(db, acct["id"])
+        assert chip is not None
+        assert chip["source_mailbox"] == "INBOX"

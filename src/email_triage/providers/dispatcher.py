@@ -39,12 +39,17 @@ multi-branch dispatch and don't pay the dispatcher tax.
 from __future__ import annotations
 
 import logging
+import html
+from email_triage.web.error_html import error_chip
+from email_triage._errfmt import fmt_exc
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from email_triage.db._helpers import row_get
+from email_triage._dbapi_errors import DB_ERRORS
 
-logger = logging.getLogger("email_triage.providers.dispatcher")
+logger = get_logger("email_triage.providers.dispatcher")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +150,7 @@ async def _imap_start_push(manager, account_id: int, acct: dict) -> str:
 
 def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> bool:
     """Infer IMAP push_enabled from the legacy ``watch:<id>`` setting."""
-    import json as _json
-    import sqlite3
+    from email_triage.db._helpers import load_json_col
     from email_triage.web.settings_keys import watch as _watch_key
 
     try:
@@ -154,7 +158,7 @@ def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> boo
             "SELECT value_json FROM settings WHERE key = ?",
             (_watch_key(account_id),),
         ).fetchone()
-    except sqlite3.Error:
+    except DB_ERRORS:
         return default
 
     if row is None:
@@ -165,20 +169,28 @@ def _imap_infer_push_enabled(conn, account_id: int, default: bool = True) -> boo
     # N-16: row_get duck-types on keys() so a sqlcipher3 Row takes the
     # keyed branch — isinstance(row, sqlite3.Row) goes False for it.
     raw_val = row_get(row, "value_json", 0)
+    # census  SSOT — corrupt value_json degrades to {} (→ enabled False).
+    parsed = load_json_col(raw_val, default={})
+    return bool(parsed.get("enabled", False))
+
+
+def _imap_release(imap) -> None:
+    """End a blocking ``imaplib`` probe session, best-effort: LOGOUT, and when the server
+    is gone (or LOGOUT itself fails) close the socket directly. Never raises."""
     try:
-        parsed = _json.loads(raw_val) if raw_val else {}
-    except (TypeError, ValueError):
-        parsed = {}
-    return bool(
-        parsed.get("enabled", False) if isinstance(parsed, dict) else False
-    )
+        imap.logout()
+    except Exception as exc:
+        logger.debug("imap probe logout failed; closing the socket", error=fmt_exc(exc, with_class=True))
+        try:
+            imap.shutdown()
+        except Exception as exc2:
+            logger.debug("imap probe socket close failed", error=fmt_exc(exc2, with_class=True))
 
 
 async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
-    """IMAP connection probe — opens IMAP4_SSL, logs in, selects mailbox."""
-    import imaplib
-    import socket
-    import ssl as ssl_mod
+    """IMAP connection probe — opens IMAP4_SSL, logs in, selects mailbox. The
+    connection itself runs on a worker thread (:func:`_imap_probe_blocking`)."""
+    import asyncio
 
     from email_triage.providers.factory import secret_key_for_account
 
@@ -191,27 +203,71 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
     username = cfg.get("username", "")
     use_ssl = cfg.get("use_ssl", True)
     sk = secret_key_for_account(account_id, ptype)
-    password = secrets.get(sk) if sk else ""
+    from email_triage.secrets import SecretsDecryptError, read_secret
+    try:
+        password = read_secret(secrets, sk) if sk else ""
+    except SecretsDecryptError:
+        # A5 — fail closed + legible: a stored password that won't decrypt
+        # (master-key mismatch) is not a connection problem to retry.
+        return False, (
+            '<small style="color:var(--pico-del-color);">'
+            'Stored password unreadable — secrets master-key mismatch. '
+            'Check the secrets master key.</small>'
+        )
 
     if not host or not username:
         return False, (
             '<small style="color:var(--pico-del-color);">'
             'Host and username required.</small>'
         )
+    # Cycle P db P1-1: imaplib blocks on connect, TLS, LOGIN, SELECT and LOGOUT (and the
+    # hostname-mismatch hint below does blocking DNS look-ups), so the whole probe runs on
+    # a worker thread: a slow or stalled server never holds the event loop.
+    return await asyncio.to_thread(
+        _imap_probe_blocking, cfg, host, port, username, password, use_ssl)
+
+
+def _imap_probe_blocking(cfg: dict, host: str, port: int, username: str,
+                         password: str, use_ssl: bool) -> tuple[bool, str]:
+    """The blocking body of :func:`_imap_test_connection`, run in a worker thread."""
+    import socket
+    import ssl as ssl_mod
+
+    from email_triage.providers.imap_fetch_transport import imap_connect
+
     try:
-        if use_ssl:
-            ctx = ssl_mod.create_default_context()
-            imap = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
-        else:
-            imap = imaplib.IMAP4(host, port)
-        imap.login(username, password or "")
-        mailbox = cfg.get("mailbox", "INBOX")
-        status, data = imap.select(mailbox, readonly=True)
-        count = data[0].decode() if data else "?"
-        imap.logout()
+        # The transport applies the account's certificate-check mode itself
+        # (tls.tls_connect), so the probe tests the same policy as the fetch it
+        # predicts, and shows the verdict when the check failed but the mode let
+        # the connection through.
+        from email_triage.tls import resolve_cert_policy
+        imap = imap_connect(host, port, use_ssl=use_ssl,
+                            cert_policy=resolve_cert_policy(cfg))
+        # Punch 694: the session is released on a failed login or select too.
+        try:
+            imap.login(username, password or "")
+            mailbox = cfg.get("mailbox", "INBOX")
+            status, data = imap.select(mailbox, readonly=True)
+            count = data[0].decode() if data else "?"
+            verdict = getattr(imap, "_et_cert_verdict", None)
+        finally:
+            _imap_release(imap)
+        note = ""
+        if verdict == "failed":
+            note = (
+                f'<br><span style="color:var(--pico-del-color);">'
+                f'Warning: the certificate of "<code>{html.escape(host)}</code>" did not '
+                f'verify. Connected anyway because certificate enforcement is off; '
+                f'the failure is in the log (tls_cert_check_failed).</span>'
+            )
+        elif verdict == "unchecked":
+            note = (
+                '<br><span style="color:var(--pico-muted-color);">'
+                'Certificate check is off for this connection.</span>'
+            )
         return True, (
             f'<small style="color:var(--pico-ins-color);">'
-            f'Connected. {count} messages in {mailbox}.</small>'
+            f'Connected. {html.escape(str(count))} messages in {html.escape(str(mailbox))}.{note}</small>'
         )
     except ssl_mod.SSLCertVerificationError as e:
         err_msg = str(e)
@@ -227,32 +283,34 @@ async def _imap_test_connection(acct: dict, secrets) -> tuple[bool, str]:
                 if suggestion and suggestion != host:
                     return False, (
                         f'<small style="color:var(--pico-del-color);">'
-                        f'SSL certificate hostname mismatch: the certificate is not valid for "<code>{host}</code>". '
-                        f'Try using the fully qualified domain name: <code>{suggestion}</code>'
+                        f'SSL certificate hostname mismatch: the certificate is not valid for "<code>{html.escape(host)}</code>". '
+                        f'Try using the fully qualified domain name: <code>{html.escape(suggestion)}</code>'
                         f'</small>'
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("imap probe hostname hint lookup failed", error=fmt_exc(exc, with_class=True))
             return False, (
                 f'<small style="color:var(--pico-del-color);">'
-                f'SSL certificate hostname mismatch. The server certificate does not match "<code>{host}</code>". '
+                f'SSL certificate hostname mismatch. The server certificate does not match "<code>{html.escape(host)}</code>". '
                 f'Use the server\'s fully qualified domain name (e.g. <code>mail.example.com</code>).'
                 f'</small>'
             )
         elif "CERTIFICATE_VERIFY_FAILED" in err_msg:
             return False, (
                 f'<small style="color:var(--pico-del-color);">'
-                f'SSL certificate verification failed for "<code>{host}</code>": {err_msg}. '
-                f'If this is a self-signed certificate, uncheck "Use SSL" and use port 143, '
-                f'or ensure the server\'s CA is trusted.'
+                f'SSL certificate verification failed for "<code>{html.escape(host)}</code>": {html.escape(err_msg)}. '
+                f'If this is a self-signed or private-CA certificate, add its CA to the '
+                f'trust store, or set this account\'s certificate enforcement to off (the '
+                f'check still runs and logs), or turn the certificate check off while '
+                f'setting up.'
                 f'</small>'
             )
         return False, (
-            f'<small style="color:var(--pico-del-color);">SSL error: {e}</small>'
+            error_chip(e, prefix='SSL error: ')
         )
     except Exception as e:
         return False, (
-            f'<small style="color:var(--pico-del-color);">Failed: {e}</small>'
+            error_chip(e, prefix='Failed: ')
         )
 
 
@@ -286,8 +344,9 @@ async def _imap_post_create_start_watch(
         except Exception as e:
             return ("", f"Account added, but watcher failed to start: {e}.")
     else:
-        # Strip HTML tags from the inline error for the banner.
-        reason = re.sub(r"<[^>]+>", "", test_msg).strip()
+        # Strip HTML tags from the inline error for the banner —  SSOT.
+        from email_triage.engine.html_text import strip_tags
+        reason = strip_tags(test_msg)
         return (
             "",
             f"Account added, but connection test failed: {reason}. "
@@ -328,15 +387,13 @@ async def _gmail_start_push(manager, account_id: int, acct: dict) -> str:
 
 def _gmail_infer_push_enabled(conn, account_id: int, default: bool = True) -> bool:
     """Infer Gmail push_enabled from the ``gmail_watches`` row."""
-    import sqlite3
-
     try:
         row = conn.execute(
             "SELECT topic_name, expires_at FROM gmail_watches "
             "WHERE account_id = ?",
             (account_id,),
         ).fetchone()
-    except sqlite3.Error:
+    except DB_ERRORS:
         return default
 
     if row is None:
@@ -357,13 +414,25 @@ async def _gmail_test_connection(acct: dict, secrets) -> tuple[bool, str]:
     module continue to apply through this dispatch path.
     """
     from email_triage.providers.factory import secret_key_for_account
+    from email_triage.providers.render_probe import (
+        USER_SCAN_PROBE_TIMEOUT_S, probe_session, render_probe,
+    )
     from email_triage.web.routers.ui import _create_provider_from_account
 
     ptype = acct["provider_type"]
     account_id = acct["id"]
 
     sk = secret_key_for_account(account_id, ptype)
-    has_token = bool(secrets.get(sk)) if sk else False
+    from email_triage.secrets import SecretsDecryptError, read_secret
+    try:
+        has_token = bool(read_secret(secrets, sk)) if sk else False
+    except SecretsDecryptError:
+        # A5 — fail closed + legible (master-key mismatch, not "not authed").
+        return False, (
+            '<small style="color:var(--pico-del-color);">'
+            'Stored token unreadable — secrets master-key mismatch. '
+            'Check the secrets master key.</small>'
+        )
     if not has_token:
         return False, (
             '<small style="color:var(--pico-color-amber-500);">'
@@ -372,15 +441,21 @@ async def _gmail_test_connection(acct: dict, secrets) -> tuple[bool, str]:
         )
     try:
         provider = _create_provider_from_account(acct, secrets)
-        labels = await provider.list_labels()
-        await provider.close()
+        async with probe_session(provider):
+            # Punch 819: bounded like the discover scan, the other probe a user
+            # started and is waiting on (the 3 s page-render bound would turn a
+            # slow Gmail into a failed button).
+            labels = await render_probe(
+                provider, "list_labels", account_id=account_id,
+                timeout_s=USER_SCAN_PROBE_TIMEOUT_S,
+            )
         return True, (
             f'<small style="color:var(--pico-ins-color);">'
             f'Connected. {len(labels)} labels visible.</small>'
         )
     except Exception as e:
         return False, (
-            f'<small style="color:var(--pico-del-color);">Failed: {e}</small>'
+            error_chip(e, prefix='Failed: ')
         )
 
 

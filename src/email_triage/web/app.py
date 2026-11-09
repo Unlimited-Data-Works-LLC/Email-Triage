@@ -10,11 +10,9 @@ Roles: admin, power_user, user.
 from __future__ import annotations
 
 import asyncio
-import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +22,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from email_triage.config import TriageConfig, load_config
-from email_triage.secrets import SecretsProvider, create_secrets_provider
+from email_triage.db._writer import WAL_SHUTDOWN_ENVELOPE_SECS  # punch 636 envelope SSOT
+from email_triage.secrets import SecretsProvider, create_secrets_provider, read_secret
 from email_triage.triage_logging import get_logger, setup_logging
 from email_triage.web.db import init_db, seed_categories
 from email_triage.web import settings_keys as _settings_keys
 from email_triage._errfmt import fmt_exc
-from email_triage._isotime import parse_iso
+from email_triage._isotime import now_utc_iso, parse_iso
+from email_triage._secret_keys import SESSION_SECRET_KEY  # N-231 R22 stored-secret-key SSOT
 
 log = get_logger("web.app")
 
@@ -37,41 +37,83 @@ _WEB_DIR = Path(__file__).parent
 _TEMPLATE_DIR = _WEB_DIR / "templates"
 _STATIC_DIR = _WEB_DIR / "static"
 
+# N-432 walresetbug hipaa-sme NTH-2 + db-sme NTH-1 fold (batched NTH-panel
+# 2026-07-19): the lifespan-shutdown WAL checkpoint is bounded by the ONE
+# writer/checkpoint envelope, ``db/_writer.WAL_SHUTDOWN_ENVELOPE_SECS``
+# (punch 636 lifted the two 10 s literals onto it,
+# feedback_da_hedge_shutdown_timeout_desync); imported at the top.
+
+# Punch 582: bounded wait for in-flight audit writes at lifespan shutdown.
+# Short enough to fit inside a container stop timeout together with the WAL
+# checkpoint and the writer join; what is still running after it is recorded,
+# not waited for.
+_AUDIT_SHUTDOWN_DRAIN_TIMEOUT_SECS: float = 5.0
+
+# Punch 636: the second audit sweep, after the writer stops, does not wait; it
+# only records what is still running (its cost is the loss sink's lock bound).
+_AUDIT_SHUTDOWN_SWEEP_TIMEOUT_SECS: float = 0.0
+
+
+def _wal_bytes_left(db_path: "Path | str") -> int:
+    """Bytes in ``<db_path>-wal``, 0 when there is none (punch 636). Read after
+    the app's last connection closed: SQLite's last close deletes the -wal, so
+    a non-zero size means frames were stranded. 0 for an in-memory database,
+    which has no -wal file, and when the size cannot be read."""
+    try:
+        return Path(f"{db_path}-wal").stat().st_size
+    except OSError:
+        return 0
+
+
+# The baked build identifier has ONE reader, in ``email_triage._build_sha``
+# (punch 539 rebase, 2026-09-30: hipaa H539-1, db N-539-X1, da DA-C6). This
+# module takes the raw value for the human-facing ``version`` and the
+# shape-gated commit sha for ``app.state.build_sha``; it opens no baked file of
+# its own.
+from email_triage._build_sha import baked_build_sha, read_baked_version  # noqa: E402
+
 
 def _resolve_version() -> str:
     """Resolve a short build identifier for the ``/health`` endpoint.
 
     Preference order:
-        1. ``EMAIL_TRIAGE_VERSION`` env var (runtime override — ad-hoc
-           testing, manual deploys, CI injection)
-        2. ``GIT_SHA`` env var (common CI convention)
-        3. ``/app/VERSION`` file baked in at container build time by
+        1. ``/app/VERSION`` file baked in at container build time by
            the Containerfile (``COPY COMMIT /app/VERSION``). The deploy
            script writes ``git rev-parse HEAD`` into the ``COMMIT`` file
            in the build context before ``podman build``.
-        4. ``.git/HEAD`` walked to a commit sha (first 7 chars) — dev
+        2. ``.git/HEAD`` walked to a commit sha (first 7 chars) — dev
            checkout fallback.
-        5. ``"unknown"``
+        3. ``"unknown"``
+
+    **No environment.** ``EMAIL_TRIAGE_VERSION`` and ``GIT_SHA`` used to sit
+    AHEAD of the baked file here, as a documented convenience for ad-hoc
+    testing, manual deploys and CI injection. The operator directed that path
+    gutted on 2026-09-29: a build identifier a runtime environment variable can
+    set is not a build identifier, and "a human reads this one, a machine acts
+    on the other one" is too thin a wall to hang the distinction on — the same
+    value has keyed lock-manifest currency reads. So BOTH readers are now
+    bounded by what was true at build time, and neither can be moved after the
+    image is built. Enforced structurally, not just documented, by
+    ``tests/test_web/test_health_build_endpoint.py``, which asserts that no
+    build-identity resolver in this module reads the environment.
 
     Resolved once at startup; the health endpoint reads the cached
     value from ``app.state.version`` and never shells out.
     """
-    for key in ("EMAIL_TRIAGE_VERSION", "GIT_SHA"):
-        val = os.environ.get(key, "").strip()
-        if val:
-            return val[:40]  # defensive cap — short sha is 7, full is 40
-
-    # Baked-in build identifier — container image path.
-    try:
-        with open("/app/VERSION", encoding="utf-8") as f:
-            v = f.read().strip()
-    except OSError:
-        v = ""
-    # Treat the placeholder "dev" / "unknown" sentinels — and an UNSUBSTITUTED
-    # ``$Format:%H$`` export-subst literal (a working-tree / non-``git archive``
-    # build where the .gitattributes substitution never ran) — as "no baked
-    # value" so local dev checkouts still fall through to the .git/HEAD walk.
-    if v and v not in {"dev", "unknown"} and not v.startswith("$Format"):
+    # Baked-in build identifier — container image path. Through the ONE reader
+    # in `_build_sha`, which also applies the placeholder predicate, so this
+    # function neither opens the file nor re-inlines the sentinel test
+    # (hipaa H538-5 / H539-1).
+    v = read_baked_version()
+    # The placeholder "dev" / "unknown" sentinels — and an UNSUBSTITUTED
+    # export-subst literal (a working-tree / non-``git archive`` build where the
+    # .gitattributes substitution never ran) — are "no baked value", so local
+    # dev checkouts still fall through to the .git/HEAD walk. Through the shared
+    # predicate, not a re-inlined copy of it (R5/PD-5): `read_baked_version`
+    # returns "" for every placeholder. Unlike `build_sha` this route is
+    # human-facing and deliberately NOT shape-gated: a short sha or a release
+    # tag is a wanted answer here, so the defensive cap stays.
+    if v:
         return v[:40]
 
     # Walk from this file up to find a .git directory or file.
@@ -259,6 +301,10 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         #       PRAGMA key as the first SQL) or plaintext (init_db);
         #   (d) DbSecrets wraps the now-decryptable secrets_store table
         #       (further down, reusing the master key read in step (a)).
+        # Punch 547: refuse to start while the environment still carries a
+        # removed control override (fail-closed + loud; _env_registry.RETIRED).
+        from email_triage._env_registry import refuse_retired_env
+        refuse_retired_env()
         from email_triage.db._engine import enforce_db_encryption_boot_contract
         from email_triage.secrets import read_bootstrap_master_key
         from email_triage.web.db import init_db_encrypted
@@ -331,6 +377,31 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         _dbp = _resolve_dbp(conn)
         if _dbp:
             _init_lock_conn(_dbp)  # async-db-ok: lifespan startup
+        # N-432 walresetbug P1 (2026-07-19) — sensor for SQLite < 3.51.3
+        # exposure. Non-fatal; the P0 (``PRAGMA wal_autocheckpoint=0`` +
+        # serialized ``checkpoint_wal_truncate`` under ``@db_write``) is
+        # the actual mitigation. This warns to logs + stamps
+        # ``app.state.sqlite_walresetbug_status`` for /health surfacing.
+        from email_triage.db._engine import assert_sqlite_walresetbug_floor
+        _wr_status = assert_sqlite_walresetbug_floor()
+        _wr_status["at"] = now_utc_iso()
+        app.state.sqlite_walresetbug_status = _wr_status
+        # N-432 Path-3 (2026-07-20) — cipher_version boot FAIL-CLOSED guard
+        # (hipaa-sme MF-4, §164.312(a)(2)(iv)). Sibling to the sensor above:
+        # the sensor logs+surfaces exposure but is non-fatal; this assertion
+        # RAISES if the running SQLCipher binding is < 4.14 (pre-walresetbug-fix)
+        # so a base-image swap or image-drift can't put a walresetbug-buggy
+        # encrypted binding into prod. Skipped cleanly on the plaintext boot
+        # path (sqlcipher3 not importable) OR when the image carries no baked
+        # Path-3 marker (non-container / pip-installed sqlcipher3 env; punch
+        # 547 — no longer an env var). Wrapped in
+        # ``asyncio.to_thread`` because the guard opens a :memory: SQLCipher
+        # conn to probe PRAGMA cipher_version — even a memory-only conn is
+        # an async-unsafe DB touch per test_no_async_reachable_unsafe_db_touch.
+        from email_triage.db._engine import assert_cipher_version_floor
+        _cv_status = await asyncio.to_thread(assert_cipher_version_floor)
+        _cv_status["at"] = now_utc_iso()
+        app.state.sqlcipher_version_status = _cv_status
         # Per-user personal categories migration -- runs before
         # seeding so seed_categories writes into the new schema.
         from email_triage.web.db import ensure_categories_user_id_migration
@@ -405,7 +476,27 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         app.state.config = config
         app.state.secrets = secrets
         app.state.started_at = time.monotonic()
+        # Punch 605: stamp the update check's armed time HERE, at boot and not
+        # in the hourly tick, so a ticker that never runs is still reported
+        # (update_check.update_check_stale, "not_running").
+        try:
+            from email_triage.update_check import arm_check_health
+            arm_check_health(  # async-db-ok: lifespan startup
+                conn,
+                getattr(getattr(config, "admin_email", None),
+                        "release_check_url", "") or "",
+                now_iso=now_utc_iso(),
+            )
+        except Exception as e:
+            log.warning("Update check: could not stamp its armed time",
+                        error=fmt_exc(e))
         app.state.version = _resolve_version()
+        # ONE reader of the baked file (`_build_sha.read_baked_version`), two
+        # states (punch 539 / N-523). Neither reads the environment (operator
+        # directive 2026-09-29). `version` is human-facing and tolerant;
+        # `build_sha` is shape-gated (`baked_build_sha`): the full sha or
+        # nothing, because a scanner acts on it.
+        app.state.build_sha = baked_build_sha()
 
         # v0.1.2 single-file encryption  — single-writer-thread serializer.
         # Phase-3 cutover (N-13, 2026-06-02): the Phase-2 A/B flag
@@ -425,7 +516,7 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         _writer.start()
         set_writer(_writer)
         app.state.db_writer = _writer
-        log.info("db-writer thread started")
+        log.info("db-writer thread started (#291 single-writer, default-on per N-13)")
 
         # H-02a (Cycle 6, 2026-05-23): G1' boot-time enforcement of
         # master-key at-rest protection + audit-chain HMAC wiring.
@@ -483,8 +574,8 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
                 )
                 if resolved:
                     log.info(
-                        "ACME: resolved %d in-flight job(s) on startup",
-                        len(resolved),
+                        "ACME: resolved in-flight job(s) on startup",
+                        extra={"n": len(resolved)},
                     )
             except Exception as e:
                 log.warning(
@@ -504,33 +595,36 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         # validating). Now: read from the secrets store, generate +
         # store on first run only. Sessions survive deploys + restarts
         # bounded only by their TTL.
-        existing_session_secret = secrets.get("session_secret")
+        existing_session_secret = read_secret(secrets, SESSION_SECRET_KEY)
         if not existing_session_secret:
             import secrets as _stdlib_secrets
             existing_session_secret = _stdlib_secrets.token_hex(32)
-            secrets.set("session_secret", existing_session_secret)
+            secrets.set(SESSION_SECRET_KEY, existing_session_secret)
             log.info("session_secret minted + stored in secrets store")
         app.state.session_secret = existing_session_secret
 
-        # PR 8 / D1 follow-up: CSRF enforcement gate.
-        # Two surfaces, env var wins:
-        #   1. tls.csrf_enforce in YAML (operator-edited via UI).
-        #   2. EMAIL_TRIAGE_CSRF_ENFORCE env var (truthy = enforce).
-        # The env var wins so an operator who's debugging "CSRF is
-        # rejecting my form" can flip it off without touching YAML +
-        # waiting for a save round-trip.
-        _env_csrf = (
-            os.environ.get("EMAIL_TRIAGE_CSRF_ENFORCE", "")
-            .strip().lower()
-        )
-        if _env_csrf in ("1", "true", "yes", "on"):
-            app.state.csrf_enforce = True
-        elif _env_csrf in ("0", "false", "no", "off"):
-            app.state.csrf_enforce = False
-        else:
-            app.state.csrf_enforce = bool(
-                getattr(config.tls, "csrf_enforce", False)
-            )
+        # PR 8 / D1 follow-up: CSRF enforcement gate. ONE store:
+        # ``tls.csrf_enforce`` in YAML, editable live at /admin/security.
+        #
+        # The ``EMAIL_TRIAGE_CSRF_ENFORCE`` env override was removed
+        # 2026-09-12 (config-surface audit finding #1). It was read once
+        # here in lifespan, so using it already cost a process restart —
+        # exactly what editing YAML costs — while creating a SECOND
+        # authoritative store for one value (style-guide R7) that no
+        # surface displayed: /admin/security renders the CONFIG value,
+        # so an operator could toggle enforcement ON in the UI, see it
+        # checked, and have the env var silently revert it on the next
+        # restart. The documented YAML break-glass
+        # ``tls: { csrf_enforce: false }`` replaces it exactly.
+        #
+        # No missing-attribute default (DA B2 / db-sme F3). `TriageConfig.tls`
+        # is `field(default_factory=TLSConfig)` and `TLSConfig.csrf_enforce:
+        # bool = True`, so a `getattr` default is unreachable for any real
+        # config — asserting "fails closed" on a dead branch is the same class
+        # as the LOG_LEVEL comment this commit deletes for describing a control
+        # nothing reads. Four sites once split three-to-one on the default;
+        # they now share one read shape and a duck-typed config fails loud.
+        app.state.csrf_enforce = bool(config.tls.csrf_enforce)
 
         #  item 4 — operator-defined CSRF exempt path prefixes.
         # Stored on app.state so a /admin/security save can refresh
@@ -592,9 +686,84 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         # INFO log) without blocking M-1+M-2 / M-3 layers.
         #
         # Non-allowlist backends raise ValueError at construction
-        # (anthropic / openai / etc.). We let the error propagate
+        # (AI provider / openai / etc.). We let the error propagate
         # so a misconfigured YAML surfaces at boot rather than the
         # first draft-reply call.
+        # Punch 569 D3: resolve a runtime update that a crash interrupted,
+        # BEFORE anything can import from the runtime prefix. Renames only
+        # (O(1)): a leftover ``.next`` is retired, a leftover ``.prev`` is
+        # retired when the live prefix serves and put back when it does not.
+        # The retired bytes go through the removal-tombstone purge in a worker
+        # thread, tracked like every fire-and-forget task. A failure
+        # here is logged and boot continues: the status funnel still refuses
+        # whatever it cannot verify (fail closed at the gate, not at boot).
+        # Panel B3 hipaa F1 / DA F569-3: what recovery did is written to the
+        # audit chain AFTER add_sqlite_handler below; here it is only captured.
+        _boot_recovery: list[str] = []
+        _boot_recovery_failed = False
+        try:
+            from email_triage.embedding_bits import (
+                purge_removal_tombstones,
+                reconcile_interrupted_install_row,
+                recover_interrupted_update,
+            )
+            # Panel B3 db F569-1(c) / DA F569-8: a just-started process runs no
+            # installer, so an in-flight install row is stale (a SIGKILL during
+            # an update); left as is, every later install/update is refused.
+            # Its own try: it must run even when the file recovery raises.
+            try:
+                # async-db-ok: lifespan startup, single-threaded
+                _row_fix = reconcile_interrupted_install_row(conn)
+                if _row_fix:
+                    _boot_recovery.append(_row_fix)
+            except Exception as e:  # noqa: BLE001
+                _boot_recovery_failed = True
+                _boot_recovery.append(f"install-record repair raised {type(e).__name__}")
+                log.error("Embedding install record repair failed at boot", error=fmt_exc(e))
+            _recovered = recover_interrupted_update()
+            _boot_recovery.extend(_recovered)
+            if _recovered:
+                _purge_task = asyncio.create_task(
+                    asyncio.to_thread(purge_removal_tombstones),
+                )
+                _pending = getattr(app.state, "_fire_and_forget_pending", None)
+                if _pending is None:
+                    _pending = set()
+                    app.state._fire_and_forget_pending = _pending
+                _pending.add(_purge_task)
+                _purge_task.add_done_callback(_pending.discard)
+        except Exception as e:  # noqa: BLE001
+            _boot_recovery_failed = True
+            _boot_recovery.append(f"recovery raised {type(e).__name__}")
+            log.error(
+                "Embedding runtime update recovery failed at boot",
+                error=fmt_exc(e),
+            )
+
+        # Operator decision 2026-10-25: the embedding runtime updates itself.
+        # AFTER the boot recovery above (it resolves a crashed update's
+        # leftovers first), wire the switch every notice surface words itself
+        # by and mirror the durable failure record; the sweeper's first tick
+        # (_embedding_auto_update_sweeper) then runs the update funnel.
+        try:
+            from email_triage.embedding_bits import configure_auto_update
+            from email_triage.web.embedding_update_runner import (
+                rehydrate_auto_failure,
+            )
+
+            configure_auto_update(config.embedding.auto_update)
+            rehydrate_auto_failure(conn)  # async-db-ok: lifespan startup
+            # Panel T DA SHOULD-A1: hold the first embedding load until the first
+            # auto-update decision when the runtime is stale_ok (so the deferral
+            # converges); the sweeper's first tick then runs without its warmup.
+            from email_triage.embedding_bits import arm_boot_update_gate
+
+            arm_boot_update_gate()
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "Embedding auto-update wiring failed at boot", error=fmt_exc(e),
+            )
+
         app.state.embedding_backend = None
         app.state.embedding_model = ""
         try:
@@ -624,6 +793,27 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
                 "Embedding backend rejected by allowlist", error=str(e),
             )
             raise
+
+        # N-01-forward landing — register the draft runtime so
+        # DraftReplyAction can resolve the install config + embedding backend
+        # without threading app.state through every TriageContext constructor.
+        try:
+            from email_triage.actions.draft_reply import (
+                register_draft_runtime,
+            )
+            register_draft_runtime(
+                config=config,
+                embedding_backend=app.state.embedding_backend,
+                embedding_model=app.state.embedding_model,
+                sqlite_vec_available=bool(
+                    getattr(app.state, "sqlite_vec_available", False),
+                ),
+            )
+        except Exception as _draft_rt_exc:  # pragma: no cover - best-effort
+            log.warning(
+                "draft runtime registration failed",
+                error=str(_draft_rt_exc),
+            )
 
         # Hydrate the soft-launch reject counter from log_entries so
         # the /health surface reflects cumulative state, not just
@@ -657,69 +847,19 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         except Exception:
             app.state.csrf_rejects = 0
 
-        # One-shot migration: lift any per-account Gmail OAuth creds
-        # up to the install-level secrets store. Pre-B1 installs kept
-        # client_id/client_secret per-account; B1 centralises them.
-        from email_triage.web.db import (
-            migrate_oauth_creds_to_install_level,
-            migrate_o365_creds_to_install_level,
+        # MIGRATE (one-shot, pre-B1) -> HYDRATE -> REGISTER the install-level
+        # Google + O365 OAuth creds with the provider factory — the ONE place
+        # this full wiring lives (N-130). The CLI mine commands call the same
+        # SSOT (passing their db conn) so a fresh/portable-reuse or un-migrated
+        # O365 install gets the creds migrated + registered identically.
+        from email_triage.providers.factory import (
+            hydrate_and_register_install_oauth,
         )
-        found = migrate_oauth_creds_to_install_level(conn)  # async-db-ok: lifespan startup
-        if found is not None:
-            cid, csec = found
-            # Only seed the Web-app slot if it's currently empty; respect
-            # any value the admin has already entered via /config.
-            if not secrets.get("GOOGLE_OAUTH_WEB_CLIENT_ID"):
-                secrets.set("GOOGLE_OAUTH_WEB_CLIENT_ID", cid)
-                secrets.set("GOOGLE_OAUTH_WEB_CLIENT_SECRET", csec)
-                log.warning(
-                    "Migrated per-account Gmail OAuth creds to install-level "
-                    "(Web-app slot). Verify at /config — retype in the "
-                    "Desktop slot if that's the flow you intended.",
-                )
-
-        # Parallel migration for Office 365: lifts per-account
-        # client_id/tenant_id from config_json + first non-empty
-        # ACCOUNT_*_O365_SECRET from the secrets store to install-level.
-        o365_found = migrate_o365_creds_to_install_level(conn, secrets)  # async-db-ok: lifespan startup
-        if o365_found is not None:
-            tid, cid, csec = o365_found
-            if tid and not secrets.get("O365_OAUTH_TENANT_ID"):
-                secrets.set("O365_OAUTH_TENANT_ID", tid)
-            if cid and not secrets.get("O365_OAUTH_CLIENT_ID"):
-                secrets.set("O365_OAUTH_CLIENT_ID", cid)
-            if csec and not secrets.get("O365_OAUTH_CLIENT_SECRET"):
-                secrets.set("O365_OAUTH_CLIENT_SECRET", csec)
-            log.warning(
-                "Migrated per-account Office 365 OAuth creds to install-level. "
-                "Verify at /config — if accounts had different Azure tenants, "
-                "only one was kept and the others will need their probe to be "
-                "rerun after editing the install tenant.",
-            )
-
-        # Hydrate config.google_oauth from the secrets store so the
-        # rest of the app can read it as plain attributes. Empty
-        # strings when unset — callers must check before use.
-        config.google_oauth.web_client_id = secrets.get("GOOGLE_OAUTH_WEB_CLIENT_ID") or ""
-        config.google_oauth.web_client_secret = secrets.get("GOOGLE_OAUTH_WEB_CLIENT_SECRET") or ""
-        config.google_oauth.desktop_client_id = secrets.get("GOOGLE_OAUTH_DESKTOP_CLIENT_ID") or ""
-        config.google_oauth.desktop_client_secret = secrets.get("GOOGLE_OAUTH_DESKTOP_CLIENT_SECRET") or ""
-
-        # Sibling hydration for the install-level Office 365 OAuth creds.
-        config.office365_oauth.tenant_id = secrets.get("O365_OAUTH_TENANT_ID") or ""
-        config.office365_oauth.client_id = secrets.get("O365_OAUTH_CLIENT_ID") or ""
-        config.office365_oauth.client_secret = secrets.get("O365_OAUTH_CLIENT_SECRET") or ""
-
-        # Register the install-level OAuth creds with the provider
-        # factory (module-level singleton — read by every provider
-        # construction site without parameter threading).
-        from email_triage.web.routers.ui import (
-            set_install_google_oauth, set_install_ingestion_config,
-            set_install_office365_oauth,
-        )
-        set_install_google_oauth(config.google_oauth)
-        set_install_office365_oauth(config.office365_oauth)
-        set_install_ingestion_config(config.ingestion)
+        # async-db-ok: lifespan startup. The folded migrations are
+        # the same single-threaded boot DB touches  already vetted (was
+        # inline migrate_oauth_creds_to_install_level(conn) with this exact
+        # opt-out); no concurrent traffic during startup, no event-loop contention.
+        hydrate_and_register_install_oauth(config, secrets, conn)  # async-db-ok: lifespan startup
 
         #  — install-level optional classification cache. Empty URL
         # returns None (no behaviour change). Lazy connect: nothing
@@ -737,6 +877,27 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
             log.warning(
                 "Classification cache init failed; cache disabled",
                 error=_fmt(_cache_init_err),
+            )
+
+        #  v3 — OPTIONAL Redis mirror of Topic feedback signals. Reuses the
+        # SAME redis_cache URL (empty URL = None = off; the feature stays
+        # DB-only). Operator-confirmed strictly optional, never required.
+        try:
+            from email_triage.cache.topic_feedback import (
+                build_feedback_cache_from_config,
+                set_install_topic_feedback_cache,
+            )
+            set_install_topic_feedback_cache(
+                build_feedback_cache_from_config(
+                    getattr(config, "redis_cache", None),
+                ),
+            )
+        except Exception as _fb_cache_err:
+            from email_triage._errfmt import fmt_exc as _fmt
+            log.warning(
+                "Topic-feedback cache init failed; mirror disabled "
+                "(DB stays the source of truth)",
+                error=_fmt(_fb_cache_err),
             )
 
         # 2026-05-13 — persistent counter backend. Mirrors cache /
@@ -765,6 +926,45 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         # Enable SQLite logging so admin log viewer works.
         from email_triage.triage_logging import add_sqlite_handler
         add_sqlite_handler(conn)  # async-db-ok: lifespan startup
+
+        # Panel B3 hipaa F1 / DA F569-3: boot recovery may have changed which
+        # embedding runtime set is live (a rollback to .prev) or released a
+        # stuck install row. One PHI-free row through the emitter SSOT, under
+        # the same event_type as the route's attempt/outcome rows, so one query
+        # reads attempt -> crash -> recovery. Nothing done -> nothing written.
+        if _boot_recovery:
+            from email_triage.web._audit import safe_audit_write
+            from email_triage.web.db import record_auth_event as _rae
+            from email_triage.web.embedding_update_runner import (
+                BOOT_RECOVERY_ACTOR_EMAIL,
+            )
+            safe_audit_write(
+                lambda: _rae(  # async-db-ok: lifespan startup
+                    conn,
+                    event_type="embedding_runtime_update",
+                    # Operator ruling R5 (2026-10-25): a named system actor, never
+                    # blank, beside the automatic updater's own.
+                    email=BOOT_RECOVERY_ACTOR_EMAIL,
+                    user_id=None,
+                    outcome="failure" if _boot_recovery_failed else "success",
+                    detail="boot recovery: " + "; ".join(_boot_recovery),
+                ),
+                description="embedding_runtime_update boot recovery",
+            )
+
+        # Punch 547 + operator ruling A4 (2026-10-21): the classify raw-head
+        # debug capture is a config decision, never refused; while on it logs a
+        # loud WARNING (here, after the chain handler attaches, so it is a
+        # log_entries row) and the admin pages show a banner.
+        if getattr(config.classifier, "debug_capture_raw_head", False):
+            from email_triage.classify.ollama import configure_debug_capture
+            from email_triage.db.accounts import list_email_accounts
+            from email_triage.triage_logging import account_hipaa_effective
+            _any_hipaa_acct = any(
+                account_hipaa_effective(account=a)
+                for a in list_email_accounts(conn)  # async-db-ok: lifespan startup
+            )
+            configure_debug_capture(True, any_hipaa_account=_any_hipaa_acct)
 
         #  (hipaa-sme condition 2) — now that the §164.312(b) audit-
         # chain handler is attached, re-emit the HIPAA-mode-plaintext
@@ -801,11 +1001,25 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
 
         # Restore runtime settings (dry-run, log level, HIPAA) from DB.
         from email_triage.web.db import get_setting
-        _rt_settings = get_setting(conn, "runtime_settings")  # async-db-ok: lifespan startup
+        # Import the KEY CONSTANT rather than repeating the literal: the N-464
+        # pin keys its predicate on this symbol, so a raw string here put the
+        # boot path — including the never-clobber fold below, the one line that
+        # decides the install's HIPAA posture — outside the net by a literal.
+        from email_triage.web.routers.ui._shared import _RUNTIME_SETTINGS_KEY
+        _rt_settings = get_setting(conn, _RUNTIME_SETTINGS_KEY)  # async-db-ok: lifespan startup
         if _rt_settings:
             import logging as stdlib_logging
             from email_triage import triage_logging
-            level_name = _rt_settings.get("log_level", "INFO").upper()
+            # Never-clobber, same rule as `hipaa` below: a row that omits the
+            # key carries no opinion, so keep the level the YAML seed set
+            # rather than forcing INFO over it. LOW — the failure direction is
+            # less logging, not less protection (hipaa-sme) — but it is the
+            # identical shape, and `_apply_runtime_settings` already
+            # establishes the preserve idiom for its sibling key.
+            level_name = str(
+                _rt_settings.get("log_level")
+                or triage_logging.effective_level_name()
+            ).upper()
             root_logger = stdlib_logging.getLogger("email_triage")
             root_logger.setLevel(getattr(stdlib_logging, level_name, stdlib_logging.INFO))
             # Bundle E5  / Q4 — BOOT-TIME EXCEPTION to the
@@ -818,12 +1032,31 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
             # one source location passes allow_hipaa_change=True")
             # keeps its tight invariant — admin_security_save remains
             # the SOLE post-boot caller of the gate.
-            triage_logging._hipaa_mode = _rt_settings.get("hipaa", False)
+            # N-464 fold — NEVER-CLOBBER at the last hop into the
+            # process-global. A row that omits the key carries no
+            # opinion about HIPAA mode; defaulting it to False turned a
+            # missing field into a safeguard-disabling write. Both
+            # writers emit the key today, so this is latent — but the
+            # flat-`False` default IS the defect shape, and it sat on
+            # the one line that decides the install's HIPAA posture.
+            if "hipaa" in _rt_settings:
+                # Bound to a named local rather than assigned straight to
+                # the module global: the N-226 pin's allow-list keys on an
+                # `ast.Name` assign target, and an Attribute target
+                # (`triage_logging._hipaa_mode`) resolves to None — whose
+                # only expressible exemption is `(path, None)`, i.e. the
+                # WHOLE FILE. Naming the local keeps the exemption exactly
+                # as wide as the one line that earned it.
+                system_hipaa_from_row = bool(_rt_settings["hipaa"])
+                triage_logging._hipaa_mode = system_hipaa_from_row
             log.info(
                 "Runtime settings restored from DB",
                 dry_run=_rt_settings.get("dry_run", False),
                 log_level=level_name,
-                hipaa=_rt_settings.get("hipaa", False),
+                # Report the EFFECTIVE flag, not a flat default: on a partial
+                # row this startup record otherwise misstates the safeguard's
+                # state in the audit-adjacent log (hipaa-sme, §164.312(b)).
+                hipaa=triage_logging.is_hipaa_mode(),
             )
 
         # Startup mode breadcrumbs — one line each, in increasing severity.
@@ -833,9 +1066,16 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         if _system_hipaa:
             log.info("Starting in HIPAA mode (system-wide)")
 
-        # For DEBUG logs, set Python log level via standard config
-        # (LOG_LEVEL env var, /admin runtime settings, or
-        # logging.dictConfig) — there is no longer a YAML toggle.
+        # For DEBUG logs, set the Python log level via the /admin
+        # runtime settings (the ``runtime_settings`` DB row restored
+        # just above) or the YAML ``logging.level`` seed. There is no
+        # LOG_LEVEL env var — this comment claimed one until 2026-09-12
+        # and nothing in src/ has ever read it — and no dictConfig
+        # path either: ``dictConfig``/``fileConfig`` appear in src/
+        # exactly once, in this comment, so following that advice
+        # requires the operator to run their own wrapper rather than
+        # the shipped entrypoint. Half-correcting a false claim leaves
+        # a false claim.
 
         # Record a boundary event if the system HIPAA state has changed
         # since the last recorded system-scope boundary.  This keeps the
@@ -853,6 +1093,25 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
                 actor_id=None, reason="startup",
             )
 
+        # Punch 711: record any restore witness `email-triage restore` left in
+        # the data dir into THIS (post-swap) chain, then remove it; the CLI's own
+        # start/end rows went to the database the swap moved aside. A failure
+        # keeps the marker for the next start and is logged; it does not block
+        # startup.
+        from email_triage.backup import ingest_restore_witness_markers
+        try:
+            _n711_count = ingest_restore_witness_markers(  # async-db-ok: lifespan startup
+                conn, Path(db_path).parent,
+            )
+            if _n711_count:
+                log.info("Restore witness recorded", count=_n711_count)
+        except Exception as _n711_e:
+            log.error(
+                "Restore witness could not be recorded; the marker is kept "
+                "for the next start",
+                error=fmt_exc(_n711_e, with_class=True),
+            )
+
         log.info("Web UI started", db_path=str(db_path))
 
         # Instantiate the Gmail push queue + consumer support state
@@ -862,8 +1121,11 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         app.state.metrics = getattr(app.state, "metrics", {})
 
         # Outbound event dispatcher — used by the triage.completed
-        # emitter from manual, watcher, push and OpenClaw API call sites.
-        from email_triage.web.events import EventDispatcher
+        # emitter from manual, watcher, push and outbound-webhook API call sites.
+        from email_triage.web.events import (
+            EventDispatcher,
+            announce_external_egress_posture,
+        )
         app.state.event_dispatcher = EventDispatcher(
             targets=getattr(config, "webhooks", []) or [],
             secrets_provider=secrets,
@@ -872,6 +1134,23 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
                 getattr(config.tls, "local_url_suffixes", []) or [],
             ),
         )
+        # Punch 414: the wizard preview's "My last real event" store. The
+        # dispatcher owns it (its ``record_fire`` belt is the only writer);
+        # ``app.state`` carries the same object for the preview endpoint.
+        app.state.last_envelope_per_target = (
+            app.state.event_dispatcher.last_envelopes
+        )
+        # N-276 R28: register the dispatcher on a module-level accessor so
+        # NotifyAction (background loop, no request context) can fire the
+        # `notification` event via `fire_notification`. Row 77 closure.
+        from email_triage.web.events import register_event_dispatcher
+        register_event_dispatcher(app.state.event_dispatcher)
+        #  deny-by-default egress guard — if external webhook targets are
+        # PERMITTED, say so LOUDLY at every boot so the §164.502(e) disclosure
+        # posture (and any silent deny→allow flip from a previously-inert
+        # hand-edited YAML flag wired by the #8-FULL round-trip fix) is never
+        # silent. See email_triage.web.events.announce_external_egress_posture.
+        announce_external_egress_posture(config)
 
         # Background-task supervisor (PR 2 / A3). Replaces the
         # bare-asyncio.create_task pattern with crash detection +
@@ -934,10 +1213,42 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         supervisor.supervise(
             "log-entries-pruner", lambda: _log_entries_prune_loop(app),
         )
+        # N-432 walresetbug P0 (2026-07-19) — periodic SERIALIZED
+        # WAL-checkpoint. Paired with ``PRAGMA wal_autocheckpoint = 0``
+        # at the opener SSOT (``db/_engine.py::_apply_standard_pragmas``)
+        # so the ONLY checkpoint fire path in the process is this loop,
+        # which runs ``checkpoint_wal_truncate`` under ``@db_write`` —
+        # no writer or other checkpoint can race the C-level checkpoint
+        # routine. Cadence 5min: bounds WAL-file growth without adding
+        # noticeable steady-state IO. Lease-gated to one instance.
+        supervisor.supervise(
+            "wal-checkpoint-loop", lambda: _wal_checkpoint_loop(app),
+        )
         # PR 9 / D3 — HIPAA boundary drift detector.
         supervisor.supervise(
             "hipaa-boundary-drift-detector",
             lambda: _hipaa_boundary_drift_detector(app),
+        )
+        #  Phase 4 — regulatory-clock escalation sweep (state derive +
+        # breach chaining). Inert until a clock exists; lease-gated.
+        supervisor.supervise(
+            "regulatory-clock-escalator",
+            lambda: _regulatory_clock_escalator(app),
+        )
+        #  — automated encrypted DB-snapshot backup. Disabled by default
+        # (config backup.enabled); lease-gated; self-gates inert until the
+        # operator enables it after the key-only export + SMB wiring.
+        supervisor.supervise(
+            "db-backup-sweeper",
+            lambda: _db_backup_sweeper(app),
+        )
+        # Operator decision 2026-10-25 — the embedding runtime replaces itself
+        # when the image's manifest moves past it (boot + every 10 min), through
+        # the same update funnel as the admin's click. Inert when
+        # embedding.auto_update is false. Lease-gated.
+        supervisor.supervise(
+            "embedding-auto-update-sweeper",
+            lambda: _embedding_auto_update_sweeper(app),
         )
         # Daily health email sender. Same cadence pattern as the
         # digest scheduler: ticks once a minute and fires when wall-clock
@@ -952,6 +1263,15 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         supervisor.supervise(
             "recipient-digest-sender",
             lambda: _recipient_digest_sender(app),
+        )
+        #  — scheduled Topic-digest sender (the output spine). Same
+        # 60s lease-gated cadence; fires each Topic's named digests when
+        # the clock crosses their schedule, rendering accumulated
+        # topic_hits and delivering per the R1 HIPAA recipient routing.
+        from email_triage.web.topic_digest_sender import _topic_digest_sender
+        supervisor.supervise(
+            "topic-digest-sender",
+            lambda: _topic_digest_sender(app),
         )
         # Background whole-mailbox triage queue drainer. Runs
         # one job at a time under operator-tunable rate-limit +
@@ -981,6 +1301,13 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
             "baa-expiry-daily-sweep",
             lambda: _baa_expiry_sweeper(app),
         )
+        # Punch 553 — hourly update check (GitHub release + security
+        # marker). Makes no request when admin_email.release_check_url is
+        # blank (OFF). Feeds the admin security banner + daily email.
+        supervisor.supervise(
+            "update-check-sweep",
+            lambda: _update_check_sweeper(app),
+        )
 
         #  Wave 3 — daily GC sweep for per-contact HIPAA style
         # descriptors. Drops rows older than 90 days since last
@@ -994,12 +1321,24 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         # -B — M-3 + M-7 trigger watcher. Ticks every 15 minutes;
         # evaluates first-time + threshold + stale triggers on every
         # eligible HIPAA-opted-in account + per-contact pair, enqueues
-        # rows on ``style_distill_queue`` / ``style_distill_queue_contacts``
-        # for the existing worker to drain. Idempotent across ticks
+        # rows on ``style_distill_queue`` / ``style_distill_queue_contacts``.
+        # NOTE: nothing drains those rows — no queue worker exists at HEAD
+        # and none ever has (N-474). Idempotent across ticks
         # (already-queued rows skip; no new sends → no work).
         supervisor.supervise(
             "style-distill-trigger-sweeper",
             lambda: _style_distill_trigger_sweeper(app),
+        )
+
+        #  V3 — Topic retention soft-expire + tombstone horizon-purge.
+        # Daily tick: sets expired_at on topic_hits past their Topic's
+        # retention_days (feedback/audit rows survive), and hard-deletes
+        # Topics soft-tombstoned past the horizon + their child rows
+        # (bounded batches; never the §164.312(b) audit chain — C-V3.2).
+        # Lease-gated; idempotent + a no-op single-instance.
+        supervisor.supervise(
+            "topic-retention-purge-sweeper",
+            lambda: _topic_retention_purge_sweeper(app),
         )
 
         # -215 — the single consolidated retry-queue drainer.
@@ -1032,11 +1371,74 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
                 error=fmt_exc(_restore_exc),
             )
 
-        yield
+        # N-192 R20_20: wire safe_audit_write's failure path into
+        # app.state.audit_failures so /health can flip degraded on a
+        # swallowed audit-write. Before N-192 the failure was WARNING-
+        # logged only — invisible to the counter-based /health drift.
+        from email_triage.web._audit import register_audit_failure_sink
+        def _bump_app_state_audit_failures():
+            current = getattr(app.state, "audit_failures", 0)
+            app.state.audit_failures = int(current) + 1
+        register_audit_failure_sink(_bump_app_state_audit_failures)
+
+        # Punch 582: a durable chained row for audit writes lost without an
+        # exception reaching the @db_write sentinel (cancelled, swallowed,
+        # left in flight at shutdown). Unregistered just before conn.close().
+        from email_triage.db.audit import make_audit_loss_sink
+        from email_triage.web._audit import register_audit_loss_sink
+        register_audit_loss_sink(make_audit_loss_sink(conn))
+        # Panel B7 DB-2: a writer queue the last shutdown abandoned (L6)
+        # left a sentinel next to the DB; record its row now, while the
+        # write lock is free, then remove the file.
+        from email_triage.db._live_app_gate import _resolve_dbdir
+        from email_triage.web._audit import replay_writer_abandoned_sentinel
+        _audit_data_dir = _resolve_dbdir(config.persistence.db_path)
+        replay_writer_abandoned_sentinel(_audit_data_dir)
+
+        # N-432 DA NTH-3 (2026-07-19) + DA-MF-1 fold (batched NTH-panel
+        # same-day): stamp the two-layer "app is live" gate — in-process
+        # bool + filesystem sentinel `<dbdir>/.app-alive.<pid>` — so raw-
+        # connect migration primitives refuse to run against a live app
+        # (including via `podman exec ... python -m et migrate` from a
+        # separate interpreter). Passing db_path plants the sentinel
+        # next to the DB so a cross-process invocation with the same
+        # DB path can find it.
+        from email_triage.db._live_app_gate import (
+            mark_app_live, mark_app_stopped,
+        )
+        mark_app_live(db_path=config.persistence.db_path)
+
+        try:
+            yield
+        finally:
+            # Never leave the boot gate armed past this app (a shutdown or a test).
+            from email_triage.embedding_bits import release_boot_update_gate
+
+            release_boot_update_gate()
 
         # Shutdown: stop watchers first, then supervised tasks.
         await watcher_mgr.stop_all()
         await supervisor.stop_all()
+
+        # Punch 582 (L4): wait, bounded, for the audit writes still in
+        # flight (fire-and-forget access_log tasks and shielded inner
+        # writes) while the writer and the connection are up. Whatever is
+        # still running is recorded as one shutdown_undrained row. The
+        # failure sink stays registered until the end of shutdown, so a loss
+        # here can still degrade /health (before punch 582 it was the first
+        # thing unregistered).
+        try:
+            from email_triage.web._audit import drain_inflight_audit_writes
+            await drain_inflight_audit_writes(
+                _AUDIT_SHUTDOWN_DRAIN_TIMEOUT_SECS,
+                pending=list(getattr(app.state, "_audit_pending", None) or ()),
+            )
+        except Exception as _drain_exc:  # noqa: BLE001
+            log.error(
+                f"audit write shutdown drain FAILED "
+                f"({type(_drain_exc).__name__}); in-flight audit writes may "
+                f"be lost unrecorded (§164.312(b))",
+            )
 
         # Drain long-lived httpx clients introduced by . Each
         # close() is best-effort + idempotent — surface any error in
@@ -1046,6 +1448,13 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         except Exception as e:
             log.warning("event_dispatcher aclose failed",
                         error=fmt_exc(e))
+        # N-276 R28: unregister the module-level accessor so a subsequent
+        # webhook attempt fails-closed (no stale dispatcher after shutdown).
+        try:
+            from email_triage.web.events import register_event_dispatcher
+            register_event_dispatcher(None)
+        except Exception:
+            pass
         try:
             from email_triage.web import watch_runner as _wr
             await _wr.aclose_module()
@@ -1072,26 +1481,229 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
         except Exception as e:
             log.warning("classifier close failed", error=fmt_exc(e))
 
+        #  Internet-Search HTTP pools — drain the module-level
+        # LazyHttpClient holders (one long-lived pool each, ). Both
+        # were unwired (SME 2026-06-08, fix-all-root-cause); best-effort.
+        for _mod_name in (
+            "email_triage.actions.web_search",
+            "email_triage.actions.clinicaltrials",
+        ):
+            try:
+                import importlib
+                _m = importlib.import_module(_mod_name)
+                if hasattr(_m, "aclose"):
+                    await _m.aclose()
+            except Exception as e:
+                log.warning(
+                    "internet-search client aclose failed",
+                    module=_mod_name, error=fmt_exc(e),
+                )
+
         # v0.1.2  Phase 2 — drain + stop the writer thread BEFORE the
         # connection closes, so any queued writes flush against a live
         # conn. Idempotent + best-effort; a stuck writer must not block
         # shutdown (10s join bound inside shutdown()).
+        # Punch 636: False only when the writer outlived its join bound; the
+        # final checkpoint below is then skipped (the wedged writer holds the
+        #  write lock, so the checkpoint could not run and its worker
+        # thread would hold process exit past the container StopTimeout).
+        _writer_stopped = True
         try:
             from email_triage.db._writer import get_writer, set_writer
 
             _writer = get_writer()
             if _writer is not None:
-                await _writer.shutdown()
-                set_writer(None)
+                try:
+                    # Panel B7 DB-2: at a join timeout, the next-boot sentinel
+                    # is written before any lock wait.
+                    import functools as _functools
+                    from email_triage.web._audit import record_writer_abandoned
+                    _writer_stopped = await _writer.shutdown(
+                        on_abandoned=_functools.partial(
+                            record_writer_abandoned, _audit_data_dir,
+                        ),
+                    ) is not False
+                finally:
+                    # Punch 636: uninstalled even when shutdown() raised, so
+                    # the final checkpoint below takes db_call's  RLock
+                    # path (no writer installed) instead of being refused by
+                    # a stopping writer (WriterStopped).
+                    set_writer(None)
         except Exception as e:
             log.warning("db-writer shutdown failed", error=fmt_exc(e))
 
-        conn.close()
-        log.info("Web UI stopped")
+        # Punch 636 fold (panel r1 DA-1, db-1): after a FAILED join the wedged
+        # writer holds the write lock, so every further database write would
+        # wait out SQLite's 30 s busy timeout, and two of them run past the
+        # container StopTimeout into a SIGKILL. So write nothing more to the
+        # database: the log lines go to the console from here, and the sweep
+        # below records to its lock-free next-boot sentinel.
+        if not _writer_stopped:
+            try:
+                from email_triage.triage_logging import remove_sqlite_handlers
+                remove_sqlite_handlers()
+            except Exception as e:
+                log.error("audit log handler close failed", error=fmt_exc(e))
 
+        # Punch 636: a second, zero-wait sweep of the in-flight audit writes.
+        # The bounded drain above ran before the httpx drains and the writer
+        # stop. A write launched after it, still running at loop close, would
+        # be cancelled after the loss sink is gone and leave only a console
+        # line. Whatever is still running now is recorded as
+        # ``shutdown_undrained`` while the sink can still write the row.
+        try:
+            import functools as _sweep_functools
+            from email_triage.web._audit import (
+                drain_inflight_audit_writes, record_writer_abandoned,
+            )
+            await drain_inflight_audit_writes(
+                _AUDIT_SHUTDOWN_SWEEP_TIMEOUT_SECS,
+                pending=list(getattr(app.state, "_audit_pending", None) or ()),
+                record=None if _writer_stopped else _sweep_functools.partial(
+                    record_writer_abandoned, _audit_data_dir,
+                    loss_class="shutdown_undrained", try_row=False,
+                ),
+            )
+        except Exception as _sweep_exc:  # noqa: BLE001
+            log.error(
+                f"audit write shutdown sweep FAILED "
+                f"({type(_sweep_exc).__name__}); in-flight audit writes may "
+                f"be lost unrecorded (§164.312(b))",
+            )
+
+        # Punch 636: close every OTHER connection on the database file, so the
+        # app connection's close below is the LAST close. SQLite's last close
+        # checkpoints whatever frames remain and deletes the -wal
+        # (sqlite.org/wal.html, sections 4 and 6). Before 636 these stayed open
+        # until process exit, so the app connection was never the last and
+        # every clean stop left WAL frames. The audit-chain log handler's
+        # connection closes last of them, just before the app connection, so
+        # the shutdown rows stay in the HMAC-chained log_entries.
+        try:
+            from email_triage.web import acme_job_state
+            acme_job_state.set_db_handle(None)
+        except Exception as e:
+            log.error(
+                "acme job-state connection close failed", error=fmt_exc(e),
+            )
+        from email_triage.single_flight import close_lock_conn
+        close_lock_conn()
+
+        # N-432 walresetbug — hipaa-sme NTH-2 (2026-07-19): fire ONE
+        # final ``checkpoint_wal_truncate`` on the way down so no writes
+        # sit stranded in the WAL when the container stops.
+        #
+        # Punch 636: it runs after the writer drained. Until 636 it ran before
+        # the httpx drains and the writer stop, so the writer's queue and the
+        # log rows after it stayed in the WAL. With no writer installed,
+        # ``db_call`` runs it on the  RLock path. The log rows written
+        # after it are folded by the app connection's last close below; this
+        # checkpoint is the belt.
+        #
+        # db-sme NTH-1 (batched NTH-panel 2026-07-19): bound the wait by the
+        # writer's own envelope (``WAL_SHUTDOWN_ENVELOPE_SECS``, one constant
+        # for the join and this wait since punch 636). A wedged writer would
+        # otherwise queue-and-wait indefinitely; try/except catches errors but
+        # not hangs. Punch 636: after a failed join it is not attempted at all
+        # (``_writer_stopped``); it is reported FAILED below without a wait.
+        #
+        # DA-SF-3 (batched NTH-panel 2026-07-19): a FAILURE to complete
+        # this checkpoint has the same integrity effect as omitting it
+        # (stranded WAL frames + walresetbug re-exposure on next boot),
+        # so it's a §164.312(c)(1) integrity signal — bump
+        # ``app.state.audit_failures`` (the counter the /health drift
+        # surface reads) and log at ERROR, not WARN.
+        try:
+            if not _writer_stopped:
+                raise TimeoutError(
+                    "skipped: the db-writer outlived its join bound and holds "
+                    "the write lock",
+                )
+            # Uses module-scope `asyncio` (imported at web/app.py top) — a
+            # function-local `import asyncio` would LEGB-shadow it per
+            # -followup-B (see test_no_legb_shadow_asyncio.py).
+            from email_triage.web.db import checkpoint_wal_truncate
+            from email_triage.web.db_threadpool import db_call
+
+            _final = await asyncio.wait_for(
+                db_call(checkpoint_wal_truncate, app.state.db),
+                timeout=WAL_SHUTDOWN_ENVELOPE_SECS,
+            )
+            log.info(
+                "WAL checkpoint (shutdown) fired",
+                busy=_final.get("busy"),
+                log=_final.get("log"),
+                checkpointed=_final.get("checkpointed"),
+            )
+        except Exception as _shutdown_ckpt_exc:  # noqa: BLE001
+            log.error(
+                "WAL checkpoint (shutdown) FAILED — stranded WAL frames "
+                "may re-open walresetbug window on next boot (§164.312(c)(1))",
+                error=fmt_exc(_shutdown_ckpt_exc),
+            )
+            try:
+                _current_af = getattr(app.state, "audit_failures", 0)
+                app.state.audit_failures = int(_current_af) + 1
+            except Exception:
+                pass
+
+        # N-432 DA NTH-3 + DA-SF-1 fold (batched NTH-panel 2026-07-19):
+        # clear the app-live gate after the db-writer drain and the final
+        # checkpoint, symmetric with mark_app_live being the last startup step
+        # before yield. Keeps the gate SET for the entire serving+shutdown
+        # window — any migration primitive invoked mid-shutdown (unlikely but
+        # the point of the defensive gate is to defend against the unlikely)
+        # still refuses.
+        mark_app_stopped()
+
+        # N-192 / punch 582: unregister both sinks only now, so every loss
+        # recorded during shutdown reaches the chain and /health; a stray
+        # call after this finds no sink and logs the gap-on-gap ERROR.
+        register_audit_failure_sink(None)
+        from email_triage.web._audit import register_audit_loss_sink
+        register_audit_loss_sink(None)
+
+        log.info("Web UI stopped")
+        # Punch 636: the log handler's connection, then the app connection,
+        # LAST. A line logged after this reaches the console only.
+        try:
+            from email_triage.triage_logging import remove_sqlite_handlers
+            remove_sqlite_handlers()
+        except Exception as e:
+            log.error("audit log handler close failed", error=fmt_exc(e))
+        try:
+            conn.close()
+        except Exception as e:
+            log.error("database connection close failed", error=fmt_exc(e))
+        # Punch 636: a SUCCESSFUL checkpoint that preceded a later write was
+        # invisible to the DA-SF-3 signal above. The -wal itself is the
+        # evidence: after the last close it is absent (or empty).
+        _wal_left = _wal_bytes_left(db_path)
+        if _wal_left:
+            log.error(
+                f"WAL file left after shutdown: {_wal_left} bytes. Another "
+                f"process may hold the database open, or a close failed; "
+                f"stranded frames re-open the walresetbug window on the next "
+                f"boot (§164.312(c)(1))",
+            )
+
+    # Interactive API docs are OFF by default (N-next / §164.308(a)(1)(ii)(B)).
+    # FastAPI's defaults serve /docs, /redoc and /openapi.json to ANY caller
+    # that can reach the port. Observed 2026-08-18 on the publish candidate:
+    # /openapi.json returned 200 unauthenticated with 288 routes enumerated,
+    # /admin/security, /admin/tls and /accounts/api-keys among them, while
+    # every other route correctly redirected to /login. The schema holds no
+    # ePHI, so this is attack-surface reconnaissance rather than a PHI
+    # access-control break — but a deployer inherits it silently, and there is
+    # no reason to hand an unauthenticated caller the complete route and
+    # parameter map. Explicit None on all three: openapi_url=None alone would
+    # disable the others, and naming each one keeps the intent un-guessable.
     app = FastAPI(
         title="Email Triage",
         lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     # Access-audit middleware). Records every
@@ -1106,10 +1718,11 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
     app.add_middleware(AccessAuditMiddleware)
     # CSRF middleware (PR 8 / D1). Enforce-by-default as of 
     # (2026-05-10). Violations return HTTP 403. Operator can opt out
-    # via ``tls: { csrf_enforce: false }`` in YAML or the
-    # ``EMAIL_TRIAGE_CSRF_ENFORCE=0`` env var (env wins). When
-    # disabled, violations still log + bump ``app.state.csrf_rejects``
-    # so the operator can size + verify before re-enabling.
+    # via ``tls: { csrf_enforce: false }`` in YAML or the live toggle
+    # at /admin/security — one store, no env override (removed
+    # 2026-09-12). When disabled, violations still log + bump
+    # ``app.state.csrf_rejects`` so the operator can size + verify
+    # before re-enabling.
     app.add_middleware(CsrfMiddleware)
     # Request-ID middleware MUST be the outermost (added LAST in
     # FastAPI's onion model = executed FIRST on inbound). Otherwise
@@ -1131,13 +1744,77 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
     # App semver — surfaced in the base-template footer on every page.
     from email_triage import __version__ as _app_version
     templates.env.globals["app_version"] = _app_version
+    # Punch 553 — the update check's default address, from its one SSOT, for
+    # the Config > General datalist/placeholder (no restated literal).
+    from email_triage.update_check import DEFAULT_RELEASE_CHECK_URL
+    templates.env.globals["default_release_check_url"] = DEFAULT_RELEASE_CHECK_URL
+    # –301 pagination — rebuild the current URL's query string with one
+    # param overridden, preserving every OTHER param (so paging one of the
+    # 5 compliance tables doesn't reset the others). The `_pager.html` macro
+    # calls this for its newer/older links.
+    from email_triage.web._pagination import page_url as _page_url
+    templates.env.globals["page_url"] = _page_url
+    # N-229 R22 — expose the is_admin SSOT to Jinja under an UNDERSCORED
+    # name (`_admin_of`) so it doesn't shadow the `is_admin` BOOL that
+    # ~60 handlers pass in TemplateResponse ctx (`{"is_admin": is_admin}`).
+    # Calling `is_admin(user)` from a template previously bombed with
+    # `TypeError: 'bool' object is not callable` because the ctx bool
+    # shadowed the global callable. `_admin_of(<user>)` is unique.
+    from email_triage.web.dependencies import is_admin as _is_admin
+    templates.env.globals["_admin_of"] = _is_admin
+    # N-265 R27: Jinja globals for HIPAA folding — the R27 census
+    # found `templates/profile/style_data.html:538` leaks reply
+    # subjects under system-HIPAA when per-account flag is OFF because
+    # it reads `entry.account.hipaa` (raw column) instead of the
+    # effective verdict. Named `_hipaa_of` (mirror of `_admin_of`) to
+    # avoid shadowing any handler-passed ctx bool. Callers use
+    # `{% if _hipaa_of(entry.account) %}` (effective) OR
+    # `{% if _hipaa_of(entry.account, strict=True) %}` (per-account
+    # only, when only that axis matters).
+    from email_triage.triage_logging import (
+        account_hipaa_effective as _account_hipaa_effective,
+        is_account_hipaa as _is_account_hipaa,
+    )
+    def _hipaa_of(account, *, strict=False):
+        """Fold HIPAA gate for a Jinja template. Default: EFFECTIVE
+        (system_hipaa OR per-account hipaa). `strict=True`: per-account
+        only. Fail-closed on missing account."""
+        if account is None:
+            return True
+        if strict:
+            return _is_account_hipaa(account)
+        return _account_hipaa_effective(account=account)
+    templates.env.globals["_hipaa_of"] = _hipaa_of
+    # run18  — the digest "Show matches" dry-run table formats its "When"
+    # cell through the digest datetime SSOT (recipient_digest._format_datetime,
+    # exposed as format_digest_datetime) so the preview matches the delivered
+    # digest's space-separated "%Y-%m-%d %H:%M" form, instead of the inline ISO
+    # "[:16]" slice that leaked the "T" separator (template-vs-Python drift).
+    from email_triage.actions.recipient_digest import (
+        format_digest_datetime as _format_digest_datetime,
+    )
+    templates.env.filters["format_digest_dt"] = (
+        lambda entry: _format_digest_datetime(entry, "")
+    )
+    # 2026-07-13 — US-locale display filter (operator ask).
+    # Renders '7/13/2026 9:12:33 AM EDT' from an ISO string or datetime.
+    # Server-side; templates that want VIEWER-local rendering use the
+    # `<time datetime='ISO' data-us-datetime>{{ ts | us_datetime }}</time>`
+    # progressive-enhancement pattern — the JS helper in base.html walks
+    # `[data-us-datetime]` elements after DOM load and rewrites text using
+    # the viewer's browser timezone. See `_us_datetime.py` module docstring.
+    from email_triage._us_datetime import install_filter as _install_us_datetime
+    _install_us_datetime(templates.env)
     app.state.templates = templates
 
     # Register routers
     from email_triage.web.routers.ui import router as ui_router
     from email_triage.web.routers.api import router as api_router
     from email_triage.web.routers.webhooks import router as webhook_router
-    from email_triage.web.routers.openclaw import router as openclaw_router
+    from email_triage.web.routers.agent_api import (
+        router as agent_api_router,
+        legacy_openclaw_redirect_router,
+    )
     from email_triage.web.routers.health import router as health_router
     #  — auth-surface upgrade routes (dev-keypair admin + login,
     # WebAuthn registration + login, ACME diagnostic test buttons).
@@ -1164,7 +1841,12 @@ def create_app(config: TriageConfig | None = None) -> FastAPI:
     app.include_router(tls_csr_router)
     app.include_router(help_router)
     app.include_router(api_router, prefix="/api")
-    app.include_router(openclaw_router)
+    #  — the external integration API is now mounted at the neutral
+    # ``/api/v1`` (prefix lives on the router). The legacy ``/api/openclaw/*``
+    # path 308-redirects to it (method/body-preserving) so existing
+    # integrations keep working through the rename.
+    app.include_router(agent_api_router)
+    app.include_router(legacy_openclaw_redirect_router)
     app.include_router(webhook_router)
 
     _register_auth_error_handler(app)
@@ -1251,6 +1933,10 @@ def _register_auth_error_handler(app: FastAPI) -> None:
     async def _auth_error_handler(
         request: Request, exc: StarletteHTTPException,
     ):
+        # Punch 579: every HTTPException passes here, so its fixed error slug
+        # (if any) reaches the request's access_log row.
+        from email_triage.web.error_surface import stash_error_slug
+        stash_error_slug(request, exc)
         if exc.status_code in _AUTH_ERROR_STATUSES and _wants_html(request):
             title = _AUTH_ERROR_TITLES.get(exc.status_code, "Error")
             detail = exc.detail if isinstance(exc.detail, str) else title
@@ -1291,6 +1977,23 @@ def _register_auth_error_handler(app: FastAPI) -> None:
             {"detail": "Database writer is saturated; retry shortly."},
             status_code=503,
             headers={"Retry-After": "1"},
+        )
+
+    #  — a `health_ro`-class principal tried to mint a web session.
+    # `auth.create_session_token` is the ONE minting funnel and refuses there, so
+    # every login surface is covered at one site; this handler is what makes the
+    # refusal read as POLICY (403) rather than as a crash (500). No body detail
+    # beyond the refusal: the route set a machine role may reach is not something
+    # an unauthenticated login attempt gets told.
+    from email_triage.web._route_scope import SessionMintRefused
+
+    @app.exception_handler(SessionMintRefused)
+    async def _session_mint_refused_handler(
+        request: Request, exc: SessionMintRefused,
+    ):
+        return JSONResponse(
+            {"detail": "This account may not sign in to the web interface."},
+            status_code=403,
         )
 
 
@@ -1411,52 +2114,158 @@ def is_listener_restart_pending(app: FastAPI) -> bool:
 
 
 def _maybe_mark_auth_stale(db, acct: dict, err: Exception) -> None:
-    """Detect OAuth refresh-token death and persist a per-account flag.
+    """Detect an auth-revoked provider failure and persist the per-account
+    ``auth_stale`` flag (the "Re-authenticate required" chip + daily-health
+    call-out).
 
-    Triggered by any provider exception whose message matches the
-    Google "Token has been expired or revoked" / "invalid_grant"
-    signatures or the IMAP / Graph "AUTHENTICATIONFAILED" /
-    "InvalidAuthenticationToken" patterns. Cleared from the same
-    setting key on the next successful provider call (see the success
-    paths in the watcher loops).
+    This is the SET half of the ``auth_stale`` lifecycle; prefer the funnel
+    ``record_provider_outcome(db, acct, exc)`` over calling this directly so
+    set and clear stay symmetric across every credentialed surface (divergence
+    census 2026-06-09, finding #1 — before then SET fired on the poll path
+    only). The needle predicate is the SSOT in ``web/_auth_revoked.py`` (the
+    Google ``invalid_grant`` / ``401 invalid_client`` and IMAP/Graph
+    ``AUTHENTICATIONFAILED`` families, scanning both the exception class name
+    and ``str(exc)``). Cleared by ``_clear_auth_stale`` on the next successful
+    provider call on ANY path.
     """
+    cls = type(err).__name__
     try:
         msg = str(err) or ""
-    except Exception:
-        return
-    needles = (
-        "Token has been expired or revoked",
-        "invalid_grant",
-        "AUTHENTICATIONFAILED",
-        "InvalidAuthenticationToken",
-        "Invalid Credentials",
-    )
-    if not any(n in msg for n in needles):
+    except Exception:  # noqa: BLE001 — an unprintable exc still has a class name
+        msg = ""  # the class-name needle (OAuthRefreshFailed, …) still decides
+    # The auth-revoked needle predicate is the SSOT in ``web/_auth_revoked.py``
+    # — do NOT re-inline the list here. It drifted from the watcher-retry copy
+    # before 2026-06-09 (the retry copy carried OAuthRefreshFailed/IMAPAuthError
+    # and scanned the class name; this SET path did not — so a class-only auth
+    # failure short-circuited retries but never flipped the chip). The shared
+    # predicate scans BOTH the class name and ``str(exc)``. The lifecycle pin
+    # (``tests/test_auth_stale_lifecycle_pin.py``) fails CI on a re-inlined list.
+    from email_triage.web._auth_revoked import is_auth_revoked
+    if not is_auth_revoked(cls, msg):
         return
     try:
         from email_triage.web.db import set_setting
-        from datetime import datetime, timezone
         set_setting(db, _settings_keys.auth_stale(acct["id"]), {
-            "at": datetime.now(timezone.utc).isoformat(),
+            "at": now_utc_iso(),
             "reason": msg[:300],
         })
+    except Exception as e:  # noqa: BLE001 — never mask the provider error
+        # The credential IS revoked but the flag did not persist, so the
+        # "Re-authenticate required" chip would read healthy. Log at ERROR
+        # (the caller is already on a provider-failure path; raising here
+        # would replace that error with this one).
+        log.error(
+            "Account auth revoked but the auth_stale flag failed to persist — "
+            "the account will NOT show 'Re-authenticate required'",
+            exc_info=e, **_acct_log_extras(acct), reason=msg[:200],
+        )
+    else:
+        # db-sme r14 NIT: outside the try, so only a failed PERSIST reaches
+        # the ERROR above (a raising log call cannot claim the flag was lost).
         log.warning(
             "Account auth flagged stale — re-authentication required",
             **_acct_log_extras(acct), reason=msg[:200],
         )
-    except Exception:
-        pass
 
 
 def _clear_auth_stale(db, account_id: int) -> None:
-    """Clear the stale-auth flag on a successful provider call."""
+    """Clear the stale-auth flag on a successful provider call.
+
+    Idempotent and cheap: reads the setting first and only issues the DB
+    delete when the flag is actually set, so every provider-success path —
+    including per-message loops (bulk re-triage, retry drain) — can call it
+    without write-amplifying the settings table. The common case (account not
+    stale) is a cache-backed read with no write.
+    """
     try:
-        # Use the public helper so the in-process settings cache
-        # is invalidated alongside the DB delete.
-        from email_triage.web.db import delete_setting
-        delete_setting(db, _settings_keys.auth_stale(account_id))
-    except Exception:
-        pass
+        # Use the public helpers so the in-process settings cache
+        # is consulted on read and invalidated alongside the DB delete.
+        from email_triage.web.db import delete_setting, get_setting
+        key = _settings_keys.auth_stale(account_id)
+        if get_setting(db, key) is None:
+            return  # not stale → nothing to clear (no write)
+        delete_setting(db, key)
+    except Exception as e:
+        log.error(
+            "auth-stale flag clear failed; flag may remain set",
+            exc_info=e,
+            account_id=account_id,
+        )
+
+
+def _resurrect_auth_revoked_retries(db, account_id: int) -> None:
+    """Symmetric CLEAR for ``watcher_retry_queue`` rows frozen by auth revocation.
+
+    N-386 — ``mark_retry_dead(reason='auth_revoked')`` at
+    ``watcher_retry.py:175`` SET the ``dead_reason`` but nothing on a
+    provider-success path CLEARED it, so a mid-outage frozen retry row stayed
+    dead forever after the account recovered. Sibling to
+    ``_clear_auth_stale``: both fire on every provider-success path via
+    ``record_provider_outcome``. Idempotent + cheap — the DB helper skips the
+    WAL page write on the common (no-frozen-rows) case.
+    """
+    try:
+        from email_triage.web.db import resurrect_auth_revoked_retries
+        n = resurrect_auth_revoked_retries(db, int(account_id))
+        if n > 0:
+            log.info(
+                "Auth restored — resurrected auth-revoked retry rows",
+                account_id=int(account_id),
+                resurrected=int(n),
+            )
+    except Exception as e:
+        log.error(
+            "auth-revoked retry resurrect failed; frozen rows may stay dead",
+            exc_info=e,
+            account_id=account_id,
+        )
+
+
+def record_provider_outcome(db, acct: dict, exc: BaseException | None) -> None:
+    """SSOT for the per-account ``auth_stale`` lifecycle — the one funnel every
+    credentialed provider surface routes its outcome through.
+
+    Call after ANY credentialed provider operation (unified poll, Gmail/O365
+    push delta, IMAP IDLE connect, Gmail-watch / O365-subscription renew,
+    sent-mail capture, bulk re-fetch, topic backscan, the manual Test action):
+
+      * ``exc is None``  → the call succeeded; the credential is alive → CLEAR
+        any prior stale-auth flag (idempotent-cheap — see ``_clear_auth_stale``)
+        AND resurrect any ``watcher_retry_queue`` rows this account froze with
+        ``dead_reason='auth_revoked'`` (N-386 — see
+        ``_resurrect_auth_revoked_retries``). Both CLEARs are per-account and
+        idempotent; a fleet of provider-success calls collapses to a single
+        write on the first success and no-ops after.
+      * ``exc is not None`` → the call failed; SET the flag IFF the error is an
+        auth-revoked signal (``_maybe_mark_auth_stale`` needle-filters via the
+        ``_auth_revoked`` SSOT, so a transient network/5xx error is ignored).
+
+    Routing every provider surface through this single funnel is what keeps the
+    flag's set and clear edges symmetric across all ~11 credentialed call sites
+    — the asymmetry the divergence census surfaced (2026-06-09, finding #1:
+    SET on the poll path only; CLEAR on poll + OAuth re-auth only; push / IDLE /
+    renewers / background jobs did neither → dead tokens invisible on those
+    paths, and an account flagged by the poll path stayed stuck once it
+    recovered via push). N-386 (2026-07-10) extends the same funnel discipline
+    to the ``watcher_retry_queue`` auth_revoked lifecycle: the frozen rows were
+    the SET-broad / CLEAR-narrow twin of the chip. Sync by design so the async
+    loops invoke it as ``await db_call(record_provider_outcome, db, acct, exc)``
+    (the  writer-thread serialisation), matching the existing
+    ``db_call(_clear_auth_stale, …)`` / ``db_call(_maybe_mark_auth_stale, …)``
+    call pattern it replaces.
+    """
+    try:
+        if exc is None:
+            _clear_auth_stale(db, acct["id"])
+            _resurrect_auth_revoked_retries(db, acct["id"])  # N-386
+        else:
+            _maybe_mark_auth_stale(db, acct, exc)
+    except Exception as e:
+        log.error(
+            "provider outcome auth-state update failed",
+            account_id=(acct.get("id") if hasattr(acct, "get") else None),
+            exc_info=e,
+        )
 
 
 async def _log_entries_prune_loop(app: FastAPI) -> None:
@@ -1471,6 +2280,13 @@ async def _log_entries_prune_loop(app: FastAPI) -> None:
         prune_push_deliveries,
         prune_triage_runs,
         prune_triaged_messages,
+    )
+    # Punch  / panel F8 — the WebAuthn challenge store had no caller for its
+    # pruner, and the passkey begin route made that growth reachable WITHOUT
+    # authentication. Expired rows already stop matching a consume; this is what
+    # makes them leave.
+    from email_triage.web.db_auth_helpers import (
+        prune_expired_webauthn_challenges,
     )
     from email_triage.web.task_supervisor import supervised_interval_loop
     #  — these prune helpers are @db_write so a direct sync call is
@@ -1495,6 +2311,11 @@ async def _log_entries_prune_loop(app: FastAPI) -> None:
                 retention_days=cfg.logging.retention_days,
                 max_rows=cfg.logging.max_rows,
             )
+        # N-227c R22 — stamp with deletion count for /admin observability.
+        app.state.log_entries_prune_loop_status = {
+            "at": now_utc_iso(),
+            "deleted": int(deleted or 0),
+        }
         # Loop-prevention dedup table: trim rows older than 90d. 90d is
         # far past any plausible cascade window (real cascades re-fire
         # within seconds) but bounded so the table can't grow unbounded
@@ -1532,6 +2353,20 @@ async def _log_entries_prune_loop(app: FastAPI) -> None:
                          deleted=run_deleted, retention_days=90)
         except Exception as e4:
             log.warning("triage_runs prune failed", error=str(e4))
+        # Punch  / panel F8 — expired WebAuthn challenges (5-minute TTL).
+        # The passkey begin step is unauthenticated, so anyone who can reach
+        # /login can mint rows; they stop being consumable at their TTL, and
+        # this is the only thing that removes them. Best-effort like its
+        # siblings: a failed prune must not block the other four.
+        try:
+            wc_deleted = await db_call(
+                prune_expired_webauthn_challenges, db,
+            )
+            if wc_deleted:
+                log.info("Pruned expired webauthn_challenges rows",
+                         deleted=wc_deleted)
+        except Exception as e5:
+            log.warning("webauthn_challenges prune failed", error=str(e5))
 
     #  — lease-gated: a global table prune; one instance per tick.
     await supervised_interval_loop(
@@ -1539,6 +2374,104 @@ async def _log_entries_prune_loop(app: FastAPI) -> None:
         warmup_secs=30,
         startup_jitter_secs=30.0,
         lease_name="log-entries-pruner",
+        lease_conn=app.state.db,
+    )
+
+
+async def _wal_checkpoint_loop(app: FastAPI) -> None:
+    """N-432 walresetbug P0 (2026-07-19) — periodic SERIALIZED WAL
+    checkpoint.
+
+    Runs ``checkpoint_wal_truncate`` (``@db_write``) via ``db_call``
+    every 5 minutes. Paired with ``PRAGMA wal_autocheckpoint = 0`` at
+    the opener SSOT so the ONLY WAL-checkpoint fire path in the
+    process is this loop under the writer-lock. That serializes the
+    checkpoint against every writer AND against every other
+    checkpoint, closing the concurrent-race surface the walresetbug
+    (SQLite < 3.51.3) exploits.
+
+    Lease-gated: one instance per install per tick (matches the
+    ``log-entries-pruner`` shape). ``PRAGMA wal_checkpoint(TRUNCATE)``
+    is idempotent — a busy checkpoint just returns busy=1 and the
+    next tick retries.
+    """
+    from email_triage.web.db import checkpoint_wal_truncate
+    from email_triage.web.task_supervisor import supervised_interval_loop
+    from email_triage.web.db_threadpool import db_call
+
+    # db-sme NTH-1 (2026-07-19): busy-aware short retry. On busy=1 the
+    # checkpoint couldn't truncate (a reader transaction outstanding); a
+    # 5-min gap risks unbounded WAL growth under pathological long-read
+    # + high-write mix. Schedule the next tick 30s out instead of the
+    # normal 5min so the WAL trends bounded even under contention.
+    _BUSY_RETRY_SECS = 30
+
+    async def _tick() -> None:
+        db = app.state.db
+        try:
+            result = await db_call(checkpoint_wal_truncate, db)
+        except Exception as exc:
+            log.warning("WAL checkpoint failed", error=str(exc))
+            app.state.wal_checkpoint_loop_status = {
+                "at": now_utc_iso(),
+                "error": str(exc),
+            }
+            return
+        # Log at debug for the happy path (5-min cadence would flood
+        # info-level otherwise); at info when the checkpoint reported
+        # busy=1 (reader contention prevented a full flush; benign but
+        # worth surfacing for observability).
+        if result.get("busy"):
+            # db-sme NTH-2 (2026-07-19): under `@db_write` no writer CAN be
+            # active during this checkpoint call — the busy=1 signal is a
+            # READER holding an outstanding read-transaction on an older
+            # frame (classic SQLite checkpoint-starvation shape). Wording
+            # matches the actual cause so operator investigation of WAL
+            # growth doesn't chase a phantom writer.
+            log.info(
+                "WAL checkpoint busy — reader transaction outstanding, "
+                "scheduling short retry",
+                busy=result["busy"], log=result["log"],
+                checkpointed=result["checkpointed"],
+                retry_secs=_BUSY_RETRY_SECS,
+            )
+            # Fire a short-retry tick outside the normal 5-min interval.
+            # Best-effort; if it fails the next scheduled tick still
+            # runs and the loop stays alive. Use module-scope `asyncio`
+            # (imported at web/app.py top) — a function-local
+            # `import asyncio` would LEGB-shadow it per -followup-B
+            # (see test_no_legb_shadow_asyncio.py).
+            try:
+                await asyncio.sleep(_BUSY_RETRY_SECS)
+                retry_result = await db_call(checkpoint_wal_truncate, db)
+                app.state.wal_checkpoint_loop_status = {
+                    "at": now_utc_iso(),
+                    "retried": True,
+                    **retry_result,
+                }
+                return
+            except Exception as retry_exc:
+                log.warning(
+                    "WAL checkpoint short-retry failed",
+                    error=str(retry_exc),
+                )
+        app.state.wal_checkpoint_loop_status = {
+            "at": now_utc_iso(),
+            **result,
+        }
+
+    # devils-advocate NTH-1 (2026-07-19): warmup_secs=60 previously
+    # created a 60-75s boot window with no checkpoint fire path (auto-
+    # checkpoint disabled AND periodic loop not ticking). Under a boot-
+    # time ingestion catch-up the WAL could grow unbounded during that
+    # window. warmup=5s + jitter=15s narrows the blind window to <=20s
+    # while still deferring the first checkpoint past the initial
+    # migration + seed run.
+    await supervised_interval_loop(
+        "wal-checkpoint-loop", 5 * 60, _tick,
+        warmup_secs=5,
+        startup_jitter_secs=15.0,
+        lease_name="wal-checkpoint-loop",
         lease_conn=app.state.db,
     )
 
@@ -1618,14 +2551,22 @@ from email_triage.web.ingestion_push import (  # noqa: E402, F401
 
 from email_triage.web.background_sweepers import (  # noqa: E402, F401
     _baa_expiry_sweeper,
+    _update_check_once,
+    _update_check_sweeper,
     _per_contact_style_gc_sweeper,
     _style_distill_trigger_sweeper,
     _recover_one_retry_row,
     _watcher_retry_sweeper,
     _hipaa_boundary_drift_detector,
+    _regulatory_clock_escalator,
+    _db_backup_sweeper,
+    _embedding_auto_update_sweeper,
     _sent_mail_capture_loop,
     _resolve_capture_interval_hours,
     _seconds_until_next_capture_tick,
     _run_sent_mail_capture_sweep,
     _run_hipaa_counter_for_account,
+    #  V3 — Topic retention soft-expire + tombstone horizon-purge sweep.
+    _topic_retention_purge_once,
+    _topic_retention_purge_sweeper,
 )

@@ -139,6 +139,33 @@ def test_aadsts_translate_no_aadsts_returns_verbatim():
     assert msg == "Connection reset by peer."
 
 
+def test_aadsts_verbatim_long_line_gets_ellipsis():
+    """ — a verbatim error longer than the chip cap is clipped with
+    a trailing ellipsis so the operator knows it was cut, not the whole
+    message."""
+    err = "Connection failed: " + ("detail " * 80)  # > 280 chars
+    code, msg = _aadsts_translate(err)
+    assert code is None
+    assert msg.endswith("…")
+    assert len(msg) <= 281  # 280 chars + the ellipsis
+
+
+def test_aadsts_verbatim_multiline_gets_ellipsis():
+    """A multi-line verbatim error shows the first line + ellipsis (the
+    dropped lines aren't silent)."""
+    err = "First line is short.\nSecond line dropped."
+    code, msg = _aadsts_translate(err)
+    assert code is None
+    assert msg == "First line is short.…"
+
+
+def test_aadsts_verbatim_short_single_line_no_ellipsis():
+    """A short single-line error is NOT decorated — no false 'there's
+    more' signal."""
+    code, msg = _aadsts_translate("Short error.")
+    assert msg == "Short error."
+
+
 def test_aadsts_translate_empty_input_handled():
     code, msg = _aadsts_translate("")
     assert code is None
@@ -156,6 +183,38 @@ def test_aadsts_translate_extracts_code_from_msal_dict_dump():
     code, msg = _aadsts_translate(err)
     assert code == "AADSTS50011"
     assert msg == _AADSTS_TRANSLATIONS["AADSTS50011"]
+
+
+def test_o365_auth_shape_tokens_survive_phi_scrub():
+    """REGRESSION (db-sme, census run13 #8): ``list_folders`` token-matches the
+    ALREADY PHI-scrubbed ``fmt_exc(e, with_class=True)`` output to demote auth
+    failures to DEBUG. That is sound ONLY by token/regex disjointness — every
+    auth token below must be NEITHER address- nor path-shaped, so ``redact_exc``
+    cannot strip it. If a future editor adds a path-shaped or ``@``-bearing
+    token to ``office365.list_folders``' ``is_auth_shape`` set, this fails
+    BEFORE the silent DEBUG-demotion break ships.
+
+    Keep this tuple in sync with the ``is_auth_shape`` tuple in
+    ``providers/office365.py:list_folders``.
+    """
+    from email_triage._errfmt import fmt_exc
+
+    auth_tokens = (
+        "AADSTS", "device code", "401", "Unauthorized",
+        "invalid_grant", "missing OAuth", "no token",
+    )
+    for tok in auth_tokens:
+        # An auth-shaped failure that ALSO echoes a PHI recipient address.
+        exc = RuntimeError(f"{tok} for mailbox patient@clinic.example")
+        rendered = fmt_exc(exc, with_class=True)
+        # (a) the auth token survives the scrub -> is_auth_shape still fires.
+        assert tok in rendered, (
+            f"auth token {tok!r} was altered by the PHI scrub — the DEBUG "
+            "demotion in office365.list_folders would silently break"
+        )
+        # (b) the PHI address is still redacted (the scrub kept doing its job).
+        assert "patient@clinic.example" not in rendered
+        assert "[redacted-addr]" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +450,7 @@ class TestSharedPartialIncluded:
             "Shared O365 field-block partial must live at "
             "templates/accounts/_o365_fields.html so both the wizard "
             "step2-o365 form and the edit-page Integrations tab can "
-            "include it."
+            "include it. (#126)"
         )
 
     def test_edit_page_field_wrapper_includes_shared_partial(self):

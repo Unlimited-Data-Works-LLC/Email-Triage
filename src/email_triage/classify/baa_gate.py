@@ -26,7 +26,7 @@ different vendor.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from urllib.parse import urlparse
 from typing import Any
 
@@ -74,7 +74,7 @@ def set_baa_ack(
     from email_triage.web.db import set_setting
     set_setting(conn, baa_ack_key(backend, host), {
         "acked": True,
-        "acked_at": datetime.now(timezone.utc).isoformat(),
+        "acked_at": now_utc_iso(),
         "acked_by_user_id": user_id,
     })
 
@@ -87,7 +87,37 @@ def revoke_baa_ack(
     from email_triage.web.db import set_setting
     set_setting(conn, baa_ack_key(backend, host), {
         "acked": False,
-        "revoked_at": datetime.now(timezone.utc).isoformat(),
+        "revoked_at": now_utc_iso(),
+    })
+
+
+def set_baa_ack_txn(
+    conn: sqlite3.Connection,
+    backend: str,
+    host: str,
+    user_id: int,
+) -> None:
+    """TXN-AWARE twin of :func:`set_baa_ack`; no commit (N-520). Same row
+    shape, written through ``set_setting_txn`` so the ACK and its ``baa_ack``
+    witness commit together (``db/audit.record_witnessed_state_change``)."""
+    from email_triage.web.db import set_setting_txn
+    set_setting_txn(conn, baa_ack_key(backend, host), {
+        "acked": True,
+        "acked_at": now_utc_iso(),
+        "acked_by_user_id": user_id,
+    })
+
+
+def revoke_baa_ack_txn(
+    conn: sqlite3.Connection,
+    backend: str,
+    host: str,
+) -> None:
+    """TXN-AWARE twin of :func:`revoke_baa_ack`; no commit (N-520)."""
+    from email_triage.web.db import set_setting_txn
+    set_setting_txn(conn, baa_ack_key(backend, host), {
+        "acked": False,
+        "revoked_at": now_utc_iso(),
     })
 
 
@@ -219,3 +249,30 @@ def is_safe_for_hipaa(
     if status["is_local"]:
         return True
     return bool(status["baa_acked"])
+
+
+def baa_block_status(
+    conn: sqlite3.Connection,
+    classifier: Any,
+    account_hipaa: bool,
+) -> dict[str, Any] | None:
+    """The ONE decision behind every classify-egress gate (PD#5, §164.308(b)(1)).
+
+    Returns the classifier's :func:`classifier_baa_status` dict when a HIPAA
+    account's PHI must NOT egress to ``classifier`` (the account is HIPAA-flagged
+    AND the classifier is external with no BAA ack on file), else ``None``.
+
+    Every code path that ships HIPAA-account message content to a classifier —
+    the live runner (``web/triage_runner``), the durable back-scan
+    (``jobs/topic_backscan``), and the synchronous Topic preview
+    (``web/routers/ui/profile._preview_account_hits``) — routes its refuse
+    decision through THIS predicate so the gate cannot drift between them. Callers
+    decide HOW to refuse (fail the job / degrade the preview / block the run); the
+    decision lives here once. The count-agnostic pin
+    ``test_n113_topic_backscan_baa_gate`` asserts every ``match_topics_for_message``
+    call site references this gate (or is upstream-gated + allow-listed)."""
+    if not account_hipaa:
+        return None
+    if is_safe_for_hipaa(conn, classifier):
+        return None
+    return classifier_baa_status(conn, classifier)

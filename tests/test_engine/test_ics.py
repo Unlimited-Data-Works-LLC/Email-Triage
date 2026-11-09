@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from email_triage.engine.ics import build_imip_reply, parse_ics
 
 
@@ -119,3 +121,83 @@ def test_build_imip_reply_carries_partstat():
     assert parsed["uid"] == "abc@x.com"
     assert parsed["method"] == "REPLY"
     assert parsed["attendees"][0]["response_status"] == "declined"
+
+
+# --- punch 442: behaviour of the paths the suite skipped across the icalendar
+# --- 7.1.2 -> 7.3.0 bump (differential run, 26 inputs, one difference: TZID).
+
+_HEAD = (
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//T//EN\r\nBEGIN:VEVENT\r\n"
+    "UID:u1@x\r\nSUMMARY:S\r\n"
+)
+_TAIL = "END:VEVENT\r\nEND:VCALENDAR\r\n"
+
+
+def _vevent(props: str) -> bytes:
+    return (_HEAD + props + _TAIL).encode()
+
+
+def test_parse_tzid_event_converts_to_utc_with_dst():
+    out = parse_ics(_vevent(
+        "DTSTART;TZID=America/New_York:20260420T100000\r\n"
+        "DTEND;TZID=America/New_York:20260420T110000\r\n"
+    ))
+    assert out is not None
+    # April is EDT (UTC-4): 10:00 local is 14:00Z.
+    assert out["start"] == datetime(2026, 4, 20, 14, 0, tzinfo=timezone.utc)
+    assert out["end"] == datetime(2026, 4, 20, 15, 0, tzinfo=timezone.utc)
+    assert out["all_day"] is False
+
+
+def test_parse_globally_unique_tzid_resolves_the_zone_not_utc():
+    """icalendar 7.1.2 read a /vendor/Europe/Berlin TZID as UTC (10:00Z, two
+    hours wrong); 7.3.0 strips the vendor prefix and warns. Berlin is CEST
+    (UTC+2) in April, so 10:00 local is 08:00Z."""
+    from icalendar.error import GloballyUniqueTZIDGuessed
+
+    with pytest.warns(GloballyUniqueTZIDGuessed):
+        out = parse_ics(_vevent(
+            "DTSTART;TZID=/freeassociation.sourceforge.net/Europe/Berlin:20260420T100000\r\n"
+        ))
+    assert out is not None
+    assert out["start"] == datetime(2026, 4, 20, 8, 0, tzinfo=timezone.utc)
+
+
+def test_parse_attendee_params_are_flattened_with_quoted_cn():
+    out = parse_ics(_vevent(
+        "DTSTART:20260420T140000Z\r\n"
+        'ATTENDEE;CN="Doe, Jane";PARTSTAT=TENTATIVE;ROLE=OPT-PARTICIPANT:mailto:jane@x.org\r\n'
+    ))
+    assert out is not None
+    assert out["attendees"] == [{
+        "email": "jane@x.org",
+        "name": "Doe, Jane",
+        "response_status": "tentative",
+        "role": "OPT-PARTICIPANT",
+    }]
+
+
+def test_parse_unfolds_and_unescapes_text_values():
+    out = parse_ics(_vevent(
+        "DTSTART:20260420T140000Z\r\n"
+        "DESCRIPTION:" + "A" * 70 + "\r\n " + "B" * 70 + "\r\n"
+        "LOCATION:Room\\, 5\\; north\r\n"
+    ))
+    assert out is not None
+    assert out["description"] == "A" * 70 + "B" * 70
+    assert out["location"] == "Room, 5; north"
+
+
+def test_parse_organizer_scheme_is_stripped_case_insensitively():
+    out = parse_ics(_vevent("DTSTART:20260420T140000Z\r\nORGANIZER;CN=Boss:MAILTO:boss@x.org\r\n"))
+    assert out is not None
+    assert out["organizer"] == "boss@x.org"
+
+
+def test_parse_non_numeric_sequence_defaults_to_zero_and_numeric_is_kept():
+    assert parse_ics(_vevent("DTSTART:20260420T140000Z\r\nSEQUENCE:abc\r\n"))["sequence"] == 0
+    assert parse_ics(_vevent("DTSTART:20260420T140000Z\r\nSEQUENCE:5\r\n"))["sequence"] == 5
+
+
+def test_parse_unparseable_dtstart_is_rejected_not_half_filled():
+    assert parse_ics(_vevent("DTSTART:garbage\r\n")) is None

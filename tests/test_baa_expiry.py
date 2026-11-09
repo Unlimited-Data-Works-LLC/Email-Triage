@@ -43,7 +43,8 @@ from email_triage.web.db import (
 @pytest.fixture
 def db():
     """Fresh in-memory DB with v26 schema applied."""
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 @pytest.fixture
@@ -74,7 +75,7 @@ def _insert_backend(
         db,
         name=name,
         type_=type_,
-        endpoint="https://example.com/v1",
+        endpoint="https://example.invalid/v1",
         api_key_secret_ref=None,
         model="gpt-4o-mini",
         baa_certified=baa_certified,
@@ -299,6 +300,52 @@ class TestAutoDisable:
         assert len(first) == 1
         assert second == []
 
+    @pytest.mark.audit_failure_expected(
+        match="baa_expiry auto-disable", count=1,
+    )
+    def test_one_failed_witness_does_not_stop_the_other_accounts(
+        self, db, user_id, monkeypatch,
+    ):
+        """S-N1 (s2 panel): per-account isolation.
+
+        The first account's witness row fails, so the funnel rolls ITS
+        clear back; the loop still disables the second account, and the
+        failed account is not reported as disabled.
+        """
+        import email_triage.db.audit as audit_mod
+
+        bid = _insert_backend(
+            db, name="ExpiredAzure",
+            baa_expires_at=_iso_today_plus(-5),
+        )
+        a1 = create_email_account(db, user_id, "A1", "imap", {}, hipaa=True)
+        a2 = create_email_account(db, user_id, "A2", "imap", {}, hipaa=True)
+        set_account_style_learning_backend(db, a1, bid)
+        set_account_style_learning_backend(db, a2, bid)
+
+        real = audit_mod.record_hipaa_access_event_txn
+
+        def _fail_first(c, **kw):
+            if kw.get("account_id") == a1:
+                raise RuntimeError("simulated witness failure")
+            return real(c, **kw)
+
+        monkeypatch.setattr(
+            audit_mod, "record_hipaa_access_event_txn", _fail_first,
+        )
+        disabled = auto_disable_expired_for_hipaa_accounts(db)
+        assert [d["account_id"] for d in disabled] == [a2]
+
+        def _fk(aid):
+            row = db.execute(
+                "SELECT style_learning_backend_id FROM email_accounts "
+                "WHERE id = ?", (aid,),
+            ).fetchone()
+            return row["style_learning_backend_id"] if hasattr(row, "keys") else row[0]
+
+        assert _fk(a1) == bid  # rolled back, still pointing at the backend
+        assert _fk(a2) is None
+
     def test_audit_row_appended_per_disabled_account(
         self, db, user_id,
     ):
@@ -361,7 +408,8 @@ class TestSurfaceHelpers:
         assert ctx["severity"] == "loud"
 
         # Reset + try expired-only
-        db2 = init_db(":memory:")
+        from _db_tracking import track
+        db2 = track(init_db(":memory:"))
         _insert_backend(
             db2, name="ExpiredAzure",
             baa_expires_at=_iso_today_plus(-10),

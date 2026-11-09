@@ -52,12 +52,16 @@ HIPAA contract:
 
 from __future__ import annotations
 
+from email_triage.db.columns import EMAIL_WATCHES_COLUMNS
+from email_triage.db._helpers import dump_json_col, load_json_col
+
 import json
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from email_triage._isotime import now_utc_iso
 from typing import Any
+from email_triage.triage_logging import REDACTED_PLACEHOLDER  # N-217 R23
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +103,27 @@ class WebhookAction:
 
 
 @dataclass
+class AutoRetireAction:
+    """ — auto-retire a watch once it has produced N matches (fires).
+
+    ``after_n <= 0`` disables the feature (the default — a watch runs
+    indefinitely). ``action`` is ``"disable"`` (set ``enabled=0``, reversible
+    — the operator can re-enable) or ``"delete"`` (remove the watch row). Stored
+    inside ``actions_json`` (no schema migration); the match count is derived
+    from the durable ``watch_fire_idempotency`` table at fire time, so it counts
+    DISTINCT delivered matches and survives restarts."""
+    after_n: int = 0
+    action: str = "disable"
+
+
+_AUTO_RETIRE_ACTIONS = ("disable", "delete")
+
+
+@dataclass
 class WatchActions:
     escalate: EscalateAction = field(default_factory=EscalateAction)
     webhook: WebhookAction = field(default_factory=WebhookAction)
+    auto_retire: AutoRetireAction = field(default_factory=AutoRetireAction)
 
 
 @dataclass
@@ -123,7 +145,7 @@ class EmailWatch:
 
     @property
     def all_accounts(self) -> bool:
-        # Kept for back-compat with the OpenClaw JSON serializer and
+        # Kept for back-compat with the webhook-API JSON serializer and
         # any downstream reader; post-v17 fresh rows always have an
         # account_id, so this is False in practice.
         return self.account_id is None
@@ -135,11 +157,13 @@ class EmailWatch:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_iso()
 
 
 def _new_id() -> str:
-    return f"watch_{uuid.uuid4().hex[:12]}"
+    # N-244 R24: SSOT — `_ids.new_short_id`. Byte-identical wire shape.
+    from email_triage._ids import new_short_id
+    return new_short_id("watch")
 
 
 def hmac_secret_key(watch_id: str) -> str:
@@ -165,6 +189,7 @@ def _coerce_actions(raw: Any) -> WatchActions:
     return WatchActions(
         escalate=_coerce(EscalateAction, raw.get("escalate")),
         webhook=_coerce(WebhookAction, raw.get("webhook")),
+        auto_retire=_coerce(AutoRetireAction, raw.get("auto_retire")),
     )
 
 
@@ -172,7 +197,7 @@ def from_dict(raw: dict[str, Any]) -> EmailWatch:
     """Hydrate a stored dict into an EmailWatch.
 
     Tolerates partial / unknown keys; missing fields default. Used by
-    the OpenClaw API + the UI route handlers.
+    the webhook API + the UI route handlers.
     """
     if not isinstance(raw, dict):
         return EmailWatch()
@@ -241,6 +266,13 @@ def validate(w: EmailWatch) -> list[str]:
             "fires on every email."
         )
 
+    if "@" in (f.from_domain or ""):
+        errors.append(
+            "Sender domain must not contain '@' — enter just the domain "
+            "part (e.g., 'example.com', not 'alice@example.com'). Use "
+            "the 'From address' field for a full address."
+        )
+
     # At least one action selected.
     a = w.actions
     if not (a.escalate.enabled or a.webhook.enabled):
@@ -259,6 +291,17 @@ def validate(w: EmailWatch) -> list[str]:
             errors.append(
                 "Webhook URL must start with http:// or https:// — "
                 "example: http://192.168.1.10:8080/hook."
+            )
+
+    #  — auto-retire config. Off by default (after_n <= 0); when on,
+    # require a sane positive threshold + a known action.
+    ar = a.auto_retire
+    if ar.after_n:
+        if not isinstance(ar.after_n, int) or ar.after_n < 0:
+            errors.append("Auto-retire 'after N matches' must be a positive whole number.")
+        if ar.action not in _AUTO_RETIRE_ACTIONS:
+            errors.append(
+                "Auto-retire action must be 'disable' (re-enableable) or 'delete'."
             )
 
     return errors
@@ -286,8 +329,8 @@ def _row_to_watch(row: sqlite3.Row | tuple) -> EmailWatch:
         name=d["name"],
         enabled=bool(d["enabled"]),
         account_id=d["account_id"],
-        filter=_coerce(WatchFilter, json.loads(d["filter_json"] or "{}")),
-        actions=_coerce_actions(json.loads(d["actions_json"] or "{}")),
+        filter=_coerce(WatchFilter, load_json_col(d["filter_json"], default={})),
+        actions=_coerce_actions(load_json_col(d["actions_json"], default={})),
         created_at=d.get("created_at", "") or "",
         updated_at=d.get("updated_at", "") or "",
         watch_group_id=d.get("watch_group_id") or None,
@@ -312,18 +355,18 @@ def list_watches(
     """
     if account_id is None:
         rows = db.execute(
-            "SELECT * FROM email_watches ORDER BY created_at ASC"
+            f"SELECT {EMAIL_WATCHES_COLUMNS} FROM email_watches ORDER BY created_at ASC"
         ).fetchall()
     elif include_all_accounts:
         rows = db.execute(
-            "SELECT * FROM email_watches "
+            f"SELECT {EMAIL_WATCHES_COLUMNS} FROM email_watches "
             "WHERE account_id = ? OR account_id IS NULL "
             "ORDER BY created_at ASC",
             (account_id,),
         ).fetchall()
     else:
         rows = db.execute(
-            "SELECT * FROM email_watches "
+            f"SELECT {EMAIL_WATCHES_COLUMNS} FROM email_watches "
             "WHERE account_id = ? "
             "ORDER BY created_at ASC",
             (account_id,),
@@ -333,7 +376,7 @@ def list_watches(
 
 def get_watch(db: sqlite3.Connection, watch_id: str) -> EmailWatch | None:
     row = db.execute(
-        "SELECT * FROM email_watches WHERE watch_id = ?", (watch_id,),
+        f"SELECT {EMAIL_WATCHES_COLUMNS} FROM email_watches WHERE watch_id = ?", (watch_id,),
     ).fetchone()
     if row is None:
         return None
@@ -341,15 +384,28 @@ def get_watch(db: sqlite3.Connection, watch_id: str) -> EmailWatch | None:
 
 
 def upsert_watch(db: sqlite3.Connection, w: EmailWatch) -> EmailWatch:
-    """Insert or update a watch. Mints id + created_at if absent."""
+    """Insert or update a watch. Mints id + created_at if absent.
+
+    OWN-COMMIT wrapper over :func:`upsert_watch_txn` (one author for the row
+    SQL, PD#5).
+    """
+    upsert_watch_txn(db, w)
+    db.commit()
+    return w
+
+
+def upsert_watch_txn(db: sqlite3.Connection, w: EmailWatch) -> EmailWatch:
+    """TXN-AWARE :func:`upsert_watch` — does NOT commit; the caller owns the
+    transaction (N-539: a watch-group save and its access-event rows commit
+    together)."""
     if not w.watch_id:
         w.watch_id = _new_id()
     now = _now_iso()
     if not w.created_at:
         w.created_at = now
     w.updated_at = now
-    filter_json = json.dumps(asdict(w.filter))
-    actions_json = json.dumps(asdict(w.actions))
+    filter_json = dump_json_col(asdict(w.filter))
+    actions_json = dump_json_col(asdict(w.actions))
     db.execute(
         "INSERT INTO email_watches "
         "(watch_id, name, enabled, account_id, filter_json, actions_json, "
@@ -370,7 +426,6 @@ def upsert_watch(db: sqlite3.Connection, w: EmailWatch) -> EmailWatch:
             w.watch_group_id, w.created_by_user_id,
         ),
     )
-    db.commit()
     return w
 
 
@@ -423,6 +478,8 @@ def list_watch_groups_for_user(
         (user_id, user_id),
     ).fetchall()
 
+    from email_triage.web.watch_runner import watch_row_refusal
+    fires_memo: dict[tuple[Any, Any], str | None] = {}
     by_group: dict[str, dict[str, Any]] = {}
     for r in rows:
         d = dict(r)
@@ -432,9 +489,16 @@ def list_watch_groups_for_user(
         # below is deterministic across legacy + new rows.
         if wgi:
             key = f"gid:{wgi}"
+        elif d.get("created_by_user_id"):
+            # Legacy rows with a KNOWN creator still group by (creator, name).
+            key = f"legacy:{d['created_by_user_id']}:{d.get('name') or ''}"
         else:
-            creator = d.get("created_by_user_id") or "_"
-            key = f"legacy:{creator}:{d.get('name') or ''}"
+            #  — a doubly-NULL legacy row (no watch_group_id AND no creator)
+            # is its OWN group, keyed by watch_id. Grouping NULL-creator rows by
+            # name would merge two UNRELATED watches that happen to share a name
+            # → an auto-retire/delete on one would wrongly hit the other.
+            # Mirrored in _group_watch_ids.
+            key = f"legacy:none:{d.get('watch_id')}"
 
         if key not in by_group:
             by_group[key] = {
@@ -443,8 +507,27 @@ def list_watch_groups_for_user(
                 "representative": _row_to_watch(r),
                 "account_ids": [],
                 "watch_ids": [],
+                # N-564: an enabled row the fire gate refuses is "not firing"
+                # (any reason: no creator, a creator who lost access, a
+                # disabled creator), through the gate's own predicate (PD-18).
+                # "unattributed" is the subset with no creator, the one a
+                # save re-claims. "not_firing_reasons" names each refusal
+                # (punch 578 adds creator_not_owner_hipaa) so the line says
+                # why.
+                "not_firing": False,
+                "unattributed": False,
+                "not_firing_reasons": [],
             }
         entry = by_group[key]
+        if d.get("enabled"):
+            w_row = _row_to_watch(r)
+            reason = watch_row_refusal(db, w_row, fires_memo)
+            if reason is not None:
+                entry["not_firing"] = True
+                if reason not in entry["not_firing_reasons"]:
+                    entry["not_firing_reasons"].append(reason)
+                if w_row.created_by_user_id is None:
+                    entry["unattributed"] = True
         if d.get("account_id") is not None:
             entry["account_ids"].append(int(d["account_id"]))
         entry["watch_ids"].append(d["watch_id"])
@@ -471,7 +554,7 @@ def get_watch_group(
     return None
 
 
-def save_watch_group(
+def save_watch_group_txn(
     db: sqlite3.Connection,
     *,
     user_id: int,
@@ -481,8 +564,18 @@ def save_watch_group(
     filter_: WatchFilter,
     actions: WatchActions,
     target_account_ids: list[int],
-) -> tuple[str, list[str], list[str]]:
-    """Insert / update / delete watch rows so the group exactly matches
+) -> tuple[str, list[str], list[str], list[int]]:
+    """TXN-AWARE: does NOT commit; the caller owns the transaction. The
+    only caller is ``db/audit.record_watch_group_save`` (N-539), which commits
+    the rows together with their access-event rows; there is deliberately no
+    own-commit wrapper (panel B2 DA-5: it had no caller and no witness).
+
+    Returns ``(group_id_final, created_watch_ids, deleted_watch_ids,
+    unbound_account_ids)``. The fourth element names the accounts whose row
+    this save DELETED, so the caller's access-event loop can witness an
+    unbind as well as a bind.
+
+    Insert / update / delete watch rows so the group exactly matches
     ``target_account_ids``.
 
     Behaviour for each ticked account_id:
@@ -507,6 +600,8 @@ def save_watch_group(
       * ``user_id`` is the creator-attribution for any newly-inserted
         row. Existing rows keep their original ``created_by_user_id``.
     """
+    from email_triage.web.account_scope import user_id_may_manage_account
+
     existing = None
     if group_id:
         existing = get_watch_group(db, group_id, user_id)
@@ -527,6 +622,7 @@ def save_watch_group(
 
     created_watch_ids: list[str] = []
     deleted_watch_ids: list[str] = []
+    unbound_account_ids: list[int] = []
 
     # UPDATE + INSERT.
     for acct_id in target_set:
@@ -538,8 +634,19 @@ def save_watch_group(
             w.actions = actions
             w.watch_group_id = wgi
             # Preserve the original creator on update; do not
-            # overwrite with the actor's user_id.
-            upsert_watch(db, w)
+            # overwrite with the actor's user_id. EXCEPT an unattributed
+            # row (NULL creator: legacy, or created through the N-564
+            # agent-API hole). The fire-time gate refuses it, and a save by
+            # a user who may manage this account is the explicit re-claim.
+            # The manageable check is HERE, at the write (PD#9 actuator;
+            # hipaa-sme panel B2 landing L-4): a stamped creator joins that
+            # user's group listing, so a caller that skipped its own filter
+            # must not hand the row to someone outside the account's scope.
+            if w.created_by_user_id is None and user_id_may_manage_account(
+                db, user_id, acct_id,
+            ):
+                w.created_by_user_id = user_id
+            upsert_watch_txn(db, w)
         else:
             w = EmailWatch(
                 watch_id="",
@@ -551,16 +658,17 @@ def save_watch_group(
                 watch_group_id=wgi,
                 created_by_user_id=user_id,
             )
-            upsert_watch(db, w)
+            upsert_watch_txn(db, w)
             created_watch_ids.append(w.watch_id)
 
     # DELETE the ones the operator unticked.
     for acct_id in (existing_set - target_set):
         w = existing_by_acct[acct_id]
-        if delete_watch(db, w.watch_id):
+        if delete_watch_txn(db, w.watch_id):
             deleted_watch_ids.append(w.watch_id)
+            unbound_account_ids.append(acct_id)
 
-    return f"gid:{wgi}", created_watch_ids, deleted_watch_ids
+    return f"gid:{wgi}", created_watch_ids, deleted_watch_ids, unbound_account_ids
 
 
 def delete_watch(db: sqlite3.Connection, watch_id: str) -> bool:
@@ -569,13 +677,158 @@ def delete_watch(db: sqlite3.Connection, watch_id: str) -> bool:
     Deleting a watch does NOT remove its HMAC secret from the secrets
     store automatically — that is left to the caller (the UI / API
     handlers do the cleanup). Keeps this function side-effect-only on
-    the DB.
+    the DB. OWN-COMMIT wrapper over :func:`delete_watch_txn`.
     """
+    removed = delete_watch_txn(db, watch_id)
+    db.commit()
+    return removed
+
+
+def delete_watch_txn(db: sqlite3.Connection, watch_id: str) -> bool:
+    """TXN-AWARE :func:`delete_watch` — does NOT commit."""
     cur = db.execute(
         "DELETE FROM email_watches WHERE watch_id = ?", (watch_id,),
     )
-    db.commit()
     return cur.rowcount > 0
+
+
+def _group_watch_ids(db: sqlite3.Connection, watch: EmailWatch) -> list[str]:
+    """Every ``watch_id`` in the SAME logical watch (group) as ``watch``.
+
+    A user-facing watch is a GROUP of per-account rows sharing a
+    ``watch_group_id`` (``save_watch_group_txn`` fans the multi-account select out
+    to one row per account). The grouping here MIRRORS
+    :func:`list_watch_groups_for_user`: by ``watch_group_id`` when set, else the
+    legacy ``(created_by_user_id, name)`` key for pre-v17 rows that have a
+    KNOWN creator. A doubly-NULL legacy row (no group column AND no creator) is
+    a SINGLETON — see . Returns ``[watch.watch_id]`` as a defensive fallback
+    if the lookup finds nothing (e.g. an unsaved watch).
+    """
+    if watch.watch_group_id:
+        rows = db.execute(
+            "SELECT watch_id FROM email_watches WHERE watch_group_id = ?",
+            (watch.watch_group_id,),
+        ).fetchall()
+    elif watch.created_by_user_id is not None:
+        # Legacy fallback for a KNOWN creator — match (creator, name). A
+        # NULL-creator row is excluded by the equality (NULL = ? is never true),
+        # mirroring list_watch_groups_for_user's known-creator key.
+        rows = db.execute(
+            "SELECT watch_id FROM email_watches "
+            "WHERE watch_group_id IS NULL "
+            "AND created_by_user_id = ? "
+            "AND IFNULL(name, '') = IFNULL(?, '')",
+            (watch.created_by_user_id, watch.name),
+        ).fetchall()
+    else:
+        #  — a doubly-NULL legacy row (no watch_group_id AND no creator) is a
+        # SINGLETON: grouping NULL-creator rows by name would over-group two
+        # UNRELATED same-name watches, so an auto-retire/delete on one would
+        # wrongly hit the other. Mirrors list_watch_groups_for_user.
+        return [watch.watch_id]
+    ids = [r[0] for r in rows]
+    return ids or [watch.watch_id]
+
+
+def delete_watch_hmac_secrets(secrets: Any, watch_ids: list[str]) -> None:
+    """Best-effort: remove each watch's HMAC secret (``watch_<id>_hmac``) from
+    the secrets store. Backends without a ``delete`` primitive (or that error)
+    leave a dangling key — harmless, since ``watch_id``s are never reused so the
+    key is never matched again. The SSOT both the interactive watch-delete and
+    the  auto-retire DELETE call, so the two clean up identically."""
+    if secrets is None or not hasattr(secrets, "delete"):
+        return
+    for wid in watch_ids:
+        try:
+            secrets.delete(hmac_secret_key(wid))
+        except Exception:
+            pass
+
+
+def maybe_auto_retire_watch(
+    db: sqlite3.Connection, watch: EmailWatch, *, secrets: Any = None,
+) -> str | None:
+    """ — retire a watch that has hit its auto-retire match threshold.
+
+    Call AFTER a new DELIVERED fire has been recorded in
+    ``watch_fire_idempotency`` (the durable, per-distinct-message fire log).
+
+    Counts at the GROUP grain: a user-facing watch may span several accounts
+    (one ``email_watches`` row each, sharing a ``watch_group_id``), but the
+    operator sets ONE ``after_n`` threshold for the whole watch. So this sums
+    delivered fires across EVERY row in the group and, at/above
+    ``actions.auto_retire.after_n``, retires the group ATOMICALLY:
+      * ``"disable"`` — ``enabled = 0`` on every row (REVERSIBLE; re-enableable),
+      * ``"delete"``  — remove every row in the group (+ purge its now-dead
+        ``watch_fire_idempotency`` rows AND, when ``secrets`` is threaded in,
+        each row's ``watch_<id>_hmac`` secret — ; ``watch_id``s never reused).
+    A single-account watch is just a group of one, so its behavior is unchanged.
+    Counting per-row would make "after N" mean "N PER ACCOUNT" and, for delete,
+    fragment the group account-by-account — the bug this grain fixes.
+
+    Returns ``"disabled"`` / ``"deleted"`` if it retired, else ``None`` (which
+    includes the off case, ``after_n <= 0``). Counting the durable table means
+    the threshold is exact across restarts + ignores idempotent re-fires.
+    Sync DB work — dispatch via ``db_call`` (its  RLock serializes the whole
+    call, so the multi-statement delete/disable is atomic against other writers).
+    """
+    ar = getattr(watch.actions, "auto_retire", None)
+    if not ar or not ar.after_n or ar.after_n <= 0:
+        return None
+    ids = _group_watch_ids(db, watch)
+    placeholders = ",".join("?" for _ in ids)
+    row = db.execute(
+        f"SELECT COUNT(*) FROM watch_fire_idempotency "
+        f"WHERE watch_id IN ({placeholders})",
+        ids,
+    ).fetchone()
+    fires = int(row[0] if row else 0)
+    if fires < ar.after_n:
+        return None
+    #  — record the retirement in access_log (operator-visible on /compliance)
+    # BEFORE the action, so a DELETE that removes the rows still leaves the trail.
+    # Best-effort: the retire is the source of truth + the runner still log.info's,
+    # so a failed audit row must not block the retire.
+    try:
+        write_auto_retire_audit_row(
+            db, watch=watch, account_id=watch.account_id,
+            action=ar.action, fires=fires, after_n=ar.after_n,
+            rows_affected=len(ids),
+        )
+    except Exception:
+        # N-242b R24: TriageLogger SSOT.
+        from email_triage.triage_logging import get_logger
+        get_logger("web.email_watches").warning(
+            "watch auto-retire audit row failed (continuing)",
+            watch_id=watch.watch_id,
+        )
+    if ar.action == "delete":
+        # Atomic group delete + purge the group's dead fire log.
+        db.execute(
+            f"DELETE FROM watch_fire_idempotency WHERE watch_id IN ({placeholders})",
+            ids,
+        )
+        db.execute(
+            f"DELETE FROM email_watches WHERE watch_id IN ({placeholders})",
+            ids,
+        )
+        db.commit()
+        #  — also purge each deleted watch's HMAC secret. The interactive
+        # delete path already does this; the auto-retire DELETE used to leave
+        # the per-watch ``watch_<id>_hmac`` key dangling. Best-effort + after
+        # the row delete commits (the rows are the source of truth; a leftover
+        # secret is harmless but untidy). When ``secrets`` isn't threaded in
+        # (e.g. a db-only test caller), this is a no-op.
+        delete_watch_hmac_secrets(secrets, ids)
+        return "deleted"
+    # "disable" (default): reversible — disable every row in the group.
+    db.execute(
+        f"UPDATE email_watches SET enabled = 0, updated_at = ? "
+        f"WHERE watch_id IN ({placeholders})",
+        [_now_iso(), *ids],
+    )
+    db.commit()
+    return "disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -588,18 +841,22 @@ def _email_address(sender: str) -> str:
 
     "Alice <a@b.com>" -> "a@b.com"
     "a@b.com"          -> "a@b.com"
+
+    A7 (census 2026-06-09): delegates to the bare-address SSOT. The old
+    ``s[s.index("<"):s.index(">")]`` first-bracket slice produced garbage
+    when the display name itself contained ``>`` (e.g. ``"A > B" <a@b>``);
+    the SSOT regex anchors on the addr-spec block. (The SSOT also
+    lower-cases — correct for case-insensitive sender/domain matching.)
     """
-    s = (sender or "").strip()
-    if "<" in s and ">" in s:
-        return s[s.index("<") + 1 : s.index(">")].strip()
-    return s
+    from email_triage.mail_headers import extract_bare_address
+    return extract_bare_address(sender)
 
 
 def _domain_of(addr: str) -> str:
-    a = _email_address(addr).lower()
-    if "@" in a:
-        return a.split("@", 1)[1]
-    return ""
+    # N-71: delegate to the mail_headers.extract_domain SSOT (rsplit on the
+    # rightmost @ so double-@ spoof addresses resolve to the real domain).
+    from email_triage.mail_headers import extract_domain as _ed
+    return _ed(addr)
 
 
 def matches(watch: EmailWatch, *, sender: str, subject: str,
@@ -645,17 +902,34 @@ def matches(watch: EmailWatch, *, sender: str, subject: str,
     if has_advanced and not has_structured:
         return True
 
-    sender_email = _email_address(sender).lower()
-    sender_domain = _domain_of(sender)
+    # run21 D3 fold: route BOTH needle and haystack through canonical_email
+    # SSOT — N-317 IDNA parity. Without this the haystack (sender_email /
+    # sender_domain) was NOT IDNA-normalized while the from_addr needle
+    # was — a §164.312(a)(1) watcher allow-list bypass on IDN A/U-label
+    # envelope variants (alice@münchen.de vs alice@xn--mnchen-3ya.de).
+    from email_triage.mail_headers import canonical_email
+    sender_email = canonical_email(sender)
+    # Derive domain from the already-canonicalized sender so the domain
+    # gate inherits the IDNA fold; empty-string sentinel preserved when
+    # sender has no @ (canonical_email returns "" or a no-@ bare form).
+    sender_domain = sender_email.rpartition("@")[2] if "@" in sender_email else ""
     subj_l = (subject or "").lower()
     body_l = (body_text or "").lower()
 
     if (f.from_addr or "").strip():
-        if (f.from_addr or "").strip().lower() not in sender_email:
+        # N-253 R25: route through canonical-email SSOT so a display-
+        # name-wrapped filter value matches the bare-address sender_email
+        # against the allow-list gate.
+        if canonical_email(f.from_addr) not in sender_email:
             return False
     if (f.from_domain or "").strip():
-        needle = (f.from_domain or "").strip().lower().lstrip("@")
-        if needle not in sender_domain:
+        # run21 D3 fold: IDNA-normalize the needle via the canonical_email
+        # SSOT (synthetic local-part so the helper's @-shape contract is
+        # met). Keeps both sides of the domain gate on the same normal
+        # form — N-317 IDNA parity.
+        raw_needle = (f.from_domain or "").strip().lower().lstrip("@")
+        needle = canonical_email(f"_@{raw_needle}").rpartition("@")[2] if raw_needle else ""
+        if not needle or needle not in sender_domain:
             return False
     if (f.subject_contains or "").strip():
         if (f.subject_contains or "").strip().lower() not in subj_l:
@@ -678,9 +952,10 @@ def _first_name(sender: str) -> str:
     "Dr. Jane Smith <a@b.com>" -> "Jane"
     "a@b.com"                  -> "a"
     """
+    from email_triage.mail_headers import extract_display_name
     s = (sender or "").strip()
     if "<" in s:
-        s = s.split("<")[0].strip().strip('"')
+        s = extract_display_name(sender)  # census run13  — shared <…> extraction
     parts = s.split()
     prefixes = {"dr.", "mr.", "mrs.", "ms.", "prof."}
     for p in parts:
@@ -711,7 +986,7 @@ def shape_webhook_payload(
     """
     if hipaa:
         out_sender = f"{_first_name(sender)} @ {_domain_of(sender)}".strip(" @")
-        out_subject = "[redacted]"
+        out_subject = REDACTED_PLACEHOLDER
         redaction = "hipaa_redacted"
     else:
         out_sender = sender or ""
@@ -781,4 +1056,126 @@ def write_audit_row(
         outcome=outcome,
         detail=detail,
         request_id=request_id,
+    )
+
+
+_SCOPE_REFUSED_OUTCOME = "watch_fire_refused_scope"
+
+
+def write_scope_refused_audit_row(
+    db: sqlite3.Connection,
+    *,
+    watch: EmailWatch,
+    account_id: int | None,
+    reason: str,
+) -> int | None:
+    """One ``access_log`` row through the ``record_access_event`` emitter when
+    the fire-time creator gate refuses a watch (N-564). At most one row
+    per watch per account per refusal reason per UTC day: the gate refuses on
+    every matching message, and a row per fire would flood the trail
+    (hipaa-b2 Addendum 6), while a NEW reason the same day (punch 578: an
+    account flipped to HIPAA under a delegate's watch) is a new fact and gets
+    its own row. PHI-free: the
+    detail carries watch_id, account_id, the creator (null when unattributed)
+    and the reason; no watch name, no message_id. Returns the row id, or None
+    when today's row already exists."""
+    from email_triage.web.db import record_access_event
+
+    route = f"/internal/watches/{watch.watch_id}/fire"
+    day_start = _now_iso()[:10]
+    # Per watch AND account: an all-accounts row refused on several accounts
+    # names each of them (hipaa-sme A3).
+    for (prior,) in db.execute(
+        "SELECT detail FROM access_log WHERE route = ? AND outcome = ? AND ts >= ? "
+        "AND account_id IS ?",
+        (route, _SCOPE_REFUSED_OUTCOME, day_start, account_id),
+    ).fetchall():
+        if load_json_col(prior, default={}).get("reason") == reason:
+            return None
+    detail = json.dumps({
+        "watch_id": watch.watch_id,
+        "account_id": account_id,
+        "creator": watch.created_by_user_id,
+        "reason": reason,
+    })
+    return record_access_event(
+        db,
+        actor_user_id=None,
+        method="POST",
+        route=route,
+        account_id=account_id,
+        message_id=None,
+        status_code=403,
+        outcome=_SCOPE_REFUSED_OUTCOME,
+        detail=detail,
+    )
+
+
+def count_not_firing_watches(db: sqlite3.Connection) -> tuple[int, int]:
+    """``(not_firing, unattributed)`` over enabled ACCOUNT-BOUND watches: how
+    many the fire gate refuses, through its own predicate
+    (``watch_runner.watch_row_fires``), and how many of those have no creator
+    at all. Feeds the ``watch_unattributed`` admin alert. All-accounts rows
+    (``account_id IS NULL``) are left out: no owner can see or re-save one,
+    so they would hold the alert open forever (DA F3). They are kept, never
+    deleted: their webhook URL is lookback evidence (hipaa-b2 Addendum 5)."""
+    from email_triage.web.watch_runner import watch_row_fires
+    rows = db.execute(
+        "SELECT watch_id, account_id, created_by_user_id FROM email_watches "
+        "WHERE enabled = 1 AND account_id IS NOT NULL"
+    ).fetchall()
+    memo: dict[tuple[Any, Any], str | None] = {}
+    not_firing = unattributed = 0
+    for r in rows:
+        w = EmailWatch(
+            watch_id=r["watch_id"], name="", account_id=r["account_id"],
+            created_by_user_id=r["created_by_user_id"] or None,
+        )
+        if not watch_row_fires(db, w, memo):
+            not_firing += 1
+            if w.created_by_user_id is None:
+                unattributed += 1
+    return not_firing, unattributed
+
+
+def write_auto_retire_audit_row(
+    db: sqlite3.Connection,
+    *,
+    watch: EmailWatch,
+    account_id: int | None,
+    action: str,
+    fires: int,
+    after_n: int,
+    rows_affected: int,
+) -> int:
+    """ — operator-visible ``access_log`` row when a watch AUTO-retires.
+
+    The auto-retire previously emitted only a ``log.info``, so a watch that
+    auto-disabled/deleted itself vanished from the UI with no operator-facing
+    trail (especially for the irreversible ``delete``). This lands a row in the
+    same ``access_log`` the fires write to (rendered on /compliance), via the
+    ``record_access_event`` emitter SSOT — never a raw INSERT (that would fork
+    the audit HMAC chain). PHI-free detail: watch metadata + counts only.
+    """
+    from email_triage.web.db import record_access_event
+
+    detail = json.dumps({
+        "watch_id": watch.watch_id,
+        "watch_name": watch.name,
+        "auto_retire_action": action,      # "disable" | "delete"
+        "fires": fires,
+        "after_n": after_n,
+        "rows_affected": rows_affected,
+    })
+    return record_access_event(
+        db,
+        actor_user_id=None,                # system-initiated, not a user action
+        method="POST",
+        route=f"/internal/watches/{watch.watch_id}/auto-retire",
+        account_id=account_id,
+        message_id=None,
+        status_code=200,
+        # "watch_auto_disabled" / "watch_auto_deleted" — distinct, greppable.
+        outcome=f"watch_auto_{action}d",
+        detail=detail,
     )

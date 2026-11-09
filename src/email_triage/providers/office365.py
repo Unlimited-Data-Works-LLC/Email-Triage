@@ -28,12 +28,15 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from email_triage._egress import Intent, egress_async_client
+from email_triage._errfmt import fmt_exc
 from email_triage._isotime import parse_iso
 from email_triage.engine.models import EmailMessage
 from email_triage.providers.base import EmailProvider, PushCapable
 from email_triage.providers._oauth_http import oauth_request, refresh_lock_for
 
-logger = logging.getLogger("email_triage.providers.office365")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+logger = get_logger("email_triage.providers.office365")  # N-196b R21_4
 
 # Guard the import — msal is optional.
 try:
@@ -43,6 +46,27 @@ except ImportError:
     HAS_MSAL = False
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# -d (2026-07-11) — CONFIG-DRIVEN Graph API httpx client timeout,
+# per feedback_dynamic_over_hardcoding. Pre-fix: hardcoded
+# ``timeout=30.0`` at the egress_async_client construction site.
+# Module-level SSOT with a boot-wired setter; the per-instance
+# ``_get_http`` reads the current constant when constructing its
+# LazyHttpClient. Existing clients keep their captured timeout —
+# a live tune reaches new provider instances only.
+_O365_HTTP_TIMEOUT_SECS: float = 30.0
+
+
+def configure_o365_http_timeout(timeout_secs: float) -> None:
+    """-d — set the Microsoft Graph API client timeout budget.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    the resolved ``config.office365_oauth.http_timeout_secs`` value.
+    Rejects non-positive values.
+    """
+    global _O365_HTTP_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _O365_HTTP_TIMEOUT_SECS = float(timeout_secs)
 
 # Default scopes for delegated access to user mail.
 DEFAULT_SCOPES = [
@@ -63,6 +87,17 @@ _MESSAGE_SELECT = (
     "id,subject,from,toRecipients,ccRecipients,"
     "body,bodyPreview,receivedDateTime,categories,"
     "conversationId,isRead,isDraft,importance,flag"
+)
+
+# Header-only projection (§164.502(b) minimum-necessary, run17 #8): the
+# listing select MINUS the PHI body fields. DERIVED from _MESSAGE_SELECT (not
+# a hand-copied second list) so the two can't drift — a metadata field added
+# to the listing select is automatically carried here, while ``body`` /
+# ``bodyPreview`` stay excluded. Used by ``fetch_message(headers_only=True)``,
+# which also drops ``$expand=attachments`` so Graph never returns attachment
+# bytes for a metadata-only caller.
+_MESSAGE_SELECT_HEADERS_ONLY = ",".join(
+    f for f in _MESSAGE_SELECT.split(",") if f not in {"body", "bodyPreview"}
 )
 
 
@@ -125,7 +160,15 @@ class Office365Provider(EmailProvider, PushCapable):
         client_id: str = "",
         tenant_id: str = "common",
         client_secret: str = "",
-        token_cache_path: str = "./data/msal_cache.json",
+        # N-202 R22 (2026-07-02): NO DEFAULT — census run22 R22_3
+        # (§164.310(d)(2)(i) + §164.312(a)(1)) — the pre-N-202 default
+        # `"./data/msal_cache.json"` was the SHARED SINGLETON that pooled
+        # every O365 account's OAuth refresh token in one file. Any
+        # caller that forgot `token_cache_path=` silently cross-pooled.
+        # Now required — the runtime raises TypeError on omission (fail-
+        # closed), forcing callers to route through
+        # `providers.factory.msal_cache_path_for_account(account_id)`.
+        token_cache_path: str = "",
         username: str = "",
         scopes: list[str] | None = None,
     ):
@@ -134,11 +177,20 @@ class Office365Provider(EmailProvider, PushCapable):
                 "msal is required for the Office 365 provider. "
                 "Install with: pip install email-triage[office365]"
             )
+        # N-202 R22: fail-closed on empty token_cache_path (see kwarg doc above).
+        if not token_cache_path:
+            raise ValueError(
+                "Office365Provider: token_cache_path is REQUIRED "
+                "(pre-N-202 shared-singleton default was a cross-account "
+                "credential-pool defect §164.310(d)(2)(i)). Route through "
+                "providers.factory.msal_cache_path_for_account(account_id)."
+            )
         self._client_id = client_id
         self._tenant_id = tenant_id
         self._client_secret = client_secret
         self._token_cache_path = Path(token_cache_path)
-        self._username = (username or "").strip().lower()
+        from email_triage.mail_headers import canonical_email
+        self._username = canonical_email(username or "")  # N-346 partial 3
         self._scopes = scopes or DEFAULT_SCOPES
         self._http: httpx.AsyncClient | None = None
         self._app: Any = None  # MSAL application
@@ -151,6 +203,34 @@ class Office365Provider(EmailProvider, PushCapable):
         self._access_token: str | None = None
         self._token_expires_at: float = 0.0
 
+        # N-151 DA fold P4 (SOFT variant, N-151-tail fix-forward on the
+        # CI-red at `7f94b840`): DA wanted fail-loud AT BOOT on missing
+        # master key.  A hard raise here breaks the ~10 existing
+        # `tests/test_providers/test_office365.py` tests that instantiate
+        # `Office365Provider(...)` without provisioning a master key
+        # (they mock at the HTTP layer, never exercise `_save_cache`).
+        # SOFT variant: probe the accessor + record availability on
+        # `self._master_key_available`.  On unavailable — WARN log at
+        # construction so operator sees the misconfig at boot (not just
+        # on the first save attempt), and `_save_cache` still fails-
+        # CLOSED via `encrypt_cache`'s raise-on-missing-key (structural
+        # plaintext-write impossibility preserved per PD #8).
+        from email_triage.providers._msal_cache_crypto import (
+            _get_master_key,
+        )
+        self._master_key_available = True
+        try:
+            _get_master_key()
+        except Exception:
+            self._master_key_available = False
+            logger.warning(
+                "Office365Provider: N-151 master key unavailable at "
+                "construction — `_save_cache` will fail-CLOSED via "
+                "encrypt_cache.  Check the bootstrap secrets backend "
+                "(`cfg.secrets.master_key_name`) if this is a prod "
+                "instance.",
+            )
+
     @property
     def name(self) -> str:
         return "office365"
@@ -160,20 +240,100 @@ class Office365Provider(EmailProvider, PushCapable):
     # ------------------------------------------------------------------
 
     def _init_cache(self) -> Any:
-        """Load or create a serialisable MSAL token cache."""
+        """Load or create a serialisable MSAL token cache.
+
+        N-151 (2026-07-08): file bytes are Fernet-encrypted at rest via
+        ``providers._msal_cache_crypto``.  Fail-CLOSED on decrypt error
+        (empty cache + re-auth) — never a plaintext fall-back read.  A
+        legacy-plaintext file (pre-N-151 layout) is detected + read
+        one-shot; the next ``_save_cache`` re-writes it as ciphertext.
+        """
         if self._cache is not None:
             return self._cache
 
         self._cache = msal.SerializableTokenCache()
         if self._token_cache_path.exists():
-            self._cache.deserialize(self._token_cache_path.read_text())
+            from email_triage.providers._msal_cache_crypto import (
+                decrypt_cache, read_legacy_plaintext,
+            )
+            raw = self._token_cache_path.read_bytes()
+            plaintext = decrypt_cache(raw)
+            legacy = False
+            if plaintext is None:
+                # Punch 430: the legacy branch raises the SAME at-rest
+                # WARNING the backup collector does (an unencrypted OAuth
+                # refresh token is on disk), naming this file; it used to
+                # log INFO here, so an install that never ran a backup
+                # never heard it.
+                plaintext = read_legacy_plaintext(
+                    raw, source=str(self._token_cache_path))
+                legacy = plaintext is not None
+            if plaintext is None:
+                # N-151 hipaa-sme fix #1: §164.312(b) audit-controls
+                # observability on the corrupt/tampered / wrong-master-key
+                # branch.  Silent-empty-cache loses the credential-store
+                # integrity signal; a WARN log preserves it in the same
+                # SQLiteLogHandler → HMAC-chained log_entries envelope
+                # the rest of the audit-of-record uses.  Distinguishes a
+                # legitimate never-authenticated-yet path (file absent →
+                # never enters this branch) from a decrypt-failure path
+                # (file present but not decryptable AND not legacy-
+                # plaintext-shaped) — the operator now sees the tamper /
+                # rotation-mismatch trace instead of just a re-auth prompt.
+                logger.warning(
+                    "N-151 msal cache: decrypt failed on non-legacy file; "
+                    "empty cache, forcing re-auth",
+                    extra={
+                        "path": str(self._token_cache_path),
+                        "event_class": "credential_store_integrity_failure",
+                    },
+                )
+            if plaintext is not None:
+                self._cache.deserialize(plaintext)
+                # N-151 db-sme fold #2: shrink the legacy-plaintext
+                # migration window from "next MSAL state change"
+                # (potentially indefinite for an idle account) to
+                # "boot" — force a save immediately so the on-disk
+                # file is re-written as ciphertext without waiting
+                # for the next silent-acquire.
+                if legacy:
+                    self._cache.has_state_changed = True
+                    self._save_cache()
         return self._cache
 
     def _save_cache(self) -> None:
-        """Persist the token cache if it has changed."""
+        """Persist the token cache if it has changed.
+
+        N-151 (2026-07-08): encrypt-at-rest via the ``_msal_cache_crypto``
+        Fernet envelope.  ``encrypt_cache`` RAISES on an unavailable
+        master key — a plaintext write is structurally impossible
+        (fail-CLOSED, Prime Directive #8).  Atomicity + 0o600 posture
+        preserved from the pre-N-151 write (census ).
+        """
         if self._cache and self._cache.has_state_changed:
+            # N-151-tail (7f94b840 CI fix-forward): if the master key
+            # was unavailable at construction (WARN logged there),
+            # `encrypt_cache` will raise here.  Catch + log — a raise
+            # would surface as a mid-request 500 which PD #8's fail-
+            # CLOSED contract does NOT require: the write is REFUSED
+            # (no plaintext lands), which IS fail-CLOSED; the WARN
+            # preserves observability.
+            if not self._master_key_available:
+                logger.warning(
+                    "N-151 msal cache: refusing to write — master key "
+                    "unavailable (see boot-time WARN).  Cache stays in "
+                    "memory only; next process restart will not preserve.",
+                    extra={"path": str(self._token_cache_path)},
+                )
+                return
             self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._token_cache_path.write_text(self._cache.serialize())
+            from email_triage._atomicio import atomic_write_bytes
+            from email_triage.providers._msal_cache_crypto import encrypt_cache
+            atomic_write_bytes(
+                self._token_cache_path,
+                encrypt_cache(self._cache.serialize()),
+                mode=0o600,
+            )
 
     def _get_app(self) -> Any:
         """Create or return the MSAL application instance."""
@@ -182,6 +342,12 @@ class Office365Provider(EmailProvider, PushCapable):
 
         cache = self._init_cache()
         authority = f"https://login.microsoftonline.com/{self._tenant_id}"
+        # Punch 547 / panel B1 (db F-O3-2, hipaa O3-H6): msal's default
+        # requests.Session trusts the environment, so HTTPS_PROXY and
+        # REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE reached the OAuth token path.
+        # Same rule as _egress: no environment variable steers this egress.
+        from email_triage._egress import egress_requests_session
+        http_client = egress_requests_session()
 
         if self._client_secret:
             self._app = msal.ConfidentialClientApplication(
@@ -189,12 +355,14 @@ class Office365Provider(EmailProvider, PushCapable):
                 authority=authority,
                 client_credential=self._client_secret,
                 token_cache=cache,
+                http_client=http_client,
             )
         else:
             self._app = msal.PublicClientApplication(
                 self._client_id,
                 authority=authority,
                 token_cache=cache,
+                http_client=http_client,
             )
         return self._app
 
@@ -214,8 +382,9 @@ class Office365Provider(EmailProvider, PushCapable):
         if not accounts:
             return None
         if self._username:
+            from email_triage.mail_headers import canonical_email  # N-346 partial 3
             for acc in accounts:
-                if str(acc.get("username", "")).strip().lower() == self._username:
+                if canonical_email(str(acc.get("username", ""))) == self._username:  # N-346 partial 3
                     return acc
             logger.warning(
                 "no cached MSAL account matched username; "
@@ -360,12 +529,13 @@ class Office365Provider(EmailProvider, PushCapable):
             # reads through ``acquire_token`` again, which is cheap
             # against the cache.
             await self.acquire_token()
-            self._http = httpx.AsyncClient(
+            self._http = egress_async_client(
+                intent=Intent.PROVIDER_API,
                 base_url=GRAPH_BASE,
                 headers={
                     "Content-Type": "application/json",
                 },
-                timeout=30.0,
+                timeout=_O365_HTTP_TIMEOUT_SECS,
             )
             return self._http
 
@@ -473,6 +643,7 @@ class Office365Provider(EmailProvider, PushCapable):
         *,
         batch_size: int = 500,
         resume_cursor: str | None = None,
+        filter: Any = None,  # MailFilter | None
     ):
         """Yield ``(batch, cursor)`` tuples by following Graph's
         ``@odata.nextLink``.
@@ -481,6 +652,13 @@ class Office365Provider(EmailProvider, PushCapable):
         per call (Graph caps individual collection page sizes at
         1000) and an ``@odata.nextLink`` URL when more results
         exist. Loop the link until absent.
+
+        ``filter`` (a structured :class:`MailFilter`) is translated to an
+        OData ``$filter`` and the folder routed exactly as :meth:`search`
+        does — so a windowed bulk caller (the topic back-scan's whole-mailbox
+        enumeration) gets the date constraint on EVERY page. The
+        ``@odata.nextLink`` cursor carries the ``$filter`` forward verbatim, so
+        only the first page builds params.
 
         Resume support: the cursor IS the absolute ``@odata.nextLink``
         URL. On a fresh run the caller passes ``resume_cursor=None``
@@ -497,12 +675,21 @@ class Office365Provider(EmailProvider, PushCapable):
         """
         page_size = min(int(batch_size), 1000)
         path = "/me/messages"
+        # Folder routing + structured date filter mirror :meth:`search` so a
+        # windowed enumeration constrains every page (not just $search free-text).
+        if filter is not None and getattr(filter, "folder", None):
+            path = f"/me/mailFolders/{filter.folder}/messages"
         first_params: dict[str, str] = {
             "$top": str(page_size),
             "$select": "id",
             "$orderby": "receivedDateTime desc",
         }
-        if query and query.strip().upper() != "ALL":
+        odata_filter = (
+            self._translate_filter(filter) if filter is not None else ""
+        )
+        if odata_filter:
+            first_params["$filter"] = odata_filter
+        elif query and query.strip().upper() != "ALL":
             # Mirror search's behaviour: bare query becomes $search.
             # RFC 3501 ``ALL`` translates to an unconstrained list
             # (orderby alone returns everything); a literal $search
@@ -560,25 +747,39 @@ class Office365Provider(EmailProvider, PushCapable):
         headers_only: bool = False,
         folder: str | None = None,
     ) -> EmailMessage:
-        """Fetch a single message by Graph ID, including any attachments.
+        """Fetch a single message by Graph ID.
 
-        ``headers_only`` and ``folder`` are accepted for cross-provider
-        symmetry but ignored — the Graph API's ``/me/messages/{id}``
-        endpoint with ``$select`` already returns a tightly-scoped
-        projection, and bulk paths use ``$expand=attachments``
-        regardless. Graph identifies messages by an opaque global ID,
-        not a per-folder UID, so the IMAP wildcard-folder semantics
-        don't apply.
+        ``headers_only`` (default False) honors the
+        :meth:`base.EmailProvider.fetch_message` minimum-necessary
+        (§164.502(b)) contract (run17 #8): when True we request the
+        header-only ``$select`` projection (``_MESSAGE_SELECT_HEADERS_ONLY``
+        — the listing select MINUS ``body`` / ``bodyPreview``) and DROP the
+        ``$expand=attachments`` blob fetch, so Graph never returns the PHI
+        body or attachment bytes for a metadata-only caller. :meth:`_normalise`
+        body / attachment extraction already degrades to "" / [] when those
+        fields are absent, leaving the metadata fields (sender / subject /
+        recipients / date / labels) populated — the contract's headers_only
+        shape. The default full path (``body`` + ``$expand=attachments``) is
+        byte-for-byte unchanged.
+
+        ``folder`` is accepted for cross-provider symmetry but ignored —
+        Graph identifies messages by an opaque global ID, not a per-folder
+        UID, so the IMAP wildcard-folder semantics don't apply.
         """
-        _ = headers_only
         _ = folder
+        if headers_only:
+            params: dict[str, str] = {
+                "$select": _MESSAGE_SELECT_HEADERS_ONLY + ",hasAttachments",
+            }
+        else:
+            params = {
+                "$select": _MESSAGE_SELECT + ",hasAttachments",
+                "$expand": "attachments",
+            }
         data = await self._request(
             "GET",
             f"/me/messages/{message_id}",
-            params={
-                "$select": _MESSAGE_SELECT + ",hasAttachments",
-                "$expand": "attachments",
-            },
+            params=params,
         )
         return self._normalise(data, message_id)
 
@@ -614,9 +815,15 @@ class Office365Provider(EmailProvider, PushCapable):
             body_text = body.get("content", "")
         elif body.get("content"):
             # HTML content — keep original HTML for link extraction, also
-            # provide a stripped plain-text rendering for body_text.
+            # provide a plain-text rendering for body_text. Route through the
+            # html_to_text SSOT (census /): the old bare-regex
+            # _strip_html removed TAGS but left <script>/<style> CONTENT,
+            # which then reached the classifier LLM (PHI/injection surface,
+            # §164.308(a)(1)(ii)(B)). html_to_text_with_links skips
+            # script/style and inlines anchor URLs.
+            from email_triage.engine.html_text import html_to_text_with_links
             body_html = body["content"]
-            body_text = self._strip_html(body_html)
+            body_text = html_to_text_with_links(body_html)
         if not body_text:
             body_text = data.get("bodyPreview", "")
 
@@ -684,7 +891,13 @@ class Office365Provider(EmailProvider, PushCapable):
                 content_b64 = raw.get("contentBytes") or ""
                 if content_b64:
                     try:
-                        blob = base64.b64decode(content_b64)
+                        #  tail — O365 push calendar attachment
+                        # ``contentBytes``; some senders strip padding.
+                        # Route through the SSOT so a length-not-multiple-
+                        # of-4 blob decodes correctly instead of silently
+                        # losing the attachment.
+                        from email_triage._base64url import b64decode_permissive
+                        blob = b64decode_permissive(content_b64, urlsafe=False, validate=False)
                     except Exception:
                         blob = None
                 if blob:
@@ -703,16 +916,6 @@ class Office365Provider(EmailProvider, PushCapable):
                 parsed=parsed,
             ))
         return out
-
-    @staticmethod
-    def _strip_html(html: str) -> str:
-        """Minimal HTML tag stripping for body text extraction."""
-        import re
-        # Remove HTML tags.
-        text = re.sub(r"<[^>]+>", " ", html)
-        # Collapse whitespace.
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
 
     async def create_draft(
         self,
@@ -830,7 +1033,15 @@ class Office365Provider(EmailProvider, PushCapable):
                 # failures demote to DEBUG (operator hasn't completed
                 # OAuth, token expired, AADSTS); real failures still
                 # WARN with the full message.
-                err_msg = f"{type(e).__name__}: {e}"
+                #
+                # SAFETY (db-sme, run13 #8): we token-match the ALREADY
+                # PHI-scrubbed ``fmt_exc`` output, which is sound ONLY by
+                # token/regex disjointness — none of the auth tokens below is
+                # address- or path-shaped, so ``redact_exc`` cannot strip them.
+                # Do NOT add a path-shaped or ``@``-bearing token here without a
+                # regression test (test_o365_probe_ui), or the DEBUG demotion
+                # silently breaks. See the NOTE in _errfmt.fmt_exc.
+                err_msg = fmt_exc(e, with_class=True)
                 is_auth_shape = any(
                     tok in err_msg for tok in (
                         "AADSTS", "device code", "401", "Unauthorized",
@@ -960,7 +1171,7 @@ class Office365Provider(EmailProvider, PushCapable):
                 if e.status == 410 or "resyncrequired" in body_str:
                     raise GraphDeltaResyncRequiredError(
                         e.status, e.error, e.url,
-                    )
+                    ) from e
                 raise
 
             if not isinstance(data, dict):

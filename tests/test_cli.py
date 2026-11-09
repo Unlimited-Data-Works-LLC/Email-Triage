@@ -113,6 +113,30 @@ class TestInit:
         data_dir = tmp_path / "triage" / "data"
         assert data_dir.is_dir()
 
+    def test_scaffolds_backup_section_loadable(self, tmp_path):
+        """ — the init scaffold carries a documented ``backup:`` block
+        (question 3: configurable via the CLI/init OR the UI). It must be
+        DISABLED by default and parse cleanly back through load_config so a
+        fresh install can fill it in without a YAML syntax surprise."""
+        import yaml
+
+        from email_triage.config import load_config
+
+        parser = build_parser()
+        args = parser.parse_args(["init", str(tmp_path / "triage")])
+        assert cmd_init(args) == 0
+
+        config_file = tmp_path / "triage" / "email-triage.yaml"
+        content = config_file.read_text()
+        assert "backup:" in content
+        raw = yaml.safe_load(content)
+        assert raw["backup"]["enabled"] is False  # OFF until a restore path exists
+
+        cfg = load_config(config_file)
+        assert cfg.backup.enabled is False
+        assert cfg.backup.cadence == "manual"
+        assert cfg.backup.encryption == "master-key"
+
     def test_refuses_if_exists(self, tmp_path):
         config_file = tmp_path / "email-triage.yaml"
         config_file.write_text("existing")
@@ -150,6 +174,43 @@ class TestInit:
             "deprecated path H-07 closes. New installs would otherwise "
             "land on the deprecation warning on first boot."
         )
+
+
+class TestBackupGenKeypairWindows:
+    """ — the `backup gen-keypair` admin tool must work on Windows.
+
+    The bug: its guidance printed a `→` (U+2192), which Windows' cp1252 console
+    cannot encode → UnicodeEncodeError killed the command AFTER its first ASCII
+    line but BEFORE it emitted the keys (exit 1, no usable output). The operator
+    hit this trying to generate a public-key-backup keypair on Windows. Two
+    independent fixes, each pinned below: (1) main() reconfigures stdout to UTF-8
+    (SSOT for the whole CLI); (2) the safety-critical keygen guidance is ASCII.
+    """
+
+    def test_gen_keypair_output_is_ascii_safe(self, capsys):
+        """The keygen output must be pure ASCII so it can't crash on ANY console
+        encoding — a future non-ASCII char reintroduced here fails this pin."""
+        rc = main(["backup", "gen-keypair"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        out.encode("ascii")  # raises UnicodeEncodeError if non-ASCII slipped back
+        assert "BEGIN PUBLIC KEY" in out
+        assert "BEGIN PRIVATE KEY" in out
+
+    def test_cli_main_forces_utf8_stdout(self, monkeypatch):
+        """SSOT class-fix: the CLI reconfigures stdout to UTF-8 at entry so ANY
+        non-ASCII CLI output survives a Windows cp1252 console — not just the
+        ASCII-ized gen-keypair. Pin via a real cp1252-backed stream."""
+        import io
+        import sys
+
+        buf = io.BytesIO()
+        stream = io.TextIOWrapper(buf, encoding="cp1252")
+        monkeypatch.setattr(sys, "stdout", stream)
+        rc = main(["backup", "gen-keypair"])
+        assert rc == 0
+        # main() reconfigured the cp1252 stream to UTF-8 before any output.
+        assert sys.stdout.encoding.lower().replace("-", "") == "utf8"
 
 
 class TestConfigValidate:
@@ -210,6 +271,10 @@ persistence:
         config_file.write_text(f"""\
 persistence:
   db_path: {db_path}
+  # Explicit plaintext intent: FlowStore built this DB unencrypted, and since
+  # 903b9618 an omitted key resolves to encrypted-at-rest. This test covers
+  # `status` output, not storage posture.
+  encryption_enabled: false
 """)
         monkeypatch.chdir(tmp_path)
         parser = build_parser()
@@ -332,36 +397,96 @@ class TestProviderCloseFailureSurface_H275:
         # Exit code preserved.
         assert actual == return_value == 1
 
-    def test_both_call_sites_have_log_warning_not_bare_pass(self):
-        """Regression-pin: the byte-pattern at the two cli.py sites
-        must contain `log.warning("provider.close failed"...)` and NOT
-        the legacy `pass` swallow. This catches a future revert that
-        bypasses the unit tests above (e.g., someone refactors the
-        pattern and accidentally restores the bare pass).
+    def test_close_failure_log_is_centralized_not_swallowed(self):
+        """Regression-pin: the close-failure `log.warning(
+        "provider.close failed"...)` must EXIST and never be a bare `pass`
+        swallow. Post-N-131 the  log is CENTRALIZED in one helper; punch 820
+        moved it from the CLI's own `_aclose_provider_quietly` onto
+        `render_probe.close_provider(..., loud=True)`, the one best-effort close.
+        All three CLI provider-close surfaces route close through it, in-loop.
+        The cross-loop `asyncio.run(provider.close())` shape that N-131 fixed is
+        pinned separately by test_cli_provider_close_in_loop_pin.py.
         """
         import re
-        from pathlib import Path
 
-        cli_src = Path(
-            __file__,
-        ).resolve().parent.parent.joinpath(
-            "src", "email_triage", "cli.py",
-        ).read_text(encoding="utf-8")
-        # Two sites must each have the post-#275 log.warning pattern.
-        # Count the live pattern + the legacy-bare-pass pattern.
+        from _pin_harness import SRC_ROOT
+
+        cli_src = (SRC_ROOT / "cli.py").read_text(encoding="utf-8")
+        probe_src = (SRC_ROOT / "providers" / "render_probe.py").read_text(encoding="utf-8")
+        # The post-#275 close-failure log must exist (>=1; centralized in
+        # close_provider). A future revert to a bare swallow drops this to 0 ->
+        # RED. N-131: match the log call itself, which uses error=fmt_exc(...)
+        # (NOT the dead exc_info=True that TriageLogger.warning silently drops,
+        # PD#10).
         post_fix = re.findall(
-            r'except Exception:\s*\n\s*log\.warning\("provider\.close failed"',
+            r'_log\.warning\("provider\.close failed"',
+            probe_src,
+        )
+        # Every CLI close site asks for the loud form.
+        loud_sites = re.findall(
+            r'await close_provider\(provider, loud=True\)',
             cli_src,
         )
+        # The legacy cross-loop close + bare-pass swallow must be gone.
         legacy_swallow = re.findall(
             r'asyncio\.run\(provider\.close\(\)\)\s*\n\s*except Exception:\s*\n\s*pass\b',
             cli_src,
         )
-        assert len(post_fix) == 2, (
-            f"expected 2 post-#275 sites, found {len(post_fix)}"
+        assert len(post_fix) >= 1, (
+            "expected >=1 post-#275 close-failure log site (centralized in "
+            f"render_probe.close_provider), found {len(post_fix)}"
+        )
+        all_sites = re.findall(r'await close_provider\(', cli_src)
+        assert loud_sites and len(loud_sites) == len(all_sites), (
+            "every CLI provider close must be close_provider(provider, loud=True) "
+            f"(#275); {len(loud_sites)} loud of {len(all_sites)} sites"
         )
         assert len(legacy_swallow) == 0, (
             f"expected 0 legacy-bare-pass sites, found {len(legacy_swallow)}"
         )
+
+
+class TestSecretsSetRefusesBlank:
+    """Panel AA SHOULD-A2: ``secrets set`` with an empty prompt entry (an
+    accidental Enter) must not overwrite the stored secret with ""."""
+
+    @staticmethod
+    def _run(monkeypatch, entered):
+        import email_triage.cli as cli_mod
+        import email_triage.secrets as secrets_mod
+        from email_triage.config import TriageConfig
+
+        writes = []
+
+        class _Provider:
+            def set(self, key, value):
+                writes.append((key, value))
+
+        monkeypatch.setattr(cli_mod, "load_config", lambda _p: TriageConfig())
+        monkeypatch.setattr(cli_mod, "_cli_open_config_db", lambda _c: object())
+        monkeypatch.setattr(
+            secrets_mod, "bootstrap_secrets_from_config", lambda _c, _cfg: _Provider())
+        monkeypatch.setattr(
+            secrets_mod, "enforce_master_key_at_rest_for_hipaa", lambda _cfg: None)
+        monkeypatch.setattr(
+            secrets_mod, "wire_audit_chain_hmac_keys", lambda _p, _cfg: None)
+        monkeypatch.setattr("getpass.getpass", lambda _prompt: entered)
+        args = build_parser().parse_args(["secrets", "set", "SMTP_PASSWORD"])
+        return cli_mod.cmd_secrets(args), writes
+
+    @pytest.mark.parametrize("entered", ["", "   ", "\t"])
+    def test_a_blank_entry_is_refused_and_nothing_is_written(
+            self, monkeypatch, capsys, entered):
+        rc, writes = self._run(monkeypatch, entered)
+        assert rc == 1
+        assert writes == []
+        err = capsys.readouterr().err
+        assert "NOT saved" in err and "unchanged" in err
+
+    def test_a_real_value_is_still_written(self, monkeypatch, capsys):
+        rc, writes = self._run(monkeypatch, "s3cret")
+        assert rc == 0
+        assert writes == [("SMTP_PASSWORD", "s3cret")]
+        assert "saved." in capsys.readouterr().out
 
 

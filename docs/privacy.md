@@ -4,18 +4,18 @@ What Email Triage does — and does not — do with the mail flowing through it.
 
 ## Verdict line
 
-**No mail content, message metadata, or PHI leaves your install unless you've explicitly opted-in to a cloud-LLM backend with a Business Associate Agreement on file.** Every classification, draft, embedding, and audit-trail row is computed locally and stored on your hardware — with SQLCipher (AES-256) database encryption at rest — on by default for new installs (v0.1.2). The only outbound network calls are to mail providers you've configured (Gmail / Outlook / your IMAP server) and the LLM backend you've selected (default: local Ollama on the same host).
+**No mail content, message metadata, or PHI leaves your install unless you've explicitly opted-in to a cloud-LLM backend with a Business Associate Agreement on file.** Every classification, draft, embedding, and audit-trail row is computed locally and stored on your hardware — with SQLCipher (AES-256) database encryption at rest — on by default for new installs (v0.2.0). The only outbound network calls are to mail providers you've configured (Gmail / Outlook / your IMAP server) and the LLM backend you've selected (default: local Ollama on the same host).
 
 ## What stays on your install
 
 | Data class | Storage |
 |---|---|
 | Mail bodies, headers, attachments (in-memory only during triage) | Not persisted by default; admin can opt-in to `sent_mail_index` for RAG draft assistance |
-| Classification decisions + reasoning | `triage_runs` in `triage.db`; SQLCipher (AES-256) encrypted at rest by default for new installs (v0.1.2), else operator-managed filesystem encryption |
+| Classification decisions + reasoning | `triage_runs` in `triage.db`; SQLCipher (AES-256) encrypted at rest by default for new installs (v0.2.0), else operator-managed filesystem encryption |
 | Per-account credentials (IMAP password, OAuth refresh tokens) | `secrets_store` table, Fernet-encrypted with the install master key |
 | Audit trail (every PHI-touch request, every admin action) | `log_entries` (hash-chained for tamper-evidence) + `access_log` + `auth_events` |
 | Style-learning descriptors | `hipaa_style_descriptors` (closed-vocabulary, no free text); per-contact descriptors keyed by salted hash of recipient address |
-| Configuration (routes, watches, categories) | `triage.db` — SQLCipher-encrypted at rest by default for new installs (v0.1.2) |
+| Configuration (routes, watches, categories) | `triage.db` — SQLCipher-encrypted at rest by default for new installs (v0.2.0) |
 
 The database is a single file. Off-host backup is the operator's responsibility; the in-app `email-triage backup export` command produces an encrypted tarball for that purpose.
 
@@ -29,8 +29,14 @@ The database is a single file. Off-host backup is the operator's responsibility;
 | Webhook URLs (off by default) | Metadata-only payloads (no body), HMAC-signed | Only when a route fires a `notify` action AND the URL is explicitly allowed |
 | Mail destination | Drafts created by `draft-reply` action AND `escalate` SMS via configured gateway | Per route configuration |
 | Daily-health email | Operator-internal status digest (no PHI) | Configurable cadence; SMTP destination is operator-controlled |
+| Public DNS-over-HTTPS resolvers — `dns.google`, `cloudflare-dns.com`, `dns.quad9.net` | One HTTPS GET per resolver for the CNAME of `_acme-challenge.<certificate host name>` (a public DNS name). **No mail data, no account, no PHI.** A resolver IP in `tls.acme.rfc2136.public_resolvers` that is not one of these three providers' addresses is queried at `dns.google`. | ACME certificate renewal check (dns-01 via RFC 2136 with `update_zone` set), before each renewal attempt. Quad9 currently refuses this HTTP/1.1 request, so it contributes no answer (punch row 589). |
+| Update check — `api.github.com` by default (the host in `admin_email.release_check_url`) | One HTTPS GET for the newest release. Carries the server's IP address and a fixed `User-Agent`; **no install id, no version, no account, no mail data, no PHI**. Receives the release tag, link, notes and security marker. | **On by default** (operator decision 553-1), once an hour, cached. Every admin sees a dismissable banner saying it is on and what it contacts. **Off** = untick "Check for updates" on Config > General (writes a blank `release_check_url`; blank means OFF and no request is made). See `internal documentation`. |
+| Telemetry beacon to the operator's endpoint (Tailscale-only by default) | Install UUID, app + schema version, OS, last-poll time, update outcomes. **No PHI, no message counts, no user names.** | **Not built in v0.2.0**. When built: **off by default**, opt-in, and every admin sees a dismissable banner while it is on. |
+| Public study registry — `clinicaltrials.gov` (`GET /api/v2/studies/{nctId}`, no key/auth) AND, **non-HIPAA accounts only**, the operator-configured SearXNG search host | **Public study identifier / study name ONLY** — the user's typed Topic query or a detected NCT id. **HIPAA Topics never reach the free-text SearXNG path** (any contributing HIPAA mailbox → ClinicalTrials.gov registry-API only, most-restrictive-wins, evaluated server-side over the saved + live mailbox selection). On the non-HIPAA path the typed query is searched verbatim — **no query scrubber** (per the 2026-06-08 operator ruling that the HIPAA→registry-only gate is the control, not a per-query scrub). **No mail body, no message metadata, no PHI.** Whitelisted response fields only. Server-side (the browser never calls the registry/host); registry responses cached by NCT. |  Topic Digest "Internet Search" — only when the operator presses it; HIPAA Topics are gated to the registry API only (no free-text web search) |
 
-**Zero telemetry.** No phone-home, no usage analytics, no error-reporting service, no feature-flag fetch, no anonymous beacon. The application phones nothing it doesn't have an operator-configured reason to phone.
+**Egress allowlist.** The `clinicaltrials.gov` + SearXNG destinations above are pinned behind an **allowlist** so a configuration mistake cannot repoint the Topic-Details lookup at an arbitrary host. This is the same outbound-host inventory the embedding-bits install fetch lives in (`project_no_external_data_flow` verified-outbound inventory); the §164.316 build-gate record is finding **N-23** in `internal documentation` §4.4. Egress is **server-side only** and carries the user's public study query — the no-PHI-in-the-box surface the **HIPAA→registry-only gate** enforces on the protected path (N-22's scrubber gates the Details/LLM-context surface, not the non-HIPAA free-text query — see the N-22/N-23 path-split note in the register).
+
+**No hidden telemetry.** No usage analytics, no error-reporting service, no feature-flag fetch. The only "phone-home" flows are the two optional ones in the table above (amended 2026-09-30, punch 553): the update check (on by default, carries nothing about the install, off with one checkbox) and the opt-in telemetry beacon (off by default, not built in v0.2.0). Each is disclosed to every admin by a banner on login. The application phones nothing else.
 
 ## HIPAA mode
 

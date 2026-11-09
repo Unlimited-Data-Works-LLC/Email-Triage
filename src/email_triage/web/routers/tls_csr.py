@@ -9,8 +9,11 @@ Routes:
 * POST ``/admin/tls/csr/import``        validate + atomically swap in CA-signed cert
 * POST ``/admin/tls/csr/self-sign``     generate self-signed cert immediately
 
-All admin-only. Audit row via ``record_auth_event`` on every write
-path so the operator-facing trail captures who did what when. Hot-
+All admin-only. Every route that changes TLS key or certificate material
+(make, cancel, import, self-sign) is WITNESS-FIRST (N-550, the N-157 shape
+N-543 uses): an intent row through ``record_auth_event`` is written and
+committed BEFORE any file write or unlink, the change is REFUSED if that write
+fails, and an outcome row follows. Hot-
 reload watcher (cli.py:_watch_cert_thread) picks up swaps within
 30s without a service restart.
 """
@@ -27,11 +30,24 @@ from fastapi import APIRouter, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from email_triage import tls_csr
+from email_triage._int_utils import bounded_int  # N-219c R23
+from email_triage.web._audit import safe_audit_write_async
+from email_triage.web.db import record_auth_event
 from email_triage.web.db_threadpool import db_call
-from email_triage.web.dependencies import get_current_user
+from email_triage.web._flash import flash_redirect  # N-179 R20_1 sub-1
+from email_triage.web.routers._redirect import read_flash
 
-log = logging.getLogger("email_triage.web.routers.tls_csr")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.web.routers.tls_csr")  # N-196b R21_4
 router = APIRouter()
+
+#: What a route shows when its intent row could not be written. Static text: an
+#: exception string in a flash is the N-179 leak class.
+_REFUSED_NO_WITNESS = (
+    "Nothing was changed: the audit record of this change could not be written, "
+    "and TLS keys and certificates are never changed without one. Try again; if "
+    "it keeps failing, the application log names the cause."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,13 +73,8 @@ async def _render(request: Request, name: str, ctx: dict[str, Any] | None = None
     return await _render_ui(_get_templates(request), request, name, ctx or {})
 
 
-def _require_admin(request: Request):
-    user = get_current_user(request)
-    if user is None:
-        return None, RedirectResponse("/login", status_code=303)
-    if user.get("role") != "admin":
-        return None, HTMLResponse("Forbidden", status_code=403)
-    return user, None
+# Census 2026-06-09 #3: byte-identical UI admin gate → the dependencies SSOT.
+from email_triage.web.dependencies import require_admin_ui as _require_admin
 
 
 def _resolve_cert_dir(config) -> Path:
@@ -85,29 +96,27 @@ async def _audit(
     email: str,
     outcome: str,
     metadata: dict[str, Any] | None = None,
-) -> None:
-    # ASYNC-DB: audit-event write off the event loop. Every
-    # caller is an ``async def`` handler, so this stays awaitable.
-    try:
-        from email_triage.web.db import record_auth_event
-        detail = json.dumps(metadata or {}, separators=(",", ":"))
-        await db_call(
+) -> bool:
+    """Write one ``auth_events`` row off the event loop; True when it landed.
+
+    ONE statement through the best-effort async SSOT, so a failure is logged and
+    counted for /health's audit-failure drift check and never raises. The
+    return value is what makes the INTENT row fail-closed (N-550): a route
+    refuses the change when the intent write returns False, exactly as the CLI's
+    N-157 gate reads ``safe_audit_write``'s ``None``. ``json.dumps`` runs inside
+    the awaited lambda, so a serialisation error is caught by the same SSOT.
+    """
+    return await safe_audit_write_async(
+        lambda: db_call(
             record_auth_event,
             db,
             event_type=event_type,
             email=email,
             outcome=outcome,
-            detail=detail,
-        )
-    except Exception as e:
-        log.warning("TLS-CSR audit write failed: %s", e)
-
-
-def _qstr(s: str) -> str:
-    """Cheap query-string escape. We only ever pass short
-    operator-facing strings; full urllib.parse.quote_plus would be
-    fine but adds a micro-import for no real win."""
-    return s.replace("&", "%26").replace(" ", "+").replace("=", "%3D")
+            detail=json.dumps(metadata or {}, separators=(",", ":")),
+        ),
+        description=f"tls_csr:{event_type}:{outcome}",
+    ) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +150,7 @@ async def admin_tls_csr_page(request: Request):
         "cert_dir": str(cert_dir),
         "active_cert": active_md,
         "saved": request.query_params.get("saved") == "1",
-        "error": request.query_params.get("err") or "",
+        "error": read_flash(request)[1] or "",
     })
 
 
@@ -168,6 +177,16 @@ async def admin_tls_csr_make(
     cert_dir = _resolve_cert_dir(config)
 
     sans_list = [s.strip() for s in extra_sans.split(",") if s.strip()]
+    # N-550: the intent row BEFORE make_csr, which can unlink a pending key/CSR
+    # and writes a new private key. No row, no change.
+    if not await _audit(
+        db,
+        event_type="tls_csr_make",
+        email=user.get("email", ""),
+        outcome="attempt",
+        metadata={"hostname": hostname.strip()},
+    ):
+        return flash_redirect("/admin/tls/csr", err=_REFUSED_NO_WITNESS, purpose="form")
     try:
         _key, _csr_path, csr_pem = tls_csr.make_csr(
             cert_dir,
@@ -183,17 +202,22 @@ async def admin_tls_csr_make(
             outcome="failure",
             metadata={"reason": "already_pending"},
         )
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except ValueError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
+        await _audit(
+            db,
+            event_type="tls_csr_make",
+            email=user.get("email", ""),
+            outcome="failure",
+            metadata={"reason": "invalid_input"},
         )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except Exception as e:
-        log.error("CSR generation failed: %s", e, exc_info=e)
+        log.error(
+            "CSR generation failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_make",
@@ -250,10 +274,7 @@ async def admin_tls_csr_download(request: Request):
     try:
         csr_pem = tls_csr.read_pending_csr(cert_dir)
     except tls_csr.NoPendingCsrError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
 
     return Response(
         content=csr_pem,
@@ -282,6 +303,15 @@ async def admin_tls_csr_cancel(request: Request):
     db = _get_db(request)
     config = _get_config(request)
     cert_dir = _resolve_cert_dir(config)
+    # N-550: the intent row BEFORE the pending private key and CSR are unlinked.
+    if not await _audit(
+        db,
+        event_type="tls_csr_cancel",
+        email=user.get("email", ""),
+        outcome="attempt",
+        metadata={},
+    ):
+        return flash_redirect("/admin/tls/csr", err=_REFUSED_NO_WITNESS, purpose="form")
     tls_csr.cancel_pending(cert_dir)
     await _audit(
         db,
@@ -328,9 +358,10 @@ async def admin_tls_csr_import(
         try:
             raw = await cert_file.read()
         except Exception as e:
-            return RedirectResponse(
-                f"/admin/tls/csr?err={_qstr(f'Upload read failed: {e}')}",
-                status_code=303,
+            return flash_redirect(
+                "/admin/tls/csr",
+                err=f"Upload read failed: {e}",
+                purpose="form",
             )
     else:
         raw = (cert_pem or "").strip().encode("utf-8")
@@ -341,18 +372,28 @@ async def admin_tls_csr_import(
             status_code=303,
         )
 
+    # N-550: the intent row BEFORE import_signed_cert, which renames the pending
+    # key over the ACTIVE private key and writes the ACTIVE certificate the
+    # service presents, then unlinks the pending CSR. No row, no change.
+    if not await _audit(
+        db,
+        event_type="tls_csr_import",
+        email=user.get("email", ""),
+        outcome="attempt",
+        metadata={"cert_bytes": len(raw)},
+    ):
+        return flash_redirect("/admin/tls/csr", err=_REFUSED_NO_WITNESS, purpose="form")
     try:
         crt_path, key_path = tls_csr.import_signed_cert(cert_dir, raw)
-    except tls_csr.NoPendingCsrError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
+    except (tls_csr.NoPendingCsrError, tls_csr.InvalidPemError) as e:
+        await _audit(
+            db,
+            event_type="tls_csr_import",
+            email=user.get("email", ""),
+            outcome="failure",
+            metadata={"reason": type(e).__name__},
         )
-    except tls_csr.InvalidPemError as e:
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except tls_csr.KeyMismatchError as e:
         await _audit(
             db,
@@ -361,12 +402,13 @@ async def admin_tls_csr_import(
             outcome="failure",
             metadata={"reason": "key_mismatch"},
         )
-        return RedirectResponse(
-            f"/admin/tls/csr?err={_qstr(str(e))}",
-            status_code=303,
-        )
+        return flash_redirect("/admin/tls/csr", err=e, purpose="form")
     except Exception as e:
-        log.error("Cert import failed: %s", e, exc_info=e)
+        log.error(
+            "Cert import failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_import",
@@ -426,13 +468,20 @@ async def admin_tls_csr_self_sign(
     cert_dir = _resolve_cert_dir(config)
 
     sans_list = [s.strip() for s in extra_sans.split(",") if s.strip()]
-    try:
-        days = int(valid_days)
-    except (TypeError, ValueError):
-        days = 365
+    days = bounded_int(valid_days, default=365)  # N-219c R23: SSOT
     if days < 1:
         days = 365
 
+    # N-550: the intent row BEFORE self_sign_now writes the ACTIVE certificate
+    # and private key.
+    if not await _audit(
+        db,
+        event_type="tls_csr_self_sign",
+        email=user.get("email", ""),
+        outcome="attempt",
+        metadata={"hostname": hostname.strip(), "valid_days": days},
+    ):
+        return flash_redirect("/admin/tls/csr", err=_REFUSED_NO_WITNESS, purpose="form")
     try:
         crt_path, key_path = tls_csr.self_sign_now(
             cert_dir,
@@ -441,7 +490,11 @@ async def admin_tls_csr_self_sign(
             valid_days=days,
         )
     except Exception as e:
-        log.error("Self-sign failed: %s", e, exc_info=e)
+        log.error(
+            "Self-sign failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            exc_info=e,
+        )
         await _audit(
             db,
             event_type="tls_csr_self_sign",

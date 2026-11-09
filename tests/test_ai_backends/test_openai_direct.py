@@ -66,10 +66,10 @@ def _patch_httpx(mock_resp):
 class TestAdapterConstruction:
     def test_minimal_construction(self):
         a = OpenAIAdapter(
-            endpoint="https://api.openai.com/v1",
+            endpoint="https://api.openai.invalid/v1",
             api_key="sk-test",
         )
-        assert a.endpoint == "https://api.openai.com/v1"
+        assert a.endpoint == "https://api.openai.invalid/v1"
         assert a.model == DEFAULT_OPENAI_MODEL
         # Public OpenAI is external; HIPAA gate stays closed pre-BAA.
         assert a.is_local is False
@@ -78,10 +78,10 @@ class TestAdapterConstruction:
 
     def test_endpoint_trailing_slash_normalised(self):
         a = OpenAIAdapter(
-            endpoint="https://api.openai.com/v1/",
+            endpoint="https://api.openai.invalid/v1/",
             api_key="sk-test",
         )
-        assert a.endpoint == "https://api.openai.com/v1"
+        assert a.endpoint == "https://api.openai.invalid/v1"
 
     def test_empty_endpoint_falls_back_to_default(self):
         """An empty endpoint legitimately falls through to public OpenAI.
@@ -114,9 +114,9 @@ class TestAdapterConstruction:
 
     def test_extra_suffix_marks_is_local_true(self):
         a = OpenAIAdapter(
-            endpoint="https://litellm.home.lan/v1",
+            endpoint="https://litellm.home.invalid/v1",
             api_key="",
-            local_url_suffixes=[".home.lan"],
+            local_url_suffixes=[".home.invalid"],
         )
         assert a.is_local is True
 
@@ -135,7 +135,7 @@ class TestAdapterConstruction:
         ``backend_type``). Pin that the adapter accepts them all without
         raising on the ``backend_type`` extra."""
         a = OpenAIAdapter(
-            endpoint="https://api.openai.com/v1",
+            endpoint="https://api.openai.invalid/v1",
             model="gpt-4o",
             api_key="sk-x",
             local_url_suffixes=[],
@@ -153,7 +153,7 @@ class TestChatComplete:
     @pytest.fixture
     def adapter(self):
         return OpenAIAdapter(
-            endpoint="https://api.openai.com/v1",
+            endpoint="https://api.openai.invalid/v1",
             api_key="sk-test-key",
             model="gpt-4o-mini",
         )
@@ -180,7 +180,7 @@ class TestChatComplete:
             )
         call = mock_client.post.call_args
         url = call.args[0] if call.args else call.kwargs.get("url", "")
-        assert url == "https://api.openai.com/v1/chat/completions"
+        assert url == "https://api.openai.invalid/v1/chat/completions"
 
     async def test_sends_bearer_auth_header(self, adapter):
         """OpenAI uses ``Authorization: Bearer``; pin that the adapter
@@ -370,7 +370,7 @@ class TestErrorHandling:
     @pytest.fixture
     def adapter(self):
         return OpenAIAdapter(
-            endpoint="https://api.openai.com/v1",
+            endpoint="https://api.openai.invalid/v1",
             api_key="sk-test",
         )
 
@@ -499,7 +499,7 @@ class TestPrivacyInvariants:
             "token_type": "Bearer",
             "scope": "openai/all",
         }
-        err = OpenAIError(500, body, "https://api.openai.com/v1/x")
+        err = OpenAIError(500, body, "https://api.openai.invalid/v1/x")
         rendered = str(err)
         for sentinel in (
             _TEST_ACCESS_TOKEN, _TEST_REFRESH_TOKEN, _TEST_ID_TOKEN,
@@ -590,7 +590,7 @@ class TestPrivacyInvariants:
         """If a future refactor ever puts the api-key in the URL query
         string, the rendered exception must redact it."""
         leaked_url = (
-            "https://api.openai.com/v1/chat/completions?"
+            "https://api.openai.invalid/v1/chat/completions?"
             "api-key=SECRET_KEY_VALUE_NEVER_LOG&model=gpt-4o"
         )
         err = OpenAIError(500, {"error": {"message": "boom"}}, leaked_url)
@@ -601,7 +601,7 @@ class TestPrivacyInvariants:
         assert "model=gpt-4o" in rendered
 
     def test_strip_sensitive_query_params_handles_no_query(self):
-        url = "https://api.openai.com/v1/x"
+        url = "https://api.openai.invalid/v1/x"
         assert _strip_sensitive_query_params(url) == url
 
     def test_strip_sensitive_query_params_handles_empty(self):
@@ -610,7 +610,7 @@ class TestPrivacyInvariants:
     def test_strip_sensitive_query_params_covers_alternates(self):
         """``api-key``, ``key``, ``token``, ``access_token``, ``code``
         all get redacted."""
-        url = "https://x/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
+        url = "https://x.invalid/?key=KKK&token=TTT&access_token=AAA&code=CCC&foo=bar"
         out = _strip_sensitive_query_params(url)
         assert "KKK" not in out
         assert "TTT" not in out
@@ -631,7 +631,7 @@ class TestClassifierShim:
     @pytest.fixture
     def classifier(self):
         return OpenAIClassifier(
-            endpoint="https://api.openai.com/v1",
+            endpoint="https://api.openai.invalid/v1",
             api_key="sk-test",
             model="gpt-4o-mini",
         )

@@ -33,6 +33,7 @@ in the baseline migration.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 import subprocess
@@ -41,6 +42,7 @@ from pathlib import Path
 
 import pytest
 
+from _pin_harness import tree_src_env
 from email_triage.web.db import init_db
 
 
@@ -54,7 +56,7 @@ _ALEMBIC_BASELINE = (
 def init_db_schema(tmp_path: Path) -> dict[str, dict]:
     """Build a fresh DB via init_db(); return its sqlite_master snapshot."""
     db_path = tmp_path / "init.db"
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     try:
         return _snapshot_schema(conn)
     finally:
@@ -76,9 +78,10 @@ def alembic_baseline_schema(tmp_path: Path) -> dict[str, dict]:
         "EMAIL_TRIAGE_DATABASE_URL": f"sqlite:///{db_path}",
         "EMAIL_TRIAGE_ALEMBIC_PLAIN": "1",
     }
-    import os
-
-    full_env = {**os.environ, **env}
+    # The subprocess must import THIS tree's email_triage. In a worktree the editable install
+    # points at the main checkout, whose init_db() lacks a column this tree's migration adds
+    # (class AH: api_key_events.actor_email, v54): the diff was the environment, not the schema.
+    full_env = tree_src_env(env)  # os.environ + the two settings above, this tree's src first
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=str(_REPO_ROOT),

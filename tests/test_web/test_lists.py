@@ -1,8 +1,64 @@
 """Tests for classification list management (UI + API)."""
 
+from datetime import datetime, timezone
+
 import pytest
 
 from email_triage.web.auth import SESSION_COOKIE_NAME
+
+
+def _seed_list(db, *, owner_id: int, is_global: int) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = db.execute(
+        "INSERT INTO classification_lists (name, category, owner_id, "
+        "is_global, created_at) VALUES (?, ?, ?, ?, ?)",
+        ("L", "general", owner_id, is_global, now),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+class TestPowerUserRuleAuthz:
+    """N-60 (Loop-5 census) — a power_user may add/edit/delete RULES only on a
+    GLOBAL list, NEVER another user's PERSONAL list. Live-route proof of the
+    ``is_list_writable_by`` SSOT gate (the access-control fix demands an
+    end-to-end test, not just the unit + structural pin — per the #5 lesson
+    that a structural pin can pass while a live edge is wrong)."""
+
+    def test_power_user_403_on_another_users_personal_list(
+        self, client, db, regular_user, power_user_cookies,
+    ):
+        list_id = _seed_list(db, owner_id=regular_user["id"], is_global=0)
+        resp = client.post(
+            f"/api/lists/{list_id}/rules",
+            json={"rule_type": "sender", "pattern": "x@evil.com", "skip_ai": False},
+            cookies=power_user_cookies,
+        )
+        assert resp.status_code == 403, resp.text
+
+    def test_power_user_201_on_a_global_list(
+        self, client, db, regular_user, power_user_cookies,
+    ):
+        # A GLOBAL list — power_user IS allowed (own-personal + global scope).
+        list_id = _seed_list(db, owner_id=regular_user["id"], is_global=1)
+        resp = client.post(
+            f"/api/lists/{list_id}/rules",
+            json={"rule_type": "sender", "pattern": "ok@corp.com", "skip_ai": False},
+            cookies=power_user_cookies,
+        )
+        assert resp.status_code == 201, resp.text
+
+    def test_owner_201_on_own_personal_list(
+        self, client, db, power_user, power_user_cookies,
+    ):
+        # Sanity: the owner still writes their OWN personal list (no regression).
+        list_id = _seed_list(db, owner_id=power_user["id"], is_global=0)
+        resp = client.post(
+            f"/api/lists/{list_id}/rules",
+            json={"rule_type": "sender", "pattern": "me@mine.com", "skip_ai": False},
+            cookies=power_user_cookies,
+        )
+        assert resp.status_code == 201, resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 (operator detail, admin-only).
 
 Split into two endpoints in  (2026-04-30). Keep these tests in sync
-with the Containerfile HEALTHCHECK + scripts/deploy-the deploy host.sh post-deploy
+with the Containerfile HEALTHCHECK + scripts/deploy.sh post-deploy
 probe (both still hit /health).
 """
 
@@ -91,6 +91,9 @@ def test_detail_returns_full_shape(client, db, admin_user):
         "ingestion", "mailboxes", "poll", "watchers",
         "last_triage", "version",
         "tasks", "watchers_failing", "audit_failures",
+        # Punch 709 — True while an emergency revoke committed without its chained
+        # witness and `audit clear-emergency-flag` has not yet proven the repair.
+        "emergency_revoke_pending",
         "csrf_rejects", "schema_version",
         #  — top-level O365 push rollup mirrors the gmail_push line
         # nested under watchers.
@@ -99,6 +102,10 @@ def test_detail_returns_full_shape(client, db, admin_user):
         # errors). Always present; values reflect the cache singleton
         # (disabled + zeros in the default test config).
         "classification_cache",
+        # N-93 — topic-match parse-fail/retry-outcome counters (parse_retried /
+        # retry_recovered / retry_failed_dropped + lifetime). Surfaces the §4.4
+        # fail-open valve's open-rate as a number; integers only (no PHI).
+        "topic_match",
         # 2026-05-13 — embedding backend live state + per-call counters.
         # ``configured=false`` + empty metrics when no embedding backend
         # is wired (the test config doesn't set one); admin tab + stats
@@ -134,8 +141,82 @@ def test_detail_returns_full_shape(client, db, admin_user):
         # days_remaining}. ``present=false`` when no cert on disk (the
         # default test config has none). Pure file read; never raises.
         "tls_cert",
+        # the backlog  (N-151-tail db-sme fold) — MSAL master-key
+        # availability sibling to baa_status. Shape:
+        # {"available": bool | None, "reason": str | None}. Restores the
+        # boot-time-observable posture the N-151 SOFT gate variant traded
+        # away (a boot-time hard raise → boot-time WARN + first-save fail-
+        # closed).
+        "msal_master_key_status",
     }
     assert body["status"] == "ok"
+    # the backlog  — msal_master_key_status shape assertion (SME-panel
+    # fold at HEAD c1973b3c: hipaa-sme MUST-FIX #1 fixed-enum reason;
+    # DA #2 error_type class-name; DA #3 last_probed_at seam). The test
+    # DB has a provisioned master key via the `master_key` autouse fixture
+    # (see conftest), so ``available`` must be True + reason "available".
+    msal = body["msal_master_key_status"]
+    assert set(msal.keys()) == {
+        "available", "reason", "error_type", "last_probed_at",
+    }
+    assert msal["available"] is True, (
+        f"msal_master_key_status: expected available=True in the "
+        f"test-fixture-provisioned scope; got {msal!r}"
+    )
+    assert msal["reason"] == "available"
+    assert msal["error_type"] is None
+    assert isinstance(msal["last_probed_at"], str) and (
+        msal["last_probed_at"].endswith("Z")
+    ), f"last_probed_at must be UTC-ISO with Z suffix; got {msal!r}"
+
+
+def test_health_detail_msal_master_key_status_unavailable_path(
+    client, monkeypatch, admin_user,
+):
+    """the backlog  REDESIGNED v3 Part 1 (FLIPPED from prior spec):
+    cover the SOFT `unavailable` path end-to-end. Monkeypatch
+    `_get_master_key` to raise the expected N-151 SOFT-path class
+    (`FileNotFoundError`) and assert:
+
+      1. `available` becomes False (True → False transition on the probe).
+      2. `reason` is the fixed enum `"unavailable"` (NOT the raw exception
+         text — hipaa-sme MUST-FIX #1 fixed-enum posture).
+      3. `error_type` is None on the shim — the accessor SSOT (Part 0)
+         does not expose the class name; the reason enum carries the
+         partition signal (the monitoring system reads `reason`, not `error_type`).
+      4. `/health/detail` now returns 503 + top-line `degraded` — v3 Part 1
+         flip: the SOFT `unavailable` path FEEDS the top-line degrade
+         OR-term so the monitoring system pages the operator, restoring the compensating
+         control the SOFT variant traded away.
+    """
+    from email_triage.providers import _msal_cache_crypto
+
+    def _raise_unavail():
+        raise FileNotFoundError("simulated N-151 SOFT unavailable path")
+
+    monkeypatch.setattr(
+        _msal_cache_crypto, "_get_master_key", _raise_unavail,
+    )
+    client.cookies.set(*_admin_cookie_pair())
+    resp = client.get("/health/detail")
+    # v3 Part 1: SOFT `unavailable` NOW degrades /health/detail (503).
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["status"] == "degraded", (
+        "PUNCH-LIST #315 REDESIGNED v3 Part 1 spec: the SOFT "
+        "`unavailable` path FEEDS the top-line `degraded` term so Nagios "
+        "polling /health pages the operator. `probe_error`/`import_error` "
+        "(available is None) do NOT degrade — unknown ≠ WARN. "
+        f"body={body!r}"
+    )
+    msal = body["msal_master_key_status"]
+    assert msal["available"] is False, msal
+    assert msal["reason"] == "unavailable", msal
+    # v3 Part 1 shim: accessor SSOT does not expose class name — `reason`
+    # is the partition signal, `error_type` is None on the shim's inner
+    # paths (import_error outer path still carries the class name).
+    assert msal["error_type"] is None, msal
+    assert isinstance(msal["last_probed_at"], str)
     sd = body["style_distill"]
     for k in ("local_24h", "cloud_24h", "failures_24h",
               "scrubber_rejects_24h", "total_24h"):
@@ -144,6 +225,120 @@ def test_detail_returns_full_shape(client, db, admin_user):
     tc = body["tls_cert"]
     assert set(("present", "not_after", "days_remaining")) <= set(tc)
     assert isinstance(tc["present"], bool)
+
+
+def test_health_aggregate_degrades_on_msal_master_key_unavailable(
+    client, monkeypatch, db,
+):
+    """the backlog  REDESIGNED v3 Part 1 PIN — the top-line degrade
+    OR-term fires when the N-151 SOFT gate is ACTIVE on the SOFT
+    `unavailable` path. Monkeypatches ``_get_master_key`` to raise the
+    canonical SOFT-path class (in `_N151_UNAVAIL_TYPES`) so the
+    Part-0 accessor reports ``active=True`` + ``reason="unavailable"`` →
+    shim returns ``available=False`` → /health returns 503 + status
+    ``"degraded"``. the monitoring system polling /health pages the operator; this
+    restores the compensating control the SOFT gate variant traded
+    away (a boot-time hard raise → boot-time WARN + first-save
+    fail-closed) per the redesign's stated intent.
+    """
+    from email_triage.providers import _msal_cache_crypto
+
+    def _raise_unavail():
+        raise FileNotFoundError("v3 Part 1 pin — SOFT unavailable path")
+
+    monkeypatch.setattr(
+        _msal_cache_crypto, "_get_master_key", _raise_unavail,
+    )
+    resp = client.get("/health")
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    assert body["status"] == "degraded", body
+    # Minimal shape preserved even in the degraded response.
+    assert set(body.keys()) == {"status", "uptime_secs", "db"}, body
+
+
+def test_health_aggregate_does_not_degrade_on_probe_error(
+    client, monkeypatch, db,
+):
+    """the backlog  REDESIGNED v3 Part 1 STRICT semantics pin — a
+    `probe_error` outcome (unexpected exception class, e.g. ``ValueError``
+    not in the SOFT ``_N151_UNAVAIL_TYPES`` set) leaves ``available=None``
+    (UNKNOWN) → top-line does NOT degrade. `unknown ≠ WARN` (the monitoring system
+    tri-state posture) — the operator gets `probe_error` visibility on
+    /health/detail without a top-line page.
+    """
+    from email_triage.providers import _msal_cache_crypto
+
+    def _raise_probe_error():
+        # A class NOT in `_N151_UNAVAIL_TYPES` — falls to `probe_error`.
+        raise ValueError("v3 Part 1 pin — probe_error path")
+
+    monkeypatch.setattr(
+        _msal_cache_crypto, "_get_master_key", _raise_probe_error,
+    )
+    resp = client.get("/health")
+    # Strict `is False` OR-term: available=None (probe_error) does NOT
+    # flip the top-line.  200 preserved.
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok", body
+
+
+def test_health_minimal_body_no_msal_key_leak_pin(
+    client, monkeypatch, db,
+):
+    """the backlog  REDESIGNED v3 Part 1 LEAK PIN — the minimal /health
+    body carries NO ``msal_master_key*`` key on any of the three
+    paths (available / unavailable / probe_error).  The MSAL block is
+    admin-only via /health/detail; /health only surfaces the top-line
+    ``status`` + ``uptime_secs`` + ``db``.
+    Guards against a future refactor that copies the block down into the
+    minimal shape and leaks the reason enum + last_probed_at to any
+    unauthenticated caller.
+    """
+    from email_triage.providers import _msal_cache_crypto
+
+    # Path 1 — healthy (real fixture master key).
+    resp = client.get("/health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for k in body.keys():
+        assert "msal_master_key" not in k, (
+            f"minimal /health body leaked msal_master_key key {k!r} on "
+            f"the healthy path; body={body!r}"
+        )
+
+    # Path 2 — SOFT unavailable → 503 body; still no leak.
+    monkeypatch.setattr(
+        _msal_cache_crypto,
+        "_get_master_key",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("leak-pin unavail")),
+    )
+    resp = client.get("/health")
+    assert resp.status_code == 503, resp.text
+    body = resp.json()
+    for k in body.keys():
+        assert "msal_master_key" not in k, (
+            f"minimal /health body leaked msal_master_key key {k!r} on "
+            f"the SOFT unavailable path; body={body!r}"
+        )
+    # Positive shape assertion — minimal contract preserved even on 503.
+    assert set(body.keys()) == {"status", "uptime_secs", "db"}, body
+
+    # Path 3 — probe_error (unexpected class) → 200 body; still no leak.
+    monkeypatch.setattr(
+        _msal_cache_crypto,
+        "_get_master_key",
+        lambda: (_ for _ in ()).throw(ValueError("leak-pin probe_error")),
+    )
+    resp = client.get("/health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for k in body.keys():
+        assert "msal_master_key" not in k, (
+            f"minimal /health body leaked msal_master_key key {k!r} on "
+            f"the probe_error path; body={body!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +460,7 @@ def test_health_last_triage_rendered_in_local_tz(
     import time as _time
 
     # Force a specific tz for this test so the offset is predictable.
-    monkeypatch.setenv("TZ", "America/New_York")
+    monkeypatch.setenv("TZ", "America/Detroit")
     if hasattr(_time, "tzset"):
         _time.tzset()
 
@@ -302,7 +497,7 @@ def test_health_last_triage_rendered_in_local_tz(
     # New York is UTC-4 (EDT) or UTC-5 (EST). Must NOT be +00:00.
     offset_hrs = dt.utcoffset().total_seconds() / 3600
     assert offset_hrs in (-4, -5), (
-        f"Expected New York offset -4/-5, got {offset_hrs} from {returned}"
+        f"Expected Detroit offset -4/-5, got {offset_hrs} from {returned}"
     )
     # Value-equality: parsed returned-dt equals parsed UTC-stored-dt.
     assert dt == datetime.fromisoformat(utc_ts)
@@ -366,6 +561,64 @@ def test_disabled_account_does_not_degrade_health(
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+def test_watching_off_account_is_neither_alert_nor_uncovered(
+    client, db, app, admin_user,
+):
+    """ follow-up (operator 2026-06-12): an ACTIVE account whose operator
+    turned BOTH push and poll OFF on purpose is "watching off" — a neutral
+    state, NOT ``alert='no_ingestion'`` and NOT ``uncovered``. Disabling a
+    watcher must never degrade /health."""
+    from email_triage.web.routers.health import _aggregate_account_states
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "INSERT INTO email_accounts (user_id, name, provider_type, "
+        "config_json, is_active, created_at, updated_at) "
+        "VALUES (?, 'paused-acct', 'imap', "
+        "'{\"push_enabled\": false, \"poll_enabled\": false}', 1, ?, ?)",
+        (admin_user["id"], now_iso, now_iso),
+    )
+    db.commit()
+
+    states = app.state.watcher_manager.account_states(db)
+    s = next(x for x in states if x["account_name"] == "paused-acct")
+    assert s["mode"] == "none"
+    assert s["watching_off"] is True
+    assert s["alert"] is None                       # NOT an error
+
+    agg = _aggregate_account_states(states)
+    assert agg["any_alert"] is False
+    assert agg["any_uncovered"] is False
+    assert agg["providers"]["imap"]["watching_off"] == 1
+    assert agg["providers"]["imap"]["uncovered"] == 0
+
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"            # deliberate pause ≠ degraded
+
+
+def test_push_off_but_poll_enabled_not_running_still_alerts(
+    client, db, app, admin_user,
+):
+    """Inverse guard: push OFF while poll stays ENABLED (default) but isn't
+    actually running is NOT a deliberate pause — ingestion was EXPECTED, so it
+    MUST still surface as ``no_ingestion``. Only BOTH-off is "watching off"."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db.execute(
+        "INSERT INTO email_accounts (user_id, name, provider_type, "
+        "config_json, is_active, created_at, updated_at) "
+        "VALUES (?, 'push-off-poll-on', 'imap', "
+        "'{\"push_enabled\": false, \"poll_enabled\": true}', 1, ?, ?)",
+        (admin_user["id"], now_iso, now_iso),
+    )
+    db.commit()
+
+    states = app.state.watcher_manager.account_states(db)
+    s = next(x for x in states if x["account_name"] == "push-off-poll-on")
+    assert s["watching_off"] is False
+    assert s["alert"] == "no_ingestion"
 
 
 # ---------------------------------------------------------------------------

@@ -65,15 +65,15 @@ def test_verify_rejects_token_with_tampered_payload():
 # Middleware behaviour (via TestClient)
 # ---------------------------------------------------------------------------
 
-def test_get_request_does_not_require_csrf(client, db, app):
+def test_get_request_does_not_require_csrf(raw_client, db, app):
     """RFC 7231 safe methods (GET/HEAD/OPTIONS) skip the check."""
-    resp = client.get("/health")
+    resp = raw_client.get("/health")
     assert resp.status_code in (200, 503)
     assert int(getattr(app.state, "csrf_rejects", 0)) == 0
 
 
 def test_post_without_csrf_soft_launch_logs_does_not_reject(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Default app.state.csrf_enforce=False → log + count, but proceed."""
     # Establish a session cookie so the middleware actually checks.
@@ -84,14 +84,14 @@ def test_post_without_csrf_soft_launch_logs_does_not_reject(
     token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, token)
 
-    resp = client.post("/api/csrf-token")
+    resp = raw_client.post("/api/csrf-token")
     # /api/csrf-token guarded? It is a POST? It's a GET in our def.
     # Use a different POST route. Hit /api/users which is admin-only
     # POST — the CSRF middleware runs before auth, so any POST will
     # bump the counter regardless of downstream auth result.
-    resp = client.post("/api/users", json={
+    resp = raw_client.post("/api/users", json={
         "email": "x@example.com", "name": "x", "role": "user",
     })
     # We don't care what the handler does (could be 403 / 422 / 400);
@@ -101,7 +101,7 @@ def test_post_without_csrf_soft_launch_logs_does_not_reject(
 
 
 def test_post_with_valid_csrf_does_not_count(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Valid token in header → no rejection, counter unchanged."""
     from email_triage.web.auth import (
@@ -111,11 +111,11 @@ def test_post_with_valid_csrf_does_not_count(
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
     csrf_token = mint_csrf_token("test-secret", sess_token)
     before = int(getattr(app.state, "csrf_rejects", 0))
-    client.post(
+    raw_client.post(
         "/api/users",
         json={"email": "y@example.com", "name": "y", "role": "user"},
         headers={CSRF_HEADER_NAME: csrf_token},
@@ -125,7 +125,7 @@ def test_post_with_valid_csrf_does_not_count(
 
 
 def test_post_with_enforce_true_rejects_403(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Flip csrf_enforce on; missing token → 403."""
     from email_triage.web.auth import (
@@ -137,8 +137,8 @@ def test_post_with_enforce_true_rejects_403(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
-        resp = client.post(
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        resp = raw_client.post(
             "/api/users",
             json={"email": "z@example.com", "name": "z", "role": "user"},
         )
@@ -148,12 +148,12 @@ def test_post_with_enforce_true_rejects_403(
         app.state.csrf_enforce = False
 
 
-def test_anonymous_post_does_not_trigger_csrf_check(client, db, app):
+def test_anonymous_post_does_not_trigger_csrf_check(raw_client, db, app):
     """No session cookie → the middleware skips (handler will reject
     with 401/403 for missing auth, but that's not our concern)."""
-    client.cookies.clear()
+    raw_client.cookies.clear()
     before = int(getattr(app.state, "csrf_rejects", 0))
-    client.post(
+    raw_client.post(
         "/api/users",
         json={"email": "z@example.com", "name": "z", "role": "user"},
     )
@@ -161,7 +161,7 @@ def test_anonymous_post_does_not_trigger_csrf_check(client, db, app):
     assert after == before
 
 
-def test_exempt_path_skips_check(client, db, app, admin_user):
+def test_exempt_path_skips_check(raw_client, db, app, admin_user):
     """Webhook routes, login routes, OAuth callbacks bypass CSRF."""
     from email_triage.web.auth import (
         SESSION_COOKIE_NAME, create_session_token,
@@ -170,16 +170,16 @@ def test_exempt_path_skips_check(client, db, app, admin_user):
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
     before = int(getattr(app.state, "csrf_rejects", 0))
     # /login/email is exempt; the handler may 4xx for missing form
     # fields, but the CSRF middleware should not bump the counter.
-    client.post("/login/email", data={"email": "x@y"})
+    raw_client.post("/login/email", data={"email": "x@y"})
     after = int(getattr(app.state, "csrf_rejects", 0))
     assert after == before
 
 
-def test_csrf_token_endpoint_returns_token(client, db, app, admin_user):
+def test_csrf_token_endpoint_returns_token(raw_client, db, app, admin_user):
     """/api/csrf-token mints + sets the cookie + returns the token."""
     from email_triage.web.auth import (
         SESSION_COOKIE_NAME, create_session_token,
@@ -188,8 +188,8 @@ def test_csrf_token_endpoint_returns_token(client, db, app, admin_user):
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
-    resp = client.get("/api/csrf-token")
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    resp = raw_client.get("/api/csrf-token")
     assert resp.status_code == 200
     body = resp.json()
     assert "token" in body
@@ -201,10 +201,10 @@ def test_csrf_token_endpoint_returns_token(client, db, app, admin_user):
     )
 
 
-def test_csrf_token_endpoint_401_without_session(client, db, app):
+def test_csrf_token_endpoint_401_without_session(raw_client, db, app):
     """No session cookie → 401, no token issued."""
-    client.cookies.clear()
-    resp = client.get("/api/csrf-token")
+    raw_client.cookies.clear()
+    resp = raw_client.get("/api/csrf-token")
     assert resp.status_code == 401
 
 
@@ -213,7 +213,7 @@ def test_csrf_token_endpoint_401_without_session(client, db, app):
 # ---------------------------------------------------------------------------
 
 def test_form_body_csrf_token_field_validates(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Hidden form field ``csrf_token`` validates the same as the
     header. Plain HTML <form method="post"> can now use CSRF without
@@ -227,13 +227,13 @@ def test_form_body_csrf_token_field_validates(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
         csrf_token = mint_csrf_token("test-secret", sess_token)
 
         # POST with form-urlencoded body containing csrf_token field.
         # No header. Should accept (not 403).
-        resp = client.post(
+        resp = raw_client.post(
             "/api/users",
             data={
                 "csrf_token": csrf_token,
@@ -250,7 +250,7 @@ def test_form_body_csrf_token_field_validates(
 
 
 def test_form_body_missing_csrf_token_rejects_in_enforce(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Same shape as above but no csrf_token field in the body.
     Enforce mode should 403."""
@@ -263,8 +263,8 @@ def test_form_body_missing_csrf_token_rejects_in_enforce(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
-        resp = client.post(
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        resp = raw_client.post(
             "/api/users",
             data={"email": "x@y", "name": "x", "role": "user"},
         )
@@ -275,7 +275,7 @@ def test_form_body_missing_csrf_token_rejects_in_enforce(
 
 
 def test_form_body_replays_to_handler_unchanged(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Buffering + replay must not corrupt the body. After CSRF
     middleware reads the form for the csrf_token field, the
@@ -288,14 +288,14 @@ def test_form_body_replays_to_handler_unchanged(
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
     csrf_token = mint_csrf_token("test-secret", sess_token)
 
     # /login/email is exempt from CSRF, but it DOES read request.form()
     # downstream -- ideal probe for "did body survive middleware".
     # We POST to a CSRF-guarded route instead: /admin/security/save
     # reads the form via request.form() and writes settings.
-    resp = client.post(
+    resp = raw_client.post(
         "/admin/security/save",
         data={
             "csrf_token": csrf_token,
@@ -315,7 +315,7 @@ def test_form_body_replays_to_handler_unchanged(
 # ---------------------------------------------------------------------------
 
 def test_rejection_writes_access_log_row(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Soft-launch rejection appends an access_log row with
     outcome='csrf_would_reject' so the admin UI can render the
@@ -324,10 +324,13 @@ def test_rejection_writes_access_log_row(
         SESSION_COOKIE_NAME, create_session_token,
     )
     app.state.session_secret = "test-secret"
+    # Soft-launch SSOT: pin enforce=False explicitly (the migration flipped the
+    # shared fixture default to True) so this asserts the would-reject path.
+    app.state.csrf_enforce = False
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
     before = db.execute(
         "SELECT COUNT(*) FROM access_log "
@@ -335,7 +338,7 @@ def test_rejection_writes_access_log_row(
     ).fetchone()[0]
 
     # POST without a token — soft-launch counts but proceeds.
-    client.post(
+    raw_client.post(
         "/api/users",
         json={"email": "a@example.com", "name": "a", "role": "user"},
     )
@@ -358,7 +361,7 @@ def test_rejection_writes_access_log_row(
 
 
 def test_enforce_rejection_writes_audit_with_403(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """Enforce mode rejection writes outcome='csrf_rejected'
     with status_code=403."""
@@ -371,8 +374,8 @@ def test_enforce_rejection_writes_audit_with_403(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
-        client.post(
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        raw_client.post(
             "/api/users",
             json={"email": "b@example.com", "name": "b", "role": "user"},
         )
@@ -392,7 +395,7 @@ def test_enforce_rejection_writes_audit_with_403(
 # ---------------------------------------------------------------------------
 
 def test_extra_exempt_prefix_skips_check(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """A prefix in app.state.csrf_extra_exempt_prefixes bypasses
     CSRF validation just like the always-on set."""
@@ -405,11 +408,11 @@ def test_extra_exempt_prefix_skips_check(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
         before = int(getattr(app.state, "csrf_rejects", 0))
         # POST without a token to a now-exempt path — counter
         # must stay flat.
-        client.post(
+        raw_client.post(
             "/api/users",
             json={"email": "c@example.com", "name": "c", "role": "user"},
         )
@@ -420,7 +423,7 @@ def test_extra_exempt_prefix_skips_check(
 
 
 def test_extra_exempt_prefix_only_matches_prefix(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """An exempt entry of '/api/users' must NOT also exempt
     '/api/userx' or '/admin/users' — exact prefix match only."""
@@ -433,15 +436,15 @@ def test_extra_exempt_prefix_only_matches_prefix(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
         before = int(getattr(app.state, "csrf_rejects", 0))
-        # /api/openclaw is unrelated — should still trip the counter.
-        client.post(
-            "/api/openclaw/health",
+        # /api/v1 is unrelated — should still trip the counter.
+        raw_client.post(
+            "/api/v1/health",
             json={},
         )
         after = int(getattr(app.state, "csrf_rejects", 0))
-        # /api/openclaw is admin-only and would 401 first, but
+        # /api/v1 is admin-only and would 401 first, but
         # the CSRF middleware runs before auth so the counter
         # increments regardless of downstream status.
         assert after >= before  # at least not negative
@@ -472,7 +475,7 @@ def test_csrf_exempt_prefixes_yaml_roundtrip(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_admin_security_page_shows_rates(
-    client, db, app, admin_user, admin_cookies,
+    raw_client, db, app, admin_user, admin_cookies,
 ):
     """/admin/security renders the 24h / 7d rate block + top-paths
     section so the operator can watch the soft-launch window."""
@@ -493,8 +496,8 @@ def test_admin_security_page_shows_rates(
     )
     db.commit()
 
-    client.cookies.update(admin_cookies)
-    r = client.get("/admin/security")
+    raw_client.cookies.update(admin_cookies)
+    r = raw_client.get("/admin/security")
     assert r.status_code == 200
     # 24h count = 1, 7d count = 2.
     assert "Last 24 hours: <code>1</code>" in r.text
@@ -508,7 +511,7 @@ def test_admin_security_page_shows_rates(
 # ---------------------------------------------------------------------------
 
 def test_oversize_form_body_without_token_returns_413(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """ — A form-urlencoded POST whose body exceeds
     ``_BODY_BUFFER_CAP`` and carries no X-CSRF-Token header used to
@@ -526,14 +529,14 @@ def test_oversize_form_body_without_token_returns_413(
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
     # Build a form-urlencoded body just over the cap. No csrf_token
     # field — so neither header nor form-field path supplies a token.
     over_cap_payload = "x=" + ("A" * (_BODY_BUFFER_CAP + 1024))
     assert len(over_cap_payload) > _BODY_BUFFER_CAP
 
-    resp = client.post(
+    resp = raw_client.post(
         "/api/users",
         content=over_cap_payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -544,7 +547,7 @@ def test_oversize_form_body_without_token_returns_413(
 
 
 def test_oversize_form_body_with_valid_header_token_does_not_413(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """ boundary — oversize body WITH a valid X-CSRF-Token header
     skips the form-buffer path entirely (header check happens before
@@ -561,11 +564,11 @@ def test_oversize_form_body_with_valid_header_token_does_not_413(
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
     csrf_token = mint_csrf_token("test-secret", sess_token)
 
     over_cap_payload = "x=" + ("A" * (_BODY_BUFFER_CAP + 1024))
-    resp = client.post(
+    resp = raw_client.post(
         "/api/users",
         content=over_cap_payload,
         headers={
@@ -581,7 +584,7 @@ def test_oversize_form_body_with_valid_header_token_does_not_413(
 
 
 def test_oversize_form_body_does_not_invoke_downstream_handler(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """ — assert via a sentinel on app.state that downstream
     code never ran. Inserts a request middleware-side counter
@@ -596,7 +599,7 @@ def test_oversize_form_body_does_not_invoke_downstream_handler(
     sess_token = create_session_token(
         "test-secret", admin_user["email"], "admin",
     )
-    client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+    raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
     # Sentinel: count rows inserted by the /api/users handler. If the
     # downstream handler runs, we'd at least see a hit on the auth /
@@ -608,7 +611,7 @@ def test_oversize_form_body_does_not_invoke_downstream_handler(
     ).fetchone()[0]
 
     over_cap_payload = "x=" + ("A" * (_BODY_BUFFER_CAP + 1024))
-    resp = client.post(
+    resp = raw_client.post(
         "/api/users",
         content=over_cap_payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -653,7 +656,7 @@ def test_default_config_yaml_loader_csrf_enforce_is_true(tmp_path):
 
 
 def test_form_post_without_token_rejects_403_under_new_default(
-    client, db, app, admin_user,
+    raw_client, db, app, admin_user,
 ):
     """With the install-wide default flipped to enforce=True, a form
     POST that carries neither header nor body csrf_token field is
@@ -675,9 +678,9 @@ def test_form_post_without_token_rejects_403_under_new_default(
         sess_token = create_session_token(
             "test-secret", admin_user["email"], "admin",
         )
-        client.cookies.set(SESSION_COOKIE_NAME, sess_token)
+        raw_client.cookies.set(SESSION_COOKIE_NAME, sess_token)
 
-        resp = client.post(
+        resp = raw_client.post(
             "/api/users",
             data={
                 "email": "n@example.com",

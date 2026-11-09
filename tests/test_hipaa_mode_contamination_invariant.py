@@ -52,7 +52,7 @@ class TestSetupLoggingHipaaContamination:
 
         # (a) Verify the autouse fixture exists and has the right shape.
         assert conftest_path.exists(), (
-            "tests/conftest.py missing. The Bundle E5  autouse fixture "
+            "tests/conftest.py missing. The Bundle E5 #21 autouse fixture "
             "`_restore_hipaa_mode_around_each_test` lives there. Restore "
             "it or the contamination class re-opens silently."
         )
@@ -60,7 +60,7 @@ class TestSetupLoggingHipaaContamination:
         assert "_restore_hipaa_mode_around_each_test" in conftest_text, (
             "tests/conftest.py does not contain the autouse fixture "
             "`_restore_hipaa_mode_around_each_test`. Add it back per "
-            "Bundle E5  to close the channel-2 contamination class."
+            "Bundle E5 #21 to close the channel-2 contamination class."
         )
         # Loose-fit shape check: the fixture snapshots, yields, restores.
         assert (
@@ -69,7 +69,7 @@ class TestSetupLoggingHipaaContamination:
         ), (
             "Autouse fixture in tests/conftest.py is present but doesn't "
             "match the expected snapshot+yield+restore shape. See Bundle "
-            "E5  spec."
+            "E5 #21 spec."
         )
 
         # (b) Enumerate all setup_logging(LoggingConfig(hipaa=...)) call sites.

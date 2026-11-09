@@ -22,7 +22,7 @@ def _make_account(db, user_id, *, name="Ops Mailbox"):
         " created_at, updated_at) "
         "VALUES (?, ?, ?, ?, 1, ?, ?)",
         (user_id, name, "imap",
-         json.dumps({"host": "mail.test.com"}), now, now),
+         json.dumps({"host": "mail.test.invalid"}), now, now),
     )
     db.commit()
     return cursor.lastrowid

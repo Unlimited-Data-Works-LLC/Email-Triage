@@ -56,7 +56,7 @@ def _expired_backend(db, *, admin_user) -> int:
         db,
         name="ExpiredAzure",
         type_="azure_openai",
-        endpoint="https://example.com/v1",
+        endpoint="https://example.invalid/v1",
         api_key_secret_ref=None,
         model="gpt-4o-mini",
         baa_certified=True,

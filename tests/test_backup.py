@@ -87,7 +87,13 @@ def _seed_test_db(path: Path) -> sqlite3.Connection:
         "CREATE TABLE log_entries ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "  ts TEXT NOT NULL, level TEXT, logger TEXT, "
-        "  message TEXT, extra_json TEXT"
+        "  message TEXT, extra_json TEXT, "
+        # Panel P F8: the chain columns every real log_entries has, so the
+        # backup prune (now the live funnel, which stamps the chain anchor)
+        # runs against the real shape.
+        "  prev_hash TEXT NOT NULL DEFAULT '', row_hash TEXT NOT NULL DEFAULT '', "
+        "  hash_alg TEXT NOT NULL DEFAULT 'sha256', "
+        "  master_key_version INTEGER NOT NULL DEFAULT 0"
         ")"
     )
     # Seed a few rows (current + old) so the prune path has something
@@ -210,7 +216,7 @@ class TestFullBundle:
                 include_tls_certs=include_tls_certs,
                 include_logs=include_logs,
                 operator_email="op@example.com",
-                hostname="testhost",
+                hostname="testhost.invalid",
                 schema_version=42,
             )
         finally:
@@ -221,7 +227,7 @@ class TestFullBundle:
         bundle = self._build(tmp_path)
         result = unbundle(bundle, passphrase=self.PASSPHRASE)
         assert result.bundle_type == "full"
-        assert result.manifest["hostname"] == "testhost"
+        assert result.manifest["hostname"] == "testhost.invalid"
         assert result.manifest["operator_email"] == "op@example.com"
         assert result.manifest["schema_version"] == 42
         # DB + YAML always present.
@@ -233,6 +239,321 @@ class TestFullBundle:
         assert "data/master_key.bin" not in result.files
         # msal_cache included whenever present (no toggle).
         assert "data/msal_cache.json" in result.files
+
+    def test_per_account_msal_caches_included(self, tmp_path):
+        """N-177 / R20_2 — the census identified backup silently omitted per-
+        account MSAL token caches. This asserts every `data/msal_cache*.json`
+        on disk is in the bundle (bijection). The legacy singleton path is a
+        subset of the glob and stays covered."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        # Two per-account caches + the legacy singleton (the old backup path
+        # only collected the singleton — the two per-account files leaked out).
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy": true}')
+        (data_dir / "msal_cache_3.json").write_bytes(b'{"acct":3}')
+        (data_dir / "msal_cache_7.json").write_bytes(b'{"acct":7}')
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost.invalid", schema_version=42,
+            )
+        finally:
+            conn.close()
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        # All 3 files bijectively present under data/.
+        want = {"data/msal_cache.json", "data/msal_cache_3.json", "data/msal_cache_7.json"}
+        got = {p for p in result.files if p.startswith("data/msal_cache")}
+        assert got == want, (
+            f"per-account MSAL bijection broken: on disk {want}, in bundle {got}"
+        )
+
+    def test_per_account_msal_caches_round_trip_restore(self, tmp_path, monkeypatch):
+        """DA/hipaa-sme must-fix — restore writes ALL msal_cache_*.json back
+        with 0o600 (bijection round-trip). Backup-side glob is worthless if
+        restore drops files."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy":true}')
+        (data_dir / "msal_cache_11.json").write_bytes(b'{"acct":11}')
+        # N-472 follow-up (hipaa-sme, corrected GO-WITH-FIXES): every fixture
+        # in this round-trip used to be PLAINTEXT JSON — the same shape that
+        # hid N-472 in the collector for 66 days, here on the RESTORE half.
+        # The N-472 regression test proves the Fernet shape reaches the bundle
+        # but asserts on `unbundle`'s in-memory result and never calls
+        # `write_unbundled_to_dir`, so the disk-restore writer was still
+        # unproven against what the writer actually emits. Build this one
+        # through the writer's own SSOT.
+        import json as _json
+
+        from cryptography.fernet import Fernet
+
+        from email_triage.providers import _msal_cache_crypto
+
+        _key = Fernet.generate_key()
+        _msal_cache_crypto._reset_master_key_cache_for_tests()
+        monkeypatch.setattr(_msal_cache_crypto, "_get_master_key", lambda: _key)
+        _encrypted = _msal_cache_crypto.encrypt_cache(
+            _json.dumps({"AccessToken": {f"k{i}": {"secret": "x" * 40} for i in range(60)}})
+        )
+        assert not _encrypted.lstrip().startswith(b"{"), (
+            "fixture is not Fernet-shaped — this assertion is what stops the "
+            "restore half silently reverting to a plaintext-only round-trip"
+        )
+        (data_dir / "msal_cache_22.json").write_bytes(_encrypted)
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost.invalid", schema_version=42,
+            )
+        finally:
+            conn.close()
+        from email_triage.backup import write_unbundled_to_dir
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        restore_dir = tmp_path / "restore"
+        written = write_unbundled_to_dir(result, restore_dir)
+        for name in ("msal_cache.json", "msal_cache_11.json", "msal_cache_22.json"):
+            p = restore_dir / "data" / name
+            assert p.is_file(), f"restore lost {name}"
+            assert p.read_bytes() == (data_dir / name).read_bytes()
+
+    def test_torn_write_msal_cache_omitted(self, tmp_path):
+        """DA must-fix — a torn/truncated JSON cache mid-backup must NOT be
+        bundled (poisoning restore is worse than missing). Skip+continue."""
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        (data_dir / "msal_cache.json").write_bytes(b'{"legacy":true}')
+        (data_dir / "msal_cache_9.json").write_bytes(b'{"truncated":')  # invalid JSON
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost.invalid", schema_version=42,
+            )
+        finally:
+            conn.close()
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        assert "data/msal_cache.json" in result.files
+        assert "data/msal_cache_9.json" not in result.files, (
+            "torn-write cache poisoned the bundle"
+        )
+
+    #: Truncation offset for the N-472 torn-write control. A MULTIPLE OF 4
+    #: on purpose: base64 then decodes cleanly, so the surviving prefix
+    #: clears the length floor and the 0x80 version byte and is rejected
+    #: ONLY by the whole-AES-block congruence. An offset that is not a
+    #: multiple of 4 is caught by a padding error instead and proves
+    #: nothing about the congruence.
+    _TRUNCATE_AT = 200
+
+    def test_fernet_encrypted_msal_cache_is_bundled(self, tmp_path, monkeypatch):
+        """N-472 regression — the shape the WRITER actually produces must
+        survive the collector's validity gate.
+
+        This is the test that did not exist for two months. Every fixture
+        in the sibling cases above is hand-typed plaintext JSON, so the
+        collector's hardcoded ``json.loads`` gate stayed green while
+        N-151's 2026-07-08 Fernet cutover meant every real install's
+        per-account MSAL cache was silently dropped from every bundle.
+
+        The fixture is generated by calling the family's own writer SSOT
+        (``encrypt_cache``), never a byte literal — a literal would
+        re-create exactly the blind spot this test closes.
+
+        Positive control in the same case: a TRUNCATED Fernet token must
+        still be rejected. Without it the assertion below would also pass
+        for a predicate that accepts everything, which proves nothing.
+        """
+        from cryptography.fernet import Fernet
+
+        from email_triage.providers import _msal_cache_crypto
+
+        key = Fernet.generate_key()
+        _msal_cache_crypto._reset_master_key_cache_for_tests()
+        monkeypatch.setattr(_msal_cache_crypto, "_get_master_key", lambda: key)
+
+        # Realistically sized: a live MSAL cache is a few KB. A toy
+        # `'{"AccessToken": {}}'` encrypts to ~120 base64 chars, and then
+        # `encrypted[:200]` silently yields the WHOLE token — the
+        # truncation control becomes a second copy of the valid file and
+        # asserts nothing. Measured: that is exactly how the first version
+        # of this test failed.
+        import json as _json
+        cache_json = _json.dumps(
+            {"AccessToken": {f"key{i}": {"secret": "x" * 40} for i in range(60)}}
+        )
+        encrypted = _msal_cache_crypto.encrypt_cache(cache_json)
+        assert not encrypted.lstrip().startswith(b"{"), (
+            "fixture is not actually Fernet-shaped — the writer changed "
+            "and this test would pass vacuously"
+        )
+        assert len(encrypted) > 2 * self._TRUNCATE_AT, (
+            f"fixture token is only {len(encrypted)} bytes; the truncation "
+            f"controls below slice at {self._TRUNCATE_AT} and would be handing "
+            "the collector an INTACT token instead of a torn one"
+        )
+
+        db_path = tmp_path / "triage.db"
+        conn = _seed_test_db(db_path)
+        config_path = _seed_test_config(tmp_path / "email-triage.yaml")
+        data_dir = tmp_path / "data"; data_dir.mkdir()
+        cert_dir = data_dir / "certs"; cert_dir.mkdir()
+        (cert_dir / "server.crt").write_bytes(b"--CERT--")
+        (cert_dir / "server.key").write_bytes(b"--KEY--")
+        (data_dir / "msal_cache_7.json").write_bytes(encrypted)
+        # Positive control A — a REALISTIC torn Fernet write. 200 is a
+        # multiple of 4, so base64 decoding SUCCEEDS and the 150 surviving
+        # bytes clear both the 57-byte floor and the 0x80 version byte.
+        # Only the whole-AES-block congruence rejects it. This is the
+        # control that matters: devils-advocate measured that floor +
+        # version alone accept 25% of real truncation offsets, and the
+        # original control below happened to land on the one branch that
+        # does fire for short files, which proved nothing about the rest.
+        (data_dir / "msal_cache_8.json").write_bytes(encrypted[:self._TRUNCATE_AT])
+        # Positive control B — a very short truncation, rejected by the
+        # length floor. Kept so both rejecting branches stay exercised.
+        (data_dir / "msal_cache_9.json").write_bytes(encrypted[:20])
+        # Positive control C — the VERSION BYTE branch. db-sme mutation-
+        # measured that deleting `decoded[0] == _FERNET_VERSION_BYTE` left
+        # the suite GREEN: controls A and B are both prefixes or short
+        # slices of a valid token, so their first decoded byte is still
+        # 0x80 and that check never fired. A check no test can see is
+        # decoration. Swapping the leading base64 char keeps the length
+        # (so the floor and the congruence both still pass) and turns the
+        # first decoded byte into 0x00, which ONLY the version check
+        # rejects.
+        (data_dir / "msal_cache_10.json").write_bytes(b"A" + encrypted[1:])
+        secrets = _FakeSecrets({"ET_MASTER_KEY": "fernet-key-base64-here-32-bytes-padded"})
+        try:
+            bundle = build_full_bundle(
+                db_conn=conn, config_path=config_path, data_dir=data_dir,
+                cert_dir=cert_dir, secrets_provider=secrets,
+                master_key_name="ET_MASTER_KEY", passphrase=self.PASSPHRASE,
+                include_master_key=False, include_tls_certs=True, include_logs=False,
+                operator_email="op@example.com", hostname="testhost.invalid", schema_version=42,
+            )
+        finally:
+            conn.close()
+        result = unbundle(bundle, passphrase=self.PASSPHRASE)
+        assert "data/msal_cache_7.json" in result.files, (
+            "N-472: the encrypted MSAL cache the writer produces was "
+            "dropped from the bundle"
+        )
+        assert result.files["data/msal_cache_7.json"].data == encrypted, (
+            "bundled bytes differ from what the writer wrote"
+        )
+        assert "data/msal_cache_8.json" not in result.files, (
+            "a torn Fernet token at a base64-clean offset was bundled — "
+            "the predicate is checking the floor and the version byte but "
+            "not the whole-block congruence, which is 25% of real "
+            "truncations"
+        )
+        assert "data/msal_cache_9.json" not in result.files, (
+            "a short truncation was bundled — the length floor is gone"
+        )
+        assert "data/msal_cache_10.json" not in result.files, (
+            "a token with a corrupted VERSION BYTE was bundled — the "
+            "0x80 check is decoration that no test can see"
+        )
+
+    def test_legacy_plaintext_warning_fires_and_names_the_file(self, caplog):
+        """N-472 — the legacy-plaintext WARNING must FIRE and must NAME the
+        artifact it is about.
+
+        Two findings in one test, both from devils-advocate:
+
+        * Nothing asserted the warning fires at all. Deleting the whole
+          `get_logger(...).warning(...)` block left the suite GREEN — the
+          exact "decoration" defect that was mutation-caught on the version
+          byte, reintroduced in the very fold that fixed it.
+        * The warning named no file. The predicate receives ``bytes`` and
+          structurally cannot know which cache produced them, so three
+          different legacy caches emitted three BYTE-IDENTICAL lines. An
+          operator told an unencrypted OAuth refresh token is on disk, and
+          not told whose — and `msal_cache_path_for_*` is per-account.
+          Reporting a state without its artifact is half a fix.
+        """
+        import logging
+
+        from email_triage.providers._msal_cache_crypto import (
+            is_valid_cache_payload,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert is_valid_cache_payload(
+                b'{"legacy": true}', source="data/msal_cache_42.json"
+            ) is True
+
+        legacy = [r for r in caplog.records if "LEGACY PLAINTEXT" in r.getMessage()]
+        assert legacy, (
+            "the legacy-plaintext branch emitted NO warning — the block is "
+            "decoration that no test can see"
+        )
+        assert any(
+            getattr(r, "source", None) == "data/msal_cache_42.json" for r in legacy
+        ), (
+            "the warning fired but did not carry the source path — an "
+            "operator cannot tell WHICH account has an unencrypted refresh "
+            "token on disk, which is the only question it exists to answer"
+        )
+
+    def test_empty_msal_cache_sits_exactly_on_the_length_floor(self, monkeypatch):
+        """N-472 — an EMPTY cache decodes to EXACTLY the floor, so the
+        comparison must stay ``>=``.
+
+        `"{}"` is 2 bytes; PKCS7 pads it to one 16-byte block, giving
+        1+8+16+16+32 = 73 decoded bytes — the floor itself, not above it.
+        A later "tightening" of `>=` to `>` would silently drop the cache
+        of every account that has not yet acquired a token, which is the
+        exact class of silent omission N-472 exists to close. This test is
+        the thing that makes that one-character change red.
+        """
+        import base64
+
+        from cryptography.fernet import Fernet
+
+        from email_triage.providers import _msal_cache_crypto
+
+        key = Fernet.generate_key()
+        _msal_cache_crypto._reset_master_key_cache_for_tests()
+        monkeypatch.setattr(_msal_cache_crypto, "_get_master_key", lambda: key)
+
+        token = _msal_cache_crypto.encrypt_cache("{}")
+        decoded_len = len(base64.urlsafe_b64decode(token))
+        assert decoded_len == _msal_cache_crypto._FERNET_MIN_DECODED_LEN, (
+            f"an empty cache decoded to {decoded_len}, not the floor "
+            f"{_msal_cache_crypto._FERNET_MIN_DECODED_LEN} — the floor "
+            "constant and Fernet's layout have diverged"
+        )
+        assert _msal_cache_crypto.is_valid_cache_payload(token), (
+            "an empty-but-VALID MSAL cache was rejected — the length floor "
+            "is exclusive when it must be inclusive"
+        )
 
     def test_include_master_key_adds_file(self, tmp_path):
         bundle = self._build(tmp_path, include_master_key=True)
@@ -340,7 +661,7 @@ class TestKeyOnlyBundle:
             master_key_name="ET_MASTER_KEY",
             passphrase=self.PASSPHRASE,
             operator_email="op@example.com",
-            hostname="testhost",
+            hostname="testhost.invalid",
         )
         assert bundle.startswith(MAGIC_KEY_ONLY)
         result = unbundle(bundle, passphrase=self.PASSPHRASE)
@@ -504,7 +825,7 @@ class TestManifest:
         m = _build_manifest(
             bundle_type="full",
             files=files,
-            hostname="h",
+            hostname="h.invalid",
             operator_email="e",
             commit_sha="c",
             schema_version=1,
@@ -524,7 +845,7 @@ class TestManifest:
         m = _build_manifest(
             bundle_type="full",
             files=files,
-            hostname="h",
+            hostname="h.invalid",
             operator_email="",
             commit_sha="",
             schema_version=1,

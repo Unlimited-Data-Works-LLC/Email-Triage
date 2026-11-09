@@ -9,6 +9,7 @@ These tests prove a re-run with the same (account, message) skips.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -29,7 +30,7 @@ from email_triage.web.db import init_db, create_email_account
 @pytest.fixture
 def idem_db(tmp_path):
     """Fully-migrated DB carrying the v34 action_idempotency table."""
-    conn = init_db(tmp_path / "idem.db")
+    conn = track(init_db(tmp_path / "idem.db"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('pi@example.com', 'PI', 'admin', ?)",
@@ -43,7 +44,7 @@ def idem_db(tmp_path):
 def _account(conn) -> int:
     return create_email_account(
         conn, user_id=1, name="acct", provider_type="imap",
-        config={"host": "imap.example.com"},
+        config={"host": "imap.example.invalid"},
     )
 
 

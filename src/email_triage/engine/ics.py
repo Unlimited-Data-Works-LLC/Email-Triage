@@ -9,6 +9,10 @@ available.
 from __future__ import annotations
 
 import logging
+import re
+
+from email_triage._int_utils import bounded_int  # N-219c/44 R23
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from datetime import date, datetime, time, timezone
 from typing import Any
 
@@ -19,7 +23,7 @@ except ImportError:
     HAS_ICAL = False
     Calendar = Event = vCalAddress = vText = None  # type: ignore[assignment]
 
-logger = logging.getLogger("email_triage.engine.ics")
+logger = get_logger("email_triage.engine.ics")  # N-196b R21_4
 
 
 def _to_utc(value: Any) -> datetime | None:
@@ -36,10 +40,72 @@ def _to_utc(value: Any) -> datetime | None:
     return None
 
 
-def _attendee_dict(att: Any) -> dict[str, Any]:
-    """Best-effort flatten of an icalendar ATTENDEE property."""
-    raw = str(att) if att is not None else ""
-    email_addr = raw.replace("mailto:", "").replace("MAILTO:", "")
+#: RFC 5545 section 3.3.8: the valid range for an "integer" is -2147483648 to 2147483647. A
+#: SEQUENCE is a revision counter, never negative; anything above the range is not a revision.
+_MAX_SEQUENCE = 2**31 - 1
+
+# Characters that make a CAL-ADDRESS unusable as ONE mailbox: every C0/C1 control (CR, LF, TAB, NUL,
+# DEL, NEL), the Unicode line/paragraph separators, whitespace, and the address-list / display-name
+# delimiters. A bare CR survives icalendar's parse (probe 2026-11-02, 7.3.0), and an address list
+# ("a@x, b@x") would address a second recipient.
+_ADDRESS_REFUSED = re.compile(r"[\x00-\x20\x7f-\x9f  ,;<>\"\\]")
+
+
+def _cal_address_email(value: Any) -> str:
+    """The mailbox of an ORGANIZER / ATTENDEE CAL-ADDRESS, or ``""`` when it is not one safe mailbox.
+
+    The ONE funnel for every address ``parse_ics`` returns (punch 774, PD-5/PD-8): REFUSE a value
+    that carries a control character or a list delimiter, never strip it, because a stripped CR
+    can join two lines into a different address. ``""`` is the fail-closed answer: ``invite.py``
+    falls back to the message sender, and an attendee with no address is dropped."""
+    raw = str(value) if value is not None else ""
+    addr = re.sub(r"^mailto:", "", raw, flags=re.IGNORECASE)  # no .strip(): a trailing CR must be refused, not eaten
+    return "" if _ADDRESS_REFUSED.search(addr) else addr
+
+
+def attendee_mailboxes(entries: Any) -> list[str]:
+    """The safe mailbox of each ``{"email": ...}`` entry in an attendee list; an entry that is not
+    one safe mailbox is dropped (punch 823, the API-supplied twin of the 774 ICS source).
+
+    The funnel for every attendee a calendar write sends to Google or Graph. A caller that must
+    not invite fewer people than it was asked to compares the length with its input and refuses."""
+    if not isinstance(entries, list):
+        return []
+    return [
+        addr for entry in entries if isinstance(entry, dict) and isinstance(entry.get("email"), str)
+        and (addr := _cal_address_email(entry["email"]))
+    ]
+
+
+def native_attendees_safe(entries: Any) -> bool:
+    """True when a provider-shaped ``attendees`` value names only safe mailboxes (punch 823).
+
+    A calendar PATCH body is forwarded as the provider's own JSON, so the list keeps its Google
+    (``email``) or Graph (``emailAddress.address``) shape. Every address-bearing key an entry
+    carries must be a string the funnel returns unchanged: a ``mailto:`` prefix is refused here,
+    not stripped, because the value is forwarded as given. An empty list is safe (it clears the
+    attendees); a value that is not a list is not."""
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        nested = entry.get("emailAddress")
+        values = [entry["email"]] if "email" in entry else []
+        if nested is not None:
+            if not isinstance(nested, dict) or "address" not in nested:
+                return False
+            values.append(nested["address"])
+        if not values or any(not isinstance(v, str) or _cal_address_email(v) != v or not v for v in values):
+            return False
+    return True
+
+
+def _attendee_dict(att: Any) -> dict[str, Any] | None:
+    """Best-effort flatten of an icalendar ATTENDEE property; ``None`` when its address is refused."""
+    email_addr = _cal_address_email(att)
+    if not email_addr:
+        return None
     params = getattr(att, "params", {}) if att is not None else {}
     return {
         "email": email_addr,
@@ -80,7 +146,10 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
     try:
         cal = Calendar.from_ical(blob)
     except Exception as e:
-        logger.debug("ICS parse failed: %s", e)
+        logger.debug(
+            "ICS parse failed",
+            extra={"error_type": type(e).__name__, "error_msg": str(e)},
+        )
         return None
 
     # Component-level METHOD lives on the top-level Calendar.
@@ -111,20 +180,18 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
             end_dt = _to_utc(end_val)
 
             organizer_prop = component.get("ORGANIZER")
-            organizer = ""
-            if organizer_prop is not None:
-                organizer = str(organizer_prop).replace("mailto:", "").replace("MAILTO:", "")
+            organizer = _cal_address_email(organizer_prop) if organizer_prop is not None else ""
 
             attendees_prop = component.get("ATTENDEE", [])
             if not isinstance(attendees_prop, list):
                 attendees_prop = [attendees_prop]
-            attendees = [_attendee_dict(a) for a in attendees_prop]
+            attendees = [d for d in (_attendee_dict(a) for a in attendees_prop) if d is not None]
 
             sequence_raw = component.get("SEQUENCE")
-            try:
-                sequence = int(sequence_raw) if sequence_raw is not None else 0
-            except (TypeError, ValueError):
-                sequence = 0
+            sequence = (
+                bounded_int(sequence_raw, default=0, lo=0, hi=_MAX_SEQUENCE)  # N-219c/44 R23: SSOT
+                if sequence_raw is not None else 0
+            )
 
             return {
                 "uid": uid,
@@ -140,7 +207,10 @@ def parse_ics(blob: bytes | str) -> dict[str, Any] | None:
                 "sequence": sequence,
             }
         except Exception as e:
-            logger.debug("VEVENT parse failed: %s", e)
+            logger.debug(
+                "VEVENT parse failed",
+                extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            )
             continue
 
     return None
@@ -191,6 +261,64 @@ def build_imip_reply(
     if attendee_name:
         attendee.params["CN"] = vText(attendee_name)
     event.add("ATTENDEE", attendee, encode=0)
+
+    cal.add_component(event)
+    return cal.to_ical()
+
+
+def build_clock_ics(
+    *,
+    uid: str,
+    label: str,
+    deadline_at: str | None,
+    deep_link: str = "",
+    lead_minutes: int = 1440,
+) -> bytes | None:
+    """Build a PHI-FREE VEVENT (+ VALARM) for a regulatory-clock deadline.
+
+    The always-on ``.ics``-in-email baseline + the direct-write payload. An
+    all-day event on the deadline's date; ``SUMMARY`` = the clock LABEL (non-PHI
+    policy metadata, the def title); ``DESCRIPTION`` = an advisory line + the
+    in-app deep-link. **SCRUB-AT-WRITE** (the ``.ics`` is readable by any
+    calendar app / webhook receiver / digest): NO ``case_ref``, NO ``raw_deadline_
+    phrase``, NO trigger-email subject/sender/body. A ``VALARM`` fires
+    ``lead_minutes`` before. Returns the ``.ics`` bytes, or ``None`` when
+    icalendar is unavailable or the deadline is unparseable."""
+    if not HAS_ICAL or not deadline_at:
+        return None
+    from datetime import timedelta
+
+    from email_triage._isotime import parse_iso
+    dl = parse_iso(deadline_at)
+    if dl is None:
+        return None
+    from icalendar import Alarm
+
+    cal = Calendar()
+    cal.add("PRODID", "-//Email Triage//Regulatory Clock//EN")
+    cal.add("VERSION", "2.0")
+
+    event = Event()
+    event.add("UID", uid)
+    event.add("DTSTAMP", datetime.now(timezone.utc))
+    event.add("SUMMARY", f"Regulatory deadline: {label}")
+    desc = (
+        "Reminder based on your configured policy — verify against your SOP. "
+        "Advisory, not an official record."
+    )
+    if deep_link:
+        desc += f"\n{deep_link}"
+    event.add("DESCRIPTION", desc)
+    # All-day event on the deadline's date (the regulator's local day boundary
+    # is pinned upstream; here we use the derived UTC deadline's date).
+    event.add("DTSTART", dl.date())
+    event.add("DTEND", (dl + timedelta(days=1)).date())
+
+    alarm = Alarm()
+    alarm.add("ACTION", "DISPLAY")
+    alarm.add("DESCRIPTION", f"Regulatory deadline: {label}")
+    alarm.add("TRIGGER", timedelta(minutes=-int(lead_minutes)))
+    event.add_component(alarm)
 
     cal.add_component(event)
     return cal.to_ical()

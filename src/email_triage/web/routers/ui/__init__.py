@@ -24,6 +24,7 @@ Patchable-helper indirection (the trickiest part of the split):
 """
 from __future__ import annotations
 
+from email_triage._errfmt import fmt_exc
 import sys
 import types as _types
 
@@ -54,7 +55,7 @@ from .admin import router as _admin_router
 from .ai_backends_crud import router as _ai_backends_crud_router
 from .embedding_install import router as _embedding_install_router
 from .triage_classify import router as _triage_classify_router
-from .openclaw import router as _openclaw_router
+from .webhook import router as _webhook_router
 from .labels import router as _labels_router
 from .retry_queue import router as _retry_queue_router
 
@@ -84,7 +85,7 @@ for _r in (
     _embedding_install_router,
     _ai_backends_crud_router,
     _triage_classify_router,
-    _openclaw_router,
+    _webhook_router,
     _labels_router,
     _retry_queue_router,
 ):
@@ -108,7 +109,7 @@ _CONCERN_MODULES = (
     ".ai_backends_crud",
     ".embedding_install",
     ".triage_classify",
-    ".openclaw",
+    ".webhook",
     ".labels",
     ".retry_queue",
 )
@@ -136,8 +137,11 @@ class _UiPackage(_types.ModuleType):
         if hasattr(_shared, name):
             try:
                 setattr(_shared, name, value)
-            except Exception:
-                pass
+            except Exception as e:
+                _shared._log.warning(
+                    "Patch propagation to _shared failed",
+                    attr=name, error=fmt_exc(e),
+                )
             import sys as _sys
             for _modname in _CONCERN_MODULES:
                 full = self.__name__ + _modname
@@ -145,8 +149,11 @@ class _UiPackage(_types.ModuleType):
                 if _m is not None and name in vars(_m):
                     try:
                         setattr(_m, name, value)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _shared._log.warning(
+                            "Patch propagation to concern module failed",
+                            attr=name, module=full, error=fmt_exc(e),
+                        )
 
     def __getattr__(self, name):
         # PEP 562 fallback. Order:

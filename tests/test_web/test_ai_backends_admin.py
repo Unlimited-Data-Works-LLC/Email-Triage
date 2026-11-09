@@ -117,6 +117,20 @@ class TestIndexRender:
 # ---------------------------------------------------------------------------
 
 class TestCreate:
+    def test_new_form_shows_backup_models_control(self, client, admin_cookies):
+        """ — the ai_backends new/edit form now renders the Backup models
+        control SHOWN (show_backups=true), since the style-learning complete()
+        path got failover. Rule 17: assert the rendered view — the fieldset must
+        NOT carry display:none on THIS form (it did, pre-#45)."""
+        client.cookies.set(
+            SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME],
+        )
+        resp = client.get("/config/ai-backends/new")
+        assert resp.status_code == 200
+        assert "Backup models" in resp.text                       # fieldset renders
+        assert "margin:0.8rem 0 0;" in resp.text                  # its style is present
+        assert "display:none;margin:0.8rem 0 0;" not in resp.text  # …and NOT hidden
+
     def test_create_round_trip(self, client, db, admin_cookies):
         client.cookies.set(
             SESSION_COOKIE_NAME,
@@ -133,7 +147,7 @@ class TestCreate:
             data={
                 "name": "Azure-OpenAI",
                 "type": "azure_openai",
-                "endpoint": "https://acme.openai.azure.com/",
+                "endpoint": "https://acme.openai.azure.invalid/",
                 "model": "gpt-4o",
                 "api_key_plain": "sk-test-key",
                 "baa_certified": "1",
@@ -170,7 +184,7 @@ class TestCreate:
             data={
                 "name": "Bad",
                 "type": "azure_openai",
-                "endpoint": "https://x.com",
+                "endpoint": "https://x.invalid",
                 "baa_certified": "1",
                 # missing baa_expires_at — should re-render form.
                 "enabled": "1",
@@ -190,7 +204,7 @@ class TestCreate:
             "/config/ai-backends",
             data={
                 "name": "X", "type": "anthropic",  # NOT in the enum
-                "endpoint": "https://api.anthropic.com",
+                "endpoint": "https://api.anthropic.invalid",
                 "enabled": "1",
             },
         )
@@ -248,7 +262,7 @@ class TestUpdate:
             data={
                 "name": "After",
                 "type": "ollama",
-                "endpoint": "http://ollama.lan:11434",
+                "endpoint": "http://ollama.invalid:11434",
                 "model": "llama3.1:8b",
                 "enabled": "1",
             },
@@ -257,7 +271,7 @@ class TestUpdate:
         assert resp.status_code in (303, 302)
         row = get_ai_backend(db, bid)
         assert row["name"] == "After"
-        assert row["endpoint"] == "http://ollama.lan:11434"
+        assert row["endpoint"] == "http://ollama.invalid:11434"
         assert row["model"] == "llama3.1:8b"
 
     def test_update_replace_key(
@@ -268,7 +282,7 @@ class TestUpdate:
         secrets.set("ai_backend_key:99-preseed", "old-key")
         bid = create_ai_backend(
             db, name="HasKey", type_="azure_openai",
-            endpoint="https://x.com",
+            endpoint="https://x.invalid",
             api_key_secret_ref="ai_backend_key:99-preseed",
             model=None,
             baa_certified=True,
@@ -284,7 +298,7 @@ class TestUpdate:
             data={
                 "name": "HasKey",
                 "type": "azure_openai",
-                "endpoint": "https://x.com",
+                "endpoint": "https://x.invalid",
                 "baa_certified": "1",
                 "baa_expires_at": "2099-01-01",
                 "enabled": "1",
@@ -370,7 +384,7 @@ class TestSelectorFilter:
         create_ai_backend(
             db, name="AzureFresh",
             type_="azure_openai",
-            endpoint="https://acme.openai.azure.com/",
+            endpoint="https://acme.openai.azure.invalid/",
             api_key_secret_ref=None, model="gpt-4o",
             baa_certified=True, baa_expires_at="2099-01-01",
             enabled=True, created_by=admin_user["id"],
@@ -378,7 +392,7 @@ class TestSelectorFilter:
         create_ai_backend(
             db, name="AzureExpired",
             type_="azure_openai",
-            endpoint="https://acme.openai.azure.com/",
+            endpoint="https://acme.openai.azure.invalid/",
             api_key_secret_ref=None, model="gpt-4o",
             baa_certified=True, baa_expires_at="2020-01-01",
             enabled=True, created_by=admin_user["id"],
@@ -440,7 +454,7 @@ class TestHealthDetailBaaStatus:
         soon = (date.today() + timedelta(days=5)).isoformat()
         create_ai_backend(
             db, name="A", type_="azure_openai",
-            endpoint="https://x.com",
+            endpoint="https://x.invalid",
             api_key_secret_ref=None, model=None,
             baa_certified=True, baa_expires_at=soon,
             enabled=True, created_by=admin_user["id"],

@@ -200,7 +200,7 @@ class TestLocalTzFormatting:
 
         # Force the process TZ. time.tzset() is POSIX-only; on Windows
         # we fall back to a manual offset check via astimezone().
-        monkeypatch.setenv("TZ", "America/New_York")
+        monkeypatch.setenv("TZ", "America/Detroit")
         if hasattr(_time, "tzset"):
             _time.tzset()
 
@@ -238,7 +238,7 @@ class TestLocalTzFormatting:
         import time as _time
         from email_triage.triage_logging import _JsonFormatter
 
-        monkeypatch.setenv("TZ", "America/New_York")
+        monkeypatch.setenv("TZ", "America/Detroit")
         if hasattr(_time, "tzset"):
             _time.tzset()
 

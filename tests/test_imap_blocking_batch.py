@@ -42,10 +42,13 @@ This test file pins:
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import MagicMock, patch
 
+from _tls_assertions import assert_verifying_context as _assert_verifying
 import pytest
 
+from _pin_harness import parse_module
 from email_triage.providers.imap_blocking import (
     _blocking_fetch_batch,
     fetch_messages_batch_blocking,
@@ -57,6 +60,7 @@ from email_triage.providers.imap_blocking import (
 # connection-opens, LOGINs, SELECTs, FETCHes, LOGOUTs separately.
 # ---------------------------------------------------------------------------
 
+
 def _make_batch_factory(
     *,
     fetch_responses: dict[str, tuple] | None = None,
@@ -65,7 +69,7 @@ def _make_batch_factory(
 ):
     """Build a factory that returns a fresh MagicMock client per
     construction call. Tracks ``opens`` in the closure so the test
-    can assert how many ``IMAP4_SSL(host, port)`` invocations
+    can assert how many ``IMAP4_SSL(host, port, ssl_context=...)`` invocations
     happened across the run.
 
     ``fetch_responses`` maps each UID string to the canned ``(typ,
@@ -90,7 +94,8 @@ def _make_batch_factory(
             ],
         )
 
-    def _factory(host, port):
+    def _factory(host, port, *, ssl_context):
+        _assert_verifying(ssl_context)
         opens["count"] += 1
         client = MagicMock()
 
@@ -219,7 +224,8 @@ class TestResultAlignment:
     def test_uid_fetch_exception_yields_empty_slot(self):
         # Per-UID FETCH that raises (network blip, server hiccup)
         # also records an empty slot rather than aborting the batch.
-        def _factory(host, port):
+        def _factory(host, port, *, ssl_context):
+            _assert_verifying(ssl_context)
             client = MagicMock()
             client.login = MagicMock(return_value=("OK", [b""]))
             client.select = MagicMock(return_value=("OK", [b"1"]))
@@ -314,7 +320,8 @@ class TestHeadersOnly:
     def test_headers_only_uses_body_peek_header(self):
         captured_sections: list[str] = []
 
-        def _factory(host, port):
+        def _factory(host, port, *, ssl_context):
+            _assert_verifying(ssl_context)
             client = MagicMock()
             client.login = MagicMock(return_value=("OK", [b""]))
             client.select = MagicMock(return_value=("OK", [b"1"]))
@@ -351,7 +358,8 @@ class TestHeadersOnly:
     def test_body_mode_uses_body_peek(self):
         captured_sections: list[str] = []
 
-        def _factory(host, port):
+        def _factory(host, port, *, ssl_context):
+            _assert_verifying(ssl_context)
             client = MagicMock()
             client.login = MagicMock(return_value=("OK", [b""]))
             client.select = MagicMock(return_value=("OK", [b"1"]))
@@ -429,11 +437,14 @@ class TestPollOnceWiring:
     def test_poll_once_calls_batch_method(self):
         import ast
         from pathlib import Path
-        src = (
+        tree = parse_module(
             Path(__file__).resolve().parent.parent
             / "src" / "email_triage" / "providers" / "imap.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(src)
+        )
+        assert tree is not None, (
+            "expected parseable source at "
+            "src/email_triage/providers/imap.py"
+        )
 
         # Find the poll_once method body.
         poll_once_body = None
@@ -461,7 +472,7 @@ class TestPollOnceWiring:
 
         assert found_batch_call, (
             "ImapProvider.poll_once must invoke "
-            "`self.fetch_messages_batch(...)` for  — a regression "
+            "`self.fetch_messages_batch(...)` for #261 — a regression "
             "that loops `self.fetch_message(uid)` per UID re-introduces "
             "the per-UID TLS+LOGIN cost. Fallback-to-single on whole-"
             "batch failure is fine; the batch CALL must be there."

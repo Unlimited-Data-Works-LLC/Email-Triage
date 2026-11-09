@@ -1,0 +1,94 @@
+name: ARM64 build check
+
+#  + N-432 Path-3 (2026-07-20) — VALIDATE-ONLY counterpart to release.yml.
+#
+# release.yml builds AND PUSHES the multi-arch image to the public-mirror GHCR
+# slot, and only fires on push-to-main / a `v*` tag. That makes it unsuitable
+# for *validating* the arm64 leg before a release: you cannot run it without
+# publishing. This workflow fans the SAME Containerfile out to
+# linux/amd64,linux/arm64 with **push: false** — it builds both arches (post-
+# Path-3 that means BOTH arches now source-build coleifer sqlcipher3 against a
+# freshly-generated SQLCipher v4.20.0 amalgamation; the arm64 leg's amalgamation
+# tclsh generation + gcc compile happens under QEMU emulation — expect the
+# arm64 leg to dominate wall-clock at ~18-25 min per run). The in-Containerfile
+# runtime smoke (`import sqlcipher3` + assert sqlite_version_info >= (3,51,3) +
+# cipher_version 4.20.x) RUNs under each platform's emulation, FAILING the build
+# if either the walresetbug fix regressed or SQLCipher pinned line drifted.
+# Nothing is pushed, tagged, or released — a green run proves "the multi-arch
+# image builds and loads its walresetbug-clean crypto" with zero public artifact.
+#
+# It does NOT prove runtime correctness on real ARM silicon (no PHI round-trip,
+# no app-boot) — that stays deferred to native-hardware validation. This
+# is the build/load gate, not the hardware gate. See internal documentation +
+# STATE_2026-07-20_0030_edt_walresetbug_path3_containerfile_drafted.md.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Containerfile'
+      - 'pyproject.toml'
+      - '.github/workflows/arm64-build-check.yml'
+  push:
+    branches: ['feat/**']
+    paths:
+      - 'Containerfile'
+      - 'pyproject.toml'
+      - '.github/workflows/arm64-build-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    name: Multi-arch build (no push)
+    # Operator 2026-10-06: the arm64 leg is required only on PUBLISH runs.
+    # On the private origin a push or PR SKIPS the job (the workflow is kept,
+    # not deleted); it runs on the public mirror (the same visibility test as
+    # release.yml) and on a manual dispatch anywhere, e.g. before a release:
+    #   gh workflow run arm64-build-check.yml --ref <branch>
+    # The publish image itself is built multi-arch by release.yml on v* tags.
+    if: github.event.repository.visibility == 'public' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Register QEMU so the amd64 runner can build the linux/arm64 leg
+      # (incl. the arm64 source-build of sqlcipher3). MUST precede buildx.
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build both arches (no push — validation only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          # push: false — this image is never deployed, so its build.sha has no
+          # drift consumer. Passed anyway so the ARG is exercised on BOTH arches
+          # here rather than first failing in a release build, and so the "every
+          # build path passes BUILD_SHA" pin needs no exemption list (an
+          # exemption list is one more thing that drifts).
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+          # Same multi-arch fan-out as release.yml. Post-Path-3 (2026-07-20)
+          # both arches take the unified source-build path (no TARGETARCH split);
+          # the arm64 leg runs the SQLCipher amalgamation-gen + gcc compile
+          # under QEMU (slow but correct). Building the default (runtime) stage
+          # runs the per-platform runtime smoke — `import sqlcipher3` +
+          # sqlite_version_info >= (3,51,3) + cipher_version 4.20.x.
+          platforms: linux/amd64,linux/arm64
+          push: false
+          # No registry interaction at all: GHA-local cache only, no GHCR
+          # pull/push, no provenance attestation (attestation needs a push).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false

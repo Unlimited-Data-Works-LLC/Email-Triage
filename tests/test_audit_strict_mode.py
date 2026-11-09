@@ -79,6 +79,42 @@ def db():
     c.close()
 
 
+async def _classify_and_drain_audit(app) -> int:
+    """GET /classify/test via an in-process ASGI client and drain the
+    fire-and-forget audit-write task ON THE SAME event loop, then return
+    ``app.state.audit_failures``.
+
+    Replaces the old ``asyncio.new_event_loop()`` + ``gather`` drain, which
+    created a SECOND loop and tried to ``gather`` tasks bound to the sync
+    ``TestClient``'s portal loop — a cross-loop await that does NOT drive them.
+    Under load (CI) the fire-and-forget ``_audit_write`` had not run when the
+    counter was read, so it read 0 (the load-amplified flake this file's header
+    acknowledges). With ``httpx.ASGITransport`` the request, the
+    ``asyncio.create_task``'d ``_audit_write``, and the drain ``gather`` all
+    share the pytest-asyncio loop (``asyncio_mode = "auto"``), so the drain
+    deterministically completes the write before the counter is read.
+    """
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test.invalid",
+    ) as client:
+        r = await client.get("/classify/test")
+        assert r.status_code == 200
+    pending = list(getattr(app.state, "_audit_pending", None) or [])
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return int(getattr(app.state, "audit_failures", 0))
+
+
+@pytest.mark.audit_failure_expected(
+    match=(
+        'access_audit:_audit_write',
+        'access_audit:dispatch',
+    ),
+    count=2,
+)
 def test_strict_mode_reraises_on_audit_write_failure(monkeypatch, db):
     """With ``EMAIL_TRIAGE_AUDIT_STRICT`` set, an audit-write
     exception must surface on the request response so the operator
@@ -99,7 +135,11 @@ def test_strict_mode_reraises_on_audit_write_failure(monkeypatch, db):
         client.get("/classify/test")
 
 
-def test_production_mode_catches_and_counts_audit_write_failure(
+@pytest.mark.audit_failure_expected(
+    match='access_log GET route=/classify/test status=200',
+    count=1,
+)
+async def test_production_mode_catches_and_counts_audit_write_failure(
     monkeypatch, db,
 ):
     """Without ``EMAIL_TRIAGE_AUDIT_STRICT``, the audit-write
@@ -122,25 +162,16 @@ def test_production_mode_catches_and_counts_audit_write_failure(
     monkeypatch.setattr(access_audit, "_record_access_event", boom)
 
     app = _build_app(db=db)
-    client = TestClient(app)
-    r = client.get("/classify/test")
-    assert r.status_code == 200
-
-    # Drain pending audit-write tasks before reading the counter.
-    pending = getattr(app.state, "_audit_pending", None)
-    if pending:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
-        finally:
-            loop.close()
-
-    assert getattr(app.state, "audit_failures", 0) == 1
+    # Production (non-strict) mode: the request returns 200 (never re-raises)
+    # and the fire-and-forget audit-write failure is counted. Same-loop drain.
+    assert await _classify_and_drain_audit(app) == 1
 
 
-def test_strict_env_var_name_is_audit_strict(monkeypatch, db):
+@pytest.mark.audit_failure_expected(
+    match='access_log GET route=/classify/test status=200',
+    count=1,
+)
+async def test_strict_env_var_name_is_audit_strict(monkeypatch, db):
     """Pin the exact env-var name. A rename or revert to the retired
     ``EMAIL_TRIAGE_DEV_MODE`` would silently regress the operator's
     deploy-time invocation; this test asserts that only the new
@@ -157,19 +188,7 @@ def test_strict_env_var_name_is_audit_strict(monkeypatch, db):
     monkeypatch.setattr(access_audit, "_record_access_event", boom)
 
     app = _build_app(db=db)
-    client = TestClient(app)
-    # Production-mode behaviour: 200 response, counter incremented.
-    r = client.get("/classify/test")
-    assert r.status_code == 200
-
-    pending = getattr(app.state, "_audit_pending", None)
-    if pending:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(
-                asyncio.gather(*pending, return_exceptions=True)
-            )
-        finally:
-            loop.close()
-
-    assert getattr(app.state, "audit_failures", 0) == 1
+    # The retired EMAIL_TRIAGE_DEV_MODE must NOT enable strict mode: the request
+    # returns 200 (strict would re-raise) and the failure is counted. Same-loop
+    # drain (the old new-loop gather raced under CI load — load-amplified flake).
+    assert await _classify_and_drain_audit(app) == 1

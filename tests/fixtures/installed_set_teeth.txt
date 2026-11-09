@@ -1,0 +1,5 @@
+# TEETH FIXTURE for scripts/run-pip-audit.sh --installed-set (N-553), not an install list.
+# pip 25.0.1 carries 6 OSV advisories fixed in 26.2.0; the audit must report it.
+# The email-triage line exercises the pyproject-named project exemption.
+pip==25.0.1
+email-triage==0.2.0

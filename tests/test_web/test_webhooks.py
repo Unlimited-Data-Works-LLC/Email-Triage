@@ -39,7 +39,7 @@ def _rsa_keypair():
 
 def _make_jwt(
     *,
-    audience: str = "https://test.example.com/webhooks/gmail",
+    audience: str = "https://test.example.invalid/webhooks/gmail",
     issuer: str = "https://accounts.google.com",
     email: str = "pubsub-push@project.iam.gserviceaccount.com",
     email_verified: bool = True,
@@ -90,8 +90,8 @@ def push_app(client, stub_cert_cache):
     app.state.config.push.gmail_subscription_sa_email = (
         "pubsub-push@project.iam.gserviceaccount.com"
     )
-    app.state.config.push.gmail_audience = "https://test.example.com/webhooks/gmail"
-    app.state.config.push.public_url = "https://test.example.com"
+    app.state.config.push.gmail_audience = "https://test.example.invalid/webhooks/gmail"
+    app.state.config.push.public_url = "https://test.example.invalid"
     app.state._gmail_cert_cache = stub_cert_cache
     app.state.push_queue = asyncio.Queue(maxsize=4)
     app.state.metrics = {}
@@ -276,6 +276,302 @@ class TestGmailPushVerification:
         # Empty / None input returns None safely.
         assert get_gmail_watch_by_email(db, "") is None
         assert get_gmail_watch_by_email(db, None) is None
+
+    def test_upsert_writes_canonical_shape_and_legacy_rows_still_found(
+        self, push_app, client, db, admin_user,
+    ):
+        """upsert_gmail_watch writes the canonical_email() shape (bare,
+        lower-cased, IDNA A-label domain), so either envelope form of an
+        IDN address finds the row. A row still holding the legacy
+        strip().lower() shape is found through the dual-shape probe, and
+        the next upsert rewrites it canonical: no backfill is needed."""
+        from email_triage.web.db import (
+            upsert_gmail_watch, get_gmail_watch_by_email,
+        )
+        from datetime import datetime, timedelta, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        for acct in (21, 22):
+            db.execute(
+                "INSERT OR IGNORE INTO email_accounts "
+                "(id, user_id, name, provider_type, config_json, created_at, updated_at) "
+                "VALUES (?, 1, 'IdnTest', 'gmail_api', '{}', ?, ?)",
+                (acct, now_iso, now_iso),
+            )
+        db.commit()
+
+        def upsert(acct, addr):
+            upsert_gmail_watch(
+                db, account_id=acct, email_address=addr,
+                topic_name="projects/test/topics/gmail-push",
+                history_id="1", expires_at=future,
+            )
+
+        def stored(acct):
+            return db.execute(
+                "SELECT email_address FROM gmail_watches WHERE account_id = ?",
+                (acct,),
+            ).fetchone()["email_address"]
+
+        upsert(21, "Alice <Alice@München.Test>")
+        assert stored(21) == "alice@xn--mnchen-3ya.test"
+        for needle in ("alice@münchen.test", "ALICE@xn--mnchen-3ya.test"):
+            row = get_gmail_watch_by_email(db, needle)
+            assert row is not None and row["account_id"] == 21, needle
+
+        # A row written before the canonical write keeps the legacy shape.
+        upsert(22, "carol@münchen.test")
+        db.execute(
+            "UPDATE gmail_watches SET email_address = ? WHERE account_id = 22",
+            ("carol@münchen.test",),
+        )
+        db.commit()
+        # Found from BOTH shapes. The A-label lookup collapses both string
+        # probes to the A-label form, so only the canonical-compare probe
+        # reaches the U-label row.
+        for needle in ("Carol@München.test", "carol@xn--mnchen-3ya.test"):
+            row = get_gmail_watch_by_email(db, needle)
+            assert row is not None and row["account_id"] == 22, needle
+        # The next re-register rewrites it canonical, and both forms find it.
+        upsert(22, "carol@münchen.test")
+        assert stored(22) == "carol@xn--mnchen-3ya.test"
+        for needle in ("carol@münchen.test", "carol@xn--mnchen-3ya.test"):
+            row = get_gmail_watch_by_email(db, needle)
+            assert row is not None and row["account_id"] == 22, needle
+
+    def test_one_mailbox_one_watch_row_across_shapes(
+        self, push_app, client, db, admin_user,
+    ):
+        """The UNIQUE index on gmail_watches.email_address compares one
+        string. With canonical writes beside legacy rows, a second account
+        must still be refused the same mailbox in EITHER shape, in both
+        directions, as the index refused a same-shape duplicate before."""
+        import sqlite3
+        from email_triage.web.db import upsert_gmail_watch
+        from datetime import datetime, timedelta, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        for acct in (31, 32, 33, 34):
+            db.execute(
+                "INSERT OR IGNORE INTO email_accounts "
+                "(id, user_id, name, provider_type, config_json, created_at, updated_at) "
+                "VALUES (?, 1, 'UniqTest', 'gmail_api', '{}', ?, ?)",
+                (acct, now_iso, now_iso),
+            )
+        db.commit()
+
+        def upsert(acct, addr):
+            upsert_gmail_watch(
+                db, account_id=acct, email_address=addr,
+                topic_name="projects/test/topics/gmail-push",
+                history_id="1", expires_at=future,
+            )
+
+        def count(addr_like):
+            return db.execute(
+                "SELECT COUNT(*) FROM gmail_watches WHERE email_address LIKE ?",
+                (addr_like,),
+            ).fetchone()[0]
+
+        # Legacy U-label row on account 31; account 32 writes the same
+        # mailbox (it would be stored canonical, a different string).
+        upsert(31, "dave@münchen.test")
+        db.execute(
+            "UPDATE gmail_watches SET email_address = ? WHERE account_id = 31",
+            ("dave@münchen.test",),
+        )
+        db.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            upsert(32, "Dave@xn--mnchen-3ya.test")
+        assert count("dave@%") == 1
+        # The holder itself may still re-register (rewritten canonical).
+        upsert(31, "dave@münchen.test")
+        assert count("dave@%") == 1
+
+        # Reverse: canonical row on account 33; account 34 writes the
+        # U-label form of the same mailbox.
+        upsert(33, "erin@xn--mnchen-3ya.test")
+        with pytest.raises(sqlite3.IntegrityError):
+            upsert(34, "erin@münchen.test")
+        assert count("erin@%") == 1
+
+    @staticmethod
+    def _plant_legacy_pair(db, accounts, local):
+        """Two legacy rows on different accounts that canonicalize to one
+        mailbox: an NFC U-label and an NFD U-label form. The old writer
+        allowed this pair; upsert_gmail_watch now refuses a new one, so it
+        is planted by rewriting the stored strings directly."""
+        import unicodedata
+        from email_triage.web.db import upsert_gmail_watch
+        from datetime import datetime, timedelta, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        nfc = f"{local}@münchen.test"
+        nfd = unicodedata.normalize("NFD", nfc)
+        assert nfc != nfd
+        for i, (acct, addr) in enumerate(zip(accounts, (nfc, nfd))):
+            db.execute(
+                "INSERT OR IGNORE INTO email_accounts "
+                "(id, user_id, name, provider_type, config_json, created_at, updated_at) "
+                "VALUES (?, 1, 'PairTest', 'gmail_api', '{}', ?, ?)",
+                (acct, now_iso, now_iso),
+            )
+            db.commit()
+            upsert_gmail_watch(
+                db, account_id=acct,
+                email_address=f"{local}{i}@placeholder.test",
+                topic_name="projects/test/topics/gmail-push",
+                history_id="1",
+                expires_at=(
+                    datetime.now(timezone.utc) + timedelta(days=7)
+                ).isoformat(),
+            )
+            db.execute(
+                "UPDATE gmail_watches SET email_address = ? WHERE account_id = ?",
+                (addr, acct),
+            )
+            db.commit()
+        return nfc, nfd
+
+    def test_two_legacy_holders_fail_closed_on_lookup(
+        self, push_app, client, db, admin_user, caplog,
+    ):
+        """F1 (pgw panel, all three seats): when two accounts' legacy rows
+        canonicalize to one mailbox, the lookup must not pick one. It
+        returns None, the webhook drops the push as no_watch, and one WARN
+        names only the account ids and the count, never the address."""
+        import logging
+        from email_triage.web.db import get_gmail_watch_by_email
+        self._plant_legacy_pair(db, (41, 42), "gina")
+        with caplog.at_level(logging.WARNING, logger="email_triage.web.db"):
+            assert get_gmail_watch_by_email(db, "gina@xn--mnchen-3ya.test") is None
+        warns = [
+            r for r in caplog.records
+            if "gmail_watch_mailbox_ambiguous" in r.getMessage()
+        ]
+        assert len(warns) == 1, [r.getMessage() for r in caplog.records]
+        rec = warns[0]
+        assert rec.levelno == logging.WARNING
+        rendered = rec.getMessage() + " " + repr(rec.__dict__)
+        assert "41" in rendered and "42" in rendered
+        for leak in ("gina", "münchen", "mnchen"):
+            assert leak not in rendered, leak
+
+        token = _make_jwt()
+        resp = client.post(
+            "/webhooks/gmail",
+            json=_push_payload("gina@xn--mnchen-3ya.test", 1),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "dropped", "reason": "no_watch"}
+        assert push_app.state.push_queue.qsize() == 0
+
+    @pytest.mark.parametrize("first,second", [(51, 52), (52, 51)])
+    def test_legacy_pair_collapses_to_one_watch_on_renewal(
+        self, push_app, client, db, admin_user, first, second,
+    ):
+        """F2 (pgw panel, sme-db SHOULD-2 and sme-da SHOULD-1): a holder of
+        the mailbox may renew. With a pre-existing legacy pair, the first
+        account to renew is rewritten canonical; the second is refused by
+        the UNIQUE index and its row is left as it was. Both renewal orders
+        run. A third account that holds no row is still refused."""
+        import sqlite3
+        from email_triage.web.db import upsert_gmail_watch, get_gmail_watch
+        from datetime import datetime, timedelta, timezone
+        self._plant_legacy_pair(db, (51, 52), "hank")
+        canonical = "hank@xn--mnchen-3ya.test"
+
+        def renew(acct, addr="hank@münchen.test", history_id="2"):
+            upsert_gmail_watch(
+                db, account_id=acct, email_address=addr,
+                topic_name="projects/test/topics/gmail-push",
+                history_id=history_id,
+                expires_at=(
+                    datetime.now(timezone.utc) + timedelta(days=7)
+                ).isoformat(),
+            )
+
+        def rows():
+            return db.execute(
+                "SELECT account_id, email_address, history_id "
+                "FROM gmail_watches WHERE account_id IN (51, 52, 53) "
+                "ORDER BY account_id"
+            ).fetchall()
+
+        db.execute(
+            "INSERT OR IGNORE INTO email_accounts "
+            "(id, user_id, name, provider_type, config_json, created_at, updated_at) "
+            "VALUES (53, 1, 'PairTest', 'gmail_api', '{}', ?, ?)",
+            (datetime.now(timezone.utc).isoformat(),) * 2,
+        )
+        db.commit()
+        # While both rows are still legacy, the canonical string collides
+        # with neither, so only the app-level check refuses a non-holder.
+        with pytest.raises(sqlite3.IntegrityError):
+            renew(53, addr=canonical)
+        assert len(rows()) == 2
+
+        loser_before = dict(get_gmail_watch(db, second))
+        renew(first)
+        assert get_gmail_watch(db, first)["email_address"] == canonical
+
+        with pytest.raises(sqlite3.IntegrityError):
+            renew(second, history_id="3")
+        assert dict(get_gmail_watch(db, second)) == loser_before
+        assert len(rows()) == 2
+
+        # The survivor keeps renewing.
+        renew(first, history_id="4")
+        assert get_gmail_watch(db, first)["history_id"] == "4"
+        assert get_gmail_watch(db, first)["email_address"] == canonical
+
+        # After the collapse, a non-holder is still refused in either shape.
+        for addr in (canonical, "hank@münchen.test"):
+            with pytest.raises(sqlite3.IntegrityError):
+                renew(53, addr=addr)
+        assert len(rows()) == 2
+
+    def test_legacy_pair_where_one_row_is_already_canonical(
+        self, push_app, client, db, admin_user,
+    ):
+        """sme-da round 2: the row whose canonical write lands first keeps
+        the mailbox. When the other row already holds the canonical string,
+        the earliest renewer is the one refused, and the canonical row keeps
+        renewing."""
+        import sqlite3
+        from email_triage.web.db import upsert_gmail_watch, get_gmail_watch
+        from datetime import datetime, timedelta, timezone
+        nfc, _ = self._plant_legacy_pair(db, (61, 62), "ivy")
+        canonical = "ivy@xn--mnchen-3ya.test"
+        # The old writer stored an A-label input as given, so a legacy row
+        # can already be the canonical string.
+        db.execute(
+            "UPDATE gmail_watches SET email_address = ? WHERE account_id = 62",
+            (canonical,),
+        )
+        db.commit()
+
+        def renew(acct, history_id):
+            upsert_gmail_watch(
+                db, account_id=acct, email_address=nfc,
+                topic_name="projects/test/topics/gmail-push",
+                history_id=history_id,
+                expires_at=(
+                    datetime.now(timezone.utc) + timedelta(days=7)
+                ).isoformat(),
+            )
+
+        early_before = dict(get_gmail_watch(db, 61))
+        with pytest.raises(sqlite3.IntegrityError):
+            renew(61, "2")
+        assert dict(get_gmail_watch(db, 61)) == early_before
+        renew(62, "3")
+        survivor = get_gmail_watch(db, 62)
+        assert survivor["email_address"] == canonical
+        assert survivor["history_id"] == "3"
+        assert db.execute(
+            "SELECT COUNT(*) FROM gmail_watches WHERE account_id IN (61, 62)"
+        ).fetchone()[0] == 2
 
     def test_garbage_base64_ignored(self, push_app, client, db, admin_user):
         _seed_watch(db)

@@ -50,7 +50,7 @@ class TestRfcMessageIdExtractor:
 class TestDedupPersistence:
     def _acct(self, db, regular_user):
         return create_email_account(
-            db, regular_user["id"], "ACCT", "imap", {"host": "x"},
+            db, regular_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
 
     def test_unmark_returns_false(self, db, regular_user):
@@ -82,7 +82,7 @@ class TestDedupPersistence:
     def test_isolation_across_accounts(self, db, regular_user, admin_user):
         a1 = self._acct(db, regular_user)
         a2 = create_email_account(
-            db, admin_user["id"], "ACCT2", "imap", {"host": "y"},
+            db, admin_user["id"], "ACCT2", "imap", {"host": "y.invalid"},
         )
         mark_triaged(db, a1, "<shared@id>")
         assert is_triaged(db, a1, "<shared@id>") is True
@@ -92,7 +92,7 @@ class TestDedupPersistence:
 class TestTrim:
     def test_prune_old_rows(self, db, regular_user):
         acct = create_email_account(
-            db, regular_user["id"], "T", "imap", {"host": "x"},
+            db, regular_user["id"], "T", "imap", {"host": "x.invalid"},
         )
         # Insert one fresh + one stale (101 days old).
         from email_triage.web.db import _hash_msg_id as _h
@@ -114,7 +114,7 @@ class TestTrim:
 
     def test_prune_no_op_when_clean(self, db, regular_user):
         acct = create_email_account(
-            db, regular_user["id"], "T", "imap", {"host": "x"},
+            db, regular_user["id"], "T", "imap", {"host": "x.invalid"},
         )
         mark_triaged(db, acct, "<recent@x>")
         deleted = prune_triaged_messages(db, retention_days=90)

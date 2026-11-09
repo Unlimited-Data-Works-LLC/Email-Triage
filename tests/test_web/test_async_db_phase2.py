@@ -116,5 +116,5 @@ def test_phase2_concurrent_accounts_polls_dont_collide(
     )
     assert all(s == 200 for s in statuses), (
         f"non-200 responses under concurrency: {statuses} — "
-        "looks like a shared-connection collision"
+        "looks like a shared-connection collision (#231)"
     )

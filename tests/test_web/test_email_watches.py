@@ -7,6 +7,7 @@ row writer.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ from email_triage.web.db import init_db
 
 @pytest.fixture
 def db():
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     yield conn
     conn.close()
 
@@ -47,7 +48,7 @@ def _make_account_row(db, *, account_id: int = 1, hipaa: bool = False):
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             account_id, user_id, "acct1", "imap",
-            json.dumps({"host": "mail.example.com", "username": "u@example.com"}),
+            json.dumps({"host": "mail.example.invalid", "username": "u@example.com"}),
             1 if hipaa else 0, now, now,
         ),
     )
@@ -169,7 +170,7 @@ class TestMatcher:
 
     def test_subject_contains(self):
         w = _make_watch(filter=W.WatchFilter(subject_contains="invoice"))
-        assert W.matches(w, sender="x@y.test", subject="Invoice ")
+        assert W.matches(w, sender="x@y.test", subject="Invoice #123")
         assert not W.matches(w, sender="x@y.test", subject="hello")
 
     def test_keyword_matches_subject_or_body(self):
@@ -317,3 +318,99 @@ class TestAudit:
         assert detail["escalate"] is True
         assert detail["webhook"] is False
         assert detail["redaction"] == "standard"
+
+
+class TestAutoRetire:
+    """ — auto-retire a watch after N matches (fires)."""
+
+    def _record_fires(self, db, watch_id, account_id, n):
+        now = datetime.now(timezone.utc).isoformat()
+        for i in range(n):
+            db.execute(
+                "INSERT OR IGNORE INTO watch_fire_idempotency "
+                "(account_id, rfc_message_id, watch_id, fired_at) "
+                "VALUES (?, ?, ?, ?)",
+                (account_id, f"<msg{i}@example.com>", watch_id, now),
+            )
+        db.commit()
+
+    def _watch(self, **ar):
+        return _make_watch(actions=W.WatchActions(
+            escalate=W.EscalateAction(enabled=True, notify_email="ops@example.com"),
+            auto_retire=W.AutoRetireAction(**ar),
+        ))
+
+    def test_config_round_trips_through_storage(self, db):
+        _make_account_row(db)
+        saved = W.upsert_watch(db, self._watch(after_n=5, action="delete"))
+        got = W.get_watch(db, saved.watch_id)
+        assert got.actions.auto_retire.after_n == 5
+        assert got.actions.auto_retire.action == "delete"
+
+    def test_off_by_default_even_with_fires(self, db):
+        _make_account_row(db)
+        saved = W.upsert_watch(db, _make_watch())  # no auto_retire -> after_n=0
+        self._record_fires(db, saved.watch_id, 1, 10)
+        assert W.maybe_auto_retire_watch(db, saved) is None
+
+    def test_below_threshold_is_noop(self, db):
+        _make_account_row(db)
+        saved = W.upsert_watch(db, self._watch(after_n=3, action="disable"))
+        self._record_fires(db, saved.watch_id, 1, 2)  # 2 < 3
+        assert W.maybe_auto_retire_watch(db, saved) is None
+        assert W.get_watch(db, saved.watch_id).enabled is True
+
+    def test_disables_at_threshold_reversibly(self, db):
+        _make_account_row(db)
+        saved = W.upsert_watch(db, self._watch(after_n=2, action="disable"))
+        self._record_fires(db, saved.watch_id, 1, 2)
+        assert W.maybe_auto_retire_watch(db, saved) == "disabled"
+        got = W.get_watch(db, saved.watch_id)
+        assert got is not None and got.enabled is False  # row kept; re-enableable
+
+    def test_deletes_at_threshold(self, db):
+        _make_account_row(db)
+        saved = W.upsert_watch(db, self._watch(after_n=2, action="delete"))
+        self._record_fires(db, saved.watch_id, 1, 2)
+        assert W.maybe_auto_retire_watch(db, saved) == "deleted"
+        assert W.get_watch(db, saved.watch_id) is None
+
+    def test_validate_rejects_bad_config(self, db):
+        errs = W.validate(self._watch(after_n=-1, action="nope"))
+        assert any("Auto-retire" in e for e in errs)
+
+    def test_group_total_across_accounts_legacy_grouping(self, db):
+        """ — two LEGACY rows (no watch_group_id) sharing
+        (created_by_user_id, name) form one logical watch: the threshold is the
+        GROUP TOTAL across both accounts, and retire disables BOTH rows. Proves
+        the legacy branch of _group_watch_ids (the watch_group_id path is
+        covered by the runner-seam group tests)."""
+        _make_account_row(db, account_id=1)
+        uid = db.execute(
+            "SELECT id FROM users WHERE email='user@example.com'"
+        ).fetchone()["id"]
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "INSERT INTO email_accounts (id, user_id, name, provider_type, "
+            "config_json, hipaa, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (2, uid, "acct2", "imap", json.dumps({}), now, now),
+        )
+        db.commit()
+        w1 = W.upsert_watch(db, _make_watch(
+            account_id=1, name="legacy-g", created_by_user_id=uid,
+            actions=W.WatchActions(
+                escalate=W.EscalateAction(enabled=True, notify_email="o@e.com"),
+                auto_retire=W.AutoRetireAction(after_n=2, action="disable"))))
+        w2 = W.upsert_watch(db, _make_watch(
+            account_id=2, name="legacy-g", created_by_user_id=uid,
+            actions=W.WatchActions(
+                escalate=W.EscalateAction(enabled=True, notify_email="o@e.com"),
+                auto_retire=W.AutoRetireAction(after_n=2, action="disable"))))
+        assert w1.watch_group_id is None and w2.watch_group_id is None
+        # One fire on each account = 2 TOTAL across the legacy group.
+        self._record_fires(db, w1.watch_id, 1, 1)
+        self._record_fires(db, w2.watch_id, 2, 1)
+        assert W.maybe_auto_retire_watch(db, w2) == "disabled"
+        assert W.get_watch(db, w1.watch_id).enabled is False
+        assert W.get_watch(db, w2.watch_id).enabled is False

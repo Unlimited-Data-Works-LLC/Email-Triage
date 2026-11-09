@@ -35,6 +35,7 @@ HMAC key at version 0, so the gap chain stamps ``hash_alg='hmac-sha256-v1'``
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 import logging
@@ -144,7 +145,7 @@ async def test_writer_queuefull_audit_durability_under_genuine_saturation(
     """Legs (b)+(c)+(d)+(e) under genuine ``WriterQueueFull`` saturation."""
     # Post-N-13 the writer routes whenever one is installed (no env flag); the
     # `set_writer(writer)` below is what makes db_call route+shed here.
-    conn = init_db(":memory:")  # real DB → audit_gap_events + HMAC chain exist
+    conn = track(init_db(":memory:"))  # real DB → audit_gap_events + HMAC chain exist
     writer = SqliteWriterThread(maxsize=1)
     writer.start()
     set_writer(writer)  # else db_call falls back to the legacy path (no shed)
@@ -165,7 +166,7 @@ async def test_writer_queuefull_audit_durability_under_genuine_saturation(
         #     WriterQueueFull and chained under the HMAC key (not degraded sha256).
         assert len(gap_rows) == N, f"expected {N} gap rows, got {len(gap_rows)}"
         assert all(r["exc_type"] == "WriterQueueFull" for r in gap_rows)
-        assert all(r["hash_alg"] == "hmac-sha256-v1" for r in gap_rows)
+        assert all(r["hash_alg"] == "hmac-sha256-v2" for r in gap_rows)
         assert all(r["master_key_version"] == 0 for r in gap_rows)
 
         # always-on Layer-2 loud ERROR, one per shed, naming the emitter.

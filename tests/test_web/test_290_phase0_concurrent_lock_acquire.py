@@ -38,6 +38,7 @@ introduces the concurrent PRAGMA / cursor-cache hazard, this test
 fails fast.
 """
 from __future__ import annotations
+from _db_tracking import track
 
 import asyncio
 import logging
@@ -62,7 +63,7 @@ def temp_db(tmp_path):
     """File-backed DB with the Phase 0 fixes (cached_statements=0,
     cached _triage_db_path attribute, timeout=30)."""
     db_path = tmp_path / "triage.db"
-    conn = init_db(str(db_path))
+    conn = track(init_db(str(db_path)))
     init_lock_conn(str(db_path))
     yield conn, str(db_path)
     try:
@@ -149,7 +150,7 @@ def test_concurrent_acquire_burst_no_corruption(temp_db, caplog):
     # Above we generate unique lease names per worker so every acquire
     # should succeed.
     assert not failures, (
-        f" Phase 0 regression: {len(failures)}/{n_workers} workers "
+        f"#290 Phase 0 regression: {len(failures)}/{n_workers} workers "
         f"observed driver corruption or unexpected error. "
         f"Failures: {failures}"
     )
@@ -162,7 +163,7 @@ def test_concurrent_acquire_burst_no_corruption(temp_db, caplog):
         and r.name == "email_triage.single_flight"
     ]
     assert not error_records, (
-        f" Phase 0 regression: {len(error_records)} ERROR log "
+        f"#290 Phase 0 regression: {len(error_records)} ERROR log "
         f"lines on email_triage.single_flight indicate the commit-"
         f"scope-leak fallback path fired. Records: "
         f"{[r.getMessage() for r in error_records]}"
@@ -214,7 +215,7 @@ def test_cached_db_path_present_after_init_db(temp_db):
     conn, db_path = temp_db
     cached = _CONN_DB_PATH_CACHE.get(id(conn))
     assert cached == db_path, (
-        f" invariant: init_db must cache db_path via "
+        f"#290 invariant: init_db must cache db_path via "
         f"set_cached_db_path. Expected {db_path!r}, got {cached!r}"
     )
 
@@ -229,7 +230,7 @@ def test_cached_statements_zero_on_init_db_connection():
     tmpdir = tempfile.mkdtemp()
     try:
         db_path = os.path.join(tmpdir, "triage.db")
-        conn = init_db(db_path)
+        conn = track(init_db(db_path))
         try:
             # No direct API to read cached_statements back; instead
             # we verify the conn was constructed with the kwarg by
@@ -270,12 +271,12 @@ def test_cached_statements_zero_on_init_db_connection():
                                 ):
                                     found_value_zero = True
             assert found_cached_statements_kwarg, (
-                " invariant: init_db's sqlite3.connect call must "
+                "#290 invariant: init_db's sqlite3.connect call must "
                 "pass cached_statements=0 to mitigate CPython #118172. "
                 "AST walk did NOT find the kwarg."
             )
             assert found_value_zero, (
-                " invariant: cached_statements MUST be the literal "
+                "#290 invariant: cached_statements MUST be the literal "
                 "0 — any other value (e.g. 128 to claw back the 5-10% "
                 "perf cost) silently re-opens CPython #118172. AST walk "
                 "found the kwarg but not the =0 literal."

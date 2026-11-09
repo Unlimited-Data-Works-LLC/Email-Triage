@@ -262,7 +262,7 @@ def test_action_subclass_holds_an_idempotency_contract(cls: type[Action]):
         f"  - naturally-idempotent: class must set "
         f"`_naturally_idempotent = True` AND `_idempotency_rationale = "
         f"'...'`.\n"
-        f" — without one of these, a crash between this action's "
+        f"#263 — without one of these, a crash between this action's "
         f"side effect and the per-iteration persist would replay the "
         f"action on recovery and duplicate the side effect. Pick a "
         f"contract."
@@ -404,7 +404,7 @@ async def test_helper_based_action_is_skipped_on_second_execute(
     assert second.result == ActionResult.SKIPPED, (
         f"{cls.__name__} second execute MUST return SKIPPED (got "
         f"{second.result.value}). The helper-based idempotency contract "
-        f"is the crash-recovery guarantee for ; a non-SKIPPED second "
+        f"is the crash-recovery guarantee for #263; a non-SKIPPED second "
         f"result means the side effect would duplicate on recovery."
     )
     assert second.data and second.data.get("skipped_idempotent"), (

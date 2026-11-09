@@ -84,7 +84,7 @@ class TestDetectState:
 class TestMakeCsr:
     def test_generates_keypair_and_csr(self, tmp_path):
         key_path, csr_path, csr_pem = tls_csr.make_csr(
-            tmp_path, hostname="triage.example.com",
+            tmp_path, hostname="triage.example.invalid",
         )
         assert key_path.is_file()
         assert csr_path.is_file()
@@ -92,12 +92,12 @@ class TestMakeCsr:
         # Round-trip the CSR -- must parse + carry the requested CN.
         csr = x509.load_pem_x509_csr(csr_pem)
         cn = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-        assert cn == "triage.example.com"
+        assert cn == "triage.example.invalid"
 
     def test_extra_sans_present_in_csr(self, tmp_path):
         _, _, csr_pem = tls_csr.make_csr(
             tmp_path,
-            hostname="primary.example.com",
+            hostname="primary.example.invalid",
             extra_sans=["alt.example.com", "10.0.0.5"],
         )
         csr = x509.load_pem_x509_csr(csr_pem)
@@ -107,25 +107,25 @@ class TestMakeCsr:
         sans = list(san_ext.value)
         dns_names = [n.value for n in sans if isinstance(n, x509.DNSName)]
         ip_addrs = [str(n.value) for n in sans if isinstance(n, x509.IPAddress)]
-        assert "primary.example.com" in dns_names
+        assert "primary.example.invalid" in dns_names
         assert "alt.example.com" in dns_names
         assert "10.0.0.5" in ip_addrs
 
     def test_refuses_to_overwrite_pending_by_default(self, tmp_path):
-        tls_csr.make_csr(tmp_path, hostname="a.example.com")
+        tls_csr.make_csr(tmp_path, hostname="a.example.invalid")
         with pytest.raises(tls_csr.CsrAlreadyPendingError):
-            tls_csr.make_csr(tmp_path, hostname="b.example.com")
+            tls_csr.make_csr(tmp_path, hostname="b.example.invalid")
 
     def test_overwrite_pending_when_explicit(self, tmp_path):
-        tls_csr.make_csr(tmp_path, hostname="a.example.com")
+        tls_csr.make_csr(tmp_path, hostname="a.example.invalid")
         # Force a new CSR over the old one. Test that the new key + CSR
         # overwrite the old, validated by checking the CN changed.
         _, _, new_csr_pem = tls_csr.make_csr(
-            tmp_path, hostname="b.example.com", overwrite_pending=True,
+            tmp_path, hostname="b.example.invalid", overwrite_pending=True,
         )
         csr = x509.load_pem_x509_csr(new_csr_pem)
         cn = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-        assert cn == "b.example.com"
+        assert cn == "b.example.invalid"
 
     def test_empty_hostname_rejected(self, tmp_path):
         with pytest.raises(ValueError):
@@ -138,7 +138,7 @@ class TestMakeCsr:
 
 class TestCancelAndRedownload:
     def test_cancel_clears_files(self, tmp_path):
-        tls_csr.make_csr(tmp_path, hostname="x.example.com")
+        tls_csr.make_csr(tmp_path, hostname="x.example.invalid")
         assert (tmp_path / tls_csr.PENDING_KEY_FILENAME).is_file()
         tls_csr.cancel_pending(tmp_path)
         assert not (tmp_path / tls_csr.PENDING_KEY_FILENAME).is_file()
@@ -150,7 +150,7 @@ class TestCancelAndRedownload:
         tls_csr.cancel_pending(tmp_path)
 
     def test_read_pending_csr_returns_bytes(self, tmp_path):
-        _, _, original = tls_csr.make_csr(tmp_path, hostname="x.example.com")
+        _, _, original = tls_csr.make_csr(tmp_path, hostname="x.example.invalid")
         re_read = tls_csr.read_pending_csr(tmp_path)
         assert re_read == original
 
@@ -169,7 +169,7 @@ class TestImportSignedCert:
         signs it) -> import. After import, server.crt + server.key
         exist; pending files are gone."""
         _, _, csr_pem = tls_csr.make_csr(
-            tmp_path, hostname="triage.example.com",
+            tmp_path, hostname="triage.example.invalid",
         )
         signed_cert_pem = _sign_with_test_ca(csr_pem)
         crt_path, key_path = tls_csr.import_signed_cert(
@@ -193,7 +193,7 @@ class TestImportSignedCert:
             tls_csr.import_signed_cert(tmp_path, garbage)
 
     def test_invalid_pem_raises(self, tmp_path):
-        tls_csr.make_csr(tmp_path, hostname="x.example.com")
+        tls_csr.make_csr(tmp_path, hostname="x.example.invalid")
         with pytest.raises(tls_csr.InvalidPemError):
             tls_csr.import_signed_cert(tmp_path, b"not a real PEM")
 
@@ -201,7 +201,7 @@ class TestImportSignedCert:
         """Make a CSR. Sign a DIFFERENT keypair's CSR. Try to import
         that. The mismatch detector rejects."""
         # First operator's pending key+CSR.
-        tls_csr.make_csr(tmp_path, hostname="legit.example.com")
+        tls_csr.make_csr(tmp_path, hostname="legit.example.invalid")
         # Generate a SECOND independent CSR + signed cert for a
         # different keypair. Operator tries to paste THIS into
         # the import form for the legit pending CSR. Detector
@@ -209,7 +209,7 @@ class TestImportSignedCert:
         other_dir = tmp_path / "elsewhere"
         other_dir.mkdir()
         _, _, other_csr_pem = tls_csr.make_csr(
-            other_dir, hostname="legit.example.com",
+            other_dir, hostname="legit.example.invalid",
         )
         other_signed = _sign_with_test_ca(other_csr_pem)
         with pytest.raises(tls_csr.KeyMismatchError):
@@ -224,7 +224,7 @@ class TestImportSignedCert:
         should accept the whole chain and write it verbatim to
         server.crt so curl / browser builds the path."""
         _, _, csr_pem = tls_csr.make_csr(
-            tmp_path, hostname="x.example.com",
+            tmp_path, hostname="x.example.invalid",
         )
         leaf = _sign_with_test_ca(csr_pem)
         # Synthesize a fake "intermediate" by signing another cert
@@ -244,7 +244,7 @@ class TestImportSignedCert:
 class TestSelfSign:
     def test_writes_active_cert_and_key(self, tmp_path):
         crt, key = tls_csr.self_sign_now(
-            tmp_path, hostname="bringup.example.com",
+            tmp_path, hostname="bringup.example.invalid",
         )
         assert crt.is_file()
         assert key.is_file()
@@ -260,16 +260,16 @@ class TestCertMetadata:
     def test_metadata_extraction(self, tmp_path):
         _, _, csr_pem = tls_csr.make_csr(
             tmp_path,
-            hostname="meta.example.com",
+            hostname="meta.example.invalid",
             extra_sans=["alt.example.com"],
         )
         cert_pem = _sign_with_test_ca(csr_pem, valid_days=365)
         md = tls_csr.cert_metadata(cert_pem)
-        assert md["subject_cn"] == "meta.example.com"
+        assert md["subject_cn"] == "meta.example.invalid"
         assert md["issuer_cn"] == "Test CA"
         # SANs include both hostnames.
         san_dns = [s for s in md["sans"] if s.startswith("DNS:")]
-        assert "DNS:meta.example.com" in san_dns
+        assert "DNS:meta.example.invalid" in san_dns
         assert "DNS:alt.example.com" in san_dns
         # ~365d remaining (allow slop for test runtime).
         assert 360 <= md["days_until_expiry"] <= 365
@@ -283,7 +283,7 @@ class TestExpiryWarning:
         """Install a self-signed cert with a chosen validity window."""
         from email_triage.tls import generate_self_signed_cert, write_cert_files
         cert_pem, key_pem = generate_self_signed_cert(
-            hostname="x.example.com",
+            hostname="x.example.invalid",
             valid_days=valid_days,
         )
         write_cert_files(tmp_path, cert_pem, key_pem)

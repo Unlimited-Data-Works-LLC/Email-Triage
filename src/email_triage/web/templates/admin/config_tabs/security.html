@@ -8,6 +8,7 @@
                 here (admin operators expect to read the spec citations
                 and the engine terms). See feedback_audience_per_page.md.
    ─────────────────────────────────────────────────────────── #}
+{% import "_macros.html" as m %}
 
 {# ── Compliance & Security card grid (was /admin/compliance-security) ──
    Six related controls grouped here. HIPAA mode + session policy +
@@ -109,11 +110,11 @@
     machine.
 </p>
 <p>
-    <strong>Hardware-key-wins rule:</strong> if a user has registered
-    any active hardware key, dev-keypair logins for that email are
+    <strong>Passkey-wins rule:</strong> if a user has registered
+    any active passkey, dev-keypair logins for that email are
     denied with 403. OTP login remains available regardless. Users
-    register their own hardware keys at
-    <a href="/profile/hardware-keys">/profile/hardware-keys</a>
+    register their own passkeys under
+    <a href="/profile/security">My Settings &rsaquo; Security</a>
     (each user manages their own; admins do NOT register on behalf
     of users -- the private side never leaves the user's device).
 </p>
@@ -139,11 +140,11 @@
 {% endif %}
 
 <aside style="border-left:3px solid var(--pico-primary);padding:0.5rem 1rem;margin:1rem 0;background:var(--pico-form-element-background-color);">
-    <strong>🔑 Personal hardware keys.</strong>
+    <strong>🔑 Personal passkeys.</strong>
     Want to register your own YubiKey / passkey for stronger login?
-    <a href="/profile/hardware-keys" role="button" class="outline secondary"
+    <a href="/profile/security" role="button" class="outline secondary"
        style="padding:0.15rem 0.6rem;font-size:0.85rem;margin-left:0.5rem;">
-        Open /profile/hardware-keys
+        Open Security settings
     </a>
 </aside>
 
@@ -152,17 +153,17 @@
     <form method="post" action="/admin/dev-keys/add">
         {{ csrf_input(request) }}
         <label>
-            Name (display only)
+            Name (display only){{ m.help("A friendly label for this key (e.g. 'laptop', 'ci-bot'). Admin-only; just helps you identify which physical key owns each registration.") }}
             <input type="text" name="name" placeholder="your laptop" required>
         </label>
         <label>
-            Public key (paste <code>~/.ssh/id_ed25519.pub</code>)
+            Public key (paste <code>~/.ssh/id_ed25519.pub</code>){{ m.help("The OpenSSH ed25519 PUBLIC key — the contents of your id_ed25519.pub. Generate with ssh-keygen -t ed25519. The private key never leaves your machine.") }}
             <textarea name="public_key" rows="4" required
                       placeholder="ssh-ed25519 AAAAC3... user@host"></textarea>
         </label>
         <div class="grid">
             <label>
-                TTL
+                TTL{{ m.help("How long this key can log in: 1 day, 1 week, or 2 weeks from registration. No auto-renewal — re-register to extend; expired keys deny login.") }}
                 <select name="ttl">
                     <option value="1d">1 day</option>
                     <option value="1w" selected>1 week</option>
@@ -170,7 +171,7 @@
                 </select>
             </label>
             <label>
-                Email allowlist (comma-separated)
+                Email allowlist (comma-separated){{ m.help("Which user emails this key may log in AS. Validated at registration — every address must be a known user. Scopes the key to intended accounts only.") }}
                 <input type="text" name="email_allowlist" placeholder="you@example.com,alt@example.com" required>
             </label>
         </div>
@@ -185,11 +186,11 @@
         <thead>
             <tr>
                 <th>Name</th>
-                <th>Fingerprint</th>
+                <th>Fingerprint{{ m.help("SHA256 fingerprint of the public key (OpenSSH format) — identifies the physical key at login. Immutable after registration.") }}</th>
                 <th>Allowlist</th>
-                <th>Status</th>
-                <th>Expires</th>
-                <th>Last used</th>
+                <th>Status{{ m.help("active (usable) · expired (past TTL) · revoked (manually disabled). Only active keys allow login.") }}</th>
+                <th>Expires{{ m.help("UTC time the key stops working. No grace period — an expired key is locked out immediately at login.") }}</th>
+                <th>Last used{{ m.help("Most recent SUCCESSFUL login with this key (UTC + the email used). Never updated for failed attempts — helps spot a forgotten or compromised key.") }}</th>
                 <th></th>
             </tr>
         </thead>
@@ -201,18 +202,18 @@
                 <td><small>{{ k.email_allowlist | join(", ") }}</small></td>
                 <td>
                     {% if k.revoked_at %}
-                    <small style="color:var(--pico-del-color);">revoked {{ k.revoked_at[:10] }}</small>
+                    <small style="color:var(--pico-del-color);">revoked <time datetime="{{ k.revoked_at }}" data-us-datetime>{{ k.revoked_at | us_datetime }}</time></small>
                     {% elif not k.active %}
                     <small style="color:var(--pico-del-color);">expired</small>
                     {% else %}
                     <small style="color:var(--pico-ins-color);">active</small>
                     {% endif %}
                 </td>
-                <td><small>{{ k.expires_at[:19] }}</small></td>
+                <td><small>{% if k.expires_at %}<time datetime="{{ k.expires_at }}" data-us-datetime>{{ k.expires_at | us_datetime }}</time>{% else %}&mdash;{% endif %}</small></td>
                 <td>
                     <small>
                         {% if k.last_used_at %}
-                        {{ k.last_used_at[:19] }}<br>
+                        <time datetime="{{ k.last_used_at }}" data-us-datetime>{{ k.last_used_at | us_datetime }}</time><br>
                         as {{ k.last_used_email }}
                         {% else %}
                         &mdash;

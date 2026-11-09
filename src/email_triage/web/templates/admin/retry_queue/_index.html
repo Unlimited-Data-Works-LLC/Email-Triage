@@ -85,6 +85,23 @@
 <p>Nothing in this view. (That's good — the queue is empty for the
    selected filter.)</p>
 {% else %}
+{# #301 reachability — single-state views page via ?offset= so the full #}
+{# backlog is reachable; the combined summary links to those views.     #}
+{% from "_pager.html" import pager %}
+{% if page_win %}
+{{ pager(page_win, "offset", request, "queue rows") }}
+{% endif %}
+{% if cap_segments %}
+{% for seg in cap_segments %}
+<p style="margin:0.3rem 0;padding:6px 10px;border-left:3px solid #b58900;background:#fff8e1;font-size:0.85rem;color:#5c4400;border-radius:3px;">
+    Showing the first <strong>{{ seg.shown }}</strong> of {{ seg.total }}
+    <code>{{ seg.label }}</code> rows (this summary caps at {{ seg.cap }});
+    {{ seg.total - seg.shown }} older row{{ 's' if (seg.total - seg.shown) != 1 else '' }}
+    not shown here —
+    <a href="?state={{ seg.view_all_state }}">view all {{ seg.total }} {{ seg.label }} &rarr;</a>
+</p>
+{% endfor %}
+{% endif %}
 <table>
     <thead>
         <tr>
@@ -151,7 +168,27 @@
                 {% endif %}
             </td>
             <td style="font-size:0.85em;">
-                {% if row.error_class_short %}
+                {# #7: plain-English flag for a watcher
+                   delivery failure. failure_kind rides the row dict (SELECT *,
+                   column since v35); without this the only signal was the raw
+                   "WatchDeliveryFailed" qualname leaking through error_class_short
+                   — which this page's audience header says operators shouldn't
+                   have to read. The badge replaces that qualname for these rows. #}
+                {% if row.failure_kind == "watch_delivery_failure" %}
+                <span style="display:inline-block;padding:0.1em 0.45em;border-radius:0.3em;background:var(--pico-del-color);color:#fff;font-weight:600;">Delivery failure</span>
+                <br>
+                {% endif %}
+                {# Suppress the raw error-class qualname for ANY delivery-failure
+                   row — the badge IS the operator-facing reason. This also covers
+                   the compound edge (a routed action errored AND a watch was
+                   undelivered on the same message): the generic re-raise bumps
+                   the row's last_error_class to e.g. "RuntimeError", but
+                   failure_kind stays watch_delivery_failure (COALESCE-preserved),
+                   so the badge renders and the raw RuntimeError qualname does NOT
+                   leak onto a page whose audience header forbids qualnames. The
+                   error MESSAGE below still shows, so detail isn't lost. #}
+                {% if row.error_class_short
+                      and row.failure_kind != "watch_delivery_failure" %}
                 <strong>{{ row.error_class_short }}</strong>
                 {% endif %}
                 {% set msg = row.error_msg or row.last_error or "" %}
@@ -167,6 +204,8 @@
                 Account needs re-authentication.
                 {% elif row.dead_reason == "max_attempts_exceeded" %}
                 Out of retry attempts.
+                {% elif row.dead_reason == "llm_unreachable_expired" %}
+                The AI service stayed unreachable past the retry window.
                 {% elif row.dead_reason == "uidvalidity_changed" %}
                 Mailbox UID space reset; address is stale.
                 {% elif row.dead_reason == "message_gone" %}

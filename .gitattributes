@@ -20,7 +20,8 @@ scripts/publish-scrub-patterns.txt text eol=lf
 scripts/embedding-bits-manifest.json text eol=lf
 
 # COMMIT carries the build identifier baked into /app/VERSION (Containerfile
-# `COPY COMMIT /app/VERSION`, read by app._resolve_version). `export-subst`
+# `COPY COMMIT /app/VERSION`, read by `_build_sha.read_baked_version`, the one
+# opener under src/email_triage/). `export-subst`
 # makes `git archive HEAD` substitute the real commit hash ($Format:%H$ -> the
 # 40-char SHA) at archive time, so EVERY archive-based build bakes the correct
 # SHA — both `scripts/deploy.sh` (which also overwrites COMMIT) AND any manual
@@ -28,3 +29,47 @@ scripts/embedding-bits-manifest.json text eol=lf
 # literal "dev" placeholder and /health reported version "unknown". eol=lf so
 # the substituted SHA is not followed by CRLF on Windows checkouts.
 COMMIT text eol=lf export-subst
+
+# N-326-C5 trust-root SSOT: the checked-in FIDO2-sk allowed_signers file
+# AND its golden-hash companion MUST be byte-stable across Windows and
+# Linux checkouts. `test_repo_trust_root_matches_golden_hash` computes
+# `sha256(read_bytes())` and compares against the golden — same drift
+# class as the embedding-bits manifest above (CI on Linux sees LF blob
+# bytes; Windows CRLF-autocrlf checkout sees `\r\n` → different hash →
+# false-positive DRIFT). Pinning LF makes the on-disk bytes match the
+# blob bytes on every platform, so the golden hash is one canonical
+# value everywhere.
+.github/op-approve/allowed_signers text eol=lf
+tests/goldens/allowed_signers.sha256 text eol=lf
+
+# N-616 (punch 634): the amalgamation sha256 pin is read by the Containerfile's
+# strict line match and by `sha256sum -c`. Under
+# `core.autocrlf=true`, `git archive HEAD` (what deploy.sh ships) emits this file
+# with CRLF, the `$` then sits after a `\r` and the match fails. Before punch 634
+# that dropped the build to BOOTSTRAP MODE, which checks nothing; it now stops
+# the build. tests/test_arch_encryption_build_pin.py derives every archived file
+# a strict reader touches and requires `eol=lf` on each.
+# Measured 2026-10-14 on the batch-F deploy context (/tmp/et-deploy, 68568a84) and
+# on a scratch build. Pinning LF keeps the archived bytes equal to the blob.
+vendor/sqlite3.expected.sha256 text eol=lf
+
+# Punch 631 round 2: the deploy-time bake step scripts are COPYed into the image and
+# run by python; pinned LF so the archived-file CR net (tests/test_arch_encryption_build_pin.py)
+# needs no runtime-consumer entry naming files that do not all ship.
+scripts/n432-path3-bake-step*.py text eol=lf
+
+# N-621: the image's own hash-pinned pip list is COPYed into the runtime stage and read by
+# `pip install --require-hashes`; pinned LF so the archived-file CR net
+# (tests/test_arch_encryption_build_pin.py, tests/test_deploy_script.py) needs no CR-tolerant reader entry.
+requirements-pip.txt text eol=lf
+# punch 775: the builder stage hash-pinned build toolchain, COPYed and read by pip install --require-hashes; LF for the same reason.
+requirements-build.txt text eol=lf
+# punch 822: deploy.sh registry mode reads /app/source-built.pins from the pulled image (strict reader); LF for the same reason.
+source-built.pins text eol=lf
+
+# Git hooks have no extension, so the `*.sh` rule above does not reach them. Git for Windows' sh tolerates a
+# CRLF copy (measured 2026-10-17), but a non-MSYS sh (WSL on this checkout; not measured) may read `exit 0\r`
+# as an error, and a non-zero exit in the reference-transaction `prepared` phase makes git ABORT the ref
+# transaction (every commit and fetch would fail).
+scripts/git-hooks/* text eol=lf
+.githooks/* text eol=lf

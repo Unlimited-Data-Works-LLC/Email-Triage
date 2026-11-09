@@ -71,9 +71,14 @@ def _resolve_version() -> str:
         return "unknown"
 
 
-def _now_iso() -> str:
-    """Local-tz ISO timestamp; matches the ``last_triage`` render style."""
-    return datetime.now().astimezone().isoformat()
+def _now_local_iso() -> str:
+    """Local-tz ISO timestamp for the human-facing ``generated=`` header
+    stamp (matches the ``last_triage`` render style). A10 (census
+    2026-06-09): renamed from the confusable ``_now_iso`` + delegates to
+    the SSOT, so the LOCAL display helper can never be crossed with the
+    UTC stored-timestamp ``_now_iso`` of the (previously) same name."""
+    from email_triage._isotime import now_local_iso
+    return now_local_iso()
 
 
 def build_triage_header(
@@ -103,7 +108,7 @@ def build_triage_header(
     if account and not hipaa:
         parts.append(f"account={account}")
     parts.append(f"version={version if version is not None else _resolve_version()}")
-    parts.append(f"generated={generated if generated is not None else _now_iso()}")
+    parts.append(f"generated={generated if generated is not None else _now_local_iso()}")
     return "; ".join(parts)
 
 
@@ -138,13 +143,63 @@ def get_rfc_message_id(headers: Any) -> str:
     return ""
 
 
-def _extract_addr(addr: str) -> str:
-    """Pull the bare ``user@host`` out of an RFC-5322 address string.
+def get_message_rfc_id(message: Any) -> str:
+    """Durable RFC-5322 Message-ID for a parsed *message*, with provider
+    fallback — the message-level SSOT (A6, divergence census 2026-06-09).
+
+    Resolution order, single casing authority:
+      1. The ``Message-Id:`` header in ANY casing — via
+         :func:`get_rfc_message_id` (the one place that knows providers
+         emit ``Message-ID`` / ``Message-Id`` / ``message-id``).
+      2. An explicit ``rfc822_message_id`` attribute/key, if present.
+      3. The provider-normalised ``message_id`` attribute/key.
+    Returns the stripped value, or ``""`` when none is present.
+
+    ``message`` may be an ``EmailMessage``-like object OR a plain dict
+    (the topic-backscan hit path passes dicts). Both header-as-attr and
+    header-as-key shapes are tolerated.
+
+    This collapses 4 hand-rolled extractors that each checked a DIFFERENT
+    subset of header casings — most consequentially ``SentMailIndex``,
+    which checked only ``Message-ID``/``message-id`` (missing the IMAP
+    ``Message-Id``) and had NO provider-id fallback, so an IMAP-cased sent
+    message resolved to ``""`` → the dedup lookup was skipped → a fresh
+    row was inserted on every re-scan (the census "double-count").
+    """
+    if isinstance(message, dict):
+        headers = message.get("headers")
+    else:
+        headers = getattr(message, "headers", None)
+    rfc = get_rfc_message_id(headers or {})
+    if rfc:
+        return rfc
+    for attr in ("rfc822_message_id", "message_id"):
+        if isinstance(message, dict):
+            val = message.get(attr)
+        else:
+            val = getattr(message, attr, None)
+        if val:
+            return str(val).strip()
+    return ""
+
+
+def extract_bare_address(addr: str) -> str:
+    """Pull the bare ``user@host`` out of an RFC-5322 address string —
+    the bare-address extraction SSOT (A7, divergence census 2026-06-09).
 
     Tolerates the four shapes we routinely see on the wire: bare
     ``a@b``, angle-bracketed ``<a@b>``, display-name ``Name <a@b>``,
     and group syntax ``"Name" <a@b>``. Lower-cased so equality
     comparisons survive provider casing drift.
+
+    Robust where the hand-rolled variants weren't: the ``<([^>]+)>``
+    regex correctly skips a display name that itself contains ``>`` (the
+    ``s[s.index("<"):s.index(">")]`` first-bracket slice broke there) and
+    the unbracketed ``"CTOx" <news@email.ctox.com>`` case (a naive
+    ``rsplit("@")`` left the trailing ``>`` so every sender match
+    silently missed). Do NOT change this function's output without
+    re-hashing the per-contact HIPAA recipient store — it feeds
+    ``style_learning.per_contact_hipaa`` (salted recipient hash).
     """
     if not addr:
         return ""
@@ -153,6 +208,208 @@ def _extract_addr(addr: str) -> str:
     if m:
         return m.group(1).strip().lower()
     return s.lower()
+
+
+# Back-compat alias — the SSOT was historically the module-private
+# ``_extract_addr`` (cross-imported by per_contact_hipaa / draft_reply).
+_extract_addr = extract_bare_address
+
+
+def canonical_email(raw: str | None) -> str:
+    """N-253 R25 — canonical email-address SSOT for allow-list gates.
+
+    Produces the STABLE case-folded bare-address form used across every
+    recipient-allow-list gate (§164.312(a)(1) unauthorized-recipient
+    enforcement). Semantics:
+
+    * ``None`` / ``""`` → ``""`` (fail-closed callers can distinguish).
+    * A display-name-wrapped shape ``"Name <a@b>"`` → ``"a@b"`` (via
+      :func:`extract_bare_address`).
+    * A bare ``"a@b"`` → ``"a@b"`` (already canonical).
+    * Whitespace on either side → stripped.
+    * Case → lower.
+
+    Callers that used ``(x or "").strip().lower()`` on an
+    address-shaped variable MUST route through this helper — a raw
+    strip/lower left ``"Alice <a@b>"`` split from ``"a@b"``, so the
+    SAME sender's two envelope shapes DIVERGED in the allow-list gate
+    → §164.312(a)(1) drift.
+
+    Wraps :func:`extract_bare_address` which already handles the four
+    wire shapes (bare / ``<a@b>`` / ``Name <a@b>`` / ``"Name" <a@b>``)
+    and lower-cases the output.
+
+    **N-317 R30 (tranche  follow-up from DA panel)**: additionally
+    IDNA-normalize the domain part so ``alice@münchen.de`` (U-label /
+    unicode) and ``alice@xn--mnchen-3ya.de`` (A-label / punycode) map
+    to the SAME canonical key. Without this, the allow-list gate at
+    §164.312(a)(1) treated the two shapes as distinct → an authorized
+    recipient's IDN-encoded envelope variant BYPASSED the gate. Fix:
+    encode the domain via the stdlib ``idna`` codec (**RFC 3490 /
+    IDNA-2003** — that is what Python's stdlib actually implements,
+    NOT IDNA-2008/UTS-46 as the original N-317 R30 docstring cited).
+
+    **N-358 R31 accuracy fix (2026-07-05 trust-repair fix-forward per
+    PHASE2 tranche  db-sme + the backlog  = TASK ):** the
+    original docstring cited RFC 5890 / 6531 (IDNA-2008 / UTS-46 —
+    what the ``idna`` PyPI package implements). Python's stdlib
+    ``.encode("idna")`` is IDNA-2003 (RFC 3490) which is a strict
+    subset. The two agree on the common Unicode/punycode cases the
+    N-317 gate protects (Latin-1 diacritics, common CJK), but differ
+    on some edge cases (TR-46 mappings, some emoji/ZWJ shapes). The
+    full migration to the ``idna`` PyPI package (IDNA-2008 / UTS-46
+    semantics) is tracked as N-317, an OPEN v0.2.0 work item awaiting
+    a proper drive (corrected 2026-07-06 from a false "v0.3.0 scope
+    item" attribution per operator directive — v0.3.0 is enterprise-
+    scaling scope only per internal documentation; IDNA
+    semantics work is v0.2.0). Until then this docstring accurately
+    reflects the stdlib IDNA-2003 shape.
+
+    **N-346c R31 (2026-07-08 trust-repair drive HIGH  close):** the
+    persisted-hash backfill/dual-lookup decision that WAS "operator-
+    parked" per an earlier revision of this docstring is LANDED. The
+    dual-lookup shim (`hash_recipient_for_install(shape=)` +
+    `hash_recipient_for_install_all_shapes()`) preserves persisted-row
+    integrity while enabling canonical-shape reads without a downtime
+    backfill window; existing rows stay legacy-shape + are still
+    addressable via the dual-lookup probe. See §4.9 register-row
+    N-346c + `tests/test_n346c_dual_lookup_shim.py`. N-317 stays open
+    as an independent work item (extending `_HASH_SHAPES` with a
+    UTS-46 variant is forward-compatible with the shim; no re-scope
+    of N-317 needed). SME panel MUST-FIX F2 fold — the register-row
+    landing is the source of truth on N-346c status; this docstring
+    no longer holds that scope.
+
+    Fail-CLOSED on encode error — return the extracted bare address
+    unchanged so any bad-domain caller matches against a shape the
+    allow-list won't accept.
+    """
+    bare = extract_bare_address(raw or "")
+    if not bare or "@" not in bare:
+        return bare
+    local, _, domain = bare.rpartition("@")
+    if not domain:
+        return bare
+    try:
+        # `idna` codec produces the A-label form (punycode-prefixed
+        # for non-ASCII labels; identity for pure-ASCII). Case is
+        # already lowered by extract_bare_address.
+        ascii_domain = domain.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        # Malformed domain — fail closed. Return the raw extraction
+        # so the caller's allow-list gate rejects (no authorized
+        # entry will match a malformed domain).
+        return bare
+    return f"{local}@{ascii_domain}"
+
+
+#: SSOT for the subject reply-prefix matcher (census run13 ). ``fwd?`` matches
+#: both ``fw`` and ``fwd``; ``re``/``fw``/``fwd`` are the recognised tokens. Two
+#: copies had drifted (one ``(?:re|fwd?|fw)``, one ``(?:re|fwd|fw)`` — equivalent
+#: today, but a future prefix added to ONE would fragment the other's dedup key).
+SUBJECT_REPLY_PREFIX_RE = re.compile(r"^\s*(?:re|fwd?|fw)\s*:\s*", re.IGNORECASE)
+
+
+def strip_reply_prefix(subject: str) -> str:
+    """Strip chained leading ``Re:`` / ``Fwd:`` / ``Fw:`` reply-prefix tokens
+    (any case) from a subject (``Re: Fwd: Re: Lunch`` -> ``Lunch``) — the SSOT
+    for subject reply-prefix normalization (census run13 ). ``None``/empty ->
+    ``""``. Returns the prefix-stripped subject WITHOUT further normalization;
+    the caller applies its own (a trailing ``.strip()`` / a cache ``_norm``), so
+    converging onto this is behaviour-preserving for both consumers."""
+    if not subject:
+        return ""
+    out = subject
+    while True:
+        new = SUBJECT_REPLY_PREFIX_RE.sub("", out, count=1)
+        if new == out:
+            break
+        out = new
+    return out
+
+
+def extract_display_name(sender: str) -> str:
+    """The DISPLAY-NAME portion of a From header (``"Alice" <a@b>`` -> ``Alice``)
+    — the SSOT (census run13 ). Strips surrounding single AND double quotes.
+    Returns ``""`` when there is no ``<…>`` bracket (a bare address) — the CALLER
+    chooses its own no-display-name fallback (digest title-cases the local-part,
+    escalate uses it raw, the watch first-name extractors take the first word),
+    because that fallback is a per-surface UX choice, not a parse. Complements
+    :func:`extract_bare_address` (which pulls the ADDRESS out of the same header)."""
+    if not sender or "<" not in sender:
+        return ""
+    return sender.split("<")[0].strip().strip('"').strip("'")
+
+
+def extract_domain(sender: str) -> str:
+    """Return the lowercased domain portion of an RFC-5322 sender value.
+
+    The SSOT for sender-domain extraction (N-71, divergence census
+    2026-06-09): before this, ``_extract_domain`` in ``classify/hints.py``
+    and ``_domain_of`` in ``web/email_watches.py`` each extracted the
+    domain independently via ``rsplit("@", 1)[-1]`` / ``split("@", 1)[1]``
+    on a bare address.  While both happened to call ``extract_bare_address``
+    first (so the display-name issue was resolved), they diverge on the
+    security-critical double-@ spoof case:
+
+      * ``addr.split("@", 1)[1]``   → for ``a@b@evil.com`` after bare-addr
+        extraction returns ``b`` (the first part after the first @).
+      * ``addr.rsplit("@", 1)[-1]`` → returns ``evil.com`` (the last part).
+
+    Per RFC 5321 §4.1.2 the domain is the LAST @-separated token in the
+    addr-spec.  ``extract_bare_address`` already handles display-name
+    stripping; here we just split on the rightmost ``@`` so that a
+    double-@ spoof consistently resolves to the real (last) domain rather
+    than the decoy local-part.
+
+    Composed on ``extract_bare_address`` (frozen SSOT) so:
+    - display-name form ``"Name" <a@b>`` → ``b``
+    - bare address ``a@b`` → ``b``
+    - double-@ ``a@b@evil.com`` → ``evil.com`` (the rightmost = real domain)
+    - no ``@`` → ``""`` (not a valid address; caller gates on empty)
+
+    The ``classify/hints.py::_extract_domain`` and
+    ``web/email_watches.py::_domain_of`` helpers delegate here; the pin
+    ``tests/test_n71_sender_domain_ssot_pin.py`` enforces that no new
+    module hand-rolls the split.
+    """
+    addr = extract_bare_address(sender)
+    if "@" not in addr:
+        return ""
+    return addr.rsplit("@", 1)[-1]
+
+
+def format_from_header(from_addr: str, from_name: str | None = "") -> str:
+    """Build an RFC-5322 ``From`` value — ``"Display Name" <addr@host>``, or the
+    bare address when there is no display name.
+
+    SSOT for the ~5 hand-rolled copies (``web/auth``, ``web/smtp_send``,
+    ``providers/gmail_api``, ``providers/imap`` ×2) that each quoted the display
+    name WITHOUT stripping CR/LF (divergence census 2026-06-09 #5). It lives here
+    in ``mail_headers`` (not ``web/``) because the providers must call it too and
+    a provider must not import from ``web``.
+
+    STRIPS CR/LF (and other control characters) from the display name — a name
+    containing a bare ``\\r``/``\\n`` could otherwise inject extra mail headers —
+    then escapes backslash + quote. The display name is operator/account-owner
+    config in the current senders (not attacker-controlled), so this is
+    defense-in-depth; but the weakest-variant rule applies (no copy stripped
+    CR/LF, so the system had no CR/LF defense at all). For a name with no control
+    characters the output is byte-identical to the old copies.
+
+    Distinct from ``extract_bare_address`` (extraction for the §164.514(b) hash,
+    byte-FROZEN) — this is header BUILDING.
+    """
+    name = (from_name or "").strip()
+    if not name:
+        return from_addr
+    # Header-injection defense: collapse any CR/LF/control run to a single space
+    # BEFORE quoting, so the quoted-string can't carry a header break.
+    cleaned = re.sub(r"[\r\n\t\x00-\x1f]+", " ", name).strip()
+    if not cleaned:
+        return from_addr
+    safe = cleaned.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{safe}" <{from_addr}>'
 
 
 def build_self_skip_query(
@@ -281,7 +538,18 @@ def decode_draft_body_header(value: str | None) -> str:
     if not cleaned:
         return ""
     try:
-        raw = base64.b64decode(cleaned, validate=False)
+        #  tail — RFC 2047 encoded-word body; some MUAs strip
+        # padding. Route through the SSOT so a length-not-multiple-of-4
+        # input decodes correctly instead of returning empty string.
+        # Post-#123 CI regression fix (2026-07-11): the pre-fix behavior
+        # `base64.b64decode(cleaned, validate=False)` RAISED on non-4-
+        # multiple garbage input (length mismatch) — the SSOT pads first
+        # so length-mismatch no longer raises. Use `validate=True` to
+        # reject non-alphabet chars (garbage) so the caller's
+        # `except: return ""` semantics are preserved for garbage input.
+        # The `test_decode_garbage_returns_empty` test pins this contract.
+        from email_triage._base64url import b64decode_permissive
+        raw = b64decode_permissive(cleaned, urlsafe=False, validate=True)
     except Exception:
         return ""
     try:
@@ -343,3 +611,53 @@ def get_triage_header(headers: Any) -> str | None:
         if isinstance(key, str) and key.lower() == target and value:
             return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# Outbound Message-Id minting (punch 599)
+# ---------------------------------------------------------------------------
+
+#: Domain for a Message-Id when no usable sender address is known. ``.invalid``
+#: is reserved (RFC 2606): it never resolves and never names a real host.
+MESSAGE_ID_FALLBACK_DOMAIN = "email-triage.invalid"
+
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def message_id_domain(from_addr: str | None) -> str:
+    """The right-hand side for an outbound Message-Id: the sender address's
+    domain, IDNA-encoded and lower-cased, or :data:`MESSAGE_ID_FALLBACK_DOMAIN`
+    when the address has no usable hostname (empty, no ``@``, a domain literal,
+    whitespace or control characters, a malformed label)."""
+    from email.utils import parseaddr
+
+    raw = str(from_addr or "")
+    if any(ord(c) < 33 and c != " " for c in raw):
+        return MESSAGE_ID_FALLBACK_DOMAIN
+    addr = parseaddr(raw)[1] or raw
+    if addr not in raw:  # parseaddr silently repaired it (e.g. dropped a space)
+        return MESSAGE_ID_FALLBACK_DOMAIN
+    domain = addr.rpartition("@")[2].strip().rstrip(".") if "@" in addr else ""
+    if not domain or " " in domain:
+        return MESSAGE_ID_FALLBACK_DOMAIN
+    try:
+        domain = domain.encode("idna").decode("ascii").lower()
+    except (UnicodeError, ValueError):
+        return MESSAGE_ID_FALLBACK_DOMAIN
+    labels = domain.split(".")
+    if len(labels) < 2 or not all(_DNS_LABEL.match(lb) for lb in labels):
+        return MESSAGE_ID_FALLBACK_DOMAIN
+    return domain
+
+
+def make_message_id(from_addr: str | None = "") -> str:
+    """Mint an RFC 5322 Message-Id whose domain comes from the sender address.
+
+    ``email.utils.make_msgid()`` without ``domain=`` calls ``socket.getfqdn()``:
+    a reverse-DNS lookup on every call (it ran on the event loop in the
+    regulatory-clock escalation sender) that also put the internal host name in
+    every outbound id. Every Message-Id in ``src/`` is minted here
+    (``tests/test_punch599_message_id_domain_pin.py``)."""
+    from email.utils import make_msgid
+
+    return make_msgid(domain=message_id_domain(from_addr))

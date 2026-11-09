@@ -27,9 +27,75 @@ Contents:
 
 from __future__ import annotations
 
+import copy
+import json
 import sqlite3
 import sys
 from typing import Any
+
+
+def load_json_col(raw: Any, *, default: Any, label: str = "") -> Any:
+    """Decode a persisted JSON column, surviving NULL **and** corruption.
+
+    Census  SSOT. A bare ``json.loads(row["x_json"])`` raises
+    ``JSONDecodeError`` on a corrupt column (an operator hand-edit, a
+    truncated write, a schema drift) and takes down the whole page / flow
+    load that reads the row — a corrupt column should degrade to the
+    default, not 500. Route every persisted-column JSON decode through
+    here.
+
+    Returns a *fresh copy* of ``default`` (never the shared object — a
+    mutable default returned by-reference and then mutated by a caller is
+    a classic aliasing bug) when ``raw`` is NULL/empty/un-decodable, OR
+    when the decoded value's type doesn't match the default's (a stored
+    ``"null"`` / wrong-shape blob is treated as corruption — every column
+    we use this for has a by-contract shape). ``label`` is for the
+    caller's own logging; this leaf helper does not log.
+    """
+    if raw is None or raw == "":
+        return copy.deepcopy(default)
+    try:
+        out = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return copy.deepcopy(default)
+    if default is not None and not isinstance(out, type(default)):
+        return copy.deepcopy(default)
+    return out
+
+
+def dump_json_col(obj: Any, *, ensure_ascii: bool = False) -> str:
+    """Serialise a Python object for storage in a persisted JSON column —
+    the WRITE twin of :func:`load_json_col` (census run18 #4 SSOT).
+
+    Every PLAIN-STORE ``*_json`` DB-column write routes through here so the
+    on-write serialization lives in ONE place instead of ~60 hand-rolled
+    ``json.dumps(...)`` call sites that were free to drift in their kwargs.
+
+    ``ensure_ascii`` defaults to ``False`` (the maintainability *and*
+    multilingual win): a non-Latin PHI value — a CJK display name, an
+    accented subject line, a Cyrillic label — is stored as compact UTF-8
+    instead of being exploded into ``\\uXXXX`` escapes (≈6 bytes per
+    non-ASCII char). The stored text stays smaller at rest and legible in a
+    raw DB dump, and is byte-for-byte round-trippable through
+    :func:`load_json_col` (the decoder is encoding-agnostic). ASCII payloads
+    are unchanged either way, so routing an existing plain-store site here is
+    a no-op for already-stored ASCII rows.
+
+    Deliberately does NOT ``sort_keys`` by default: the existing plain-store
+    rows are written key-insertion-ordered, and forcing sorted keys would
+    needlessly diff every historical row's serialized form for zero integrity
+    gain (these columns are decoded structurally by ``load_json_col``, never
+    compared byte-wise).
+
+    NOT for the hash/match-keyed sites. ``db/audit.py`` ``_hash_args`` /
+    ``_build_gap_payload`` and the ``extra_json`` HMAC-chain rows
+    (``triage_logging`` / ``db/audit.py``) keep their own
+    ``sort_keys=True`` / store-equals-the-hashed-string serialization — they
+    feed a SHA-256 / HMAC chain, so re-keying their byte output through this
+    helper would FORK that chain (the opposite of a fix). They are
+    allow-listed out of the write-pin and must stay a bare ``json.dumps``.
+    """
+    return json.dumps(obj, ensure_ascii=ensure_ascii)
 
 
 def apply_compatible_row_factory(conn: sqlite3.Connection) -> None:
@@ -117,3 +183,33 @@ def _has_column(
         if name == column_name:
             return True
     return False
+
+
+def refuse_undeclared_nesting(nested: bool, declared: bool, *, what: str) -> None:
+    """Refuse a write whose transaction state disagrees with its caller's claim.
+
+    Punch 708 (N-642). A nested-aware funnel reads ``conn.in_transaction`` and,
+    when it is True, leaves BEGIN/COMMIT/ROLLBACK to the caller. That flag cannot
+    tell a caller's deliberate transaction from one LEAKED on the shared
+    connection: on a leak the funnel's write and its witness were left
+    uncommitted and reported done, and the next ``@db_write`` raise rolled them
+    back. So nesting must be DECLARED by the caller (``_in_caller_txn=True``):
+
+    * open but not declared: a leaked transaction; refuse before any write.
+    * declared but not open: the caller believes it owns atomicity it does not
+      have; refuse.
+
+    ``RuntimeError`` (fail CLOSED, PD#8). Under ``@db_write`` the raise also
+    rolls the leaked transaction back, so the next writer starts clean.
+    """
+    if nested and not declared:
+        raise RuntimeError(
+            f"{what}: the connection already holds a transaction this call does "
+            "not own (a leaked transaction?); refusing to write into it. A caller "
+            "that holds the transaction on purpose passes _in_caller_txn=True."
+        )
+    if declared and not nested:
+        raise RuntimeError(
+            f"{what}: _in_caller_txn=True but the connection holds no "
+            "transaction; refusing, the caller's atomicity is not in place."
+        )

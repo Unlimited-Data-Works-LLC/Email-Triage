@@ -41,7 +41,7 @@
             <strong>{{ row.name }}</strong>
             ({{ row.type }}) &mdash;
             <strong style="color:var(--pico-del-color);">
-                expired {{ row.baa_expires_at }}
+                expired {% if row.baa_expires_at %}<time datetime="{{ row.baa_expires_at }}" data-us-date>{{ row.baa_expires_at | us_date }}</time>{% else %}&mdash;{% endif %}
             </strong>.
             HIPAA accounts using this backend have been switched to
             the install default.
@@ -53,7 +53,7 @@
             ({{ row.type }}) &mdash;
             <strong style="color:var(--pico-del-color);">
                 expires in {{ row.days_until_expiry }} days
-                ({{ row.baa_expires_at }})
+                ({% if row.baa_expires_at %}<time datetime="{{ row.baa_expires_at }}" data-us-date>{{ row.baa_expires_at | us_date }}</time>{% else %}&mdash;{% endif %})
             </strong>.
         </li>
         {% endfor %}
@@ -62,7 +62,7 @@
             <strong>{{ row.name }}</strong>
             ({{ row.type }}) &mdash;
             expires in {{ row.days_until_expiry }} days
-            ({{ row.baa_expires_at }}).
+            ({% if row.baa_expires_at %}<time datetime="{{ row.baa_expires_at }}" data-us-date>{{ row.baa_expires_at | us_date }}</time>{% else %}&mdash;{% endif %}).
         </li>
         {% endfor %}
     </ul>

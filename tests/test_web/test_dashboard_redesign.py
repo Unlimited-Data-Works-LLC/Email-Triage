@@ -29,7 +29,7 @@ def _make_account(db, user_id, *, name="Inbox"):
         "(user_id, name, provider_type, config_json, is_active, "
         " created_at, updated_at) "
         "VALUES (?, ?, ?, ?, 1, ?, ?)",
-        (user_id, name, "imap", json.dumps({"host": "mail.test.com"}), now, now),
+        (user_id, name, "imap", json.dumps({"host": "mail.test.invalid"}), now, now),
     )
     db.commit()
     return cursor.lastrowid
@@ -74,6 +74,86 @@ def test_dashboard_regular_user_sees_checklist_not_stats(
     assert "System Log" not in resp.text
     # Quick action buttons exist.
     assert "Triage Now" in resp.text
+
+
+def test_dashboard_backfill_capped_banner(
+    client, db, regular_user, user_cookies,
+):
+    """ (DA M2) — a bounded-backfill saturation chip on an owned
+    account surfaces a banner on the dashboard landing page, not just
+    on the Accounts list."""
+    from email_triage.web._backfill_chip import (
+        mark_backfill_capped, BACKFILL_CAP,
+    )
+    acct = _make_account(db, regular_user["id"], name="Inbox")
+    mark_backfill_capped(
+        db, acct, kind="gmail_history", window="last 7 days",
+        recovered=BACKFILL_CAP,
+    )
+    resp = client.get("/dashboard", cookies=user_cookies)
+    assert resp.status_code == 200
+    assert "Some mail may not have been triaged" in resp.text
+    assert "recovery capped" in resp.text
+
+
+def test_dashboard_backfill_banner_names_a_folder_renumber(
+    client, db, regular_user, user_cookies,
+):
+    """Punch 854 (DA S2): an IMAP UIDVALIDITY reseed reads as a renumbered
+    folder, not a capped recovery."""
+    from email_triage.web._backfill_chip import mark_backfill_capped
+    acct = _make_account(db, regular_user["id"], name="Inbox")
+    mark_backfill_capped(
+        db, acct, kind="imap_uidvalidity", window="reseed",
+        recovered=0, source_mailbox="INBOX",
+    )
+    resp = client.get("/dashboard", cookies=user_cookies)
+    assert resp.status_code == 200
+    assert "Some mail may not have been triaged" in resp.text
+    assert "folder renumbered" in resp.text
+    assert "— recovery capped" not in resp.text
+
+
+def test_dashboard_no_backfill_banner_when_clean(
+    client, db, regular_user, user_cookies,
+):
+    """No chip → no backfill banner (don't cry wolf)."""
+    _make_account(db, regular_user["id"], name="Inbox")
+    resp = client.get("/dashboard", cookies=user_cookies)
+    assert resp.status_code == 200
+    assert "Some mail may not have been triaged" not in resp.text
+
+
+def test_dashboard_recent_runs_more_notice(
+    client, db, regular_user, user_cookies,
+):
+    """ — the Recent-activity widget shows 5 runs; when there are
+    more it says so (limit+1 sentinel) instead of reading as complete."""
+    acct = _make_account(db, regular_user["id"], name="Inbox")
+    # 6 runs → 5 shown + the sentinel trips has_more.
+    for i in range(6):
+        _record_run(
+            db, account_id=acct, account_name="Inbox",
+            when=f"2026-06-1{i}T08:00:00+00:00",
+        )
+    resp = client.get("/dashboard", cookies=user_cookies)
+    assert resp.status_code == 200
+    assert "5 most recent runs" in resp.text
+
+
+def test_dashboard_recent_runs_no_notice_under_cap(
+    client, db, regular_user, user_cookies,
+):
+    """≤5 runs → no 'more' notice (don't imply hidden history)."""
+    acct = _make_account(db, regular_user["id"], name="Inbox")
+    for i in range(3):
+        _record_run(
+            db, account_id=acct, account_name="Inbox",
+            when=f"2026-06-1{i}T08:00:00+00:00",
+        )
+    resp = client.get("/dashboard", cookies=user_cookies)
+    assert resp.status_code == 200
+    assert "5 most recent runs" not in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +376,39 @@ def test_dashboard_health_chip_counts_watching_status_as_connected(
     assert "2/2 accounts covered" in resp.text
     assert "IMAP: 2 acct" in resp.text
     assert "2 push" in resp.text
+
+
+def test_dashboard_health_box_watching_off_section(
+    client, db, app, admin_user, admin_cookies,
+):
+    """ follow-up (operator 2026-06-12): a deliberately-paused account
+    (push+poll OFF) renders under 'Watching off (by choice)' with a re-enable
+    link — NOT as an alert, and the Ingestion chip stays un-warned. Uses the
+    REAL watcher_manager so the new intent-aware account_states folds the
+    account config (test-the-view for the new template sections)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur = db.execute(
+        "INSERT INTO email_accounts (user_id, name, provider_type, "
+        "config_json, is_active, created_at, updated_at) "
+        "VALUES (?, 'paused-mbx', 'imap', "
+        "'{\"push_enabled\": false, \"poll_enabled\": false}', 1, ?, ?)",
+        (admin_user["id"], now_iso, now_iso),
+    )
+    db.commit()
+    assert cur.lastrowid  # account created
+
+    # Do NOT replace app.state.watcher_manager — the real one runs the new
+    # intent-aware account_states.
+    resp = client.get("/dashboard", cookies=admin_cookies)
+    assert resp.status_code == 200
+    body = resp.text
+    # The new neutral section + a re-enable link to the account's settings.
+    assert "Watching off (by choice)" in body
+    assert "paused-mbx" in body
+    assert "re-enable" in body
+    assert "watching off" in body.lower()        # per-provider neutral count
+    # NOT surfaced as a problem.
+    assert "Needs attention" not in body
 
 
 # ---------------------------------------------------------------------------

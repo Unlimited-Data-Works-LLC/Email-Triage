@@ -1,0 +1,35 @@
+{# Admin update-check-failing banner (punch 553, db panel F-O5-1).
+
+   AUDIENCE:    admin (system operator). Never rendered for other users:
+                ``_shared._inject_update_check_banners_ctx`` returns None
+                for a non-admin, and this partial self-guards on it.
+   TECH-SKILL:  medium.
+   COPY RULES:  plain English: the check is failing, since when, why it
+                matters, what to look at. NOT dismissable: it clears by
+                itself on the next successful check (one funnel,
+                ``update_check.record_check_outcome``).
+
+   Reads ``update_check_banners.stale`` — shape from
+   ``update_check.update_check_stale``. Title, cause and advice come from
+   that notice (one copy per reason, punch 574): a check that stopped
+   running must not be told to check its internet access.
+#}
+{% if update_check_banners is defined and update_check_banners and update_check_banners.stale %}
+{% set _st = update_check_banners.stale %}
+<aside id="update-check-stale-banner" role="status" data-reason="{{ _st.reason }}"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+    <strong>{{ _st.title }}</strong>
+    <p style="margin:0.3rem 0 0;">
+        No successful check of <code>{{ _st.host }}</code>
+        {% if _st.since %}since <time datetime="{{ _st.since }}" data-us-datetime>{{ _st.since | us_datetime }}</time>{% else %}since the check was turned on{% endif %}
+        ({{ _st.cause }}). Until a check succeeds you will not be told about
+        security updates.
+    </p>
+    <p style="margin:0.3rem 0 0;font-size:0.9em;">
+        {{ _st.advice }} This notice clears by itself after the next
+        successful check.
+    </p>
+</aside>
+{% endif %}

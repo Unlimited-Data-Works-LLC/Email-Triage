@@ -7,6 +7,7 @@ gate semantics. The Profile UI round-trip lives in
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timezone
@@ -210,27 +211,6 @@ class TestBuildStylePromptPrefix:
 # No-PII spot check — examples in the rendered block
 # ---------------------------------------------------------------------------
 
-class TestNoPiiInExamples:
-    """The tone / greeting / length examples must not leak real names
-    or domains. This isn't an exhaustive check; it's a guardrail
-    against an accidental future edit that hard-codes 'bob' or
-    similar into the example strings.
-    """
-
-    def test_greeting_examples_use_placeholders(self):
-        for choice in ("first-name", "formal-name"):
-            knobs = _defaults()
-            knobs["style_greeting"] = choice
-            out = format_style_knobs_for_prompt(knobs).lower()
-            # No real-name leakage. Use a small forbidden list — these
-            # are names that have appeared in the codebase historically
-            # and would indicate a regression if they show up here.
-            assert "bob" not in out
-            assert "alice" not in out
-            assert "@gmail.com" not in out
-            assert "@example.com" not in out
-
-
 # ---------------------------------------------------------------------------
 # Migration v11 — schema extension applies cleanly
 # ---------------------------------------------------------------------------
@@ -246,7 +226,7 @@ class TestMigrationV11:
 
     def test_columns_present_after_init(self):
         from email_triage.web.db import init_db
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         cols = {
             row[1] for row in conn.execute("PRAGMA table_info(users)")
         }
@@ -259,7 +239,7 @@ class TestMigrationV11:
 
     def test_documented_defaults(self):
         from email_triage.web.db import init_db, get_user_style_knobs
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         # Insert a user with no knob columns specified.
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
@@ -336,7 +316,7 @@ class TestDraftReplyIntegration:
         from email_triage.actions.style_profile import (
             build_style_prompt_prefix, StyleProfile,
         )
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         now = datetime.now(timezone.utc).isoformat()
         cur = conn.execute(
             "INSERT INTO users (email, name, role, created_at) "

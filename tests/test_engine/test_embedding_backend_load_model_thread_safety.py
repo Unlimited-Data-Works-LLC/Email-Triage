@@ -97,7 +97,7 @@ def st_stub(monkeypatch):
         def encode(self, text, convert_to_numpy=True):
             return [0.1, 0.2, 0.3]
 
-        def get_sentence_embedding_dimension(self):
+        def get_embedding_dimension(self):
             return 384
 
     stub_module = types.ModuleType("sentence_transformers")

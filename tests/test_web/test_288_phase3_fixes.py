@@ -485,7 +485,7 @@ class TestCrossThreadReleaseRegression:
             if t == "RuntimeError" and "cannot release" in m
         ]
         assert not release_bugs, (
-            f" HOTFIX regression: cross-thread RLock release "
+            f"#288 HOTFIX regression: cross-thread RLock release "
             f"bug fired in {len(release_bugs)}/{len(errors)} workers: "
             f"{release_bugs[:3]}"
         )

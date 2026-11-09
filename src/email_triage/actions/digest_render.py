@@ -51,37 +51,26 @@ from collections import OrderedDict
 from typing import Any, Callable
 
 from email_triage._isotime import parse_iso
+from email_triage._textfmt import truncate
 from email_triage.actions.digest_configs import DigestConfig
+# run18  — the reason + datetime cell helpers are the recipient_digest SSOT;
+# this module imports them rather than carrying byte-identical duplicates. The
+# old copies were justified by "ship phase 3 without an import-cycle refactor",
+# but the import edge to recipient_digest ALREADY existed (for the
+# HIPAA_REASON_* constants the duplicate used) — so there was never a real cycle
+# to dodge. The  dedup pin (test_digest_render_ssot_pin.py) bans re-defining
+# these names outside recipient_digest so the duplicate can't silently return.
 from email_triage.actions.recipient_digest import (
-    HIPAA_REASON_BY_SOURCE, HIPAA_REASON_DEFAULT, REASON_TRUNCATE,
+    _format_datetime, _render_reason,
 )
+from email_triage.triage_logging import REDACTED_PLACEHOLDER  # N-217 R23
 
 
 # ---------------------------------------------------------------------------
-# Shared row helpers (parity with recipient_digest)
+# Shared row helpers — _render_reason + _format_datetime are imported from the
+# recipient_digest SSOT above (run18 ). parse_iso is still imported because
+# _group_key (day/sender grouping) parses dates directly.
 # ---------------------------------------------------------------------------
-
-
-def _render_reason(entry: dict[str, Any], hipaa: bool) -> str:
-    """HIPAA mode: fixed phrase keyed on ``source``. Standard mode:
-    verbatim, truncated. Mirrors recipient_digest._render_reason —
-    duplicated here so we can ship phase 3 without an import-cycle
-    refactor on the legacy module."""
-    if hipaa:
-        source = str(entry.get("source") or "")
-        return HIPAA_REASON_BY_SOURCE.get(source, HIPAA_REASON_DEFAULT)
-    raw = str(entry.get("reason") or "")
-    if len(raw) > REASON_TRUNCATE:
-        return raw[: REASON_TRUNCATE - 1] + "…"
-    return raw
-
-
-def _format_datetime(entry: dict[str, Any], fallback_iso: str) -> str:
-    raw = entry.get("date") or fallback_iso or ""
-    dt = parse_iso(raw)
-    if dt is None:
-        return str(raw)[:16]
-    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _preview(entry: dict[str, Any], hipaa: bool) -> str:
@@ -96,12 +85,10 @@ def _preview(entry: dict[str, Any], hipaa: bool) -> str:
     aggregators (newsletter format) without paying any LLM cost.
     """
     if hipaa:
-        return "[redacted]"
+        return REDACTED_PLACEHOLDER
     raw = str(entry.get("body_text") or entry.get("snippet") or "")
     raw = " ".join(raw.split())  # collapse whitespace
-    if len(raw) > 200:
-        return raw[:199] + "…"
-    return raw
+    return truncate(raw, 200)  # run18  — ellipsis SSOT (was raw[:199] + "…")
 
 
 def _cheap_preview(
@@ -124,11 +111,11 @@ def _cheap_preview(
     need a full DOM walk for top-level headings, and avoiding
     BeautifulSoup keeps the cheap-preview path actually cheap.
 
-    HIPAA mode returns ("[redacted]", []) — body content (text
+    HIPAA mode returns (REDACTED_PLACEHOLDER, []) — body content (text
     OR HTML) can carry PHI and is never quoted in the digest.
     """
     if hipaa:
-        return ("[redacted]", [])
+        return (REDACTED_PLACEHOLDER, [])
 
     body_text = str(entry.get("body_text") or entry.get("snippet") or "")
     body_html = str(entry.get("body_html") or "")
@@ -138,7 +125,8 @@ def _cheap_preview(
     for line in body_text.splitlines():
         line = line.strip()
         if len(line) >= 5:
-            lede = line[:120] + ("…" if len(line) > 120 else "")
+            # run18  — truncate SSOT (was line[:120] + ("…" if len>120)).
+            lede = truncate(line, 120)
             break
 
     # Headings — regex-pull <h1>/<h2> content, strip inner tags,
@@ -146,14 +134,17 @@ def _cheap_preview(
     headings: list[str] = []
     if body_html:
         import re as _re
+        from email_triage.engine.html_text import html_to_text_with_links
         matches = _re.findall(
             r"<h[12][^>]*>(.*?)</h[12]>",
             body_html,
             _re.IGNORECASE | _re.DOTALL,
         )
         for m in matches:
-            text = _re.sub(r"<[^>]+>", "", m)
-            text = " ".join(text.split())
+            # census  — route through the html_to_text SSOT so a
+            # <style>/<script> block inside a heading can't bleed its
+            # CONTENT into the digest (bare re.sub stripped tags only).
+            text = " ".join(html_to_text_with_links(m).split())
             if text:
                 headings.append(text[:120])
             if len(headings) >= 3:
@@ -184,12 +175,15 @@ def _group_key(entry: dict[str, Any], group_by: str, fallback_iso: str) -> str:
             return "unknown"
         return dt.strftime("%Y-%m-%d")
     if group_by == "sender":
-        # Use the From header verbatim. Display-name extraction
-        # (e.g. "Stratechery <ben@stratechery.com>" → "Stratechery")
-        # is intentionally NOT applied here — the renderer keeps
-        # the raw value so two messages from the same address
-        # always group together regardless of display-name
-        # variations between sends.
+        # Group by the From header VERBATIM (display name included). NOTE this
+        # FORKS sections on display-name/casing drift between sends from one
+        # address ("Acme" vs "Acme via Mailgun" <a@b>) — a known limitation,
+        # tracked as a follow-up (run17  DA catch). It is deliberately NOT
+        # bare-address-normalised here: this is the DELIVERED digest's section
+        # key, so re-keying would merge/rename the sections a recipient sees (a
+        # delivery-visible change, out of scope for a divergence-convergence
+        # pass). Contrast cache/classification.py make_outer_cache_key, which
+        # DOES normalise to the bare address — a cache bucket is not user-visible.
         return str(entry.get("sender") or "(unknown sender)")
     return ""  # 'none' or unknown — single bucket
 
@@ -230,6 +224,7 @@ _DEFAULT_COLUMN_LABELS: dict[str, str] = {
 def _column_value(
     entry: dict[str, Any], key: str, *,
     hipaa: bool, fallback_dt_iso: str,
+    redact_pii: bool = False,
 ) -> str:
     """Resolve one column's cell value for one entry.
 
@@ -238,14 +233,37 @@ def _column_value(
     sender / headline pass through verbatim per the design
     contract (those values already live in the recipient's
     mailbox via the original messages).
+
+    ``redact_pii`` (N-175) is the orthogonal DISPLAY-min gate the
+    PREVIEW seam (``digest_preview`` → ``_render_digest_payload`` →
+    ``render_digest``) sets, because that surface is reachable by a
+    managing NON-OWNER. When True the matched-message PHI cells —
+    ``sender``, ``subject`` / ``headline``, and ``link`` (a body-extracted
+    URL that can be a patient-portal link) — collapse to ``REDACTED_PLACEHOLDER``
+    (the N-174 / N-162 idiom). The ``reason`` + ``preview`` cells redact
+    on the separate ``hipaa`` gate; ``datetime`` / ``category`` /
+    ``unread`` / ``attachment`` / ``folder`` carry no matched-message PHI
+    and pass through. Default ``False`` = the DELIVERED digest's verbatim
+    behavior (byte-unchanged to the account's own mailbox). NOTE the
+    SORT pass intentionally calls this with ``redact_pii=False`` so the
+    preview's row ORDER stays identical to the delivered digest — only
+    the displayed cell is redacted, not the sort key.
     """
     if key == "datetime":
         return _format_datetime(entry, fallback_dt_iso)
     if key == "sender":
-        return str(entry.get("sender") or "—")
+        return REDACTED_PLACEHOLDER if redact_pii else str(entry.get("sender") or "—")
     if key in ("headline", "subject"):
-        return str(entry.get("subject") or "—")
+        return REDACTED_PLACEHOLDER if redact_pii else str(entry.get("subject") or "—")
     if key == "link":
+        # N-175 (DA catch) — the link is a provider-extracted URL from the
+        # message body; for a HIPAA medical email it can be a patient-portal
+        # URL (PHI). The PREVIEW seam is reachable by a managing non-owner, so
+        # redact it to the display minimum — matching the newsletter branch,
+        # which sets ``url=None`` under the same gate. Delivered (redact_pii=
+        # False) keeps it verbatim, byte-unchanged.
+        if redact_pii:
+            return REDACTED_PLACEHOLDER
         # Provider-extracted URL list lives on the entry under
         # ``links``. Take the first; empty when no links found.
         links = entry.get("links") or []
@@ -307,6 +325,7 @@ def render_table_generic(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
     """Generic table render — per-digest variant of the preset's
     legacy table.
@@ -353,13 +372,19 @@ def render_table_generic(
             value = _column_value(
                 entry, col.key,
                 hipaa=hipaa, fallback_dt_iso=fallback_dt_iso,
+                redact_pii=redact_pii,
             )
             # Link column: render as an <a> when the value looks
             # like a URL. Other columns are plain text. Cap link
             # display length so a giant tracker URL doesn't blow
-            # the table layout.
-            if col.key == "link" and value:
-                shown = value if len(value) <= 60 else value[:57] + "…"
+            # the table layout. Under redact_pii the value is the
+            # REDACTED_PLACEHOLDER sentinel (N-175 DA catch), NOT a URL — render
+            # it as a plain redacted cell, never an <a href=REDACTED_PLACEHOLDER>.
+            if col.key == "link" and value and not redact_pii:
+                # run18  — truncate SSOT. The old ``value[:57] + "…"`` was a
+                # stale 3-char-ellipsis ``-3`` that capped at 58, not the
+                # intended 60; truncate(value, 60) restores the 60-char cap.
+                shown = truncate(value, 60)
                 cells.append(
                     f'<td><a href="{html.escape(value)}">'
                     f"{html.escape(shown)}</a></td>"
@@ -368,7 +393,7 @@ def render_table_generic(
                 cells.append(f"<td>{html.escape(value)}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    hipaa_banner = _hipaa_banner_html() if hipaa else ""
+    hipaa_banner = _hipaa_banner_html(redact_pii) if hipaa else ""
     return (
         "<html><body>"
         f"<h2>{html.escape(cfg.name)} — {html.escape(account_name)}</h2>"
@@ -401,6 +426,7 @@ def render_grouped_list(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
     """Default custom-digest format. One section per group.
 
@@ -424,6 +450,7 @@ def render_grouped_list(
             cfg=cfg, rows=rows,
             account_name=account_name, account_email=account_email,
             hipaa=hipaa, fallback_dt_iso=fallback_dt_iso,
+            redact_pii=redact_pii,
         )
 
     buckets = _group_rows(rows, group_by, fallback_dt_iso)
@@ -431,8 +458,18 @@ def render_grouped_list(
     for label, bucket_rows in buckets.items():
         if not bucket_rows:
             continue
+        # N-175 — when grouping BY sender, the section heading IS the
+        # verbatim sender (``_group_key`` returns ``entry['sender']``),
+        # so the display-min preview gate must redact the heading too;
+        # category / folder / day labels are not matched-message PHI.
+        label_display = (
+            REDACTED_PLACEHOLDER if (redact_pii and group_by == "sender") else label
+        )
         item_html = "".join(
-            _row_block_html(e, hipaa, fallback_dt_iso, include_preview)
+            _row_block_html(
+                e, hipaa, fallback_dt_iso, include_preview,
+                redact_pii=redact_pii,
+            )
             for e in bucket_rows
         )
         # Section heading: bigger font + left-border accent + light
@@ -447,14 +484,14 @@ def render_grouped_list(
             "background:#f1f5f9;"
             "padding:0.35em 0.7em;"
             "border-radius:4px;\">"
-            f"{html.escape(label)} "
+            f"{html.escape(label_display)} "
             "<small style=\"color:#888;font-weight:normal;"
             "font-size:0.75em;\">"
             f"({len(bucket_rows)})</small></h3>"
             "<div style=\"margin-left:1em;\">"
             f"{item_html}</div></section>"
         )
-    hipaa_banner = _hipaa_banner_html() if hipaa else ""
+    hipaa_banner = _hipaa_banner_html(redact_pii) if hipaa else ""
     return (
         "<html><body style=\"font-family:sans-serif;font-size:0.95em;\">"
         f"<h2>{html.escape(cfg.name)} — {html.escape(account_name)}</h2>"
@@ -484,15 +521,19 @@ def render_plain_list(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
     """Flat ungrouped list. Same per-row block shape as
     grouped_list — just no section headers."""
     include_preview = cfg.format.include_body_preview
     items_html = "".join(
-        _row_block_html(e, hipaa, fallback_dt_iso, include_preview)
+        _row_block_html(
+            e, hipaa, fallback_dt_iso, include_preview,
+            redact_pii=redact_pii,
+        )
         for e in rows
     )
-    hipaa_banner = _hipaa_banner_html() if hipaa else ""
+    hipaa_banner = _hipaa_banner_html(redact_pii) if hipaa else ""
     return (
         "<html><body style=\"font-family:sans-serif;font-size:0.95em;\">"
         f"<h2>{html.escape(cfg.name)} — {html.escape(account_name)}</h2>"
@@ -513,8 +554,17 @@ def _row_block_html(
     hipaa: bool,
     fallback_dt_iso: str,
     include_preview: bool,
+    *,
+    redact_pii: bool = False,
 ) -> str:
     """One entry rendered as a sender · subject (when) block.
+
+    ``redact_pii`` (N-175): the PREVIEW seam sets it because the
+    digest_preview surface is reachable by a managing non-owner, so the
+    per-row ``sender`` + ``subject`` collapse to ``REDACTED_PLACEHOLDER`` (the
+    N-174 / N-162 display-min idiom). Default ``False`` = delivered
+    verbatim (byte-unchanged). The body-preview block below is gated
+    SEPARATELY by ``hipaa`` (it already redacts on the classifier flag).
 
     Per operator feedback (2026-05-07) the second meta line —
     ``category · why`` — was dropped: ``why`` is LLM-rationale
@@ -526,13 +576,17 @@ def _row_block_html(
     Preview block (when ``include_preview=True``) carries the
     cheap-preview pair: first line of body_text + up to 3
     extracted ``<h1>``/``<h2>`` headings from body_html. No LLM.
-    HIPAA mode renders "[redacted]". Defaults to OFF on new
+    HIPAA mode renders REDACTED_PLACEHOLDER. Defaults to OFF on new
     digests; toggle stays available for operators who want the
     extra context per-row.
     """
     dt = html.escape(_format_datetime(entry, fallback_dt_iso))
-    sender = html.escape(str(entry.get("sender") or "—"))
-    subject = html.escape(str(entry.get("subject") or "—"))
+    if redact_pii:
+        sender = REDACTED_PLACEHOLDER
+        subject = REDACTED_PLACEHOLDER
+    else:
+        sender = html.escape(str(entry.get("sender") or "—"))
+        subject = html.escape(str(entry.get("subject") or "—"))
     preview_block = ""
     if include_preview:
         if hipaa:
@@ -569,7 +623,32 @@ def _row_block_html(
     )
 
 
-def _hipaa_banner_html() -> str:
+def _hipaa_banner_html(redact_pii: bool = False) -> str:
+    """The HIPAA-mode banner for the custom (table / grouped / plain)
+    renders.
+
+    ``redact_pii`` (N-175 DA follow-on) makes the banner CONTEXT-AWARE,
+    matching the preset banner N-174 already disambiguated. When True
+    (the PREVIEW seam, reachable by a managing non-owner) the banner must
+    NOT claim sender + subject are verbatim — they are ``[redacted]`` in
+    this preview to the display minimum-necessary; they appear verbatim
+    only in the digest DELIVERED to the authorized recipient. When False
+    (the DELIVERED render) the wording is byte-unchanged from the
+    pre-N-175 banner.
+    """
+    if redact_pii:
+        # PREVIEW context — sender + subject ARE redacted here (mirrors
+        # the preset preview banner in recipient_digest.render_html).
+        return (
+            '<p style="font-size:0.85em;color:#666;">'
+            "HIPAA mode (preview): sender + subject are redacted to the "
+            "display minimum-necessary because this preview is reachable "
+            "by a managing non-owner. Classifier reasoning is also "
+            "redacted to a fixed phrase, and body previews are redacted. "
+            "The DELIVERED digest shows sender + subject verbatim to the "
+            "account's own authorized mailbox."
+            "</p>"
+        )
     return (
         '<p style="font-size:0.85em;color:#666;">'
         "HIPAA mode: classifier reasoning is redacted to a "
@@ -600,8 +679,15 @@ def render_digest(
     account_email: str,
     hipaa: bool,
     fallback_dt_iso: str = "",
+    redact_pii: bool = False,
 ) -> str:
     """Format a digest as HTML based on ``cfg.format.render_as``.
+
+    ``redact_pii`` (N-175) threads the display-min PREVIEW gate down to
+    every concrete renderer (table / grouped_list / plain_list) so a
+    digest_preview reachable by a managing NON-OWNER does not leak
+    verbatim sender + subject. Default ``False`` = the DELIVERED digest
+    (``_fire_one_digest`` / ``topic_digest_sender``) stays byte-unchanged.
 
     The preset (``cfg.kind == 'preset_daily_activity'``) is NOT
     routed through here — the sender keeps calling the legacy
@@ -619,6 +705,7 @@ def render_digest(
         cfg=cfg, rows=rows,
         account_name=account_name, account_email=account_email,
         hipaa=hipaa, fallback_dt_iso=fallback_dt_iso,
+        redact_pii=redact_pii,
     )
 
 
@@ -677,8 +764,20 @@ async def render_newsletter_async(
     signature: str = "",
     digest_name: str = "",
     html_template: str = "",
+    redact_pii: bool = False,
 ) -> str:
     """Render a newsletter-shaped digest.
+
+    ``redact_pii`` (N-175): the digest_preview seam sets it (preview is
+    reachable by a managing non-owner). It threads into
+    ``generate_digest`` → ``build_digest_html``, which collapses every
+    per-message PHI surface the newsletter renders — the per-sender
+    group heading (``sender_name`` = the message sender), each article
+    ``headline`` (= the message subject under the HIPAA fail-closed
+    extraction path) and ``summary`` (= body content under a LOCAL
+    classifier, NOT otherwise redacted by ``hipaa``), and the article
+    ``url`` — to ``REDACTED_PLACEHOLDER`` / ``None``. Default ``False`` = the
+    DELIVERED newsletter to the account's own mailbox, byte-unchanged.
 
     Two visual treatments based on ``cfg.format.render_as``:
       - "newsletter" — compact Jinja default in
@@ -728,5 +827,6 @@ async def render_newsletter_async(
         account=account_email,
         html_template=template,
         digest_name=digest_name or getattr(cfg, "name", "") or "",
+        redact_pii=redact_pii,
     )
     return html_body

@@ -187,3 +187,80 @@ class TestNavLink:
         resp = client.get("/dashboard", cookies=user_cookies)
         assert resp.status_code == 200
         assert 'href="/help/tasks"' in resp.text
+
+
+# ---------------------------------------------------------------------------
+# No repeated consecutive words in user-visible copy (punch P4b)
+# ---------------------------------------------------------------------------
+
+# The repeated-word rule of scripts/publish-proofread.py, inlined because this
+# test ships to the public tree and the proofreader does not
+# (publish_shipset.make_ships: test -> True, proofreader -> False). Where the
+# proofreader exists (the dev tree), _proofread_rules() asserts these still
+# equal its DUP / OK_DUP, so the copy cannot drift silently.
+_DUP_PATTERN = r"\b([A-Za-z]{2,})\s+\1\b"
+_OK_DUP = {"that", "had", "has", "is", "do", "so", "no", "ha", "very", "really"}
+
+
+_PROOFREAD_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "publish-proofread.py"  # publish: absent-tolerant: the proofreader does not ship; absent, the test enforces its inlined copy of the DUP/OK_DUP rule, so the read can only add a drift check, never remove the typo check; pinned by test_the_proofread_rule_degrades_to_the_inlined_copy_without_the_script
+
+
+def _proofread_rules(script: Path | None = None):
+    import ast
+    import re
+
+    from _pin_harness import parse_module
+
+    script = _PROOFREAD_SCRIPT if script is None else script
+    if script.is_file():
+        tree = parse_module(script)
+        assert tree is not None, "scripts/publish-proofread.py does not parse"
+        found = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name == "DUP":
+                    found["DUP"] = ast.literal_eval(node.value.args[0])
+                elif name == "OK_DUP":
+                    found["OK_DUP"] = ast.literal_eval(node.value)
+        assert found == {"DUP": _DUP_PATTERN, "OK_DUP": _OK_DUP}, (
+            "scripts/publish-proofread.py's DUP/OK_DUP changed; update the "
+            "inlined copy in this test to match: %r" % found)
+    return re.compile(_DUP_PATTERN, re.I), _OK_DUP
+
+
+def test_the_proofread_rule_degrades_to_the_inlined_copy_without_the_script(tmp_path):
+    """On the public mirror scripts/publish-proofread.py is absent. The rule must
+    then be the inlined copy, and it must still catch the stutter this file pins."""
+    pattern, ok = _proofread_rules(tmp_path / "absent-publish-proofread.py")
+    assert pattern.pattern == _DUP_PATTERN and ok == _OK_DUP
+    assert pattern.search("a single email Email Triage sends")
+
+
+class TestNoRepeatedWords:
+    def test_no_repeated_consecutive_words_in_content(self, client):
+        """User-visible copy (including m.help() tooltip text, which renders
+        into data-tooltip attributes) has no "email Email"-class doubled
+        word. Same rule as scripts/publish-proofread.py, applied to the
+        rendered <main> block so a typo fails here, before publish."""
+        import html
+
+        body = client.get("/help/tasks").text
+        lo = body.lower()
+        start = lo.find("<main")
+        end = lo.find("</main>", start)
+        assert start != -1 and end != -1, "no <main> block in /help/tasks"
+        content = html.unescape(body[start:end])
+
+        dup, ok_dup = _proofread_rules()
+        hits = []
+        for m in dup.finditer(content):
+            if m.group(1).lower() in ok_dup:
+                continue
+            pair = m.group(0).split()
+            # the proofreader's CLI-placeholder / ALL-CAPS-emphasis skip
+            if len(pair) == 2 and pair[1].isupper() and not pair[0].isupper():
+                continue
+            hits.append(content[max(0, m.start() - 40):m.end() + 40])
+        assert not hits, "repeated word(s) in /help/tasks copy: %r" % hits

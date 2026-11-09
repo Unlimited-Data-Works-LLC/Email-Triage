@@ -14,11 +14,24 @@ Built for operators whose inboxes carry data that shouldn't visit someone else's
 - **Calendar-aware meeting scheduling** — when a `meeting-request` lands, drafts a reply listing free windows from the operator's calendar.
 - **Daily digest** of overnight activity, BAA-expiry banner, /health endpoint for monitoring, tamper-evident audit hash chain.
 
+## New in v0.2.0
+
+- v0.2.0 ships multilingual mailbox support — Turkish, Spanish, Chinese, and 100+ other languages selectable from a single Admin dropdown. One install, any customer language.
+- v0.2.0 ships ARM64 support; the DGX Spark is now a supported one-box deployment target.
+- **Automated encrypted database backup** — supervised in-app snapshotter with configurable cadence + age-based retention. Full `.etbk` bundles (DB + config + TLS certs + MSAL cache) or raw-DB. Two encryption modes: master-key (HKDF-derived passphrase) or write-only X25519 public-key (ECIES — the private key never lives on the box). Every snapshot passes a fail-closed restorability gate before it counts. **Ships DISABLED by default**; opt in on the admin Backup tab.
+- **Regulatory clock awareness** — a propose-then-confirm deadline engine for clinical-trial safety mail. Tracks the site/IRB reporting deadline as an escalating acknowledgement-required clock; notes sponsor FDA/EU deadlines as informational receipts. Surfaces on `/clocks`, in the daily digest, via escalation email with portable `.ics`, and as an optional direct calendar-write. Optional automatic content detection ships OFF.
+- **Topic / Study Digest** — define a Topic (a study, subject, or thread of interest) and the app watches for matching mail across mailboxes, rolled up into per-Topic recurring digests. Matching is baked into the primary classify pass — no new body read, no new model, no new egress. Per-Topic sender reinforcement, whole-window Re-Triage Preview.
+- **Encryption at rest is now the default** for new installs (SQLCipher). The HMAC-SHA256 audit hash chain now spans 8 sibling audit-event tables + a per-request PHI-access log, all reachable through a paginated `/compliance` review surface, and survives master-key rotation.
+- **Live AI-backend model picker** — replaces the free-text model field. Fetches what's actually installed on your Ollama endpoint and shows capabilities, size, quantization, context length, VRAM residency. Embedding-only models are flagged. An ordered `backup_models` list fails over on capability/resource errors.
+- **Multilingual embedding model selector** — default `intfloat/multilingual-e5-base` (100+ languages) for sent-mail similarity retrieval, with automatic E5 prefix handling and a confirm-gated background reindex when the model changes.
+- **Per-target webhook body templating with wizard live preview** — 5 built-in target types (Slack, PagerDuty Events v2, Opsgenie, Discord, Microsoft Teams) selectable from an admin dropdown, so a webhook points directly at Slack/PagerDuty/etc. without a middleware reshaper. HIPAA-flagged targets force-lock a minimal `{category, timestamp, flow_id}` shape regardless of the operator's template. The wizard preview renders the exact bytes email-triage would POST as the operator types.
+- **Security:** `env` secrets-backend deprecation tightened (RuntimeError in non-HIPAA mode unless a carve-out env var is set). CSRF protection enforced by default in the test/e2e harness with a route-coverage pin. `starlette` bumped 1.2.1 → 1.3.1 to close a form-field denial-of-service (CVE-2026-54283); a small dedicated form-size guard keeps the raw-email classify box (the only route that legitimately accepts a large paste) working with tighter limits everywhere else.
+
 ## Privacy posture
 
 Operator-confirmed boundary, audited:
 
-- **Mail data** stays in your install's SQLite database. Per-account credentials are Fernet-encrypted; since v0.1.2 the whole database is encrypted at rest with SQLCipher (AES-256, key derived from your master key) — on by default for new installs. The master key lives in a container secret, never the process environment.
+- **Mail data** stays in your install's SQLite database. Per-account credentials are Fernet-encrypted; since v0.2.0 the whole database is encrypted at rest with SQLCipher (AES-256, key derived from your master key) — on by default for new installs. The master key lives in a container secret, never the process environment.
 - **Outbound network** is restricted to: mail providers you configure (Gmail / Outlook / your IMAP server). No analytics, no telemetry by default, no CDN.
 - **LLM inference** runs on Ollama on your hardware. Cloud-LLM backends (OpenAI / Gemini / Azure OpenAI) are off by default; HIPAA-flagged accounts only see BAA-certified backends in the admin dropdown.
 - **HIPAA mode** per-account or install-wide — enforces MFA (WebAuthn passkey), rejects the deprecated env master-key backend at boot, and fails closed on database encryption. Audit hash chain (§164.312(b)). Describe-and-discard style learning means the LLM produces structured-output descriptors, not summaries — message bodies are read in memory and never persisted.
@@ -29,21 +42,22 @@ Full detail: [docs/privacy.md](docs/privacy.md) and [docs/hipaa-audit.md](docs/h
 
 ```bash
 # 1. Run the container (image is cosign-signed; verify before pulling)
-sudo cosign verify ghcr.io/unlimited-data-works-llc/email-triage:0.1.2 \
+sudo cosign verify ghcr.io/unlimited-data-works-llc/email-triage:0.2.0 \
     --certificate-identity-regexp 'https://github.com/Unlimited-Data-Works-LLC/.+/release\.yml@.+' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-sudo podman pull ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+sudo podman pull ghcr.io/unlimited-data-works-llc/email-triage:0.2.0
 
 # 2. Generate master key + bootstrap secret backend
-sudo podman run --rm -it ghcr.io/unlimited-data-works-llc/email-triage:0.1.2 \
+sudo podman run --rm -it ghcr.io/unlimited-data-works-llc/email-triage:0.2.0 \
     secrets bootstrap
 
 # 3. Start the service (systemd quadlet or podman directly)
 sudo systemctl start email-triage
 
 # The database is encrypted at rest (SQLCipher) by default for new installs;
-# set EMAIL_TRIAGE_DB_ENCRYPTION=false for a plaintext install. See docs/install.md.
+# set persistence.encryption_enabled: false in the config for a plaintext install.
+# See docs/install.md.
 ```
 
 Step-by-step guide: [docs/install.md](docs/install.md).
@@ -60,11 +74,11 @@ On first run, the admin UI prompts to either install the local embedding backend
 
 Released container images are published to `ghcr.io/unlimited-data-works-llc/email-triage`. Tag scheme:
 
-- `X.Y.Z` — pinned semver release (e.g. `0.1.2`). The same image is also tagged `vX.Y.Z` (e.g. `v0.1.2`) so commands that match the git tag form still resolve. Both forms point at the same digest.
+- `X.Y.Z` — pinned semver release (e.g. `0.2.0`). The same image is also tagged `vX.Y.Z` (e.g. `v0.2.0`) so commands that match the git tag form still resolve. Both forms point at the same digest.
 - `X.Y`, `X` — semver aliases that move forward with each compatible release.
 - `:stable` — alias for the most recent semver release.
 - `:latest` — same as `:stable` at release time. Don't depend on it long-term in scripts.
-- `:edge` — every push to `main`; for operators tracking development.
+- `:edge` — the latest release (published at each `v*` tag, alongside `:latest`/`:stable`); for operators tracking the newest release.
 
 Every published image is cosign-signed (keyless OIDC). HIPAA installs additionally require an operator-issued in-toto attestation with a `hipaa_safe: true` predicate before applying an update — that's a second OIDC subject, separately approved by a human reviewer. The customer-side verification recipe is in [docs/install.md](docs/install.md) § Verifying a release.
 

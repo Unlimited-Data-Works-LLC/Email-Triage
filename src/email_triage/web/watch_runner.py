@@ -19,6 +19,8 @@ audit gate uniform.
 
 from __future__ import annotations
 
+from email_triage._isotime import now_utc_iso
+
 import asyncio
 import json
 import logging
@@ -28,19 +30,23 @@ from typing import Any
 import httpx
 
 from email_triage._errfmt import fmt_exc
-from email_triage._http_client import LazyHttpClient
-from email_triage.triage_logging import is_account_hipaa, is_hipaa_mode
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.secrets import SecretsDecryptError, read_secret
+from email_triage.triage_logging import is_account_hipaa, account_hipaa_effective
 from email_triage.web.email_watches import (
     EmailWatch,
     hmac_secret_key,
     list_watches,
     matches,
+    maybe_auto_retire_watch,
     shape_webhook_payload,
     write_audit_row,
 )
 from email_triage.web.events import sign_payload
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
 
-log = logging.getLogger("email_triage.web.watch_runner")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+log = get_logger("email_triage.web.watch_runner")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -56,16 +62,64 @@ log = logging.getLogger("email_triage.web.watch_runner")
 #
 # Drained from the FastAPI lifespan shutdown via :func:`aclose_module`.
 
-_WEBHOOK_CLIENT = LazyHttpClient(timeout=10.0)
+# -d (2026-07-11) — CONFIG-DRIVEN webhook client timeout, per
+# feedback_dynamic_over_hardcoding. Pre-fix the timeout was baked as
+# a `timeout=10.0` float literal at module import. Now:
+#   - ``_WEBHOOK_TIMEOUT_SECS`` is the module SSOT (default 10.0).
+#   - ``configure_webhook_timeout(secs)`` rebinds it at boot from
+#     ``config.push.webhook_timeout_secs`` (set at load_config time).
+#   - ``_get_webhook_client()`` lazily constructs the LazyHttpClient
+#     on first use, reading the CURRENT ``_WEBHOOK_TIMEOUT_SECS``.
+#     A reconfigure tears down the existing client so the next
+#     get() rebuilds with the new value.
+# LazyHttpClient captures its httpx kwargs at __init__ (not at
+# .get()), so rebuilding is required for a live-tune.
+_WEBHOOK_TIMEOUT_SECS: float = 10.0
+_WEBHOOK_CLIENT: LazyHttpClient | None = None
+
+
+def configure_webhook_timeout(timeout_secs: float) -> None:
+    """-d — set the process-wide webhook client timeout.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    the resolved ``config.push.webhook_timeout_secs`` value. Rebinds
+    ``_WEBHOOK_CLIENT`` to None so the next :func:`_get_webhook_client`
+    call rebuilds with the new timeout. Safe to call before any first
+    request. If a client is already open, callers should invoke
+    :func:`aclose_module` before re-configuring so the outgoing pool
+    drains cleanly (aclose is async; setter is sync).
+    """
+    global _WEBHOOK_TIMEOUT_SECS, _WEBHOOK_CLIENT
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _WEBHOOK_TIMEOUT_SECS = float(timeout_secs)
+    _WEBHOOK_CLIENT = None
+
+
+def _get_webhook_client() -> LazyHttpClient:
+    """-d — lazy accessor for the module-level webhook client.
+
+    Constructs on first call using the CURRENT
+    ``_WEBHOOK_TIMEOUT_SECS`` (so a boot-time config wire is reflected
+    even if this module was imported before wiring fired). Idempotent
+    on subsequent calls.
+    """
+    global _WEBHOOK_CLIENT
+    if _WEBHOOK_CLIENT is None:
+        _WEBHOOK_CLIENT = LazyHttpClient(
+            intent=Intent.WEBHOOK, timeout=_WEBHOOK_TIMEOUT_SECS,
+        )
+    return _WEBHOOK_CLIENT
 
 
 async def aclose_module() -> None:
     """Drain the module-level webhook client.
 
     Called from the FastAPI lifespan shutdown so the connection pool
-    closes cleanly. Idempotent — safe to call when no fire ever ran.
+    closes cleanly. Idempotent — safe to call when no fire ever ran
+    (the lazy client is only constructed on first outgoing request).
     """
-    await _WEBHOOK_CLIENT.aclose()
+    if _WEBHOOK_CLIENT is not None:
+        await _WEBHOOK_CLIENT.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +167,159 @@ def _user_notify_email(
 # ---------------------------------------------------------------------------
 
 
+class WatchScopeRefused(Exception):
+    """A watch's creator may not manage the account it would fire for (F5 /
+    N-564). Raised by :func:`fire_one_watch`; never caught as a delivery."""
+
+
+def watch_fire_refusal(
+    db: sqlite3.Connection, watch: EmailWatch, account: dict,
+) -> str | None:
+    """The fire-time actuator gate (F5 / N-564, PD-9; punch 578, PD-14) as
+    ONE function: None when ``watch`` may fire for ``account``, else the
+    fixed reason it may not. Every fire path, the owner's "Not firing" line
+    and the admin alert read this, so the refusal and its reason cannot
+    disagree (PD-5 / PD-18).
+
+    * ``creator_unattributed``: no creator. The agent-API hole stored every
+      API-created watch with none, and no record exists to backfill one
+      from, so the watch does not fire until a save re-claims it.
+    * ``creator_disabled`` / ``creator_out_of_scope``: the creator may not
+      manage the account (owner or delegate, an enabled user,
+      ``account_scope.user_id_may_manage_account``). An all-accounts watch
+      therefore fires only on the accounts its creator may manage.
+    * ``creator_not_owner_hipaa``: the account is HIPAA-effective (the system
+      flag OR its own flag, most-restrictive, read from the passed account
+      AND the stored row) and the creator is not its owner. A delegate's
+      watch would carry Safe-Harbor identifiers to a destination the delegate
+      chose with no ``hipaa_access_events`` row, so it does not fire
+      (fail-closed; hipaa-sme F5 A2). The owner comes from the stored row,
+      so a caller's partial account dict cannot open the gate."""
+    from email_triage.web.account_scope import (
+        is_account_owner, user_id_may_manage_account,
+    )
+    from email_triage.web.db import get_email_account, is_user_disabled
+    creator = watch.created_by_user_id
+    if creator is None:
+        return "creator_unattributed"
+    if not user_id_may_manage_account(db, creator, account.get("id")):
+        if is_user_disabled(db, creator):
+            return "creator_disabled"
+        return "creator_out_of_scope"
+    stored = get_email_account(db, account.get("id"))
+    if stored is None:
+        return "creator_out_of_scope"
+    hipaa = (account_hipaa_effective(account=account)
+             or account_hipaa_effective(account=stored))
+    if hipaa and not is_account_owner(stored, creator):
+        return "creator_not_owner_hipaa"
+    return None
+
+
+def watch_creator_may_fire(
+    db: sqlite3.Connection, watch: EmailWatch, account: dict,
+) -> bool:
+    """True iff :func:`watch_fire_refusal` lets ``watch`` fire for
+    ``account``."""
+    return watch_fire_refusal(db, watch, account) is None
+
+
+def watch_row_refusal(
+    db: sqlite3.Connection, watch: EmailWatch,
+    memo: dict[tuple[Any, Any], str | None] | None = None,
+) -> str | None:
+    """Display / alert form of :func:`watch_fire_refusal`, so the owner's
+    "Not firing" line, the admin alert and the refusal share one predicate
+    (PD-5 / PD-18; DA F2, hipaa-sme B1 extension). An account-bound row is
+    tested on its own account. An all-accounts row has no single account: it
+    fires nowhere when its creator is NULL or disabled, manages nothing, or
+    manages only HIPAA-effective accounts (:func:`_all_accounts_refusal`).
+    ``memo`` caches per (creator, account) across a loop."""
+    key = (watch.created_by_user_id, watch.account_id)
+    if memo is not None and key in memo:
+        return memo[key]
+    if watch.account_id is not None:
+        reason = watch_fire_refusal(db, watch, {"id": watch.account_id})
+    elif watch.created_by_user_id is None:
+        reason = "creator_unattributed"
+    else:
+        reason = _all_accounts_refusal(db, watch.created_by_user_id)
+    if memo is not None:
+        memo[key] = reason
+    return reason
+
+
+def _all_accounts_refusal(db: sqlite3.Connection, creator: Any) -> str | None:
+    """Why an all-accounts row fires nowhere, or None. It fires on each account
+    its creator may manage that is NOT HIPAA-effective
+    (``resolve_watches_for_account`` leaves all-accounts rows out on a HIPAA
+    account), so it fires nowhere when the creator is disabled, manages
+    nothing, or manages only HIPAA-effective accounts, as every account is
+    under the system flag (panel B4 F578-3: the list said "On")."""
+    from email_triage.web.account_scope import manageable_accounts
+    from email_triage.web.db import is_user_disabled
+    if is_user_disabled(db, creator):
+        return "creator_disabled"
+    accounts = manageable_accounts(db, {"id": creator})
+    if not accounts:
+        return "creator_out_of_scope"
+    if all(account_hipaa_effective(account=a) for a in accounts):
+        return "all_accounts_hipaa"
+    return None
+
+
+def watch_row_fires(
+    db: sqlite3.Connection, watch: EmailWatch,
+    memo: dict[tuple[Any, Any], str | None] | None = None,
+) -> bool:
+    """True iff :func:`watch_row_refusal` finds no refusal."""
+    return watch_row_refusal(db, watch, memo) is None
+
+
+def _record_scope_refused(
+    db: sqlite3.Connection, watch: EmailWatch, account: dict, reason: str,
+) -> None:
+    """Log + audit one refused fire (sync; callers off the loop). ``reason``
+    is :func:`watch_fire_refusal`'s. The audit row is
+    ``email_watches.write_scope_refused_audit_row``'s, once per watch per
+    account per reason per UTC day (hipaa-b2 Addendum 6), PHI-free: no watch
+    name, no message_id. The WARNING is emitted only when that row was
+    written; repeat refusals log at DEBUG, which the chained ``log_entries``
+    sink does not persist (hipaa-sme B8 / db-sme F5: the chain must not
+    become a log of every message)."""
+    from email_triage.web._audit import safe_audit_write
+    from email_triage.web.email_watches import write_scope_refused_audit_row
+    row_id = safe_audit_write(
+        lambda: write_scope_refused_audit_row(
+            db, watch=watch, account_id=account.get("id"), reason=reason,
+        ),
+        description=f"watch_fire_refused watch={watch.watch_id}",
+    )
+    emit = log.warning if row_id is not None else log.debug
+    emit(
+        "watch not fired: the fire gate refused its creator",
+        watch_id=watch.watch_id,
+        account_id=account.get("id"),
+        account_name=account.get("name"),
+        reason=reason,
+    )
+
+
+def resolve_escalate_recipient(db: sqlite3.Connection, account: dict) -> str:
+    """The ONE escalate recipient for a watch fire on ``account`` (F5 /
+    N-564): the account's own ``notify_email`` (account config), else the
+    account OWNER's profile ``users.notify_email`` (the post-#156 canonical
+    address). Both are owner-controlled. The per-watch
+    ``actions.escalate.notify_email`` is deliberately NOT a source: the agent
+    API let any key holder set it, so it was an attacker-chosen destination
+    with no allowlist, and the UI stopped offering it in . Sync; the
+    edit page and the fire path both call it so they cannot disagree."""
+    notify = ((account.get("config") or {}).get("notify_email") or "").strip()
+    if notify:
+        return notify
+    return _user_notify_email(db, account.get("user_id"))
+
+
 def resolve_watches_for_account(
     db: sqlite3.Connection,
     account: dict,
@@ -139,7 +346,18 @@ def resolve_watches_for_account(
             account_id=account["id"],
             include_all_accounts=not is_account_hipaa(account),
         )
-    return [w for w in rows if w.enabled]
+        out: list[EmailWatch] = []
+        for w in rows:
+            if not w.enabled:
+                continue
+            # N-564: refused watches never enter the idempotency /
+            # auto-retire machinery below.
+            reason = watch_fire_refusal(db, w, account)
+            if reason is not None:
+                _record_scope_refused(db, w, account, reason)
+                continue
+            out.append(w)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +402,10 @@ async def _send_escalate(
     if hipaa:
         # First-name extraction: drop honorifics, take the first
         # meaningful word of the display segment.
+        from email_triage.mail_headers import extract_display_name
         s = (sender or "").strip()
         if "<" in s:
-            s = s.split("<")[0].strip().strip('"')
+            s = extract_display_name(sender)  # census run13  — shared <…> extraction
         parts = s.split()
         prefixes = {"dr.", "mr.", "mrs.", "ms.", "prof."}
         first = ""
@@ -210,9 +429,17 @@ async def _send_escalate(
     smtp_password = ""
     if secrets is not None:
         try:
-            smtp_password = secrets.get("SMTP_PASSWORD") or ""
-        except Exception:
-            smtp_password = ""
+            smtp_password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            # A5 — fail closed + diagnose distinctly: an unreadable secret
+            # store (master-key mismatch) is NOT "no password configured".
+            log.error(
+                "watch escalate aborted — SMTP password unreadable "
+                "(corrupt secret row or master-key mismatch)",
+                extra={"to": notify_email},
+            )
+            return {"ok": False, "to": notify_email, "mode": mode,
+                    "error": "smtp_password_unreadable"}
 
     try:
         from email_triage.web.smtp_send import send_simple_smtp_email
@@ -254,7 +481,10 @@ async def _post_webhook(
     Always returns a result dict; never raises (best-effort, mirrors
     EventDispatcher._deliver).
     """
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    # N-258 R26: canonical JSON SSOT — deterministic key order so a
+    # receiver re-serialising gets identical bytes.
+    from email_triage._signing import canonical_json
+    body = canonical_json(payload)
     headers = {
         "Content-Type": "application/json",
         "X-Event-Type": "watch.fired",
@@ -263,7 +493,7 @@ async def _post_webhook(
         headers["X-Signature-256"] = f"sha256={sign_payload(body, secret)}"
 
     try:
-        client = await _WEBHOOK_CLIENT.get()
+        client = await _get_webhook_client().get()
         # Per-request ``timeout=`` override flows to httpx and lets
         # callers tighten / loosen the budget without standing up a
         # second client. Default 10 s matches the legacy value.
@@ -307,41 +537,34 @@ async def fire_one_watch(
 
     Returns a structured result dict with ``escalate`` + ``webhook``
     sub-results so the test-fire UI surface can echo what happened.
+
+    Raises :class:`WatchScopeRefused` when :func:`watch_fire_refusal` refuses
+    the watch's creator for ``account`` (N-564; punch 578: on a HIPAA-effective
+    account only the owner's watches fire). This is the actuator gate for
+    every caller; it
+    raises rather than returning a skip dict because ``_delivered`` would count
+    an all-None result as a delivery and record it.
     """
-    hipaa = is_account_hipaa(account) or is_hipaa_mode()
+    from email_triage.web.db_threadpool import db_call as _db_call
+    reason = await _db_call(watch_fire_refusal, db, watch, account)
+    if reason is not None:
+        await _db_call(_record_scope_refused, db, watch, account, reason)
+        raise WatchScopeRefused(watch.watch_id)
+
+    hipaa = account_hipaa_effective(account=account)
 
     escalate_result: dict[str, Any] | None = None
     webhook_result: dict[str, Any] | None = None
 
     if watch.actions.escalate.enabled:
-        # Resolution order:
-        #   1. Per-watch override (legacy field, kept for back-compat
-        #      with rows saved before the "Send to" box was removed).
-        #   2. Per-account notify_email in the account config blob
-        #      (older surface — still respected on existing installs).
-        #   3. User profile notify_email (users.notify_email) — the
-        #      canonical address post-#156. The watch editor no longer
-        #      asks for a per-watch destination; everything routes to
-        #      the operator's stored profile address.
-        # If all three are empty the action no-ops with a logged
-        # "no_notify_email" result — visible in the audit row.
-        from email_triage.web.db_threadpool import db_call
-        #  — _user_notify_email reads the users table on the shared
-        # connection; this fires from background watcher/push loops, so
-        # dispatch it off the loop thread via db_call. The short-circuit
-        # is preserved: the profile lookup runs only when neither the
-        # per-watch nor the per-account address resolved.
-        notify = (
-            (watch.actions.escalate.notify_email or "").strip()
-            or (account.get("config") or {}).get("notify_email", "")
-        )
-        if not notify:
-            notify = (
-                await db_call(
-                    _user_notify_email, db, account.get("user_id"),
-                )
-                or ""
-            )
+        # Recipient: resolve_escalate_recipient — the account's
+        # notify_email, else the owner's profile address. The legacy
+        # per-watch override is no longer a source (N-564). If both
+        # are empty the action no-ops with a logged "no_notify_email"
+        # result — visible in the audit row.
+        #  — the profile lookup reads the users table on the shared
+        # connection; dispatch it off the watcher/push loop via db_call.
+        notify = await _db_call(resolve_escalate_recipient, db, account) or ""
         if not notify:
             log.info(
                 "watch escalate: no notify address resolved",
@@ -362,16 +585,18 @@ async def fire_one_watch(
         )
 
     if watch.actions.webhook.enabled and (watch.actions.webhook.url or "").strip():
-        # Resolve secret from store; fall back to empty (the receiver
-        # can still verify nothing — but the operator should set a
-        # secret. We don't refuse to fire; the audit row records the
-        # posture).
+        # Resolve secret from store. A genuinely-absent secret (operator
+        # never set one) falls back to empty — unsigned by design, the
+        # audit row records the posture. But a secret that EXISTS and
+        # won't decrypt (corrupt row / master-key mismatch) must NOT
+        # degrade to an unsigned send: fail closed + drop. (A5)
         secret = ""
+        secret_unreadable = False
         if secrets is not None:
             try:
-                secret = secrets.get(hmac_secret_key(watch.watch_id)) or ""
-            except Exception:
-                secret = ""
+                secret = read_secret(secrets, hmac_secret_key(watch.watch_id)) or ""
+            except SecretsDecryptError:
+                secret_unreadable = True
         payload = shape_webhook_payload(
             watch,
             sender=sender,
@@ -383,11 +608,43 @@ async def fire_one_watch(
             message_id=message_id,
             hipaa=hipaa,
         )
-        webhook_result = await _post_webhook(
-            url=watch.actions.webhook.url.strip(),
-            secret=secret,
-            payload=payload,
-        )
+        _wh_url = watch.actions.webhook.url.strip()
+        _allow_ext = bool(getattr(config, "webhooks_allow_external", False))
+        _suffixes = getattr(
+            getattr(config, "tls", None), "local_url_suffixes", (),
+        ) or ()
+        from email_triage.web.events import is_local_webhook_url
+        if not _allow_ext and not is_local_webhook_url(_wh_url, _suffixes):
+            # A4 (census 2026-06-09) — uniform external-URL egress gate. The
+            # sibling EventDispatcher drops external targets unless
+            # webhooks_allow_external; this watch-fired path was the one
+            # webhook-egress path that BYPASSED the policy. Now consistent.
+            log.warning(
+                "watch webhook dropped — external URL "
+                "(set webhooks_allow_external: true to permit)",
+                extra={"watch_id": watch.watch_id, "url": _wh_url},
+            )
+            webhook_result = {
+                "url": _wh_url, "ok": False,
+                "dropped": "external_url_not_allowed",
+            }
+        elif secret_unreadable:
+            # A5 — configured signing secret won't decrypt; refuse to
+            # ship the webhook unsigned. Audit-visible via webhook_result.
+            log.error(
+                "watch webhook dropped — signing secret unreadable "
+                "(corrupt secret row or master-key mismatch); refusing to "
+                "send unsigned",
+                extra={"watch_id": watch.watch_id, "url": _wh_url},
+            )
+            webhook_result = {
+                "url": _wh_url, "ok": False,
+                "dropped": "signing_secret_unreadable",
+            }
+        else:
+            webhook_result = await _post_webhook(
+                url=_wh_url, secret=secret, payload=payload,
+            )
 
     redaction = "hipaa_redacted" if hipaa else "standard"
     try:
@@ -619,10 +876,9 @@ def _record_watch_fired(
     """
     if account_id is None or not idempotency_key or watch_id is None:
         return
-    from datetime import datetime, timezone
 
     from email_triage.web.db_writelock import get_write_lock
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     try:
         with get_write_lock():
             db.execute(
@@ -696,6 +952,16 @@ async def fire_watches_for_message(
     request_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve + match + fire every applicable watch.
+
+    ⚠️ DRY-RUN CONTRACT (N-61, DA MF-2): this function takes REAL ACTIONS —
+    ``_send_escalate`` (live SMTP/SMS page) + ``_post_webhook`` (live HMAC POST,
+    external when ``webhooks_allow_external``). It has NO dry_run awareness; the
+    CALLER must NOT invoke it under a dry_run/preview. ``triage_single_message``
+    gates the one production call site on ``not ctx.dry_run`` (and the
+    ``test_dry_run_side_effects_pin`` structural pin enforces that). The
+    watcher-retry drainer only re-fires watches that were ENQUEUED on a real
+    (non-dry_run) pass, so it never reaches a previewed message. A new caller
+    must add its own ``not dry_run`` gate.
 
     Called by the triage runner after classification, before the
     action loop. Errors in one watch never block the others —
@@ -824,6 +1090,28 @@ async def fire_watches_for_message(
                         _record_watch_fired,
                         db, account_id, idem_key, w.watch_id,
                     )
+                    #  — auto-retire after N matches. The fire is now
+                    # recorded in watch_fire_idempotency, so the durable count
+                    # includes THIS match; retire the watch (disable/delete) if
+                    # it has reached its configured threshold. No-op when the
+                    # watch isn't configured for auto-retire. (Imported at
+                    # module top — no circular dep, so it resolves at load.)
+                    #  — thread ``secrets`` in so a DELETE auto-retire also
+                    # purges each deleted watch's HMAC secret (parity with the
+                    # interactive delete path), not just its rows + fire log.
+                    retired = await db_call(
+                        maybe_auto_retire_watch, db, w, secrets=secrets,
+                    )
+                    if retired:
+                        res["auto_retired"] = retired
+                        log.info(
+                            "watch auto-retired after reaching its match threshold",
+                            extra={
+                                "watch_id": w.watch_id,
+                                "account_id": account_id,
+                                "action": retired,
+                            },
+                        )
                 else:
                     log.info(
                         "watch fire did not deliver; not recorded",

@@ -17,6 +17,7 @@ adds:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timedelta, timezone
 
@@ -50,7 +51,7 @@ from email_triage.web.mfa import (
 @pytest.fixture
 def db():
     """Fresh in-memory DB + seeded test user. HIPAA mode default OFF."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES (?, ?, ?, ?)",
@@ -95,7 +96,7 @@ def hipaa_off():
 
 class TestRecoveryCodes:
     def test_issue_default_count(self, db, user):
-        codes = issue_recovery_codes(db, user_id=user["id"])
+        codes = issue_recovery_codes(db, user_id=user["id"], actor_email="cli:tester")
         assert len(codes) == RECOVERY_CODE_COUNT_DEFAULT
         # All codes unique.
         assert len(set(codes)) == RECOVERY_CODE_COUNT_DEFAULT
@@ -105,19 +106,19 @@ class TestRecoveryCodes:
             int(c, 16)  # raises if not hex
 
     def test_issue_custom_count(self, db, user):
-        codes = issue_recovery_codes(db, user_id=user["id"], count=5)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=5, actor_email="cli:tester")
         assert len(codes) == 5
 
     def test_issue_zero_raises(self, db, user):
         with pytest.raises(ValueError, match="count must be > 0"):
-            issue_recovery_codes(db, user_id=user["id"], count=0)
+            issue_recovery_codes(db, user_id=user["id"], count=0, actor_email="cli:tester")
 
     def test_issue_over_cap_raises(self, db, user):
         with pytest.raises(ValueError, match="count must be <= 100"):
-            issue_recovery_codes(db, user_id=user["id"], count=101)
+            issue_recovery_codes(db, user_id=user["id"], count=101, actor_email="cli:tester")
 
     def test_consume_valid_code_succeeds_once(self, db, user):
-        codes = issue_recovery_codes(db, user_id=user["id"], count=3)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=3, actor_email="cli:tester")
         assert consume_recovery_code(
             db, user_id=user["id"], code=codes[0],
         ) is True
@@ -127,20 +128,20 @@ class TestRecoveryCodes:
         ) is False
 
     def test_consume_wrong_user(self, db, user):
-        codes = issue_recovery_codes(db, user_id=user["id"], count=1)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=1, actor_email="cli:tester")
         # Different user_id, same plaintext code → fail.
         assert consume_recovery_code(
             db, user_id=user["id"] + 999, code=codes[0],
         ) is False
 
     def test_consume_unknown_code(self, db, user):
-        issue_recovery_codes(db, user_id=user["id"], count=1)
+        issue_recovery_codes(db, user_id=user["id"], count=1, actor_email="cli:tester")
         assert consume_recovery_code(
             db, user_id=user["id"], code="ffffffffffff",
         ) is False
 
     def test_count_active(self, db, user):
-        codes = issue_recovery_codes(db, user_id=user["id"], count=5)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=5, actor_email="cli:tester")
         assert count_active_recovery_codes(db, user["id"]) == 5
         consume_recovery_code(db, user_id=user["id"], code=codes[0])
         assert count_active_recovery_codes(db, user["id"]) == 4
@@ -149,7 +150,7 @@ class TestRecoveryCodes:
 
     def test_codes_hashed_at_rest(self, db, user):
         """Verify plaintext is NEVER stored — only SHA-256 hashes."""
-        codes = issue_recovery_codes(db, user_id=user["id"], count=2)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=2, actor_email="cli:tester")
         rows = db.execute(
             "SELECT code_hash FROM recovery_codes WHERE user_id = ?",
             (user["id"],),
@@ -170,6 +171,7 @@ class TestOperatorRecoveryTokens:
             db,
             target_user_id=user["id"],
             operator_user_id=None,
+            actor_email="cli:tester",
         )
         assert len(token) == 32  # 16 bytes = 32 hex chars
         int(token, 16)  # is hex
@@ -177,6 +179,7 @@ class TestOperatorRecoveryTokens:
     def test_consume_valid_token(self, db, user):
         token = issue_operator_recovery_token(
             db, target_user_id=user["id"], operator_user_id=None,
+            actor_email="cli:tester",
         )
         target_id = consume_operator_recovery_token(db, token=token)
         assert target_id == user["id"]
@@ -184,6 +187,7 @@ class TestOperatorRecoveryTokens:
     def test_consume_single_use(self, db, user):
         token = issue_operator_recovery_token(
             db, target_user_id=user["id"], operator_user_id=None,
+            actor_email="cli:tester",
         )
         assert consume_operator_recovery_token(db, token=token) == user["id"]
         # Second consume → None.
@@ -198,6 +202,7 @@ class TestOperatorRecoveryTokens:
         token = issue_operator_recovery_token(
             db, target_user_id=user["id"], operator_user_id=None,
             ttl_secs=60,
+            actor_email="cli:tester",
         )
         # Force-expire the token.
         past = (
@@ -214,6 +219,7 @@ class TestOperatorRecoveryTokens:
         before = datetime.now(timezone.utc)
         issue_operator_recovery_token(
             db, target_user_id=user["id"], operator_user_id=None,
+            actor_email="cli:tester",
         )
         row = db.execute(
             "SELECT created_at, expires_at FROM operator_recovery_keys "
@@ -230,6 +236,7 @@ class TestOperatorRecoveryTokens:
             issue_operator_recovery_token(
                 db, target_user_id=user["id"], operator_user_id=None,
                 ttl_secs=OPERATOR_RECOVERY_TOKEN_TTL_SECS_CAP + 1,
+                actor_email="cli:tester",
             )
 
     def test_ttl_zero_raises(self, db, user):
@@ -237,11 +244,13 @@ class TestOperatorRecoveryTokens:
             issue_operator_recovery_token(
                 db, target_user_id=user["id"], operator_user_id=None,
                 ttl_secs=0,
+                actor_email="cli:tester",
             )
 
     def test_token_hashed_at_rest(self, db, user):
         token = issue_operator_recovery_token(
             db, target_user_id=user["id"], operator_user_id=None,
+            actor_email="cli:tester",
         )
         row = db.execute(
             "SELECT token_hash FROM operator_recovery_keys "
@@ -260,7 +269,7 @@ class TestMfaRequiredPredicate:
         """Outside HIPAA mode, predicate is always False, even when
         the user has registered credentials (matches the medical-scope
         §2 principle 1 HIPAA-scope discipline)."""
-        issue_recovery_codes(db, user_id=user["id"], count=1)
+        issue_recovery_codes(db, user_id=user["id"], count=1, actor_email="cli:tester")
         assert is_mfa_required_for(db, user) is False
 
     def test_hipaa_mode_no_credentials_is_false(self, db, user, hipaa_on):
@@ -272,7 +281,7 @@ class TestMfaRequiredPredicate:
         self, db, user, hipaa_on,
     ):
         """HIPAA + at least one unconsumed recovery code → MFA required."""
-        issue_recovery_codes(db, user_id=user["id"], count=1)
+        issue_recovery_codes(db, user_id=user["id"], count=1, actor_email="cli:tester")
         assert is_mfa_required_for(db, user) is True
 
     def test_hipaa_mode_consumed_all_codes_is_false(
@@ -280,10 +289,10 @@ class TestMfaRequiredPredicate:
     ):
         """When ALL codes are consumed, the predicate falls back to
         first-login-enrollment shape (no credentials available)."""
-        codes = issue_recovery_codes(db, user_id=user["id"], count=2)
+        codes = issue_recovery_codes(db, user_id=user["id"], count=2, actor_email="cli:tester")
         consume_recovery_code(db, user_id=user["id"], code=codes[0])
         consume_recovery_code(db, user_id=user["id"], code=codes[1])
-        # No active hardware key + zero unused codes → first-login
+        # No active passkey + zero unused codes → first-login
         # path. Operator should re-issue codes if user is in this
         # state without a passkey.
         assert is_mfa_required_for(db, user) is False

@@ -39,7 +39,8 @@ from email_triage.tls import cert_mtime, generate_self_signed_cert
 
 @pytest.fixture
 def db(tmp_path: Path) -> sqlite3.Connection:
-    return init_db(str(tmp_path / "test.db"))
+    from _db_tracking import track
+    return track(init_db(str(tmp_path / "test.db")))
 
 
 class _MemSecrets:
@@ -70,7 +71,7 @@ def cfg():
     )
     return AcmeConfig(
         enabled=True,
-        directory_url="https://acme-staging-v02.api.letsencrypt.org/directory",
+        directory_url="https://acme-staging-v02.api.letsencrypt.invalid/directory",
         account_email="ops@example.com",
         domains=["triage.example.com"],
         challenge="dns-01",
@@ -128,6 +129,38 @@ class TestCertMetadata:
         assert meta["subject_cn"] == "triage.example.com"
         assert "triage.example.com" in meta["sans"]
         assert meta["days_remaining"] >= 9
+
+    def test_parse_failure_surfaces_the_scrubbed_text_not_the_parser_message(self, renewer):
+        """Punch 426: the dict feeds acme_status.html and /health/detail; the parser text
+        (here a planted address in the PEM body) stays on the log side."""
+        crt, _ = renewer.cert_paths()
+        crt.parent.mkdir(parents=True, exist_ok=True)
+        crt.write_bytes(b"-----BEGIN CERTIFICATE-----\npatient.smith@example.invalid\n"
+                        b"-----END CERTIFICATE-----\n")
+        meta = renewer.cert_metadata()
+        assert meta["present"] is True and meta["valid"] is False
+        assert meta["parse_error"] == "config operation failed"
+        assert "smith" not in repr(meta) and "PEM" not in repr(meta)
+
+    def test_health_block_carries_the_scrubbed_parse_error(self, renewer, monkeypatch):
+        from email_triage.web import acme_renewer as mod
+        crt, _ = renewer.cert_paths()
+        crt.parent.mkdir(parents=True, exist_ok=True)
+        crt.write_bytes(b"not a certificate: /srv/triage/secret-path token=abc123")
+        monkeypatch.setattr(mod, "_build_renewer_from_app", lambda app: renewer)
+        block = mod.read_tls_cert_health(object())
+        assert block["present"] is True and block["error"] == "config operation failed"
+
+    def test_health_block_scrubs_a_failure_to_even_build_the_renewer(self, monkeypatch):
+        from email_triage.web import acme_renewer as mod
+
+        def boom(app):
+            raise RuntimeError("read /srv/triage/data/keyfile failed for jane@example.invalid")
+
+        monkeypatch.setattr(mod, "_build_renewer_from_app", boom)
+        block = mod.read_tls_cert_health(object())
+        assert block["present"] is False and block["error"] == "config operation failed"
+        assert "jane" not in repr(block) and "keyfile" not in repr(block)
 
     def test_needs_renewal_within_threshold(self, renewer):
         # Write a cert valid for 5 days. Threshold is 30 days, so it
@@ -391,7 +424,7 @@ class TestResumePendingAcmeJobs:
                 max_attempts=3,
             )
             acme_job_state.transition(
-                "publishing", order_url="https://le/order/abc",
+                "publishing", order_url="https://le.invalid/order/abc",
             )
             resolved_startup = acme_job_state.resume_on_startup()
             assert any(
@@ -407,3 +440,164 @@ class TestResumePendingAcmeJobs:
         finally:
             acme_job_state.set_db_handle(None)
             acme_job_state.reset()
+
+
+
+# ---------------------------------------------------------------------------
+# N-550 (539 fold, round 5): the scheduled renewal's FAIL-SOFT system-actor witness
+# ---------------------------------------------------------------------------
+
+def _renewal_rows(db):
+    return db.execute(
+        "SELECT user_id, outcome, detail FROM auth_events WHERE event_type = ?",
+        (AcmeRenewer.RENEWAL_EVENT_TYPE,),
+    ).fetchall()
+
+
+def _write_self_signed(renewer):
+    from email_triage.tls import generate_self_signed_cert, write_cert_files
+
+    cert_pem, key_pem = generate_self_signed_cert("triage.example.com")
+    crt, _key = renewer.cert_paths()
+    write_cert_files(Path(crt).parent, cert_pem, key_pem)
+
+
+class TestScheduledRenewalWitness:
+    def test_success_writes_a_system_actor_row_with_the_cert_identity(
+        self, renewer, db, monkeypatch,
+    ):
+        monkeypatch.setattr(renewer, "needs_renewal", lambda: True)
+
+        def fake_issue(**_kw):
+            _write_self_signed(renewer)
+            return {"not_after": "x"}
+
+        monkeypatch.setattr(renewer, "issue_now", fake_issue)
+        assert renewer.check_and_renew()["action"] == "renewed"
+        rows = _renewal_rows(db)
+        assert len(rows) == 1, rows
+        user_id, outcome, detail = rows[0][0], rows[0][1], rows[0][2]
+        assert user_id is None and outcome == "success"
+        assert "serial=" in detail and "sha256=" in detail and "job_id=" in detail
+        assert len(detail.split("sha256=")[1].split()[0]) == 64
+
+    def test_failure_writes_a_failure_row_and_still_raises(
+        self, renewer, db, monkeypatch,
+    ):
+        monkeypatch.setattr(renewer, "needs_renewal", lambda: True)
+
+        def boom(**_kw):
+            raise RuntimeError("acme down")
+
+        monkeypatch.setattr(renewer, "issue_now", boom)
+        with pytest.raises(RuntimeError):
+            renewer.check_and_renew()
+        rows = _renewal_rows(db)
+        assert [(r[0], r[1]) for r in rows] == [(None, "failure")]
+        assert "error=RuntimeError" in rows[0][2]
+
+    @pytest.mark.audit_failure_expected(
+        match='acme_cert_renewed:success',
+        count=1,
+    )
+    def test_a_witness_miss_does_not_stop_the_renewal(
+        self, renewer, db, monkeypatch,
+    ):
+        """FAIL-SOFT by design: the emitter raises, the renewal still reports
+        renewed, and the miss goes through safe_audit_write (logged + counted)."""
+        from email_triage.web import _audit
+        from email_triage.web import db as web_db
+
+        monkeypatch.setattr(renewer, "needs_renewal", lambda: True)
+        monkeypatch.setattr(renewer, "issue_now", lambda **_kw: (_write_self_signed(renewer), {})[1])
+
+        def failing_emit(*_a, **_kw):
+            raise RuntimeError("audit store unavailable")
+
+        monkeypatch.setattr(web_db, "record_auth_event", failing_emit)
+        bumps: list[int] = []
+        monkeypatch.setattr(_audit, "_bump_failure_counter", lambda: bumps.append(1))
+        assert renewer.check_and_renew()["action"] == "renewed"
+        assert bumps == [1], "the miss must be counted for /health"
+
+
+def _witness_arms(fn) -> dict[str, int]:
+    """Witness calls per arm of the renewal ``try``: the success arm (``else``)
+    and each ``except Exception`` handler (the failure arm)."""
+    import ast
+    import inspect
+    import textwrap
+
+    names = ("_witness_scheduled_renewal", "_witness_scheduled_renewal_async")
+
+    def count(nodes) -> int:
+        return sum(
+            1 for node in nodes for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr in names
+        )
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and n.orelse]
+    assert len(tries) == 1, "expected one try/except/else around the issuance"
+    t = tries[0]
+    failure = [h for h in t.handlers
+               if isinstance(h.type, ast.Name) and h.type.id == "Exception"]
+    assert len(failure) == 1
+    return {"success": count(t.orelse), "failure": count(failure[0].body),
+            "in_try_body": count(t.body)}
+
+
+def test_both_renewal_entrypoints_reach_the_emitter():
+    """Structural pin, per ARM (devils-advocate round 5): each entrypoint has a
+    witness on the success arm (``else``, so a witness can never be reported as
+    a failed renewal) and on the ``except Exception`` failure arm, and none
+    inside the ``try`` body."""
+    import inspect
+
+    for fn in (AcmeRenewer.check_and_renew, AcmeRenewer.check_and_renew_async):
+        assert _witness_arms(fn) == {"success": 1, "failure": 1, "in_try_body": 0}, fn
+    # the witnesses reach the emitter SSOT, not a raw INSERT
+    for fn in (AcmeRenewer._witness_scheduled_renewal, AcmeRenewer._witness_scheduled_renewal_async):
+        src = inspect.getsource(fn)
+        assert "record_auth_event" in src and "safe_audit_write" in src
+
+
+def test_the_arm_pin_has_teeth():
+    """Moving the success witness INTO the try body, or dropping the failure
+    witness, changes the per-arm counts the pin asserts."""
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(AcmeRenewer.check_and_renew))
+    no_failure = src.replace(
+        'self._witness_scheduled_renewal(outcome="failure", error=type(e).__name__)', "pass", 1,
+    )
+    assert no_failure != src
+    tree = ast.parse(no_failure)
+    t = next(n for n in ast.walk(tree) if isinstance(n, ast.Try) and n.orelse)
+    h = next(h for h in t.handlers if isinstance(h.type, ast.Name) and h.type.id == "Exception")
+    assert not any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_witness_scheduled_renewal"
+        for node in h.body for n in ast.walk(node)
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_async_entrypoint_writes_the_witness(renewer, db, monkeypatch):
+    """devils-advocate round 5: ``renewal_loop`` drives check_and_renew_async,
+    so the production path is exercised too (db_call forwarding + async SSOT)."""
+    monkeypatch.setattr(renewer, "needs_renewal", lambda: True)
+
+    async def fake_issue_async(**_kw):
+        _write_self_signed(renewer)
+        return {}
+
+    monkeypatch.setattr(renewer, "issue_now_async", fake_issue_async)
+    result = await renewer.check_and_renew_async()
+    assert result["action"] == "renewed"
+    rows = _renewal_rows(db)
+    assert [(r[0], r[1]) for r in rows] == [(None, "success")]
+    assert "sha256=" in rows[0][2]

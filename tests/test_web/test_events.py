@@ -42,21 +42,21 @@ class TestEventDispatcher:
     def test_matching_targets(self):
         # Non-local URLs require allow_external=True.
         targets = [
-            WebhookTarget(url="http://a", events=["flow.classified", "flow.finished"]),
-            WebhookTarget(url="http://b", events=["flow.failed"]),
-            WebhookTarget(url="http://c", events=[]),  # Subscribe to all.
+            WebhookTarget(url="http://a.invalid", events=["flow.classified", "flow.finished"]),
+            WebhookTarget(url="http://b.invalid", events=["flow.failed"]),
+            WebhookTarget(url="http://c.invalid", events=[]),  # Subscribe to all.
         ]
         dispatcher = EventDispatcher(targets=targets, allow_external=True)
 
         matched = dispatcher._matching_targets("flow.classified")
         urls = [t.url for t in matched]
-        assert "http://a" in urls
-        assert "http://c" in urls  # Empty events = all.
-        assert "http://b" not in urls
+        assert "http://a.invalid" in urls
+        assert "http://c.invalid" in urls  # Empty events = all.
+        assert "http://b.invalid" not in urls
 
     def test_matching_all_events(self):
         targets = [
-            WebhookTarget(url="http://catch-all", events=[]),
+            WebhookTarget(url="http://catch-all.invalid", events=[]),
         ]
         dispatcher = EventDispatcher(targets=targets, allow_external=True)
 
@@ -76,14 +76,14 @@ class TestEventDispatcher:
         ``test_external_url_local_suffix_extends_set`` below.
         """
         targets = [
-            WebhookTarget(url="http://api.example.com/hook", events=[]),
+            WebhookTarget(url="http://api.example.invalid/hook", events=[]),
             WebhookTarget(url="http://192.168.1.50:9000/hook", events=[]),
             WebhookTarget(url="http://localhost:9999/hook", events=[]),
         ]
         dispatcher = EventDispatcher(targets=targets)  # allow_external=False default
         matched = dispatcher._matching_targets("flow.classified")
         urls = [t.url for t in matched]
-        assert "http://api.example.com/hook" not in urls
+        assert "http://api.example.invalid/hook" not in urls
         assert "http://192.168.1.50:9000/hook" in urls
         assert "http://localhost:9999/hook" in urls
 
@@ -101,7 +101,7 @@ class TestEventDispatcher:
         assert [t.url for t in matched] == ["http://box.lab.test/hook"]
 
     def test_external_url_allowed_when_flag_set(self):
-        targets = [WebhookTarget(url="http://api.example.com/hook", events=[])]
+        targets = [WebhookTarget(url="http://api.example.invalid/hook", events=[])]
         dispatcher = EventDispatcher(targets=targets, allow_external=True)
         matched = dispatcher._matching_targets("flow.classified")
         assert len(matched) == 1
@@ -219,8 +219,8 @@ class TestEventDispatcher:
 
     async def test_fire_multiple_targets(self):
         targets = [
-            WebhookTarget(url="http://a/hook", events=["test"]),
-            WebhookTarget(url="http://b/hook", events=["test"]),
+            WebhookTarget(url="http://a.invalid/hook", events=["test"]),
+            WebhookTarget(url="http://b.invalid/hook", events=["test"]),
         ]
         dispatcher = EventDispatcher(targets=targets, allow_external=True)
 
@@ -243,7 +243,7 @@ class TestEventDispatcher:
         mock_secrets = MagicMock()
         mock_secrets.get.return_value = "resolved-secret"
 
-        target = WebhookTarget(url="http://hook", secret_key="WEBHOOK_SECRET")
+        target = WebhookTarget(url="http://hook.invalid", secret_key="WEBHOOK_SECRET")
         dispatcher = EventDispatcher(targets=[target], secrets_provider=mock_secrets)
 
         secret = dispatcher._resolve_secret(target)
@@ -252,18 +252,63 @@ class TestEventDispatcher:
 
     def test_resolve_secret_fallback(self):
         """Without a secrets provider, secret_key is used directly."""
-        target = WebhookTarget(url="http://hook", secret_key="direct-secret")
+        target = WebhookTarget(url="http://hook.invalid", secret_key="direct-secret")
         dispatcher = EventDispatcher(targets=[target], allow_external=True)
 
         secret = dispatcher._resolve_secret(target)
         assert secret == "direct-secret"
 
     def test_resolve_secret_empty(self):
-        target = WebhookTarget(url="http://hook", secret_key="")
+        target = WebhookTarget(url="http://hook.invalid", secret_key="")
         dispatcher = EventDispatcher(targets=[target], allow_external=True)
 
         secret = dispatcher._resolve_secret(target)
         assert secret == ""
+
+    def test_resolve_secret_propagates_decrypt_error(self):
+        """A5 — a configured signing secret that won't decrypt must NOT
+        collapse to "" (which would ship an unsigned webhook). It raises."""
+        from email_triage.secrets import SecretsDecryptError
+
+        mock_secrets = MagicMock()
+        mock_secrets.get.side_effect = SecretsDecryptError("WEBHOOK_SECRET")
+        target = WebhookTarget(url="http://hook.invalid", secret_key="WEBHOOK_SECRET")
+        dispatcher = EventDispatcher(targets=[target], secrets_provider=mock_secrets)
+
+        with pytest.raises(SecretsDecryptError):
+            dispatcher._resolve_secret(target)
+
+    async def test_fire_drops_when_signing_secret_unreadable(self):
+        """A5 (security-material) — when a target HAS a configured
+        secret_key but it won't decrypt (corrupt row / master-key
+        mismatch), fire() must DROP the delivery, never POST it unsigned.
+        Proves the webhook signing control fails CLOSED."""
+        from email_triage.secrets import SecretsDecryptError
+
+        mock_secrets = MagicMock()
+        mock_secrets.get.side_effect = SecretsDecryptError("WEBHOOK_SECRET")
+        target = WebhookTarget(
+            url="http://hook.test/cb", events=["test.event"],
+            secret_key="WEBHOOK_SECRET",
+        )
+        dispatcher = EventDispatcher(
+            targets=[target], allow_external=True, secrets_provider=mock_secrets,
+        )
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_client
+
+            results = await dispatcher.fire("test.event", {"k": "v"})
+
+            # The delivery is dropped, fail-closed...
+            assert len(results) == 1
+            assert results[0]["success"] is False
+            assert results[0]["dropped"] == "signing_secret_unreadable"
+            # ...and NOTHING was ever POSTed (no unsigned send).
+            mock_client.post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +319,7 @@ from datetime import datetime, timezone
 from email_triage.config import PushConfig, TriageConfig
 from email_triage.web.events import (
     fire_triage_completed,
-    get_openclaw_quiet_settings,
+    get_webhook_quiet_settings,
     is_in_quiet_hours,
 )
 
@@ -317,7 +362,7 @@ def _hipaa_acct(hipaa=False):
 
 
 def _push_cfg(enabled=True):
-    return TriageConfig(push=PushConfig(openclaw_webhook_enabled=enabled))
+    return TriageConfig(push=PushConfig(webhook_enabled=enabled))
 
 
 class TestFireTriageCompleted:
@@ -326,7 +371,7 @@ class TestFireTriageCompleted:
         from email_triage.web.db import set_setting
         acct = _hipaa_acct()
         dispatcher = EventDispatcher(targets=[
-            WebhookTarget(url="http://hook", events=["triage.completed"], secret_key=""),
+            WebhookTarget(url="http://hook.invalid", events=["triage.completed"], secret_key=""),
         ])
         dispatcher.fire = AsyncMock(return_value=[{"success": True}])
         run = {

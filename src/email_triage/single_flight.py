@@ -45,6 +45,8 @@ import asyncio
 import functools
 import inspect
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import sqlite3
 import threading
 import time
@@ -62,7 +64,7 @@ from typing import (
 from fastapi import HTTPException
 
 
-_log = logging.getLogger(__name__)
+_log = get_logger(__name__)  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +159,17 @@ def single_flight(
         return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def in_flight(key: str) -> bool:
+    """True if a ``single_flight(key)`` unit is currently running.
+
+    Best-effort, lock-free read for a PRE-DISPATCH "already in flight" check
+    (e.g. the backup-trigger endpoint returning 409 before scheduling). The
+    decorator's own ``lock.locked()`` fast-fail remains the authoritative guard;
+    this just lets a caller respond cleanly without scheduling a doomed task."""
+    lock = _locks.get(key)
+    return lock is not None and lock.locked()
 
 
 def _reset_for_tests() -> None:
@@ -281,6 +294,28 @@ def init_lock_conn(db_path: str) -> sqlite3.Connection:
         return lock_conn
 
 
+def close_lock_conn() -> None:
+    """Close + clear the process-wide lock_conn. Idempotent.
+
+    Punch 636: the web lifespan calls this at shutdown, before the final
+    WAL checkpoint. An open lock_conn keeps the database open, so the app
+    connection's close is not the LAST close and SQLite does not checkpoint
+    and delete the ``-wal`` (sqlite.org/wal.html, section 4). A close
+    failure is logged, never raised: shutdown continues.
+    """
+    global _LOCK_CONN
+    with _LOCK_CONN_RLOCK:
+        if _LOCK_CONN is not None:
+            try:
+                _LOCK_CONN.close()
+            except Exception as exc:
+                _log.error(
+                    f"single_flight lock_conn close failed "
+                    f"({type(exc).__name__}); the -wal may survive this stop",
+                )
+            _LOCK_CONN = None
+
+
 def _reset_lock_conn_for_tests() -> None:
     """Close + clear the singleton. Per-test fixture teardown only.
 
@@ -289,14 +324,7 @@ def _reset_lock_conn_for_tests() -> None:
     the next. Mirrors ``_reset_for_tests`` for the asyncio Lock dict
     above.
     """
-    global _LOCK_CONN
-    with _LOCK_CONN_RLOCK:
-        if _LOCK_CONN is not None:
-            try:
-                _LOCK_CONN.close()
-            except Exception:
-                pass
-            _LOCK_CONN = None
+    close_lock_conn()
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -441,7 +469,7 @@ def _open_lock_conn(
         # failure separately.
         _log.error(
             "_open_lock_conn fell back to shared connection — "
-            "commit-scope leak active. The lock primitive "
+            "commit-scope leak active (#288). The lock primitive "
             "will write to the shared app connection, which can "
             "interleave with @db_write operations and corrupt cursor "
             "state. Investigate the underlying open failure.",

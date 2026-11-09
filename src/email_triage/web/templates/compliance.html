@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Compliance - Email Triage{% endblock %}
 {% block content %}
+{# #299 reachability — each audit table below renders with a hard page #}
+{# cap; the shared pager surfaces "showing N–M of T" AND newer/older    #}
+{# links so the full §164.312(b) trail is reachable, not just counted.  #}
+{% from "_pager.html" import pager %}
+{% set _audit_pages = audit_pages if audit_pages is defined else {} %}
 <h2>Compliance</h2>
 <p>
     Spot-check HIPAA state across the install. System-wide flag is at the
@@ -104,6 +109,7 @@
 {% if not recent_events %}
 <p style="color:var(--pico-muted-color);">No boundary events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('recent_events'), 'boundary_offset', request, 'boundary events') }}
 <table>
     <thead>
         <tr>
@@ -142,6 +148,7 @@
 {% if not access_events %}
 <p style="color:var(--pico-muted-color);">No access events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('access_events'), 'access_offset', request, 'access events') }}
 <table>
     <thead>
         <tr>
@@ -180,7 +187,7 @@
 <h3 style="margin-top:1.5rem;">Recent PHI-route accesses (generic)</h3>
 <p style="font-size:0.9rem;color:var(--pico-muted-color);">
     Every authenticated request hitting a route that handles mail content
-    (classify, triage, digest, folder, message-fetch, OpenClaw API) is
+    (classify, triage, digest, folder, message-fetch, outbound-webhook API) is
     recorded here. Sibling of the HIPAA-account access table above —
     captures the broader §164.312(b) "access to PHI" audit, including
     routes that touch non-HIPAA accounts. Route + method + status only;
@@ -189,6 +196,7 @@
 {% if not generic_access_events %}
 <p style="color:var(--pico-muted-color);">No generic access events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('generic_access_events'), 'generic_offset', request, 'PHI-route accesses') }}
 <table>
     <thead>
         <tr>
@@ -234,7 +242,8 @@
     point. Verification is a read-only walk; runs on every load of
     this page.
 </p>
-{% if log_chain.first_break_id %}
+{# Punch 625 rule (a): a row below id 1 is a break, and id 0 is falsy. #}
+{% if log_chain.first_break_id is not none %}
 <article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
     <strong>⚠ Chain break detected.</strong>
     <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
@@ -243,16 +252,131 @@
         <li>Verified rows before break: {{ log_chain.valid_through_id or '—' }}</li>
         <li>Total chain-aware rows: {{ log_chain.chain_length }}</li>
         <li>Pre-chain (legacy) rows: {{ log_chain.prechain_count }}</li>
+        {% if log_chain.legacy_chain_length %}
+        <li>Keyless (SHA-256) rows: {{ log_chain.legacy_chain_length }} — hashed without the HMAC key. They verify, but anyone who can write the database could have produced them; rows written before the key existed (pre-H-02a) are expected here.</li>
+        {% endif %}
     </ul>
 </article>
 {% else %}
 <article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
     <strong>✓ Chain intact.</strong>
     <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {# Panel P G2: the one verdict verify_log_chain returns. #}
+        <li>Verdict: <strong>{{ (log_chain.get('verdict') or '') | upper }}</strong></li>
         <li>Chain-aware rows verified: {{ log_chain.rows_checked }}</li>
         <li>Highest valid id: {{ log_chain.valid_through_id or '—' }}</li>
+        {# Panel P G1b: a gap sentinel is a disclosed audit-record loss, never silent. #}
+        <li>Gap sentinels (log-handler drop markers; rows may be missing there): {{ log_chain.get('gap_sentinel_count') or 0 }}</li>
         {% if log_chain.prechain_count %}
         <li>Pre-chain (legacy) rows skipped: {{ log_chain.prechain_count }}</li>
+        {% endif %}
+        {% if log_chain.legacy_chain_length %}
+        <li>Keyless (SHA-256) rows: {{ log_chain.legacy_chain_length }} — hashed without the HMAC key. They verify, but anyone who can write the database could have produced them; rows written before the key existed (pre-H-02a) are expected here.</li>
+        {% endif %}
+    </ul>
+</article>
+{% endif %}
+
+{# ── Audit-event chains: the same tamper-evidence over the PHI-access trail ── #}
+<h3 style="margin-top:1.5rem;">Audit-event chains (tamper-evidence)</h3>
+<p style="font-size:0.9rem;color:var(--pico-muted-color);">
+    Each audit-event log — who accessed which HIPAA account, HIPAA mode flips,
+    sign-ins, account enable/disable, API-key lifecycle, Discover scans, and
+    cloud-egress style distillation — now carries its own HMAC chain, like the
+    activity log above. Deleting, altering, or forging a row breaks every
+    following row's recomputed hash. Read-only walk on each page load.
+    Tamper-evidence is prospective from this feature's deploy; rows written
+    before it are counted as pre-chain and not flagged.
+</p>
+{% set audit_chains_broken = audit_chains.values() | rejectattr('intact') | list %}
+{% if audit_chains_broken %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ {{ audit_chains_broken | length }} audit chain(s) show a break.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for c in audit_chains_broken %}
+        <li><code>{{ c.table }}</code>: {% if c.first_break_id is not none %}first break at id
+            <code>{{ c.first_break_id }}</code> — {% endif %}{{ c.first_break_reason }}{% if c.break_count is defined and c.break_count > 1 %} ({{ c.break_count }} rows in this chain do not verify; only the first is described){% endif %}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% else %}
+<article style="border-left:3px solid var(--pico-ins-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>✓ All {{ audit_chains | length }} audit chains intact.</strong>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for name, c in audit_chains.items() %}
+        <li><code>{{ name }}</code>: {{ c.rows_checked }} row(s) verified{% if c.prechain_count %}, {{ c.prechain_count }} pre-chain skipped{% endif %}{% if c.keyless_count %}, {{ c.keyless_count }} keyless{% endif %}{% if c.missing_id_count %}, {{ c.missing_id_count }} issued id(s) missing{% endif %}</li>
+        {% endfor %}
+    </ul>
+</article>
+{% endif %}
+{% set audit_chains_keyless = audit_chains.values() | selectattr('keyless_count') | list %}
+{# Punch #527: log_entries joins the banner. Its pre-boundary legacy rows are
+   expected history (shown in the log block above); a keyless row AFTER its
+   first keyed row has no current writer and is the N-507 signature. #}
+{% set log_chain_keyless = log_chain.post_boundary_keyless_count %}
+{% if audit_chains_keyless or log_chain_keyless %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ {{ audit_chains_keyless | length + (1 if log_chain_keyless else 0) }} audit chain(s) contain rows hashed without the HMAC key.</strong>
+    <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+        These rows verify, but anyone who can write the database could have produced them.
+        In <code>audit_gap_events</code> they are expected when a failed audit write also
+        found the key unavailable (N-467). No current writer produces them in the other tables.
+    </p>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for c in audit_chains_keyless %}
+        <li><code>{{ c.table }}</code>: {{ c.keyless_count }} keyless row(s)</li>
+        {% endfor %}
+        {% if log_chain_keyless %}
+        <li><code>log_entries</code>: {{ log_chain_keyless }} keyless row(s) after the first keyed row (id {{ log_chain.hash_alg_boundary_id }}); no current writer produces one</li>
+        {% endif %}
+    </ul>
+</article>
+{% endif %}
+{# Punch 625 (N-609), a fixed rule with no setting: a keyless row with no keyed
+   boundary after it is UNVERIFIABLE, since a pre-H-02a legacy row and a
+   substitution look the same. `audit verify` exits 3 and the bake refuses. #}
+{% set log_chain_unverifiable = log_chain.get('unverifiable_keyless_count') or 0 %}
+{% set log_chain_unverifiable_blank = log_chain.get('unverifiable_blank_count') or 0 %}
+{% if log_chain.get('verdict') == 'unverifiable' %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ The <code>log_entries</code> chain is UNVERIFIABLE.</strong>
+    {% if log_chain_unverifiable %}
+    <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {{ log_chain_unverifiable }} sha256 row(s) with no keyed boundary after them: pre-H-02a legacy
+        rows or a substitution (N-609) cannot be told apart; see punch 669 (legacy seal).
+    </p>
+    {% endif %}
+    {% if log_chain_unverifiable_blank %}
+    <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {{ log_chain_unverifiable_blank }} blank-hash row(s) that are not the gap sentinel, below the
+        first hashed row or with no hashed row at all: pre-chain history or a fabrication (N-609)
+        cannot be told apart.
+    </p>
+    {% endif %}
+    <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+        These rows are not authenticated by the key. Until then <code>audit verify</code> exits 3 and
+        the deploy bake refuses.
+    </p>
+</article>
+{% endif %}
+{# N-507 option A: every writer stamps hmac-sha256-v2, whose hash covers the
+   row's own alg and key version. A v1 row after a chain's first v2 row has no
+   current producer. #}
+{% set audit_chains_downgraded = audit_chains.values() | selectattr('downgrade_count') | list %}
+{% set log_chain_downgraded = log_chain.downgrade_count %}
+{% if audit_chains_downgraded or log_chain_downgraded %}
+<article style="border-left:3px solid var(--pico-del-color);padding:0.5rem 1rem;margin:0.5rem 0;background:var(--pico-card-background-color);">
+    <strong>⚠ {{ audit_chains_downgraded | length + (1 if log_chain_downgraded else 0) }} audit chain(s) contain older-format (hmac-sha256-v1) rows after their first hmac-sha256-v2 row.</strong>
+    <p style="margin:0.3rem 0 0;font-size:0.9rem;">
+        Every current writer uses hmac-sha256-v2, so no current writer produces these rows.
+        Each one is a downgrade signal (N-507).
+    </p>
+    <ul style="margin:0.3rem 0 0;font-size:0.9rem;">
+        {% for c in audit_chains_downgraded %}
+        <li><code>{{ c.table }}</code>: {{ c.downgrade_count }} row(s) after id {{ c.current_alg_from_id }}</li>
+        {% endfor %}
+        {% if log_chain_downgraded %}
+        <li><code>log_entries</code>: {{ log_chain_downgraded }} row(s) after id {{ log_chain.current_alg_from_id }}</li>
         {% endif %}
     </ul>
 </article>
@@ -269,6 +393,7 @@
 {% if not api_key_events %}
 <p style="color:var(--pico-muted-color);">No API key events recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('api_key_events'), 'apikey_offset', request, 'API-key events') }}
 <table>
     <thead>
         <tr>
@@ -298,9 +423,9 @@
             <td><code>#{{ e.key_id }}</code></td>
             <td>{{ e.name or '—' }}</td>
             <td>{{ e.target_email or ('user#' ~ e.target_user_id if e.target_user_id else '—') }}</td>
-            <td>{{ e.actor_email or ('user#' ~ e.actor_user_id if e.actor_user_id else '—') }}</td>
+            <td>{{ e.actor_email or ('user#' ~ e.actor_user_id if e.actor_user_id else '—') }}{% if e.recorded_actor_email and e.recorded_actor_email != e.actor_email %} (recorded as {{ e.recorded_actor_email }}){% endif %}</td>
             <td><code>{{ e.source }}</code></td>
-            <td style="font-size:0.85rem;color:var(--pico-muted-color);">{{ e.expires_at or 'never' }}</td>
+            <td style="font-size:0.85rem;color:var(--pico-muted-color);">{% if e.expires_at %}<time datetime="{{ e.expires_at }}" data-us-datetime>{{ e.expires_at | us_datetime }}</time>{% else %}never{% endif %}</td>
         </tr>
         {% endfor %}
     </tbody>
@@ -318,6 +443,7 @@
 {% if not discover_runs %}
 <p style="color:var(--pico-muted-color);">No discover runs recorded yet.</p>
 {% else %}
+{{ pager(_audit_pages.get('discover_runs'), 'discover_offset', request, 'discover scans') }}
 <table>
     <thead>
         <tr>
@@ -332,7 +458,7 @@
     <tbody>
         {% for r in discover_runs %}
         <tr>
-            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{{ r.created_at }}</td>
+            <td style="font-family:var(--pico-font-family-monospace);font-size:0.85rem;">{% if r.created_at %}<time datetime="{{ r.created_at }}" data-us-datetime>{{ r.created_at | us_datetime }}</time>{% else %}—{% endif %}</td>
             <td>{{ r.actor_email or '—' }}</td>
             <td>{{ r.account_name or ('#' ~ r.account_id) }}</td>
             <td style="font-size:0.85rem;color:var(--pico-muted-color);">

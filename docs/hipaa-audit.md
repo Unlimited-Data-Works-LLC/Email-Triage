@@ -1,12 +1,12 @@
 # HIPAA Compliance Audit — Findings Summary
 
-**Date of most recent audit:** 2026-05-31 (v0.1.2 — encryption-at-rest + MFA-enforcement review)
+**Date of most recent audit:** 2026-05-31 (v0.1.2 — encryption-at-rest + MFA-enforcement review). This summary was not re-issued for v0.2.0. Every finding since v0.1.2 is recorded one per change, with its status, in the [HIPAA findings register](hipaa-findings-register.md), which is the current record.
 **Audit scope:** Source code at `src/email_triage/` + container build pipeline + admin surfaces
 **Audit type:** Internal review (single-maintainer project)
 
 ## Verdict
 
-**No open findings.** All HIPAA-relevant code paths surveyed are gated by privacy-invariant runtime tests + the audit hash chain. The latest weekly cycle audited:
+**No open findings as of the 2026-05-31 audit.** Findings opened after it, and whether each is open or closed, are in the register. All HIPAA-relevant code paths surveyed are gated by privacy-invariant runtime tests + the audit hash chain. The latest weekly cycle audited:
 
 - Digest body-preview HIPAA redaction (verified by `tests/test_privacy_invariants_digest.py`).
 - OAuth refresh log scrub across Gmail, Office 365, and the shared `oauth_request` helper (`tests/test_privacy_invariants_oauth.py`).
@@ -76,10 +76,12 @@ The audit produces a finding when any of (1)-(5) fails. Findings are filed in th
 Customers can verify their own install's audit-chain integrity at any time:
 
 ```bash
-sudo podman exec email-triage email-triage audit verify
+sudo podman exec email-triage email-triage audit verify --all-chains
 ```
 
-The command walks `log_entries` end-to-end, recomputes the chain, and reports the first break (if any) with the row id + reason. Exit code 0 = clean; non-zero = break detected. Run after any maintenance event (DB restore, migration, manual edit) to confirm chain integrity.
+The command walks `log_entries` end-to-end, recomputes the chain, and reports the first break (if any) with the row id + reason. With `--all-chains` it also walks every other chained audit table (sign-ins, account access, key lifecycle, the audit gap-event backstop and the rest shown on `/compliance`) and names each table that breaks. Exit code 0 = clean; non-zero = break detected. Without the flag only `log_entries` is checked. Run after any maintenance event (DB restore, migration, manual edit) to confirm chain integrity.
+
+With `--all-chains`, a keyless (`sha256`) row fails the check on every table except `audit_gap_events`: that table's writer degrades to a keyless row when the chain key is unavailable, and no current writer of the other tables produces one (register N-507). `--db PATH` (verify a backup snapshot) wires no master key, so on that path every keyed row reads "hash recompute failed"; run the check against the live install, without `--db`, to verify keyed rows. The walk cannot detect one anomaly pair: a row written during a concurrent write, plus deletion of the rows that write skipped, verifies intact (register N-510, open).
 
 The same check runs on every `/compliance` page load (under a second for typical row counts). The chain has run continuously since the install was first started — there is no "chain reset" event in the application's lifetime.
 
@@ -93,7 +95,7 @@ The same check runs on every `/compliance` page load (under a second for typical
 
 For your own install, the recommended periodic review:
 
-1. Confirm `email-triage audit verify` exits clean.
+1. Confirm `email-triage audit verify --all-chains` exits clean.
 2. Inspect `/compliance` for any "audit chain break" warnings.
 3. Confirm `/admin/ai-backends` shows no `BAA certified` row past its `baa_expires_at` date.
 4. Confirm `/admin/retry-queue` is empty or all entries are `state='done'`.

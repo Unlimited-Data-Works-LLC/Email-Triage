@@ -12,19 +12,20 @@ Session: ``itsdangerous.URLSafeTimedSerializer`` encoding email + role.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import secrets
 import sqlite3
-import smtplib
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
+from email_triage._isotime import now_utc_iso, parse_iso, parse_iso_aware, to_utc_iso
+from email_triage._errfmt import fmt_exc
 from email_triage.triage_logging import get_logger
 from email_triage.web.db_writelock import db_write, get_write_lock
+from email_triage._dbapi_errors import DB_ERRORS
 
 log = get_logger("web.auth")
 
@@ -62,7 +63,7 @@ def effective_session_ttl(config: Any) -> int:
 SESSION_MAX_AGE = 86400 * 7  # 7 days
 
 
-def set_session_cookie(response: Any, token: str, config: Any) -> None:
+def set_session_cookie(response: Any, token: str, config: Any, request: Any = None) -> None:
     """Attach the session cookie to ``response`` — the single place
     its flags are defined.
 
@@ -79,7 +80,15 @@ def set_session_cookie(response: Any, token: str, config: Any) -> None:
     unlike the SameSite=strict CSRF cookie) are the established
     posture — unchanged; only the absent Secure flag is fixed.
     """
-    secure = bool(getattr(getattr(config, "tls", None), "enabled", False))
+    # N-200 R22 (2026-07-02): route Secure decision through the _cookies SSOT
+    # so the reverse-proxy topology (nginx-front) is captured (via
+    # request.url.scheme=='https') alongside the direct-uvicorn HTTPS listener
+    # (via config.tls.enabled). Callers pre-N-200 that don't pass `request`
+    # degrade cleanly to the config.tls.enabled-only path (byte-identical to
+    # the pre-fix behavior — new callers pass `request` to get the widened
+    # coverage).
+    from email_triage.web._cookies import is_request_https
+    secure = is_request_https(request, config)
     response.set_cookie(
         SESSION_COOKIE_NAME,
         token,
@@ -91,8 +100,9 @@ def set_session_cookie(response: Any, token: str, config: Any) -> None:
 
 
 def _hash_code(code: str) -> str:
-    """SHA-256 hash of an OTP code."""
-    return hashlib.sha256(code.encode()).hexdigest()
+    """SHA-256 hash of an OTP code (routes through the credential-hash SSOT)."""
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(code)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +135,7 @@ def store_otp(conn: sqlite3.Connection, email: str, code: str) -> None:
 
     conn.execute(
         "INSERT INTO otp_codes (email, code_hash, expires_at, used) VALUES (?, ?, ?, 0)",
-        (email, _hash_code(code), expires.isoformat()),
+        (email, _hash_code(code), to_utc_iso(expires)),
     )
     conn.commit()
 
@@ -154,9 +164,21 @@ def verify_otp(conn: sqlite3.Connection, email: str, code: str) -> bool:
         log.info("OTP verification failed: no matching code", email=email)
         return False
 
-    expires = datetime.fromisoformat(row["expires_at"])
-    if now > expires:
-        log.info("OTP verification failed: code expired", email=email)
+    # Census N-65 — route through the parse_iso SSOT, never raw fromisoformat:
+    # a corrupt/unparseable expires_at on this OTP-verify path used to raise
+    # ValueError and 500 the login. parse_iso returns None on bad input → treat
+    # as expired/invalid (FAIL CLOSED — refuse the code), same as a real expiry.
+    # N-357 R31 (2026-07-05 trust-repair fix-forward — SSOT collapse of
+    # the N-302 assume-UTC-on-naive shim). Was 3 lines of inline
+    # `parse_iso` + `if tzinfo is None: replace(tzinfo=utc)`; now one
+    # `parse_iso_aware` call. Behaviour identical (None on unparseable,
+    # naive stamped UTC, aware returned as-is).
+    expires = parse_iso_aware(row["expires_at"])
+    if expires is None or now > expires:
+        log.info(
+            "OTP verification failed: code expired or invalid expiry",
+            email=email,
+        )
         conn.execute("UPDATE otp_codes SET used = 1 WHERE id = ?", (row["id"],))
         conn.commit()
         return False
@@ -176,7 +198,7 @@ def cleanup_expired_otps(conn: sqlite3.Connection) -> int:
      — ``@db_write`` serialises the DELETE + commit on the shared
     connection's write lock.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     cursor = conn.execute(
         "DELETE FROM otp_codes WHERE expires_at < ? OR used = 1",
         (now,),
@@ -231,7 +253,27 @@ def create_session_token(
     rejects any session lacking this claim when HIPAA mode is on —
     forcing pre-cutover sessions through an MFA step-up. Per Q6
     design: hard cutover, no grandfather.
+
+     — refuses an ``_route_scope.API_ONLY_ROLES`` role (``health_ro``).
+    THIS is the "cannot log in through the web session path" gate, and it lives
+    here because this is the ONE session-minting funnel: every login surface —
+    OTP (``routers/ui/users.py``), WebAuthn begin/finish, passkey, recovery-code
+    and admin dev-keypair (``routers/auth_keys.py``, 5 call sites) — passes
+    through it. Gating the four handlers instead would be a four-site predicate,
+    i.e. the R5 drift shape. ``web/app.py`` maps the raised
+    :class:`~email_triage.web._route_scope.SessionMintRefused` to a 403 so the
+    refusal reads as policy, not as a crash. The cookie READ path in
+    ``dependencies.get_current_user`` re-checks the same predicate — both edges
+    through one funnel (R42).
     """
+    from email_triage.web._route_scope import (
+        SessionMintRefused,
+        role_may_hold_web_session,
+    )
+    if not role_may_hold_web_session(role):
+        raise SessionMintRefused(
+            f"role {role!r} is API-only and may not hold a web session"
+        )
     s = _get_serializer(secret_key)
     payload: dict[str, Any] = {"email": email, "role": role}
     # Only include the new fields when non-default to keep the cookie
@@ -297,7 +339,15 @@ def get_user_by_email(conn: sqlite3.Connection, email: str) -> dict[str, Any] | 
     SELECT is serialised through the process-wide DB lock. The lock is
     an ``RLock``: callers already inside ``db_call`` (which holds the
     same lock) re-acquire it on the same thread without deadlock.
+
+     R32 (census wf_56d1585d 2026-07-09 DA-fold R1) — canonicalise
+    the lookup key at the READ SSOT so any caller passing a raw
+    ``.strip().lower()`` form OR a display-wrapped input still finds
+    the row (write paths were also fixed same-drive; this is the
+    symmetric read-side).
     """
+    from email_triage.mail_headers import canonical_email
+    email = canonical_email(email)
     with get_write_lock():
         row = conn.execute(
             "SELECT id, email, name, role, notify_email, created_at, last_login, "
@@ -318,10 +368,69 @@ def update_last_login(conn: sqlite3.Connection, email: str) -> None:
     directly, and ``@db_write`` also covers it when it lands on a
     threadpool worker via ``db_call``). The decorator serialises the
     UPDATE + commit on the process-wide write lock.
+
+     R32 — canonicalise the WHERE-clause key to match the
+    canonicalised storage form (see :func:`get_user_by_email`).
     """
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("UPDATE users SET last_login = ? WHERE email = ?", (now, email))
+    update_last_login_txn(conn, email)
     conn.commit()
+
+
+def update_last_login_txn(conn: sqlite3.Connection, email: str) -> None:
+    """TXN-AWARE twin of :func:`update_last_login`; no commit (N-520 step 2)."""
+    from email_triage.mail_headers import canonical_email
+    email = canonical_email(email)
+    now = now_utc_iso()
+    conn.execute("UPDATE users SET last_login = ? WHERE email = ?", (now, email))
+
+
+def classify_otp(
+    conn: sqlite3.Connection, email: str, code: str,
+) -> tuple[str, int | None]:
+    """READ-ONLY half of :func:`verify_otp` (N-520 step 2).
+
+    Returns ``("none", None)`` when no unused code matches, ``("expired",
+    id)`` for a matching code past (or with an unparseable) expiry, and
+    ``("valid", id)`` otherwise. Writes nothing: the burn is the caller's
+    (:func:`burn_otp_txn` inside the witnessed success unit, or
+    :func:`burn_otp` for the tightening burn of an expired code)."""
+    row = conn.execute(
+        """SELECT id, expires_at FROM otp_codes
+           WHERE email = ? AND code_hash = ? AND used = 0
+           ORDER BY id DESC LIMIT 1""",
+        (email, _hash_code(code)),
+    ).fetchone()
+    if row is None:
+        log.info("OTP verification failed: no matching code", email=email)
+        return "none", None
+    # Census N-65 / N-357: parse_iso_aware SSOT; None (unparseable) is
+    # treated as expired (FAIL CLOSED), same as verify_otp.
+    expires = parse_iso_aware(row["expires_at"])
+    if expires is None or datetime.now(timezone.utc) > expires:
+        log.info(
+            "OTP verification failed: code expired or invalid expiry",
+            email=email,
+        )
+        return "expired", int(row["id"])
+    return "valid", int(row["id"])
+
+
+def burn_otp_txn(conn: sqlite3.Connection, otp_id: int) -> bool:
+    """Mark one OTP used; no commit (N-520 step 2). True only when THIS call
+    burned it (``used = 0`` guard), so two racing verifies cannot both win."""
+    cur = conn.execute(
+        "UPDATE otp_codes SET used = 1 WHERE id = ? AND used = 0", (int(otp_id),),
+    )
+    return cur.rowcount > 0
+
+
+@db_write
+def burn_otp(conn: sqlite3.Connection, otp_id: int) -> bool:
+    """Own-commit form of :func:`burn_otp_txn`: the TIGHTENING burn (an expired
+    or refused code), which never depends on audit-chain health."""
+    burned = burn_otp_txn(conn, otp_id)
+    conn.commit()
+    return burned
 
 
 # ---------------------------------------------------------------------------
@@ -329,17 +438,13 @@ def update_last_login(conn: sqlite3.Connection, email: str) -> None:
 # ---------------------------------------------------------------------------
 
 def format_from_header(from_addr: str, from_name: str | None = None) -> str:
-    """Compose an RFC-5322 ``From:`` value.
-
-    With a display name, emit ``"Display Name" <addr@example.com>``.
-    With an empty name, fall back to the bare address so operators who
-    don't care about branding see no change.  Double-quotes inside the
-    name are escaped so a malformed operator input can't break parsing.
-    """
-    if not from_name:
-        return from_addr
-    safe_name = from_name.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{safe_name}" <{from_addr}>'
+    """Compose an RFC-5322 ``From:`` value — delegates to the mail_headers SSOT
+    (divergence census 2026-06-09 #5), which additionally strips CR/LF from the
+    display name (header-injection defense). Kept as a re-export so existing
+    ``from web.auth import format_from_header`` callers (recipient_digest,
+    daily_health) are unchanged."""
+    from email_triage.mail_headers import format_from_header as _ssot
+    return _ssot(from_addr, from_name)
 
 
 def send_otp_email(
@@ -410,29 +515,30 @@ def smtp_send_digest(
     import email.utils
     import re
 
-    msg = email.mime.multipart.MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = format_from_header(from_addr, from_name)
-    msg["To"] = to_addr
+    # N-272 R28: route through the MIME envelope SSOT.
+    from email_triage.web._mime_builder import build_alternative_message
+    from email_triage.engine.html_text import strip_tags
+    plain = strip_tags(html_body)
+    _hdrs = dict(extra_headers) if extra_headers else {}
     if reply_to:
-        msg["Reply-To"] = reply_to
-    msg["Date"] = email.utils.formatdate(localtime=True)
-    if extra_headers:
-        for key, value in extra_headers.items():
-            msg[key] = value
+        _hdrs["Reply-To"] = reply_to
+    msg = build_alternative_message(
+        subject=subject,
+        from_addr=from_addr,
+        from_name=from_name,
+        to=to_addr,
+        plain_body=plain,
+        html_body=html_body,
+        source_tag="auth_email",
+        extra_headers=_hdrs or None,
+    )
 
-    # Plain-text fallback (strip tags, collapse whitespace).
-    plain = re.sub(r"<[^>]+>", "", html_body)
-    plain = re.sub(r"\s+", " ", plain).strip()
-    msg.attach(email.mime.text.MIMEText(plain, "plain", "utf-8"))
-    msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        if use_tls:
-            server.starttls()
-        if smtp_user:
-            server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+    # Census 2026-06-09 #2: route through the smtplib-transport SSOT.
+    from email_triage.web.smtp_send import send_smtp_message
+    send_smtp_message(
+        msg, smtp_host=smtp_host, smtp_port=smtp_port,
+        smtp_user=smtp_user, smtp_password=smtp_password, use_tls=use_tls,
+    )
 
     log.info("Digest email sent via SMTP", to=to_addr, subject=subject)
 
@@ -450,8 +556,49 @@ def generate_api_key() -> str:
 
 
 def hash_api_key(key: str) -> str:
-    """SHA-256 hash of an API key for storage."""
-    return hashlib.sha256(key.encode()).hexdigest()
+    """SHA-256 hash of an API key for storage (credential-hash SSOT)."""
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(key)
+
+
+class ApiKeyGrantError(RuntimeError):
+    """:func:`store_api_key` refused the grant: its insert or its witness
+    failed and was rolled back, so no key exists. A caller catches this type
+    and never returns or prints the raw key (fail closed, panel P F5)."""
+
+
+class ApiKeyRevokeError(RuntimeError):
+    """:func:`delete_api_key` refused the revocation: its delete or its
+    ``api_key_revoked`` witness failed and was rolled back, so the key still
+    exists and still authenticates (punch 689). A caller catches this type and
+    tells the operator the key was NOT revoked, so they can retry."""
+
+
+def _record_api_key_witness_gap(
+    conn: sqlite3.Connection,
+    exc: BaseException,
+    *,
+    helper_name: str = "store_api_key",
+    event: str = "api_key_created",
+) -> None:
+    """One ``audit_gap_events`` row for an api-key grant or revocation whose
+    witness failed (panel P F4, punch 689). The caller holds the write lock
+    (``@db_write``) and has rolled back. Best effort: a failed gap write is
+    logged and never masks ``exc``."""
+    try:
+        from email_triage.db.audit import mark_audit_gap_recorded, record_audit_write_loss
+        record_audit_write_loss(
+            conn, loss_class="failed_unrecorded", table="api_key_events",
+            helper_name=helper_name,
+        )
+        mark_audit_gap_recorded(exc)
+    except Exception as gap_exc:
+        log.error(
+            "api_key witness failed AND its gap row failed",
+            event=event,
+            witness_error=type(exc).__name__,
+            gap_error=fmt_exc(gap_exc, with_class=True),
+        )
 
 
 @db_write
@@ -462,6 +609,7 @@ def store_api_key(
     user_id: int,
     expires_at: str | None = None,
     *,
+    scope: str | None = None,
     actor_user_id: int | None = None,
     actor_email: str | None = None,
     source: str = "unknown",
@@ -477,22 +625,91 @@ def store_api_key(
     handle.
 
     Audit context (``actor_user_id``, ``actor_email``, ``source``) is
-    keyword-only so callers must opt into providing it. When omitted
-    the entry is still emitted with NULL actor fields and a
-    ``source="unknown"`` marker — that way an unaudited mint shows up
-    in the trail rather than disappearing silently.
+    keyword-only so callers must opt into providing it. A grant with
+    neither ``actor_user_id`` nor ``actor_email`` is REFUSED with
+    ``ApiKeyEventUnattributed`` (punch 710, register N-644): no key is
+    minted without an actor named in the chained witness.
 
-    The audit-table insert is wrapped in try/except so a failure there
-    cannot block the actual key creation. The structured log line
-    always fires regardless.
+    Punch 627 (N-611): the ``api_keys`` row and its ``api_key_created``
+    witness go through ONE transaction (``record_api_key_event_txn``, the
+    N-520 shape), so a failed witness (``_chain_insert`` is fail-closed on an
+    HMAC-key gap, Directive 12) refuses the mint and raises instead of leaving
+    a key nobody can see was granted (fail CLOSED, PD#8). The structured log
+    line fires only after the commit.
+
+     — ``scope`` is the serialized ``api_keys.scope`` JSON (or None for an
+    unscoped, full-principal key). Where it is recorded, stated precisely,
+    because the obvious answer is wrong:
+
+    * ``api_keys.scope`` — the live authoritative state, surfaced by
+      ``apikey list`` so an operator can audit what they issued.
+    * the ``api_key_created`` structured log line below. **Which sink that
+      reaches depends on the PROCESS.** ``SQLiteLogHandler`` (the HMAC-chained
+      ``log_entries`` writer, ) is attached by ``add_sqlite_handler``, and
+      the ONLY caller is the server lifespan in ``web/app.py`` — ``setup_logging``
+      itself attaches console + optional file handlers and nothing else. So from
+      the **server** (the UI and API mint paths) this line lands in the chained
+      table; from the **CLI** it reaches stderr/file only. Do not read this line
+      as tamper-evidence on the CLI path.
+    * therefore, for the CLI path, the tamper-evident record is the
+      ``@_cli_audit("apikey")`` row: ``_emit_cli_audit_event`` routes through the
+      ``record_cli_admin_op`` ``@db_write`` + ``@audit_emitter`` SSOT into the
+      ``log_entries`` chain, and ``scope`` / ``expires_days`` were added to its
+      ``_SAFE_ARG_KEYS`` allowlist in this change so they actually appear (the
+      allowlist drops anything unlisted). Note that emitter is **HIPAA-gated** —
+      it early-returns when ``logging.hipaa`` is off — so on a non-HIPAA install
+      the CLI mint has no chained record of its scope. the deploy host runs HIPAA mode on.
+    * **NOT** ``api_key_events``. That table is chain-hashed over the DECLARED
+      tuple ``_AUDIT_CHAIN_CANONICAL_FIELDS["api_key_events"]``
+      (``db/audit.py``), so adding ``scope`` to it would change the RECOMPUTED
+      row_hash of every historical row and break §164.312(c) re-verification —
+      the trap documented in ``db/audit.py`` for ``hipaa_access_events``. The
+      lifecycle event itself still routes through the ``record_api_key_event``
+      emitter SSOT unchanged (PD#3); no raw INSERT is added anywhere.
+
+    A route scope is a list of code-defined HTTP route strings: no PHI, no
+    Safe-Harbor identifier, so it is safe in a log field (R30).
     """
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "INSERT INTO api_keys (key_hash, name, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-        (key_hash, name, user_id, now, expires_at),
-    )
-    conn.commit()
-    new_id = cursor.lastrowid
+    if conn.isolation_level is None:
+        raise RuntimeError(
+            "an API-key grant requires a transaction-capable (non-autocommit) "
+            "connection so the api_keys insert + its chained api_key_events "
+            "witness are atomic; got isolation_level=None (autocommit)"
+        )
+    from email_triage.db.audit import record_api_key_event_txn
+    now = now_utc_iso()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO api_keys (key_hash, name, user_id, created_at, expires_at, scope) VALUES (?, ?, ?, ?, ?, ?)",
+            (key_hash, name, user_id, now, expires_at, scope),
+        )
+        new_id = cursor.lastrowid
+    except Exception as exc:
+        # A refused business write: nothing was granted and no witness was
+        # due, so no gap row (panel P F4).
+        conn.rollback()
+        raise ApiKeyGrantError(str(exc)) from exc
+    try:
+        record_api_key_event_txn(
+            conn,
+            event="api_key_created",
+            key_id=new_id,
+            actor_user_id=actor_user_id,
+            target_user_id=user_id,
+            name=name,
+            expires_at=expires_at,
+            source=source,
+            actor_email=actor_email,
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        # Panel P F4 (punch 627): the WITNESS failed, so the grant is refused
+        # and its audit row is lost. Leave the gap trace, as @audit_emitter
+        # does for the dev-key funnel, then re-raise (fail closed).
+        err = ApiKeyGrantError(str(exc))
+        _record_api_key_witness_gap(conn, err)
+        raise err from exc
 
     # Look up target email for the log line. Best-effort — auth must
     # not fail if the user row was deleted between calls.
@@ -503,8 +720,11 @@ def store_api_key(
         ).fetchone()
         if row is not None:
             target_email = row["email"]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as _swallow_exc:
+        log.warning(
+            "api-key audit target-email lookup failed",
+            error=fmt_exc(_swallow_exc),
+        )
 
     log.info(
         "api_key_created",
@@ -516,25 +736,8 @@ def store_api_key(
         target_email=target_email,
         name=name,
         expires_at=expires_at,
+        scope=scope,
         source=source,
-    )
-
-    # Persist to the audit table. A failure here is logged but does
-    # NOT block the mint — the key is already in api_keys.
-    from email_triage.web._audit import safe_audit_write
-    from email_triage.web.db import record_api_key_event
-    safe_audit_write(
-        lambda: record_api_key_event(
-            conn,
-            event="api_key_created",
-            key_id=new_id,
-            actor_user_id=actor_user_id,
-            target_user_id=user_id,
-            name=name,
-            expires_at=expires_at,
-            source=source,
-        ),
-        description=f"api_key_created key_id={new_id}",
     )
 
     return new_id
@@ -562,7 +765,8 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
     key_hash = hash_api_key(key)
     row = conn.execute(
         """SELECT ak.id AS key_id, ak.user_id, ak.name AS key_name,
-                  ak.expires_at, u.email, u.name, u.role, u.disabled
+                  ak.expires_at, ak.scope AS key_scope,
+                  u.email, u.name, u.role, u.disabled
            FROM api_keys ak
            JOIN users u ON u.id = ak.user_id
            WHERE ak.key_hash = ?""",
@@ -572,11 +776,15 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
     if row is None:
         return None
 
-    # Check expiry.
+    # Check expiry. Census N-65 — parse_iso SSOT, never raw fromisoformat:
+    # a corrupt expires_at used to 500 every bearer-token check. None (bad /
+    # unparseable) → FAIL CLOSED (reject the key), same as an elapsed expiry.
     if row["expires_at"]:
-        expires = datetime.fromisoformat(row["expires_at"])
-        if datetime.now(timezone.utc) > expires:
-            log.info("API key expired", key_name=row["key_name"])
+        # N-357 R31 (2026-07-05 SSOT collapse). See docstring at
+        # `_isotime.parse_iso_aware` and companion site above at ~L169.
+        expires = parse_iso_aware(row["expires_at"])
+        if expires is None or datetime.now(timezone.utc) > expires:
+            log.info("API key expired or invalid expiry", key_name=row["key_name"])
             return None
 
     # Fail-closed: a disabled user's keys never authenticate.
@@ -589,7 +797,7 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
         return None
 
     # Update last_used_at.
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (now, row["key_id"]))
     conn.commit()
 
@@ -601,21 +809,32 @@ def verify_api_key(conn: sqlite3.Connection, key: str) -> dict[str, Any] | None:
         "auth_method": "api_key",
         "key_name": row["key_name"],
         "api_key_id": row["key_id"],
+        #  — the RAW stored scope column, carried to the seam that owns the
+        # decision. Deliberately un-parsed here: this helper resolves IDENTITY,
+        # `web/_route_scope.check_principal_fences` decides AUTHORITY, and it is
+        # the one that holds the request's method + path. NULL = unscoped =
+        # pre-#420 full-principal behaviour.
+        "api_key_scope": row["key_scope"],
     }
 
 
 def list_api_keys(conn: sqlite3.Connection, user_id: int | None = None) -> list[dict[str, Any]]:
-    """List API keys. If user_id is given, filter to that user."""
+    """List API keys. If user_id is given, filter to that user.
+
+     — ``scope`` is selected because an operator who cannot SEE the scope they
+    issued cannot audit the credential; the column would otherwise be a fence
+    nobody can read.
+    """
     if user_id is not None:
         rows = conn.execute(
-            """SELECT ak.id, ak.name, ak.user_id, u.email, u.name AS user_name, ak.created_at, ak.last_used_at, ak.expires_at
+            """SELECT ak.id, ak.name, ak.user_id, u.email, u.name AS user_name, ak.created_at, ak.last_used_at, ak.expires_at, ak.scope
                FROM api_keys ak JOIN users u ON u.id = ak.user_id
                WHERE ak.user_id = ? ORDER BY ak.id""",
             (user_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT ak.id, ak.name, ak.user_id, u.email, u.name AS user_name, ak.created_at, ak.last_used_at, ak.expires_at
+            """SELECT ak.id, ak.name, ak.user_id, u.email, u.name AS user_name, ak.created_at, ak.last_used_at, ak.expires_at, ak.scope
                FROM api_keys ak JOIN users u ON u.id = ak.user_id
                ORDER BY ak.id""",
         ).fetchall()
@@ -630,12 +849,26 @@ def delete_api_key(
     actor_user_id: int | None = None,
     actor_email: str | None = None,
     source: str = "unknown",
+    emergency_reason: str | None = None,
+    cli_principal: str | None = None,
 ) -> bool:
     """Delete an API key by ID and emit a lifecycle audit entry.
 
-     — ``@db_write`` serialises the SELECT + DELETE + commit + the
-    nested ``record_api_key_event`` audit write as one unit on the
-    shared connection's write lock.
+    Punch 709: ``emergency_reason`` (a code from ``EMERGENCY_REVOKE_REASONS``)
+    is the explicit emergency flag. Unset, nothing below changes. Set, a
+    failure of the WITNESS phase alone (the DELETE already succeeded) commits
+    the delete without its witness and calls ``record_emergency_revoke`` (a gap
+    row, a CRITICAL line, the ``/health`` marker); a healthy chain takes the
+    normal path and writes no gap row. Only an enabled admin, or the host CLI
+    (no user id, ``source="cli"``), may pass the flag: anyone else gets
+    ``EmergencyRevokeRefused`` from ``check_emergency_actor``, the flag branch's
+    first statement, and nothing is written (no delete, no row, no marker).
+    The gap row's actor is built by the funnel from ``actor_user_id`` and, for
+    the host CLI only, ``cli_principal``: never a caller-supplied label.
+
+     — ``@db_write`` serialises the SELECT + DELETE + the
+    ``api_key_revoked`` witness + commit as one unit on the shared
+    connection's write lock.
 
     Returns True if a row was deleted. Audit context is keyword-only;
     see ``store_api_key`` for the schema rationale.
@@ -643,32 +876,94 @@ def delete_api_key(
     The audit row in ``api_key_events`` survives the deletion of the
     underlying ``api_keys`` row (no FK on ``key_id``) so revocations
     remain auditable indefinitely.
+
+    Punch 689 (an N-520 member until now): the DELETE and its
+    ``api_key_revoked`` witness go through ONE transaction
+    (``record_api_key_event_txn``), the revocation edge of
+    :func:`store_api_key`. A failed witness rolls the delete back, leaves the
+    gap row and raises :class:`ApiKeyRevokeError` (fail CLOSED on the record,
+    PD#8): a key is never gone without its chained witness, and the caller
+    tells the operator the key is still live. The structured log line fires
+    only after the commit. Deleting a key that does not exist is a no-op: no
+    write, no row.
     """
-    # Capture target+name BEFORE delete — once the row is gone we
-    # can't recover those for the audit entry.
-    target_user_id: int | None = None
-    name: str = ""
-    expires_at: str | None = None
+    if conn.isolation_level is None:
+        raise RuntimeError(
+            "an API-key revocation requires a transaction-capable "
+            "(non-autocommit) connection so the api_keys delete + its chained "
+            "api_key_events witness are atomic; got isolation_level=None "
+            "(autocommit)"
+        )
+    from email_triage.db.audit import (
+        check_emergency_actor,
+        check_emergency_reason,
+        record_api_key_event_txn,
+        record_emergency_revoke,
+    )
+    if emergency_reason is not None:
+        check_emergency_actor(conn, actor_user_id, source)
+        check_emergency_reason(emergency_reason)
     try:
+        # Capture target+name BEFORE delete — once the row is gone we
+        # can't recover those for the audit entry.
         row = conn.execute(
             "SELECT user_id, name, expires_at FROM api_keys WHERE id = ?",
             (key_id,),
         ).fetchone()
-        if row is not None:
-            target_user_id = row["user_id"]
-            name = row["name"] or ""
-            expires_at = row["expires_at"]
-    except sqlite3.Error:
-        pass
-
-    cursor = conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
-    conn.commit()
-    deleted = cursor.rowcount > 0
-
-    # Only emit the audit entry if a row actually existed; deleting a
-    # non-existent key is a no-op, not an event worth recording.
-    if not deleted:
-        return False
+        if row is None:
+            # Deleting a non-existent key is a no-op, not an event.
+            return False
+        target_user_id: int | None = row["user_id"]
+        name: str = row["name"] or ""
+        expires_at: str | None = row["expires_at"]
+        cursor = conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return False
+    except Exception as exc:
+        # A refused business write: nothing was revoked and no witness was
+        # due, so no gap row (the store_api_key panel P F4 shape).
+        conn.rollback()
+        raise ApiKeyRevokeError(str(exc)) from exc
+    witness_failure: Exception | None = None
+    try:
+        record_api_key_event_txn(
+            conn,
+            event="api_key_revoked",
+            key_id=key_id,
+            actor_user_id=actor_user_id,
+            target_user_id=target_user_id,
+            name=name,
+            expires_at=expires_at,
+            source=source,
+            actor_email=actor_email,
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        if emergency_reason is None:
+            # The WITNESS failed, so the revocation is refused and the key
+            # stays. Leave the gap trace, then re-raise (fail closed).
+            err = ApiKeyRevokeError(str(exc))
+            _record_api_key_witness_gap(
+                conn, err, helper_name="delete_api_key", event="api_key_revoked",
+            )
+            raise err from exc
+        # Punch 709: the witness phase failed under the explicit emergency
+        # flag. The rollback undid the delete; redo ONLY the delete and commit.
+        witness_failure = exc
+        try:
+            conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+            conn.commit()
+        except Exception as redo_exc:
+            conn.rollback()
+            raise ApiKeyRevokeError(str(redo_exc)) from redo_exc
+    if witness_failure is not None:
+        record_emergency_revoke(
+            conn, kind="api_key", target_id=key_id,
+            actor_user_id=actor_user_id, cli_principal=cli_principal,
+            reason=emergency_reason, witness_exc=witness_failure,
+        )
 
     log.info(
         "api_key_revoked",
@@ -681,21 +976,4 @@ def delete_api_key(
         expires_at=expires_at,
         source=source,
     )
-
-    from email_triage.web._audit import safe_audit_write
-    from email_triage.web.db import record_api_key_event
-    safe_audit_write(
-        lambda: record_api_key_event(
-            conn,
-            event="api_key_revoked",
-            key_id=key_id,
-            actor_user_id=actor_user_id,
-            target_user_id=target_user_id,
-            name=name,
-            expires_at=expires_at,
-            source=source,
-        ),
-        description=f"api_key_revoked key_id={key_id}",
-    )
-
     return True

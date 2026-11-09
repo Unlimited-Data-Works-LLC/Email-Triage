@@ -1,0 +1,23 @@
+# CI's SQLCipher (punch 624). `key: value`, one per line; `#` lines and blank lines are comments.
+#
+# Readers:
+#   - .github/workflows/tests.yml, "Confirm sqlcipher" step: the wheel's PRAGMA cipher_version
+#     must EQUAL wheel-sqlcipher below (an equality, never a `4.` prefix).
+#   - tests/test_punch624_ci_sqlcipher_version_matches_the_declaration_pin.py: wheel-version must
+#     equal the sqlcipher3 pin in requirements-dev.lock, and wheel-sqlcipher must equal the
+#     `c sqlcipher` row of source-built.pins. They may differ only while the lag-* record below
+#     is present, dated, and names both versions, the upstream check and the re-check trigger,
+#     and wheel-sqlcipher is never below the walresetbug floor in db/_engine.py. The record is
+#     deleted the day they are equal again.
+#
+# The real fix is for CI to source-build against the pinned amalgamation (the image's own
+# SQLCipher); until then CI tests the wheel's SQLCipher, and this file says how far it lags.
+wheel-package: sqlcipher3
+# 2026-11-08 (cve-arc SQLCIPHER3-RELEASE-0.6.5): sqlcipher3 0.6.5 (PyPI upload 2026-11-05) vendors
+# SQLCipher 4.20.0 / SQLite 3.54.1, equal to the `c sqlcipher` row, so the 2026-10-30 lag record
+# (wheel 0.6.4 at 4.19.0) is deleted as it instructed. Measured: the cp313 win_amd64 wheel returned
+# PRAGMA cipher_version ('4.20.0 community',); the cp314 manylinux x86_64 wheel CI installs
+# (pytest job, Python 3.14) carries the strings `4.20.0` and `3.54.1`, and no `4.19.0`, in its
+# _sqlite3 .so. CI's Confirm step re-measures the installed wheel on every run.
+wheel-version: 0.6.5
+wheel-sqlcipher: 4.20.0

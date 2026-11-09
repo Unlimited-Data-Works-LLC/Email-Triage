@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+
+from _db_tracking import track
 
 from email_triage.actions.hipaa_sent_counter import HipaaSentCounterLoop
 from email_triage.engine.models import EmailMessage
@@ -48,7 +50,7 @@ def _make_db() -> sqlite3.Connection:
     the loop. Build a minimal CREATE TABLE that satisfies the
     foreign-key constraints in the v29/v33 tables.
     """
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn = track(sqlite3.connect(":memory:", check_same_thread=False))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("""
@@ -381,8 +383,14 @@ class TestPruneDedup:
         conn = _make_db()
         acct_id = _seed_account(conn)
         # Insert two rows directly — one 100 days old, one yesterday.
-        old_ts = "2026-02-07T00:00:00+00:00"   # ~100 days before 2026-05-18
-        recent_ts = "2026-05-17T00:00:00+00:00"
+        # Anchor both fixtures to the CURRENT clock, not to absolute dates.
+        # These were literals ("2026-02-07" / "2026-05-17") pinned to a "now" of
+        # 2026-05-18; the prune window is 90 days, so on 2026-08-15 the "recent"
+        # row aged past the cutoff and this test began failing on wall-clock time
+        # alone — a green suite turning red with no commit behind it.
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(days=100)).isoformat()
+        recent_ts = (now - timedelta(days=1)).isoformat()
         conn.execute(
             "INSERT INTO hipaa_sent_dedup "
             "(account_id, msgid_hash, recorded_at) VALUES (?, ?, ?)",

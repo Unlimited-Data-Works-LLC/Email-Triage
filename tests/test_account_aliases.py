@@ -15,6 +15,7 @@ Covers the JSON-array-first cut:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -43,7 +44,7 @@ class TestMigrationV10:
     def test_fresh_db_has_aliases_column_with_empty_default(self):
         """A fresh init_db should create email_accounts with an
         ``aliases_json`` column whose default is the empty JSON array."""
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         try:
             cols = conn.execute(
                 "PRAGMA table_info(email_accounts)"
@@ -242,7 +243,7 @@ class TestNormalizeAliases:
 @pytest.fixture
 def db_with_account():
     """Init the DB and seed one user + one IMAP account."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
@@ -360,6 +361,11 @@ class _FakeSmtp:
 
 
 @pytest.mark.asyncio
+@pytest.mark.audit_failure_expected(
+    match='recipient_digest_sent route=/internal/recipient-digest account_id=42 digest_id=digest_x',
+    count=1,
+    reason='incidental (punch 629 r3): the stub db object has no execute(), so the recipient_digest_sent audit write fails',
+)
 async def test_recipient_mismatch_guard_accepts_primary(
     acct_with_aliases, dcfg_custom,
 ):
@@ -393,6 +399,11 @@ async def test_recipient_mismatch_guard_accepts_primary(
 
 
 @pytest.mark.asyncio
+@pytest.mark.audit_failure_expected(
+    match='recipient_digest_sent route=/internal/recipient-digest account_id=42 digest_id=digest_x',
+    count=1,
+    reason='incidental (punch 629 r3): the stub db object has no execute(), so the recipient_digest_sent audit write fails',
+)
 async def test_recipient_mismatch_guard_accepts_alias(
     acct_with_aliases, dcfg_custom,
 ):
@@ -427,6 +438,14 @@ async def test_recipient_mismatch_guard_accepts_alias(
 
 
 @pytest.mark.asyncio
+@pytest.mark.audit_failure_expected(
+    match=(
+        'recipient_digest_sent hipaa_access account_id=42 digest_id=digest_x',
+        'recipient_digest_sent route=/internal/recipient-digest account_id=42 digest_id=digest_x',
+    ),
+    count=2,
+    reason='incidental (punch 629 r3): the stub db object has no execute(), so the recipient_digest_sent audit write fails',
+)
 async def test_recipient_mismatch_guard_accepts_alias_under_hipaa(
     acct_with_aliases, dcfg_custom,
 ):
@@ -490,6 +509,11 @@ async def test_recipient_mismatch_guard_rejects_third_party(
 
 
 @pytest.mark.asyncio
+@pytest.mark.audit_failure_expected(
+    match='recipient_digest_sent route=/internal/recipient-digest account_id=42 digest_id=digest_x',
+    count=1,
+    reason='incidental (punch 629 r3): the stub db object has no execute(), so the recipient_digest_sent audit write fails',
+)
 async def test_recipient_mismatch_guard_case_insensitive(
     acct_with_aliases, dcfg_custom,
 ):

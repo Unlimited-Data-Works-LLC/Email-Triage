@@ -66,7 +66,7 @@ def test_build_provider_imap_uses_first_mailbox():
         "id": 5,
         "provider_type": "imap",
         "config": {
-            "host": "imap.example.com",
+            "host": "imap.example.invalid",
             "port": 993,
             "username": "user",
             "use_ssl": True,
@@ -86,7 +86,7 @@ def test_build_provider_imap_mailbox_override():
         "id": 5,
         "provider_type": "imap",
         "config": {
-            "host": "imap.example.com",
+            "host": "imap.example.invalid",
             "username": "user",
             "mailboxes": ["INBOX"],
         },
@@ -112,6 +112,49 @@ def test_build_provider_gmail_uses_install_oauth():
         assert provider._refresh_token == "rt-abc"
     finally:
         set_install_google_oauth(None)
+
+
+def test_hydrate_and_register_install_oauth_wires_gmail_client_id():
+    """N-130: the SSOT reads the install OAuth creds from the secrets store +
+    registers them, so build_provider gives a gmail_api account a real
+    client_id — the fix for the CLI mine's 'client_id not configured' (the CLI
+    runs outside the boot, so nothing else registered them)."""
+    from email_triage.config import TriageConfig
+    from email_triage.providers.factory import (
+        hydrate_and_register_install_oauth,
+        set_install_google_oauth,
+        set_install_office365_oauth,
+        set_install_ingestion_config,
+    )
+
+    secrets = FakeSecrets({
+        "GOOGLE_OAUTH_WEB_CLIENT_ID": "web-cid",
+        "GOOGLE_OAUTH_WEB_CLIENT_SECRET": "web-secret",
+        "ACCOUNT_3_GMAIL_REFRESH_TOKEN": "rt-abc",
+    })
+    config = TriageConfig()
+    try:
+        # Pre-condition: nothing registered -> a Gmail build would have an empty
+        # client_id (the bug). After the SSOT runs, it's wired.
+        hydrate_and_register_install_oauth(config, secrets)
+        assert config.google_oauth.web_client_id == "web-cid"
+        assert config.google_oauth.web_client_secret == "web-secret"
+        acct = {
+            "id": 3,
+            "provider_type": "gmail_api",
+            "config": {"account": "alice@example.com"},
+        }
+        provider = build_provider(acct, secrets)
+        assert provider._client_id == "web-cid", (
+            "hydrate_and_register_install_oauth did not wire the install client_id "
+            "into the factory -> the CLI mine would fail 'client_id not configured'"
+        )
+        assert provider._client_secret == "web-secret"
+        assert provider._refresh_token == "rt-abc"
+    finally:
+        set_install_google_oauth(None)
+        set_install_office365_oauth(None)
+        set_install_ingestion_config(None)
 
 
 def test_build_provider_gmail_falls_back_to_desktop():
@@ -160,19 +203,32 @@ def test_build_provider_gmail_explicit_oauth_override():
 
 def test_build_provider_o365():
     pytest.importorskip("msal")
-    secrets = FakeSecrets({"ACCOUNT_9_O365_SECRET": "graph-secret"})
-    acct = {
-        "id": 9,
-        "provider_type": "office365",
-        "config": {
-            "client_id": "graph-cid",
-            "tenant_id": "common",
-        },
-    }
-    provider = build_provider(acct, secrets)
-    assert provider.name == "office365"
-    assert provider._client_id == "graph-cid"
-    assert provider._client_secret == "graph-secret"
+    # Per the 2026-05-10 per-account -> install-level OAuth lift, build_provider
+    # reads O365 client_id/secret from the INSTALL-level Office365OAuthConfig, NOT
+    # the per-account config. (This test was silently SKIPPED while msal was
+    # absent — importorskip — so it drifted stale against the lift; the conftest
+    # msal stub now runs it. Updated to set up install-level OAuth, mirroring the
+    # gmail sibling above.)
+    from email_triage.config import Office365OAuthConfig
+    from email_triage.providers.factory import set_install_office365_oauth
+    set_install_office365_oauth(
+        Office365OAuthConfig(
+            tenant_id="common", client_id="graph-cid", client_secret="graph-secret",
+        )
+    )
+    try:
+        secrets = FakeSecrets()
+        acct = {
+            "id": 9,
+            "provider_type": "office365",
+            "config": {"account": "clinic@example.com"},
+        }
+        provider = build_provider(acct, secrets)
+        assert provider.name == "office365"
+        assert provider._client_id == "graph-cid"
+        assert provider._client_secret == "graph-secret"
+    finally:
+        set_install_office365_oauth(None)
 
 
 def test_build_provider_unknown_type_raises():

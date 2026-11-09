@@ -52,21 +52,22 @@ class TestSmtpSendDigest:
         captured = {}
 
         class FakeSMTP:
-            def __init__(self, host, port):
+            def __init__(self, host, port, timeout=None):
                 captured["host"] = host
                 captured["port"] = port
+                captured["timeout"] = timeout
             def __enter__(self):
                 return self
             def __exit__(self, *a):
                 return False
-            def starttls(self):
+            def starttls(self, *, context=None):
                 captured["tls"] = True
             def login(self, u, p):
                 captured["login"] = (u, p)
             def send_message(self, msg):
                 captured["msg"] = msg
 
-        monkeypatch.setattr(auth_mod.smtplib, "SMTP", FakeSMTP)
+        monkeypatch.setattr("email_triage.web.smtp_send.smtplib.SMTP", FakeSMTP)
         auth_mod.smtp_send_digest(
             smtp_host="smtp.test",
             smtp_port=587,

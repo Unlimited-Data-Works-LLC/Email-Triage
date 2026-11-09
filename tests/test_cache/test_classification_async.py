@@ -37,6 +37,7 @@ This test file pins:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import sys
 import threading
@@ -62,6 +63,7 @@ from tests.test_cache.test_classification import (  # noqa: E402
     _StubRedis,
     _reset_counters_and_singleton,  # noqa: F401  # autouse fixture
 )
+from tests._pin_harness import assert_pin_has_teeth, walk_src  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +94,7 @@ def stub():
 
 @pytest.fixture
 def cache(stub):
-    c = ClassificationCache(url="redis://stub:6379/0")
+    c = ClassificationCache(url="redis://stub.invalid:6379/0")
     set_install_classification_cache(c)
     yield c
     set_install_classification_cache(None)
@@ -467,121 +469,106 @@ class TestAsyncHelperBoundaryCases:
 
 
 # ---------------------------------------------------------------------------
-# Pin 5 — structural guard against regression
+# Pin 5 — count-agnostic structural guard against the  regression
 # ---------------------------------------------------------------------------
 
-class TestClassifyBaseUsesAsyncHelpers:
-    """``classify/base.py``'s ``async def classify`` body MUST invoke
-    the ``a*`` helper variants. A regression that puts the sync
-    ``cache_lookup_for_message`` / ``cache_store_for_message`` back on
-    the loop would re-open : a 2.0 s socket_timeout would again
-    pin the loop and stall every other classify in flight.
+# The synchronous, Redis-blocking cache surface. Calling any of these from an
+# ``async def`` body re-opens  — a 2.0 s ``socket_timeout`` on a stuck
+# Redis pins the WHOLE event loop. The async-safe path uses the ``a*`` mirrors
+# / ``asyncio.to_thread`` (the sync method passed AS AN ARGUMENT to to_thread
+# is not a ``Call`` and is correctly NOT flagged).
+_SYNC_CACHE_HELPER_NAMES = frozenset({
+    "cache_lookup_for_message",   # module-level sync helpers (globally unique)
+    "cache_store_for_message",
+})
+_SYNC_CACHE_METHOD_NAMES = frozenset({
+    "lookup_inner", "store_inner", "fetch_category_distribution", "flush_all",
+})
 
-    Structural pin via AST: walk every ``async def`` in the file and
-    fail if it contains a non-``await`` call to the sync helpers.
+
+def _async_sync_cache_offenders(tree) -> list[str]:
+    """Describe every Call inside an ``async def`` body that invokes a
+    synchronous Redis-blocking cache op (the  regression shape). A nested
+    *sync* ``def`` resets the scope (its body runs synchronously, off the loop,
+    when called)."""
+    offenders: list[str] = []
+
+    class _Walker(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self._async_stack: list[str] = []
+
+        def visit_AsyncFunctionDef(self, node):
+            self._async_stack.append(node.name)
+            self.generic_visit(node)
+            self._async_stack.pop()
+
+        def visit_FunctionDef(self, node):
+            saved = self._async_stack
+            self._async_stack = []          # nested sync def == its own scope
+            self.generic_visit(node)
+            self._async_stack = saved
+
+        def visit_Call(self, node):
+            if self._async_stack:
+                name = None
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in _SYNC_CACHE_HELPER_NAMES:
+                        name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    if node.func.attr in _SYNC_CACHE_METHOD_NAMES:
+                        name = node.func.attr
+                if name is not None:
+                    offenders.append(
+                        f"async def {self._async_stack[-1]}() calls sync "
+                        f"{name}() at line {node.lineno} — use the async mirror "
+                        f"(a{name} / .a{name} / asyncio.to_thread) (#262)."
+                    )
+            self.generic_visit(node)
+
+    _Walker().visit(tree)
+    return offenders
+
+
+class TestNoSyncCacheCallFromAsyncBody:
+    """ regression guard — COUNT-AGNOSTIC (Prime Directive 6).
+
+    Supersedes the two hand-written per-file guards (``classify/base.py`` +
+    ``web/routers/integrations.py``). Each of those hard-coded ONE file path,
+    so a THIRD module that put a sync Redis cache call back on the event loop
+    was invisible until someone hand-added a third method — the count-coupled
+    pin shape the divergence playbook forbids ("a property over every site via
+    rglob, never a fixed list"; "converge the hand-rolled AST walkers onto one
+    shared harness"). This walks EVERY ``async def`` body under
+    ``src/email_triage`` via the shared ``_pin_harness`` src walk, so a new
+    offending caller anywhere is caught with no edit to this test.
     """
 
-    def test_async_classify_does_not_call_sync_cache_helpers(self):
-        import ast
-        from pathlib import Path
-        src = (
-            Path(__file__).resolve().parents[2]
-            / "src" / "email_triage" / "classify" / "base.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        offenders: list[str] = []
-
-        class _Walker(ast.NodeVisitor):
-            def __init__(self) -> None:
-                self._async_stack: list[str] = []
-
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-                self._async_stack.append(node.name)
-                self.generic_visit(node)
-                self._async_stack.pop()
-
-            def visit_FunctionDef(self, node: ast.FunctionDef):
-                # Nested sync def — separate scope, classify body
-                # doesn't have one but stay defensive.
-                saved = self._async_stack
-                self._async_stack = []
-                self.generic_visit(node)
-                self._async_stack = saved
-
-            def visit_Call(self, node: ast.Call):
-                if self._async_stack:
-                    name = None
-                    if isinstance(node.func, ast.Name):
-                        name = node.func.id
-                    elif isinstance(node.func, ast.Attribute):
-                        name = node.func.attr
-                    if name in (
-                        "cache_lookup_for_message",
-                        "cache_store_for_message",
-                    ):
-                        offenders.append(
-                            f"async def {self._async_stack[-1]}() "
-                            f"calls sync {name}() at line "
-                            f"{node.lineno} — must use the async "
-                            f"helper (a{name}) instead."
-                        )
-                self.generic_visit(node)
-
-        _Walker().visit(tree)
-        if offenders:
-            joined = "\n  ".join(offenders)
+    def test_no_async_body_calls_sync_cache_ops(self):
+        violations: list[str] = []
+        for _path, rel, tree in walk_src():
+            for off in _async_sync_cache_offenders(tree):
+                violations.append(f"{rel}: {off}")
+        if violations:
+            joined = "\n  ".join(violations)
             pytest.fail(
-                "Sync cache helper called from an async body in "
-                f"classify/base.py:\n  {joined}"
+                "Synchronous Redis-blocking cache op called from an async "
+                f"body (re-opens #262):\n  {joined}"
             )
 
-    def test_integrations_admin_flush_uses_async_mirror(self):
-        # Sister guard for the admin flush endpoint.
-        import ast
-        from pathlib import Path
-        src = (
-            Path(__file__).resolve().parents[2]
-            / "src" / "email_triage" / "web" / "routers"
-            / "integrations.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-
-        async_with_flush_all_offenders: list[str] = []
-
-        class _Walker(ast.NodeVisitor):
-            def __init__(self) -> None:
-                self._async_stack: list[str] = []
-
-            def visit_AsyncFunctionDef(self, node):
-                self._async_stack.append(node.name)
-                self.generic_visit(node)
-                self._async_stack.pop()
-
-            def visit_FunctionDef(self, node):
-                saved = self._async_stack
-                self._async_stack = []
-                self.generic_visit(node)
-                self._async_stack = saved
-
-            def visit_Call(self, node):
-                if self._async_stack:
-                    # Bare attribute call .flush_all() on anything but
-                    # an awaited expression.
-                    if (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "flush_all"
-                    ):
-                        async_with_flush_all_offenders.append(
-                            f"async def {self._async_stack[-1]}() "
-                            f"calls sync .flush_all() at line "
-                            f"{node.lineno} — must use .aflush_all()"
-                        )
-                self.generic_visit(node)
-
-        _Walker().visit(tree)
-        if async_with_flush_all_offenders:
-            joined = "\n  ".join(async_with_flush_all_offenders)
-            pytest.fail(
-                "Sync .flush_all() called from an async body in "
-                f"integrations.py:\n  {joined}"
-            )
+    def test_detector_has_teeth(self):
+        # Plant a bad shape (sync helper + sync methods from an async body) and
+        # a good shape (the a* mirrors). The pin must flag the former and pass
+        # the latter, else a scoping drift makes it silently vacuous.
+        bad = (
+            "async def f(msg, cache):\n"
+            "    a, b, c, d = cache_lookup_for_message(msg, 'm', {})\n"
+            "    cache.store_inner(a, b, {})\n"
+            "    cache.flush_all()\n"
+        )
+        good = (
+            "async def f(msg, cache):\n"
+            "    a, b, c, d = await acache_lookup_for_message(msg, 'm', {})\n"
+            "    await cache.astore_inner(a, b, {})\n"
+            "    await cache.aflush_all()\n"
+        )
+        assert_pin_has_teeth(_async_sync_cache_offenders, bad, good)

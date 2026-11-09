@@ -49,7 +49,7 @@
             </p>
             <div class="grid">
                 <label>
-                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com) — useful for catching everyone at a company. subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com) — useful for catching everyone at a company. subject searches for the phrase anywhere in the subject line (case-insensitive). list_id matches the mailing-list identifier from the List-Id header (e.g. announce.python.org) — case-insensitive, brackets optional.") }}
                     <select name="rule_type">
                         {% for rt in rule_types %}
                         <option value="{{ rt }}">{{ rt }}</option>
@@ -57,7 +57,7 @@
                     </select>
                 </label>
                 <label>
-                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase. Leave blank to skip adding a first rule.") }}
+                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase. For list_id: the mailing-list identifier, like announce.python.org. For list_id: the mailing-list identifier, like announce.python.org. Leave blank to skip adding a first rule.") }}
                     <input type="text" name="pattern" placeholder="example.com">
                 </label>
             </div>
@@ -124,7 +124,7 @@
             {{ csrf_input(request) }}
             <div class="grid">
                 <label>
-                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com). subject searches for the phrase anywhere in the subject line (case-insensitive).") }}
+                    Type{{ m.help("What part of the email to match. sender matches the sender's full address (vendor@example.com). sender_domain matches the part after @ (example.com). subject searches for the phrase anywhere in the subject line (case-insensitive). list_id matches the mailing-list identifier from the List-Id header (e.g. announce.python.org).") }}
                     <select name="rule_type">
                         {% for rt in rule_types %}
                         <option value="{{ rt }}">{{ rt }}</option>
@@ -132,7 +132,7 @@
                     </select>
                 </label>
                 <label>
-                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase.") }}
+                    Pattern{{ m.help("What to look for. For sender: a full email address. For sender_domain: the domain only, like example.com (no @). For subject: a phrase. For list_id: the mailing-list identifier, like announce.python.org.") }}
                     <input type="text" name="pattern" placeholder="example.com" required>
                 </label>
             </div>

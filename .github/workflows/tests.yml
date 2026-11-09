@@ -1,0 +1,260 @@
+name: Unit + Pin Suite
+
+# The unit / structural-pin suite — `pytest tests/` (the default addopts
+# `--ignore=tests/e2e` keeps the browser tier in its own e2e.yml job). This
+# is where all ~53 count-agnostic structural pins live. Until this job
+# existed the pins were a run-it-yourself lint: nothing pulled the trigger
+# on a push, so a pin could go red at HEAD and sit unnoticed (the recurring
+# "broad green" miss). This job is the trigger — make it a REQUIRED check.
+#
+# sqlcipher: the `encryption` extra, installed from requirements-dev.lock
+# (punch 511), is the PyPI `sqlcipher3` manylinux wheel. Since 2026-11-08 that is sqlcipher3
+# 0.6.5, whose wheels vendor SQLCipher 4.20.0 / SQLite 3.54.1, the same versions the image
+# source-builds from source-built.pins (punch 731), so the wheel no longer lags the image
+# (0.6.4 vendored 4.19.0 / 3.53.4; before punch 631 the CI log on 2026-10-06 read
+# `sqlcipher ('4.12.0 community',)`). The Confirm step below
+# asserts the wheel is exactly the version vendor/ci-sqlcipher3-wheel.record names, and
+# tests/test_punch624_ci_sqlcipher_version_matches_the_declaration_pin.py ties that record
+# to source-built.pins: equal, or a dated lag record naming both versions and the upstream
+# check. The encrypted-DB / encrypted-backup
+# tests (otherwise importorskip-gated and never run in CI) actually execute here. That is
+# the WHEEL's SQLCipher build, not the image's source-built one; run them in the image to
+# cover that. Python is pinned to 3.14 to match the deploy host runtime. (Corrected
+# 2026-10-06: this comment used to name `sqlcipher3-binary`, which the
+# install surfaces no longer use.)
+#
+# Actions pinned to the Node-24 majors the other workflows use
+# (checkout@v5 / setup-python@v6 / upload-artifact@v4).
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+  # Callable as a release gate: release.yml `uses:` this before build-and-push,
+  # so a tag/release REFUSES to build on a red pin suite (/goal Phase 1 #1).
+  workflow_call:
+
+# A newer push to the same ref cancels an in-flight run (the suite is ~minutes).
+concurrency:
+  # ${{ github.workflow }} is included so the STANDALONE run and the
+  # Release-embedded workflow_call (release.yml `uses:` this file) land in
+  # DIFFERENT groups — with a shared `unit-<ref>` group, every main push
+  # spawned both instances into one cancel-in-progress group and the loser
+  # of the race got cancelled (2026-07-24: standalone run 30088541708
+  # cancelled 1s in, turning the required "pytest tests/ (unit + pins)"
+  # check red while the suite itself passed inside the Release run).
+  # Rapid same-branch pushes still cancel their own stale runs.
+  group: unit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege, declared explicitly. Under a repo default of read-only this
+# changes nothing today; it exists so that RAISING the repo-wide default (which
+# ci-green-ref.yml needs in order to write its marker branch) cannot silently
+# hand write access to a workflow that never asked for it.
+permissions:
+  contents: read
+
+jobs:
+  # Layer-3 of the v0.2.0 CIDI-drift defense (Drive 3): fail-close when a
+  # new FastAPI route or Jinja template ships without a matching Playwright
+  # walk under tests/e2e/walk/. Runs BEFORE pytest so a missing walk
+  # short-circuits the PR without spending the pytest budget.
+  feature-add-e2e-gate:
+    name: feature-add-e2e-gate (walks required for new routes/templates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Need full history so the base rev (origin/main or the PR base)
+          # is fetchable for the diff.
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Run feature-add-e2e-gate
+        env:
+          # Base for the diff scan:
+          #   1. Pull-request events → PR base sha (walks required for the PR
+          #      diff, which is what a reviewer cares about).
+          #   2. Push events → github.event.before = the branch tip BEFORE
+          #      this push (incremental — only checks walks for routes added
+          #      IN THIS PUSH, not the accumulated branch backlog).
+          #   3. Fallback origin/main when neither is set (cron, manual
+          #      dispatch). On the FIRST push of a new branch GitHub sets
+          #      github.event.before to all zeros, which is truthy, so the
+          #      `||` below never reaches 'origin/main'; the SCRIPT treats an
+          #      all-zeros base as unset and falls back to origin/main itself
+          #      (one resolver). Any other unresolvable ref exits 2.
+          # Rationale: the aggregate branch-vs-main missing-walks debt is a
+          # DRIVE-plan concern (retrofit backfill), not a per-push gate — the
+          # gate is designed to prevent NEW drift, not backfill known debt.
+          # Merge-to-main PR trigger still enforces the full-branch check
+          # via case (1). See DA panel-2 MF5 (2026-07-16).
+          E2E_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: python scripts/workflows/feature-add-e2e-gate.py
+
+  # Punch 549 (N-545, panel B1 DA): install the hashed requirements.lock on
+  # Linux under the image's Python, the way the image build does, so a lock the
+  # build would refuse goes red HERE and not in the deploy host deploy window. The
+  # pre-push lock-freshness guard SKIPs on a push host that does not match the
+  # lock's `# resolved-for:` line, so without this job the deploy build is the
+  # lock's first install. `--require-hashes` makes the mode explicit: pip turns
+  # it on implicitly only when the file carries hashes, so a lock regenerated
+  # without --generate-hashes would otherwise install unchecked. No `--no-deps`:
+  # the image's install resolves dependencies, and a transitive dependency the
+  # lock does not pin must be refused here as it is there. requirements-dev.lock
+  # gets the same proof in its OWN fresh venv (db-sme panel D F-1): the pytest
+  # job installs it into the runner's persistent toolcache, where pip's hash
+  # mode checks only what it downloads, so a transitive left there by an earlier
+  # job would hide a lock that is missing it. Pinned by
+  # tests/test_n545_lock_describes_the_image_ssot_pin.py (P7, every repo lock).
+  lock-hash-install:
+    name: lock-hash-install (each lock installs into a fresh venv with --require-hashes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install the image lock into a throwaway venv, every hash required
+        run: |
+          python -m venv "$RUNNER_TEMP/lock-venv"
+          "$RUNNER_TEMP/lock-venv/bin/python" -m pip install --no-cache-dir \
+            --disable-pip-version-check --require-hashes -r requirements.lock
+      - name: Install the dev lock into its own throwaway venv, every hash required
+        run: |
+          python -m venv "$RUNNER_TEMP/dev-lock-venv"
+          "$RUNNER_TEMP/dev-lock-venv/bin/python" -m pip install --no-cache-dir \
+            --disable-pip-version-check --require-hashes -r requirements-dev.lock
+      - name: Install the CI tools lock into its own throwaway venv, every hash required
+        # Punch 623: the scan and SBOM jobs install it with --no-deps, which
+        # never checks it is complete; this install resolves every dependency
+        # of every entry and refuses one the lock does not pin.
+        run: |
+          python -m venv "$RUNNER_TEMP/ci-tools-lock-venv"
+          "$RUNNER_TEMP/ci-tools-lock-venv/bin/python" -m pip install --no-cache-dir \
+            --disable-pip-version-check --require-hashes -r requirements-ci-tools.lock
+
+  pytest:
+    name: pytest tests/ (unit + pins)
+    # Self-hosted runner on the deploy host (podman-containerized). gcc + libffi-dev
+    # baked into the runner image; the sqlcipher3 manylinux wheel resolves
+    # without a source build. Runner user has NO sudo.
+    runs-on: ubuntu-latest
+    # 45, not 30 (2026-10-26): this job now takes 29m51s-30m20s (27m16s before
+    # 18ef0024), so a 30-minute limit cancelled runs by luck. The +2.7 min is
+    # UNDIAGNOSED: this job ignores tests/e2e, so 18ef0024's e2e split cannot be
+    # it; candidates are the subprocess tests added in 92815e63 / f023ceec. The
+    # --durations=25 below names the slowest tests on the next run. 45 keeps a
+    # hang bound with real margin. push-ci-shepherd.ps1 PerRunTimeoutMin must
+    # stay >= this + 10 (pinned in tests/test_push_ci_shepherd_matches_push_gate.py).
+    # finding_2026-10-26_unit_pin_job_runs_at_its_30min_timeout_edge.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history: tests/test_n477_discharge_partition_pin.py runs `git log`
+          # over named commits and FAILS (never skips) on a missing object. The
+          # default shallow checkout would turn it red (punch 536 fold, db F-R3-6).
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+
+      - name: Install project + dev + encryption (sqlcipher)
+        # Punch 511: everything this job installs comes from requirements-dev.lock
+        # with every hash required, then the project itself with --no-deps. The
+        # dev lock is requirements.lock's packages at the same versions plus the
+        # dev and encryption extras (pytest & co., the `sqlcipher3` manylinux
+        # wheel, so the encrypted-DB tests run instead of importorskip-skipping;
+        # the image builds SQLCipher from source, this is the wheel's build).
+        # Every PACKAGE installed here comes from the hashed lock on this runner,
+        # which shares a host with production, and the lock carries
+        # `--only-binary :all:`, so no package's sdist build runs here. Not
+        # everything is hashed: `pip install --no-deps -e .` still fetches the
+        # build backend (pyproject [build-system] requires, setuptools) from PyPI
+        # unhashed into pip's isolated build env (the punch-511 pin's SCOPE
+        # CAVEAT; devils-advocate panel D FIX-2). No `pip install --upgrade pip`: that was
+        # an unhashed PyPI install too, and the lock-hash-install job above runs
+        # a --require-hashes install under the bundled pip. Both locks are
+        # written by scripts/regen-lock.sh; tests/test_punch511_ci_installs_are_
+        # hash_locked_pin.py fails an unhashed install on any self-hosted job.
+        run: |
+          pip install --require-hashes -r requirements-dev.lock
+          pip install --no-deps -e .
+
+      - name: Confirm sqlcipher is importable at the recorded wheel version (fail loud if the wheel didn't land)
+        # Punch 624: an equality against vendor/ci-sqlcipher3-wheel.record, not a `4.` prefix.
+        # The record equals the `c sqlcipher` row of source-built.pins unless it carries a
+        # dated lag record, and the punch 624 pin holds both edges.
+        run: python -c "import sqlcipher3; rec=dict((k.strip(), w.strip()) for k, _, w in (l.partition(':') for l in open('vendor/ci-sqlcipher3-wheel.record') if l.strip() and not l.startswith('#'))); v=sqlcipher3.dbapi2.connect(':memory:').execute('PRAGMA cipher_version').fetchone(); print('sqlcipher', v); assert v and str(v[0]).split()[0] == rec['wheel-sqlcipher'], (v, rec['wheel-sqlcipher'])"
+
+      - name: Run the unit + pin suite
+        # the backlog  (2026-07-11 drain-helper root-cause fix)
+        # closes the audit-write drain wall-clock deadline as an
+        # event-driven signal via ``app.state._audit_pending_signal``
+        # fired from ``attach_audit_done_callback`` — wake latency
+        # drops from ~20ms fixed poll to microseconds under xdist_load
+        # scheduler starvation on the 4-vCPU self-hosted the deploy host runner.
+        # db-sme F1 (2026-07-11) — the ``-n 2`` interim from PUNCH-
+        # LIST  STAYS for now. The drain-helper fix eliminates
+        # the audit-write flake class #1-#4 but OTHER wall-clock
+        # deadlines in ``tests/test_web/`` (test_291_writer_queuefull
+        # drains, test_290 concurrent lock timing, test_db_threadpool,
+        # test_288 concurrent connection) can still starve under
+        # ``-n auto`` on this hardware. Flip to ``-n auto`` in a
+        # follow-up after 5 CI cycles green under ``-n 2`` OR after
+        # those other deadlines are event-driven.
+        #
+        # `-r sfE`: list every skip with its reason. Under `-q` the log
+        # otherwise shows only "N skipped", so nobody can tell from CI
+        # which tests did not run (2026-10-06, N-559 R3-O8-1).
+        run: python -m pytest tests/ -n 2 -q -r sfE --durations=25
+
+      - name: Per-test lines for the sqlcipher-gated tests (fail if they skipped)
+        # The suite above runs these with `-q`, which prints no per-test
+        # line, and they `importorskip("sqlcipher3")` (or a submodule such
+        # as "sqlcipher3.dbapi2"), so a run where they all skipped looks
+        # like a pass. The register quotes their result
+        # lines from CI (N-559 R3-O8-1), so print them with `-rA` here and
+        # fail the job if any of them did not run: any SKIPPED, XFAIL or
+        # XPASS line, whatever its reason (devils-advocate da-ev1006 F2: a
+        # reason-keyed match passes an arm skipped for any other reason).
+        # Nothing in these files skips or xfails once sqlcipher3 is
+        # installed. `--color=no` because the match is anchored at line
+        # start and PY_COLORS=1 (which overrides NO_COLOR) would put an
+        # escape code there and turn this step green on skips (da-ev1006
+        # F1, measured). The file set is discovered, not listed: a new
+        # gated file joins by using the same importorskip. The pattern
+        # accepts a dotted submodule: "sqlcipher3.dbapi2" was missed before
+        # (punch 560 panel), and test_n560_dbapi_error_funnel_ssot_pin.py
+        # fails if any sqlcipher3 importorskip falls outside this set. Keep discovery
+        # importorskip-only: test_sqlite_version_floor_ssot_pin.py skips
+        # legitimately in CI on an unset EMAIL_TRIAGE_PATH3_BASELINE. An
+        # empty set fails too.
+        shell: bash
+        run: |
+          mapfile -t files < <(grep -rlE --include='*.py' "importorskip\(\s*[\"']sqlcipher3(\.[A-Za-z_][A-Za-z0-9_]*)*[\"']" tests/ | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::found no test file that importorskips sqlcipher3; the discovery pattern no longer matches"
+            exit 1
+          fi
+          printf 'sqlcipher-gated test files (%d):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          out="${RUNNER_TEMP:-.}/sqlcipher-gated.out"
+          python -m pytest "${files[@]}" -q -rA --color=no 2>&1 | tee "$out"
+          if grep -E "^(SKIPPED|XFAIL|XPASS)" "$out"; then
+            echo "::error::a sqlcipher-gated test did not run (skipped, xfailed or xpassed); its runtime arms are unproven"
+            exit 1
+          fi

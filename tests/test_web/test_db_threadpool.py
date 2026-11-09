@@ -96,7 +96,7 @@ class TestDbCall:
         # gather preserves input order — also confirms arg routing.
         assert results == [0, 1, 2]
         assert max_overlap == 1, (
-            f"db_call must serialise — saw {max_overlap} "
+            f"db_call must serialise (#231) — saw {max_overlap} "
             "workers inside the shared-connection section at once"
         )
 

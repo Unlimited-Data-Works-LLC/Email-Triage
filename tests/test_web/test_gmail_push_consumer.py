@@ -162,6 +162,43 @@ class TestProcessPushItem:
         fake_provider.fetch_message.assert_not_awaited()
         assert get_gmail_watch(db, 1)["history_id"] == "200"
 
+    async def test_inactive_account_is_skipped_and_cursor_preserved(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Loop-5 census (N-62, DA HIGH-1): a DEACTIVATED account's push
+        item is NOT classified/acted — AND the Gmail history cursor is
+        PRESERVED (NOT advanced). The historyId is a whole-mailbox
+        watermark; advancing it past this un-fetched delta would lose the
+        mail permanently when the account is re-activated. Leaving it put
+        means re-activation re-walks from the last real processed point
+        (dedup-safe). No mail loss."""
+        _make_account(db)
+        _seed_watch(db, history_id="100")
+        # Deactivate the account.
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = 1")
+        db.commit()
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_push_item(
+                push_app,
+                {"email": "user@gmail.com", "history_id": "175",
+                 "account_id": 1},
+            )
+
+        # No live ingestion: no history walk, no fetch, no classify.
+        fake_provider.list_history.assert_not_awaited()
+        fake_provider.fetch_message.assert_not_awaited()
+        fake_classifier.classify.assert_not_awaited()
+        # Cursor PRESERVED at the last real processed point — re-activation
+        # re-walks (dedup-safe), so the inactive-window mail is NOT lost.
+        assert get_gmail_watch(db, 1)["history_id"] == "100"
+
     async def test_history_expired_falls_back_to_search(
         self, push_app, db, fake_provider, fake_classifier,
     ):
@@ -187,13 +224,139 @@ class TestProcessPushItem:
                 push_app, {"email": "user@gmail.com", "history_id": "999", "account_id": 1},
             )
 
-        # Bounded backfill widened to 7d / 200 (2026-04-29) so a
-        # full week of messages can be recovered after Gmail's
-        # cursor-retention window expires the start_history_id.
-        fake_provider.search.assert_awaited_once_with("newer_than:7d", limit=200)
+        # Bounded backfill widened to 7d (2026-04-29) so a full week of
+        # messages can be recovered after Gmail's cursor-retention window
+        # expires the start_history_id.  — fetch is CAP+1 (=201) as a
+        # saturation probe; we still enumerate at most CAP.
+        fake_provider.search.assert_awaited_once_with("newer_than:7d", limit=201)
         assert fake_provider.fetch_message.await_count == 1
         # Cursor advanced to the incoming historyId after the resync.
         assert get_gmail_watch(db, 1)["history_id"] == "999"
+        #  — a NON-saturated recovery sets no chip (1 < cap).
+        from email_triage.web._backfill_chip import get_backfill_capped
+        assert get_backfill_capped(db, 1) is None
+
+    async def test_history_expired_saturated_sets_chip(
+        self, push_app, db, fake_provider, fake_classifier, monkeypatch,
+    ):
+        """ — when the bounded backfill SATURATES the cap (the probe
+        fetch returns MORE than cap), the operator-visible chip is set so
+        the gap isn't silent. Cap is monkeypatched small to stay fast."""
+        from email_triage.providers.gmail_api import GmailHistoryExpiredError
+        import email_triage.web._backfill_chip as _bc
+        from email_triage.web._backfill_chip import get_backfill_capped
+
+        monkeypatch.setattr(_bc, "BACKFILL_CAP", 3)
+        _make_account(db)
+        _seed_watch(db, history_id="100")
+
+        fake_provider.list_history.side_effect = GmailHistoryExpiredError(
+            404, "historyId is too old", "/users/me/history",
+        )
+        # Probe (limit=cap+1=4) returns cap+1 ids → saturated. We still
+        # only enumerate the first cap (3).
+        fake_provider.search.return_value = ["m1", "m2", "m3", "m4"]
+        fake_provider.fetch_message.return_value = _fake_message("m1")
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_push_item(
+                push_app,
+                {"email": "user@gmail.com", "history_id": "999",
+                 "account_id": 1},
+            )
+
+        # Probe asked for cap+1; only cap messages were enumerated.
+        fake_provider.search.assert_awaited_once_with("newer_than:7d", limit=4)
+        assert fake_provider.fetch_message.await_count == 3
+        chip = get_backfill_capped(db, 1)
+        assert chip is not None
+        assert chip["kind"] == "gmail_history"
+        assert chip["recovered"] == 3  # reported as the cap, not cap+1
+
+    async def test_history_expired_exactly_cap_sets_no_chip(
+        self, push_app, db, fake_provider, fake_classifier, monkeypatch,
+    ):
+        """ false-positive guard (DA M1) — a gap holding EXACTLY cap
+        messages lost nothing (the probe returns cap, not cap+1), so NO
+        chip + NO alarming warning fire. Without the +1 probe this case
+        would have falsely cried 'mail may be un-triaged'."""
+        from email_triage.providers.gmail_api import GmailHistoryExpiredError
+        import email_triage.web._backfill_chip as _bc
+        from email_triage.web._backfill_chip import get_backfill_capped
+
+        monkeypatch.setattr(_bc, "BACKFILL_CAP", 3)
+        _make_account(db)
+        _seed_watch(db, history_id="100")
+
+        fake_provider.list_history.side_effect = GmailHistoryExpiredError(
+            404, "historyId is too old", "/users/me/history",
+        )
+        # Exactly cap available → probe (limit=4) returns 3 → NOT saturated.
+        fake_provider.search.return_value = ["m1", "m2", "m3"]
+        fake_provider.fetch_message.return_value = _fake_message("m1")
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_push_item(
+                push_app,
+                {"email": "user@gmail.com", "history_id": "999",
+                 "account_id": 1},
+            )
+
+        assert fake_provider.fetch_message.await_count == 3  # all 3 enumerated
+        assert get_backfill_capped(db, 1) is None  # no false alarm
+
+    async def test_history_expired_unsaturated_keeps_a_stored_chip(
+        self, push_app, db, fake_provider, fake_classifier,
+    ):
+        """Punch 854 — a non-saturated 7-day walk cannot reach mail an
+        EARLIER gap skipped, so a chip already stored survives it. This
+        path used to clear the chip."""
+        from email_triage.providers.gmail_api import GmailHistoryExpiredError
+        from email_triage.web._backfill_chip import (
+            BACKFILL_CAP, get_backfill_capped, mark_backfill_capped,
+        )
+
+        _make_account(db)
+        _seed_watch(db, history_id="100")
+        mark_backfill_capped(
+            db, 1, kind="gmail_history", window="last 7 days",
+            recovered=BACKFILL_CAP, source_mailbox="INBOX",
+        )
+        fake_provider.list_history.side_effect = GmailHistoryExpiredError(
+            404, "historyId is too old", "/users/me/history",
+        )
+        fake_provider.search.return_value = ["m-recent-1"]
+        fake_provider.fetch_message.return_value = _fake_message("m-recent-1")
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ), patch(
+            "email_triage.web.routers.ui._build_classifier_from_config",
+            return_value=fake_classifier,
+        ):
+            await _process_push_item(
+                push_app,
+                {"email": "user@gmail.com", "history_id": "999",
+                 "account_id": 1},
+            )
+
+        assert fake_provider.fetch_message.await_count == 1
+        chip = get_backfill_capped(db, 1)
+        assert chip is not None, "a 7-day walk erased an earlier gap's chip"
+        assert chip["kind"] == "gmail_history"
 
     async def test_hipaa_account_writes_no_access_event(
         self, push_app, db, fake_provider, fake_classifier,
@@ -457,6 +620,33 @@ class TestWatchRenewalSweep:
         assert w["history_id"] == "200"
         # expires_at moved forward past the original 12h mark.
         assert w["expires_at"] > soon
+
+    async def test_skips_inactive_account_watch(self, push_app, db, fake_provider):
+        """Loop-5 census: a DEACTIVATED account's expiring Gmail watch is
+        NOT re-registered — re-arming the push registration is exactly
+        what would resurrect live PHI ingestion for a paused account."""
+        _make_account(db)
+        soon = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        upsert_gmail_watch(
+            db,
+            account_id=1,
+            email_address="user@gmail.com",
+            topic_name="projects/test/topics/gmail-push",
+            history_id="100",
+            expires_at=soon,
+        )
+        db.execute("UPDATE email_accounts SET is_active = 0 WHERE id = 1")
+        db.commit()
+
+        with patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ):
+            await _run_watch_renewal_sweep(push_app, window_hours=48)
+
+        fake_provider.register_watch.assert_not_awaited()
+        # The watch row is untouched (left to expire on its own clock).
+        assert get_gmail_watch(db, 1)["expires_at"] == soon
 
     async def test_skips_watches_outside_window(self, push_app, db, fake_provider):
         _make_account(db)

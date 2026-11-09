@@ -19,6 +19,7 @@ parked per-message failure. Covered here:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -41,7 +42,7 @@ from email_triage.web.db import (
 
 @pytest.fixture
 def conn() -> sqlite3.Connection:
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     yield c
     c.close()
 
@@ -154,6 +155,45 @@ async def test_recover_re_fetches_and_re_triages(
     assert triaged["msg_id"] == "42"
     fake_provider.fetch_message.assert_awaited_once()
     fake_provider.close.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_imap_empty_fetch_verifies_expunge(
+    monkeypatch, conn, account_id,
+):
+    """Verified split (2026-06-19): an IMAP re-fetch that comes back COMPLETELY
+    empty is classified by VERIFYING the UID. Confirmed-absent (uid_exists
+    False) -> benign ``message_expunged``; still-present (True) or unverifiable
+    (None) -> ``message_gone`` so the spike fail-safe keeps watching a real
+    fetch degradation that returns empty for mail that is actually there."""
+    from email_triage.web import app as app_mod
+    from email_triage.web.routers import ui as ui_mod
+
+    async def _run(uid_exists_val, expected):
+        retry_id = enqueue_retry(
+            conn, account_id=account_id, provider_type="imap",
+            mailbox="INBOX", uid=42, uidvalidity=111,
+            error_class="TimeoutError", error_msg="x",
+        )
+        row = get_retry(conn, retry_id)
+        empty = _msg("42", sender="", body_text="", body_html="", headers={})
+        fake = MagicMock()
+        fake.get_uidvalidity = AsyncMock(return_value=111)
+        fake.fetch_message = AsyncMock(return_value=empty)
+        fake.uid_exists = AsyncMock(return_value=uid_exists_val)
+        fake.close = AsyncMock()
+        monkeypatch.setattr(
+            ui_mod, "_create_provider_from_account",
+            lambda acct, secrets, **kw: fake,
+        )
+        app = _make_app(conn)
+        verdict = await app_mod._recover_one_retry_row(app, row)
+        assert verdict == expected, (uid_exists_val, verdict)
+        fake.uid_exists.assert_awaited_once()
+
+    await _run(False, "dead:message_expunged")  # confirmed gone -> benign
+    await _run(True, "dead:message_gone")        # still present -> keep fail-safe
+    await _run(None, "dead:message_gone")        # unverifiable -> conservative
 
 
 @pytest.mark.asyncio
@@ -425,7 +465,7 @@ async def test_recover_llm_down_returns_llm_unreachable_verdict(
 
     async def _llm_down_triage(ctx, message, msg_id, **kw):
         raise LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
 
     monkeypatch.setattr(t1_mod, "triage_single_message", _llm_down_triage)
@@ -459,7 +499,7 @@ async def test_recover_llm_down_subclass_returns_llm_unreachable_verdict(
     _patch_recover_provider(monkeypatch)
 
     async def _llm_down_triage(ctx, message, msg_id, **kw):
-        raise _DerivedUnreachable(backend="ollama", host="llm-host", port=11434)
+        raise _DerivedUnreachable(backend="ollama", host="llm-host.invalid", port=11434)
 
     monkeypatch.setattr(t1_mod, "triage_single_message", _llm_down_triage)
 
@@ -503,7 +543,7 @@ async def test_sweeper_reenqueues_llm_down_row_with_failure_kind(
 
     async def _llm_down_triage(ctx, message, msg_id, **kw):
         raise LLMBackendUnreachableError(
-            backend="ollama", host="llm-host", port=11434,
+            backend="ollama", host="llm-host.invalid", port=11434,
         )
 
     monkeypatch.setattr(t1_mod, "triage_single_message", _llm_down_triage)
@@ -595,3 +635,129 @@ async def test_sweeper_ordinary_retry_preserves_existing_failure_kind(
     # and COALESCE keeps the original.
     assert row["failure_kind"] == "llm_unreachable"
     assert app.state.watcher_retry_sweep_status["re_enqueued"] == 1
+
+
+# ---------------------------------------------------------------------------
+# census run15 #4 — the retry drainer routes its credentialed re-fetch outcome
+# through the auth_stale lifecycle funnel (record_provider_outcome): CLEAR on a
+# successful re-fetch (PD#18 clear edge), SET on an auth-revoked one (set edge),
+# and NEITHER on an ordinary transient failure (the funnel needle-filters).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_recover_success_clears_auth_stale_chip(
+    monkeypatch, conn, account_id,
+):
+    """A successful re-fetch is a healthy credentialed call → the drainer must
+    CLEAR any prior auth_stale re-auth chip. Before the fix it re-fetched
+    without touching the chip, so a row that drained AFTER the token recovered
+    left the 'Re-authenticate required' chip stuck."""
+    from email_triage.web import app as app_mod
+    from email_triage.web import triage_one as t1_mod
+    from email_triage.web.db import get_setting, set_setting
+    from email_triage.web.settings_keys import auth_stale as _auth_stale_key
+
+    retry_id = enqueue_retry(
+        conn, account_id=account_id, provider_type="imap",
+        mailbox="INBOX", uid=42, uidvalidity=111,
+        error_class="TimeoutError", error_msg="x",
+    )
+    row = get_retry(conn, retry_id)
+
+    # Pre-set the chip (a prior auth outage flagged this account).
+    key = _auth_stale_key(account_id)
+    set_setting(conn, key, {"at": "2026-06-21T00:00:00+00:00", "reason": "invalid_grant"})
+    assert get_setting(conn, key) is not None
+
+    _patch_recover_provider(monkeypatch)
+
+    async def _ok_triage(ctx, message, msg_id, **kw):
+        return SimpleNamespace(status="p", entry={})
+    monkeypatch.setattr(t1_mod, "triage_single_message", _ok_triage)
+
+    app = _make_app(conn)
+    verdict = await app_mod._recover_one_retry_row(app, row)
+    assert verdict == "done"
+    assert get_setting(conn, key) is None, (
+        "a successful re-fetch must CLEAR the auth_stale chip (PD#18 clear edge)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_auth_revoked_fetch_sets_auth_stale_chip(
+    monkeypatch, conn, account_id,
+):
+    """An auth-revoked re-fetch failure must SET the auth_stale chip through the
+    funnel (PD#18 set edge) so a dead token on the drainer path is not
+    invisible. The funnel needle-filters, so only an auth-revoked error flips
+    it."""
+    from email_triage.web import app as app_mod
+    from email_triage.web.routers import ui as ui_mod
+    from email_triage.web.db import get_setting
+    from email_triage.web.settings_keys import auth_stale as _auth_stale_key
+
+    retry_id = enqueue_retry(
+        conn, account_id=account_id, provider_type="imap",
+        mailbox="INBOX", uid=42, uidvalidity=111,
+        error_class="TimeoutError", error_msg="x",
+    )
+    row = get_retry(conn, retry_id)
+
+    fake = MagicMock()
+    fake.get_uidvalidity = AsyncMock(return_value=111)
+    # invalid_grant is an auth-revoked needle (web/_auth_revoked.py SSOT).
+    fake.fetch_message = AsyncMock(side_effect=Exception("invalid_grant"))
+    fake.close = AsyncMock()
+    monkeypatch.setattr(
+        ui_mod, "_create_provider_from_account",
+        lambda acct, secrets, **kw: fake,
+    )
+    monkeypatch.setattr(ui_mod, "_is_dry_run", lambda db: False)
+
+    key = _auth_stale_key(account_id)
+    assert get_setting(conn, key) is None
+
+    app = _make_app(conn)
+    verdict = await app_mod._recover_one_retry_row(app, row)
+    assert verdict == "retry"
+    assert get_setting(conn, key) is not None, (
+        "an auth-revoked re-fetch must SET the auth_stale chip (PD#18 set edge)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_transient_fetch_does_not_set_chip(
+    monkeypatch, conn, account_id,
+):
+    """A plain transient re-fetch failure (NOT auth-revoked) must NOT set the
+    chip — the funnel needle-filters. Guards against over-flagging a healthy
+    account on an ordinary network blip."""
+    from email_triage.web import app as app_mod
+    from email_triage.web.routers import ui as ui_mod
+    from email_triage.web.db import get_setting
+    from email_triage.web.settings_keys import auth_stale as _auth_stale_key
+
+    retry_id = enqueue_retry(
+        conn, account_id=account_id, provider_type="imap",
+        mailbox="INBOX", uid=42, uidvalidity=111,
+        error_class="TimeoutError", error_msg="x",
+    )
+    row = get_retry(conn, retry_id)
+
+    fake = MagicMock()
+    fake.get_uidvalidity = AsyncMock(return_value=111)
+    fake.fetch_message = AsyncMock(side_effect=TimeoutError("read timed out"))
+    fake.close = AsyncMock()
+    monkeypatch.setattr(
+        ui_mod, "_create_provider_from_account",
+        lambda acct, secrets, **kw: fake,
+    )
+    monkeypatch.setattr(ui_mod, "_is_dry_run", lambda db: False)
+
+    key = _auth_stale_key(account_id)
+    app = _make_app(conn)
+    verdict = await app_mod._recover_one_retry_row(app, row)
+    assert verdict == "retry"
+    assert get_setting(conn, key) is None, (
+        "a transient (non-auth) re-fetch must NOT flag auth_stale"
+    )

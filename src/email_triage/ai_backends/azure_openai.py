@@ -28,10 +28,10 @@ bottom of this file).
 HTTP transport choice — httpx, not the openai SDK
 -------------------------------------------------
 The codebase's established pattern is raw httpx (see Ollama, Gemini,
-OpenAI-compat, embedding-backend). ``openai`` is an OPTIONAL
-dependency (``pyproject.toml`` ``[project.optional-dependencies]``); a
-fresh install does not have it. Mirror that pattern for portability +
-to keep the cold-import surface small.
+OpenAI-compat, embedding-backend). The ``openai`` SDK is not a
+dependency of this project (its ``openai`` extra was removed in punch
+489, 2026-10-18); nothing imports it. Mirror that pattern for
+portability + to keep the cold-import surface small.
 
 api-version choice — 2024-10-21
 -------------------------------
@@ -54,12 +54,13 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
-from urllib.parse import urlsplit
+from email_triage._secret_scrub import strip_url_query_secrets as _strip_sensitive_query_params
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.classify.base import JsonChatClassifier
 
-logger = logging.getLogger("email_triage.ai_backends.azure_openai")
+logger = get_logger("email_triage.ai_backends.azure_openai")  # N-196b R21_4
 
 # Default api-version. Operator can override via the ``ai_backends``
 # row; this constant is the "what shipped when this adapter was
@@ -130,39 +131,7 @@ class AzureOpenAIAuthError(AzureOpenAIError):
     """Raised when Azure rejects the api-key (401 / 403)."""
 
 
-def _strip_sensitive_query_params(url: str) -> str:
-    """Remove ``api-key`` / ``key`` / ``token`` query params from URL.
-
-    Belt-and-suspenders: today the adapter never puts the key in the
-    URL (it goes in the ``api-key`` header), but third-party Azure
-    samples sometimes show ``?api-key=...`` patterns; a future
-    refactor that copy-pastes from one of those samples would
-    introduce a leak. Strip at error-render time so a leaked URL
-    can't surface plaintext in logs.
-    """
-    if not url or "?" not in url:
-        return url
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return url
-    sensitive = {"api-key", "key", "token", "access_token", "code"}
-    pairs = []
-    for raw in parts.query.split("&"):
-        if not raw:
-            continue
-        k, _, _v = raw.partition("=")
-        if k.lower() in sensitive:
-            pairs.append(f"{k}=REDACTED")
-        else:
-            pairs.append(raw)
-    new_query = "&".join(pairs)
-    return f"{parts.scheme}://{parts.netloc}{parts.path}" + (
-        f"?{new_query}" if new_query else ""
-    )
-
-
-from email_triage.ai_backends.base import BackendAdapter
+from email_triage.ai_backends.base import BackendAdapter, meter_chat_complete
 
 
 class AzureOpenAIAdapter(BackendAdapter):
@@ -254,7 +223,7 @@ class AzureOpenAIAdapter(BackendAdapter):
         # instance, reused across every chat_complete() call instead of
         # a fresh AsyncClient (TLS handshake) per call. Mirrors the
         # classify/* cloud classifiers and OllamaClassifier.
-        self._http = LazyHttpClient(timeout=timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
 
     async def close(self) -> None:
         """Drain the pooled HTTP client (BackendAdapter.close override)."""
@@ -264,6 +233,7 @@ class AzureOpenAIAdapter(BackendAdapter):
     # Canonical W1-A method
     # ------------------------------------------------------------------
 
+    @meter_chat_complete  # N-194b R21_9: et_llm_chat_seconds metric
     async def chat_complete(
         self,
         messages: list[dict[str, Any]],
@@ -425,6 +395,12 @@ class AzureOpenAIAdapter(BackendAdapter):
                 payload,
                 url,
             )
+        #  silent-truncation guard (shared SSOT).
+        from email_triage.llm_truncation import warn_if_llm_truncated
+        warn_if_llm_truncated(
+            payload, family="openai", model=str(payload.get("model") or ""),
+            context="chat_complete", logger=logger,
+        )
         content = (
             choices[0].get("message", {}).get("content")
             or ""

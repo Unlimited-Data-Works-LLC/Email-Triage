@@ -32,18 +32,26 @@ import pytest
 
 _REDIS_URL = os.environ.get("EMAIL_TRIAGE_TEST_REDIS_URL", "")
 
+pytestmark = pytest.mark.allow_outbound_network(
+    reason="manual integration test: talks to the live Redis named by "
+           "$EMAIL_TRIAGE_TEST_REDIS_URL, and skips when that is unset")
+
 
 def _redis_or_skip():
     """Skip the test cleanly unless a usable Redis is reachable."""
     if not _REDIS_URL:
         pytest.skip("EMAIL_TRIAGE_TEST_REDIS_URL not set")
+    # run17  — this reachability probe was the realised 4th fork of the
+    # ``from_url`` params (``socket_timeout=5``, no connect-timeout / decode).
+    # It now builds through the factory SSOT, passing the more-tolerant 5 s
+    # probe timeout as an EXPLICIT override (the factory supplies the canonical
+    # decode/connect-timeout params), so the param set can no longer drift here.
+    from email_triage.cache._redis import build_redis_client
     try:
-        import redis
+        client = build_redis_client(_REDIS_URL, socket_timeout=5)
+        client.ping()
     except ImportError:
         pytest.skip("redis client library not installed")
-    try:
-        client = redis.Redis.from_url(_REDIS_URL, socket_timeout=5)
-        client.ping()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Redis not reachable at {_REDIS_URL}: {exc}")
     return client

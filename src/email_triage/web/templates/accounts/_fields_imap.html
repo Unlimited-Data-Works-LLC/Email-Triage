@@ -20,12 +20,21 @@
     <div class="grid">
         <label>
             Host{{ m.help("The IMAP server's address. Example: imap.gmail.com for Gmail, outlook.office365.com for Office 365, mail.fastmail.com for Fastmail. Your provider's IMAP help page lists this.") }}
-            <input type="text" name="host" value="{{ acct.config.host or acct.config.get('host', '') if acct is defined else '' }}" required
-                   placeholder="mail.example.com">
+            {{ m.combo_input(
+                "host",
+                acct.config.host or acct.config.get('host', '') if acct is defined else '',
+                ["imap.gmail.com", "outlook.office365.com", "mail.fastmail.com", "imap.aol.com", "imap.mail.yahoo.com"],
+                placeholder="mail.example.com",
+                attrs="required") }}
         </label>
         <label>
             Port{{ m.help("The IMAP server port. 993 for SSL/TLS (default and recommended), 143 for plain (avoid).") }}
-            <input type="number" name="port" value="{{ acct.config.port or acct.config.get('port', 993) if acct is defined else 993 }}" required>
+            {{ m.combo_input(
+                "port",
+                acct.config.port or acct.config.get('port', 993) if acct is defined else 993,
+                ["993", "143"],
+                type="number",
+                attrs="required min=1 max=65535") }}
         </label>
     </div>
     <div class="grid">
@@ -43,8 +52,7 @@
     <div class="grid">
         <label>
             Password{{ m.help("Your IMAP password. For Gmail / Outlook / Fastmail and most modern providers this needs to be an APP password — not your regular login password — because of two-factor authentication. Generate one in your provider's account-security page.") }}
-            <input type="password" name="password" value=""
-                   placeholder="{{ '********' if (acct is defined and acct.get('has_password', false)) else 'Enter password' }}">
+            {{ m.secret_input("password", (acct is defined and acct.get('has_password', false)), "Enter password") }}
             {% if acct is defined and acct.get('has_password', false) %}
             <small>Leave blank to keep existing password.</small>
             {% endif %}
@@ -55,6 +63,29 @@
             <input type="checkbox" name="use_ssl" value="1"
                    {% if acct is not defined or acct.config.get('use_ssl', true) %}checked{% endif %}>
             Use SSL/TLS{{ m.help("Connect with TLS encryption from the start. Leave on for port 993 (the default). Turn off only when the server doesn't support TLS — rare and not recommended.") }}
+        </label>
+    </div>
+    {# Operator certificate modes (2026-10-21): this account's override of the
+       install-wide certificate setting. "Use the install-wide setting" stores
+       nothing. #}
+    {% set _cc = acct.config.get('cert_check') if acct is defined else none %}
+    {% set _ce = acct.config.get('cert_enforce') if acct is defined else none %}
+    <div style="margin:0.5rem 0;">
+        <label>
+            Check the server's certificate{{ m.help("Confirms you are talking to your real mail server. Leave on the install-wide setting unless you are setting up or troubleshooting this account. Off connects without checking.") }}
+            <select name="cert_check" style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        <option value="inherit" {% if _cc is none %}selected{% endif %}>Use the install-wide setting</option>
+                        <option value="on" {% if _cc is sameas true %}selected{% endif %}>On</option>
+                        <option value="off" {% if _cc is sameas false %}selected{% endif %}>Off</option>
+                    </select>
+        </label>
+        <label>
+            Refuse the connection if the check fails{{ m.help("On: a certificate that does not check out stops the connection, with the server's name in the error. Off: the problem is logged and the connection goes ahead.") }}
+            <select name="cert_enforce" style="margin:0;padding:0.25rem 0.5rem;font-size:0.9rem;">
+                        <option value="inherit" {% if _ce is none %}selected{% endif %}>Use the install-wide setting</option>
+                        <option value="on" {% if _ce is sameas true %}selected{% endif %}>On</option>
+                        <option value="off" {% if _ce is sameas false %}selected{% endif %}>Off</option>
+                    </select>
         </label>
     </div>
     {# 2026-05-13 — Drafts folder override. When email-triage saves

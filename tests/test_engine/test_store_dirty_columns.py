@@ -23,12 +23,16 @@ the column-list is what proves the SQLite I/O was actually skipped.
 
 from __future__ import annotations
 
+import re
+
 from email_triage.engine.models import (
     Classification,
     FlowState,
     FlowStatus,
 )
 from email_triage.engine.store import FlowStore
+
+from _db_tracking import track
 
 
 def _trace(conn):
@@ -57,17 +61,39 @@ def _last_update_sql(captured: list[str]) -> str:
     return updates[-1]
 
 
+# -followup-A hardening (2026-07-11): Python 3.13's ``sqlite3.set_trace_callback``
+# INLINES bound parameter values into the rendered SQL string. Substring
+# assertions like ``"classification_json" in sql`` false-positive when a
+# bound value happens to contain the column-name string (e.g. a JSON blob
+# whose keys look like column names). Column-membership checks now route
+# through ``_written_columns(sql)`` which parses the SET clause and
+# returns the set of left-hand-side names — a bound value on the RHS
+# cannot pollute it.
+_SET_LHS_RE = re.compile(r"(?:^\s*|,\s*)(\w+)\s*=", re.MULTILINE)
+
+
+def _written_columns(sql: str) -> set[str]:
+    """Extract the set of column names on the LEFT-HAND side of an
+    UPDATE statement's ``SET`` clause. Robust against bound values that
+    happen to contain a column-name substring."""
+    m = re.search(r"\bSET\b(.*?)(?:\bWHERE\b|$)", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return set()
+    return set(_SET_LHS_RE.findall(m.group(1).strip()))
+
+
 class TestDirtyColumnSkip:
     def test_no_op_update_skips_all_4_json_columns(self, tmp_path):
         """Load a flow, change nothing, ``update_flow`` — SQL must
         NOT contain any of the 4 JSON column names. Pre-#274 all 4
         were always present."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
 
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
+        written = _written_columns(sql)
 
         for col in (
             "classification_json",
@@ -75,20 +101,20 @@ class TestDirtyColumnSkip:
             "actions_pending_json",
             "state_bag_json",
         ):
-            assert col not in sql, (
+            assert col not in written, (
                 f"no-op update should NOT write {col}; SQL was:\n{sql}"
             )
         # Sanity: status / revision / error / updated_at always write.
-        # Note: sqlite3.set_trace_callback inlines bound parameters in
-        # the rendered SQL on Python 3.13, so we check for the column
-        # name rather than the literal ``?`` placeholder.
-        assert "status =" in sql
+        assert "status" in written
+        # revision uses a scalar RHS expression (revision + 1), which
+        # is checked as a literal — the SET-clause parser above only
+        # tracks LHS column names.
         assert "revision = revision + 1" in sql
 
     def test_classification_scalar_reassign_caught(self, tmp_path):
         """Reassigning ``flow.classification`` (None → real value)
         must include classification_json in the UPDATE."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
         flow.classification = Classification(
             category="to-respond", confidence=0.9,
@@ -98,59 +124,61 @@ class TestDirtyColumnSkip:
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
-        assert "classification_json =" in sql
-        # Other 3 unchanged → not in SQL.
-        assert "actions_completed_json" not in sql
-        assert "actions_pending_json" not in sql
-        assert "state_bag_json" not in sql
+        written = _written_columns(sql)
+        assert "classification_json" in written
+        # Other 3 unchanged → not in the SET clause.
+        assert "actions_completed_json" not in written
+        assert "actions_pending_json" not in written
+        assert "state_bag_json" not in written
 
     def test_actions_completed_in_place_append_caught(self, tmp_path):
         """In-place ``.append()`` is the failure mode dirty-flag-on-
         __setattr__ would miss. Baseline-compare catches it because
         the serialized form changes."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
         flow.actions_completed.append("labeled")
 
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
-        assert "actions_completed_json =" in sql
+        written = _written_columns(sql)
+        assert "actions_completed_json" in written
         # Sibling columns unchanged.
-        assert "classification_json" not in sql
-        assert "state_bag_json" not in sql
+        assert "classification_json" not in written
+        assert "state_bag_json" not in written
 
     def test_state_bag_in_place_setitem_caught(self, tmp_path):
         """``flow.state_bag["k"] = "v"`` is the most common mutation
         shape — every action's ``record_action_output`` does it.
         Must be caught."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
         flow.state_bag["action_results"] = {"label": "ok"}
 
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
-        assert "state_bag_json =" in sql
+        assert "state_bag_json" in _written_columns(sql)
 
     def test_state_bag_update_in_place_caught(self, tmp_path):
         """``flow.state_bag.update(other_dict)`` — the engine/flow.py
         precedent at line 183."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
         flow.state_bag.update({"foo": "bar", "baz": 42})
 
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
-        assert "state_bag_json =" in sql
+        assert "state_bag_json" in _written_columns(sql)
 
     def test_baseline_rebased_after_update(self, tmp_path):
         """Two updates in a row: first mutates state_bag (column
         dirty), second changes nothing (column clean). The second
         update must NOT re-write state_bag — proves the baseline was
         rebased after the first persist."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = _new_flow(store)
 
         # First update: dirties state_bag.
@@ -164,14 +192,15 @@ class TestDirtyColumnSkip:
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
+        written = _written_columns(sql)
 
         # state_bag was dirtied in the FIRST update but NOT the
         # second; baseline must have rebased so it's clean now.
-        assert "state_bag_json" not in sql, (
+        assert "state_bag_json" not in written, (
             f"baseline did not rebase post-write — second update "
             f"falsely re-wrote state_bag_json. SQL:\n{sql}"
         )
-        assert "status =" in sql
+        assert "status" in written
 
     def test_no_baseline_safe_fails_to_all_dirty(self, tmp_path):
         """A FlowState whose ``_baseline`` attr is absent (e.g. a
@@ -181,7 +210,7 @@ class TestDirtyColumnSkip:
         preserve the pre-fix contract for test-constructed flows
         AND for any external code path that hand-builds a FlowState
         (e.g. cycle 6's ingestion path before the round-trip)."""
-        store = FlowStore(":memory:")
+        store = track(FlowStore(":memory:"))
         flow = store.create_flow(message_id="m-baseline", provider="test")
         # Strip the baseline that create_flow stamped to simulate a
         # hand-built path.
@@ -196,6 +225,7 @@ class TestDirtyColumnSkip:
         captured = _trace(store._conn)
         store.update_flow(flow, expected_revision=flow.revision)
         sql = _last_update_sql(captured)
+        written = _written_columns(sql)
 
         # All 4 JSON columns should be in the UPDATE — safe-fail to
         # pre-fix behavior.
@@ -205,7 +235,7 @@ class TestDirtyColumnSkip:
             "actions_pending_json",
             "state_bag_json",
         ):
-            assert col in sql, (
+            assert col in written, (
                 f"no-baseline safe-fail should write {col} (treat "
                 f"all-dirty); SQL was:\n{sql}"
             )

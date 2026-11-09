@@ -14,6 +14,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import json
 import sqlite3
@@ -31,7 +32,7 @@ from email_triage.web.db import init_db
 
 @pytest.fixture
 def db(tmp_path):
-    conn = init_db(str(tmp_path / "acme_jobs_test.db"))
+    conn = track(init_db(str(tmp_path / "acme_jobs_test.db")))
     yield conn
     conn.close()
 
@@ -86,7 +87,7 @@ def test_migration_creates_phase_index(db):
 def test_start_inserts_row_with_starting_phase(db):
     job_id = acme_job_state.start(
         domains=["a.example.com", "b.example.com"],
-        directory_url="https://acme-staging/",
+        directory_url="https://acme-staging.invalid/",
         max_attempts=3,
         actor_user_id=42,
     )
@@ -264,7 +265,7 @@ def test_resume_marks_recent_order_as_resume_pending(db):
         domains=["x.test"], directory_url="d", max_attempts=2,
     )
     acme_job_state.transition(
-        "publishing", attempt=1, order_url="https://le/order/abc",
+        "publishing", attempt=1, order_url="https://le.invalid/order/abc",
     )
     acme_job_state.reset()
     resolved = acme_job_state.resume_on_startup()
@@ -285,7 +286,7 @@ def test_resume_marks_stale_order_as_cancelled(db):
         domains=["x.test"], directory_url="d", max_attempts=1,
     )
     acme_job_state.transition(
-        "publishing", attempt=1, order_url="https://le/order/old",
+        "publishing", attempt=1, order_url="https://le.invalid/order/old",
     )
     # Wind started_at backwards by faking the row.
     db.execute(
@@ -312,7 +313,7 @@ def test_resume_honours_pre_kill_cancel_request(db):
         domains=["x.test"], directory_url="d", max_attempts=2,
     )
     acme_job_state.transition(
-        "publishing", attempt=1, order_url="https://le/order/x",
+        "publishing", attempt=1, order_url="https://le.invalid/order/x",
     )
     acme_job_state.request_cancel()
     acme_job_state.reset()
@@ -331,7 +332,7 @@ def test_adopt_persisted_loads_into_ram(db):
         domains=["x.test"], directory_url="d", max_attempts=2,
     )
     acme_job_state.transition(
-        "polling_local", attempt=1, order_url="https://le/order/x",
+        "polling_local", attempt=1, order_url="https://le.invalid/order/x",
     )
     acme_job_state.reset()
     assert acme_job_state.current_state()["job_id"] is None

@@ -1,6 +1,6 @@
 """Bulk-operation helpers for mail.
 
-The OpenClaw endpoints (and any future internal caller) use these to
+The webhook API endpoints (and any future internal caller) use these to
 apply a single operation across a list of message ids, gathering
 per-item results without aborting on the first failure.
 """
@@ -40,10 +40,33 @@ async def _apply_one(
     operation: str,
     args: dict,
     message_id: str,
+    *,
+    hipaa: bool = False,
 ) -> BulkItemResult:
     try:
         if operation == "label":
-            await provider.apply_label(message_id, args["label"])
+            # §164.502(e) egress gate via the provider-label SSOT.
+            # Defense-in-depth: the only caller (the webhook-API bulk
+            # endpoint) already 403s a HIPAA account at
+            # ``_require_webhook_account`` before bulk runs, so for a
+            # HIPAA account this is unreachable in practice — but routing
+            # through the SSOT means that if that upstream block is ever
+            # removed, the per-write gate still holds (fail-closed).
+            from email_triage.actions.provider_labels import push_provider_labels
+
+            applied, skipped, errors = await push_provider_labels(
+                provider, message_id, [args["label"]], hipaa=hipaa,
+            )
+            if errors:
+                return BulkItemResult(
+                    message_id=message_id, status="error",
+                    error="; ".join(f"{lbl}: {d}" for lbl, d, _ in errors),
+                )
+            if skipped and not applied:
+                return BulkItemResult(
+                    message_id=message_id, status="skipped",
+                    data={"reason": "hipaa_mode" if hipaa else "labels_unsupported"},
+                )
             return BulkItemResult(message_id=message_id, status="ok")
         if operation == "move":
             await provider.move_message(message_id, args["folder"])
@@ -71,20 +94,22 @@ async def bulk_apply(
     operation: str,
     args: dict | None,
     message_ids: list[str],
+    *,
+    hipaa: bool = False,
 ) -> BulkResult:
     """Run ``operation`` against each id; aggregate per-item results.
 
     Items run sequentially — providers vary in their tolerance for
     parallel writes (Gmail labels are forgiving; IMAP keyword stores
     on a single connection are not). Sequential is also predictable
-    for the rate-limit budget on the OpenClaw side.
+    for the rate-limit budget on the webhook side.
     """
     args = args or {}
-    t0 = time.time()
+    t0 = time.monotonic()
     items: list[BulkItemResult] = []
     for mid in message_ids:
-        items.append(await _apply_one(provider, operation, args, mid))
-    elapsed = time.time() - t0
+        items.append(await _apply_one(provider, operation, args, mid, hipaa=hipaa))
+    elapsed = time.monotonic() - t0
     succeeded = sum(1 for it in items if it.status == "ok")
     failed = sum(1 for it in items if it.status == "error")
     return BulkResult(

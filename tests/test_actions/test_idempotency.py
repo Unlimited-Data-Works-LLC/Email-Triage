@@ -6,6 +6,7 @@ escalate, notify, and label (audit-only).
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -213,7 +214,7 @@ async def test_escalate_skips_on_retry(monkeypatch):
     cls = _make_classification()
 
     smtp_cfg = MagicMock()
-    smtp_cfg.host = "smtp.example.com"
+    smtp_cfg.host = "smtp.example.invalid"
     smtp_cfg.port = 587
     smtp_cfg.username = "u"
     smtp_cfg.from_addr = "from@example.com"
@@ -304,7 +305,7 @@ def idem_db(tmp_path):
     table) for the durable-idempotency tests. Seeds user 1 so
     create_email_account satisfies the email_accounts.user_id FK."""
     from email_triage.web.db import init_db
-    conn = init_db(tmp_path / "idem.db")
+    conn = track(init_db(tmp_path / "idem.db"))
     conn.execute(
         "INSERT INTO users (email, name, role, created_at) "
         "VALUES ('pi@example.com', 'PI', 'admin', ?)",
@@ -319,7 +320,7 @@ def _make_account(conn) -> int:
     from email_triage.web.db import create_email_account
     return create_email_account(
         conn, user_id=1, name="acct", provider_type="imap",
-        config={"host": "imap.example.com"},
+        config={"host": "imap.example.invalid"},
     )
 
 

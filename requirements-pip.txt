@@ -1,0 +1,11 @@
+# The image's own pip, hash-pinned (Containerfile runtime stage; N-553, N-621).
+# The admin Install runs `sys.executable -m pip install` inside the PHI container,
+# so this pip ships in the image. 26.2.2 vendors certifi 2026.10.19; 26.2.1 vendored
+# 2026.06.17, inside GHSA-6q48-6c7w-9gw2. Hashes: PyPI JSON digests for 26.2.2,
+# cross-checked by `pip download` + sha256sum (2026-10-20).
+# One hand-kept pin, not a pip-compile lock, and named outside requirements*.lock on
+# purpose: tests/test_n545_lock_describes_the_image_ssot_pin.py reads those as
+# compiled locks with a generator header.
+pip==26.2.2 \
+    --hash=sha256:3a8e5c800492787f33a4114ef54444546c340df428974ebba17e0fd47e11af2f \
+    --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70

@@ -57,7 +57,8 @@ def _make_db_full() -> sqlite3.Connection:
     """Bring up the full schema via init_db so every helper this
     module pokes at has the columns / settings rows it needs."""
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:
@@ -185,7 +186,7 @@ def _make_classification() -> Classification:
 
 class TestBackendAllowlists:
     """The two allowlists are the privacy-critical constants for M-4
-    and M-5. Future commits that reach for OpenAI / Gemini / Anthropic
+    and M-5. Future commits that reach for OpenAI / Gemini / AI provider
     embeddings should land on a pre-failed test, not a green merge.
     """
 
@@ -193,17 +194,15 @@ class TestBackendAllowlists:
     # local-only additions for the AI Backends feature:
     #   * "sentence_transformers" — in-process CPU embedder, no
     #     network hop, no external service.
-    #   * "fallback" — composite wrapper that re-validates both of
-    #     its wrapped members against this same allowlist at
-    #     construction, so a non-local backup can't sneak in via
-    #     the YAML fallback key.
-    # Each addition was a conscious privacy decision; the test below
-    # forces ANY future expansion to land on a pre-failed test the
-    # same way.
+    # 2026-10-01 (punch 552 / N-555) — "fallback" (the composite
+    # primary+backup wrapper) REMOVED with the chain: a backup embedder
+    # is a different model, its vectors never match the index, and it
+    # hid a refused primary. Each change here is a conscious decision;
+    # the test below forces ANY future expansion to land on a
+    # pre-failed test the same way.
     _PINNED_LOCAL_BACKENDS = (
         "ollama",
         "sentence_transformers",
-        "fallback",
     )
 
     def test_local_backends_constant_pinned(self):
@@ -628,7 +627,7 @@ class TestHipaaDraftReply:
 class TestNonLocalBackendRejection:
     """SentMailIndex.__init__ must refuse non-local backends. The
     sibling ``test_sent_mail_index.py`` covers the openai / gemini /
-    anthropic cases; this module pins the contract a second time so a
+    AI provider cases; this module pins the contract a second time so a
     future test-file deletion doesn't silently strip the guard."""
 
     @pytest.mark.parametrize("forbidden", [
@@ -672,8 +671,11 @@ class TestEmbeddingBackendFactoryAllowlist:
         with pytest.raises(ValueError) as excinfo:
             embedding_backend_mod.build_embedding_backend(cfg)
         # The error must name the rejected value AND the allowlist.
-        msg = str(excinfo.value)
-        assert forbidden in msg
+        # Case-insensitive + derived from the param: the publish sanitizer
+        # rewrites vendor tokens to a MIXED-CASE replacement while the code
+        # lowercases the backend, so a literal needle fails in the curated tree.
+        msg = str(excinfo.value).lower()
+        assert forbidden.lower() in msg
         assert "ollama" in msg
 
 
@@ -692,7 +694,7 @@ class TestEmbeddingBackendFactoryAllowlist:
 #     / M-7 — they stay hard-off (the opt-in is scoped to operator self-
 #     disclosure, not derivative-of-PHI surfaces).
 #
-# Companion drawer: internal documentation walks the per-layer
+# Companion drawer: docs/hipaa-audit.md walks the per-layer
 # audit; internal documentation carries the sign-off log entry.
 # ---------------------------------------------------------------------------
 

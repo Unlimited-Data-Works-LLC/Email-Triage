@@ -94,8 +94,8 @@
                         <span class="op-value">{{ health.uptime_secs | default(0) }} s</span>
                     </div>
                     <div class="op-row">
-                        <span class="op-label">last_triage {{ m.help("ISO timestamp of the most recent triage_runs row across every account. Compared against now() to derive the 'stale > 24h' degraded flag.") }}</span>
-                        <span class="op-value"><small>{{ health.last_triage or "—" }}</small></span>
+                        <span class="op-label">last_triage {{ m.help("Timestamp of the most recent triage_runs row across every account. Server-rendered as US-local; JS enhances to your browser's local timezone.") }}</span>
+                        <span class="op-value"><small>{% if health.last_triage %}<time datetime="{{ health.last_triage }}" data-us-datetime>{{ health.last_triage | us_datetime }}</time>{% else %}—{% endif %}</small></span>
                     </div>
                     <div class="op-row">
                         <span class="op-label">db {{ m.help("'ok' when a SELECT 1 on triage.db succeeds within the health budget; 'error' when the DB ping fails or times out.") }}</span>
@@ -154,10 +154,9 @@
                 <strong>Embedding backend</strong>
                 <small class="et-card-desc">
                     Vector embedder used for the recent-reply-examples
-                    retrieval + captured-edit-pair indexing. A
-                    ``fallback`` backend means a primary+backup chain
-                    is active; fires count is how often the backup
-                    absorbed a primary failure.
+                    retrieval + captured-edit-pair indexing. There is
+                    no fallback chain: a failing embedder shows here as
+                    errors.
                 </small>
             </header>
             <div class="et-card-body">
@@ -165,7 +164,6 @@
                 {% set _emb_life = _emb.lifetime or {} %}
                 {% set _life_ollama = _emb_life.ollama or {} %}
                 {% set _life_st = _emb_life.sentence_transformers or {} %}
-                {% set _life_fb = _emb_life.fallback or {} %}
                 <dl class="op-metrics" style="margin-bottom:0.4rem;">
                     <div class="op-row">
                         <span class="op-label">configured</span>
@@ -195,48 +193,18 @@
                         </tr>
                     </thead>
                     <tbody>
-                    {% if _em.backend_type == "fallback" %}
-                        {% set _pri = _em.primary or {} %}
-                        {% set _bak = _em.backup or {} %}
-                        <tr>
-                            <td><code>fallback_fires</code>{{ m.help("Count of times the primary embedder raised and the backup absorbed the call.") }}</td>
-                            <td style="text-align:right;">{% if _em.fallback_fires %}<strong style="color:var(--pico-color-amber-500);">{{ _em.fallback_fires }}</strong>{% else %}0{% endif %}</td>
-                            <td style="text-align:right;">{{ _life_fb.fires | default(0) }}</td>
-                        </tr>
-                        <tr>
-                            <td><code>primary.calls</code>{{ m.help("Successful embed_text calls into the primary backend.") }}</td>
-                            <td style="text-align:right;">{{ _pri.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _pri.avg_latency_ms | default(0) }} ms</small></td>
-                            <td style="text-align:right;">{{ _life_ollama.calls | default(0) }}{% if _life_ollama.calls and _life_ollama.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_life_ollama.latency_us_sum or 0) / (_life_ollama.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
-                        </tr>
-                        <tr>
-                            <td><code>primary.errors</code></td>
-                            <td style="text-align:right;">{% if _pri.errors %}<strong style="color:var(--pico-del-color);">{{ _pri.errors }}</strong>{% else %}0{% endif %}</td>
-                            <td style="text-align:right;">{{ _life_ollama.errors | default(0) }}</td>
-                        </tr>
-                        <tr>
-                            <td><code>backup.calls</code>{{ m.help("Successful embed_text calls into the backup backend (only fires when primary raises).") }}</td>
-                            <td style="text-align:right;">{{ _bak.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _bak.avg_latency_ms | default(0) }} ms</small></td>
-                            <td style="text-align:right;">{{ _life_st.calls | default(0) }}{% if _life_st.calls and _life_st.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_life_st.latency_us_sum or 0) / (_life_st.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
-                        </tr>
-                        <tr>
-                            <td><code>backup.errors</code></td>
-                            <td style="text-align:right;">{% if _bak.errors %}<strong style="color:var(--pico-del-color);">{{ _bak.errors }}</strong>{% else %}0{% endif %}</td>
-                            <td style="text-align:right;">{{ _life_st.errors | default(0) }}</td>
-                        </tr>
-                    {% else %}
-                        {# Single backend — match its namespace to the lifetime slice. #}
+                        {# Match the backend's namespace to the lifetime slice. #}
                         {% set _single_life = _life_ollama if _em.backend_type == "ollama" else (_life_st if _em.backend_type == "sentence_transformers" else {}) %}
                         <tr>
                             <td><code>calls</code></td>
                             <td style="text-align:right;">{{ _em.calls | default(0) }}<br><small style="color:var(--pico-muted-color);">avg {{ _em.avg_latency_ms | default(0) }} ms</small></td>
-                            <td style="text-align:right;">{{ _single_life.calls | default(0) }}{% if _single_life.calls and _single_life.latency_us_sum %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_single_life.latency_us_sum or 0) / (_single_life.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
+                            <td style="text-align:right;">{{ _single_life.calls | default(0) }}{% if (_single_life.calls | default(0)) and (_single_life.latency_us_sum | default(0)) %}<br><small style="color:var(--pico-muted-color);">avg {{ ((_single_life.latency_us_sum or 0) / (_single_life.calls or 1) / 1000) | round(0, 'floor') | int }} ms</small>{% endif %}</td>
                         </tr>
                         <tr>
                             <td><code>errors</code></td>
-                            <td style="text-align:right;">{% if _em.errors %}<strong style="color:var(--pico-del-color);">{{ _em.errors }}</strong>{% else %}0{% endif %}</td>
+                            <td style="text-align:right;">{% if _em.errors | default(0) %}<strong style="color:var(--pico-del-color);">{{ _em.errors }}</strong>{% else %}0{% endif %}</td>
                             <td style="text-align:right;">{{ _single_life.errors | default(0) }}</td>
                         </tr>
-                    {% endif %}
                     </tbody>
                 </table>
                 {% endif %}
@@ -510,7 +478,7 @@
             <tr>
                 <th>Account</th>
                 <th>Status</th>
-                <th style="text-align:right;">Processed</th>
+                <th style="text-align:right;">Processed <small style="color:var(--pico-muted-color);">(window)</small></th>
                 <th style="text-align:right;">Errors</th>
                 <th>Started</th>
             </tr>
@@ -529,9 +497,14 @@
                     {% endif %}
                 </td>
                 <td><code>{{ w.status }}</code></td>
-                <td style="text-align:right;">{{ w.processed }}</td>
+                {# N-411 anti-irony fold-in: count semantics differ per-provider
+                   (IMAP lifetime vs Gmail/O365 14-day rolling). Surface the
+                   window per-row so an operator comparing accounts side-by-side
+                   can't draw a false conclusion — exactly the operator-facing
+                   accuracy defect class N-411 exists to prevent. #}
+                <td style="text-align:right;">{{ w.processed }} <small style="color:var(--pico-muted-color);">({{ w.count_window or "?" }})</small></td>
                 <td style="text-align:right;">{{ w.errors }}</td>
-                <td><small>{{ w.started_at or "-" }}</small></td>
+                <td><small>{% if w.started_at %}<time datetime="{{ w.started_at }}" data-us-datetime>{{ w.started_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
             </tr>
             {% endfor %}
         </tbody>

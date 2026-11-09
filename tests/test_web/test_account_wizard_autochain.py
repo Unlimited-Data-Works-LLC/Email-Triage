@@ -108,7 +108,7 @@ class TestAutoChainStepTransitions:
             "/accounts/new/step2-imap",
             data={
                 "account_id": str(aid),
-                "host": "imap.example.com",
+                "host": "imap.example.invalid",
                 "port": "993",
                 "username": "user@example.com",
                 "password": "redacted-secret-string",
@@ -168,7 +168,8 @@ class TestAutoChainStepTransitions:
         assert r.status_code == 303
         loc = r.headers.get("location", "")
         # New auto-chain target: /accounts with a success flash.
-        assert loc.startswith("/accounts?success=")
+        # N-232b R25: routed through `_redirect.msg_qs` (wire shape `?msg=`).
+        assert loc.startswith("/accounts?msg=")
         # Banner mentions the account name so the operator confirms
         # the right mailbox was set up.
         assert "Operator+A" in loc or "Operator%20A" in loc
@@ -199,7 +200,7 @@ class TestAnonymousRedirects:
     def test_anonymous_step2_imap_redirects_login(self, client):
         r = client.post(
             "/accounts/new/step2-imap",
-            data={"account_id": "1", "host": "h", "username": "u"},
+            data={"account_id": "1", "host": "h.invalid", "username": "u"},
             follow_redirects=False,
         )
         assert r.status_code == 303

@@ -1,0 +1,87 @@
+name: E2E (browser)
+
+# Playwright end-to-end gate. Each spec in tests/e2e boots a real uvicorn
+# server (lifespan off, inert + seeded — no external IMAP/Graph egress)
+# and drives a real Chromium browser against it, covering the
+# template<->handler contract that the in-process TestClient suite can't
+# see render (the  Topic editor multiselect / save-redirect / digest
+# round-trip class of bug).
+#
+# Opt-in by construction: the unit suite skips tests/e2e via pyproject
+# `addopts = --ignore=tests/e2e`, so this is the ONLY job that installs a
+# browser. Runs on the active feature branches + every PR/push to main.
+#
+# Actions pinned to the Node 24-compatible majors used by the other
+# workflows (checkout@v5 / setup-python@v6 / upload-artifact@v4).
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main]
+
+# Rapid feat/* pushes cancel prior in-flight e2e runs (no cost to a stale run).
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege, declared explicitly. Under a repo default of read-only this
+# changes nothing today; it exists so that RAISING the repo-wide default (which
+# ci-green-ref.yml needs in order to write its marker branch) cannot silently
+# hand write access to a workflow that never asked for it.
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Playwright e2e (chromium)
+    # Self-hosted runner on the deploy host (podman-containerized). Chromium runtime deps
+    # + Python 3.12 are baked into the runner image (Debian 12 slim); the
+    # runner user has NO sudo, so `--with-deps` must NOT be passed to
+    # `playwright install` — the browser download is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+
+      - name: Install project + e2e extra
+        # The hashed dev lock (requirements.lock's packages plus the dev,
+        # encryption and e2e extras at the locked versions; punch 511 and,
+        # for Playwright, punch 622 / register N-607 residual a), then the
+        # project itself with --no-deps. Nothing here resolves from PyPI
+        # unhashed (tests/test_punch511_ci_installs_are_hash_locked_pin.py F1).
+        # No `pip install --upgrade pip`: that was an unhashed pip from PyPI
+        # (punch 623); the runner's bundled pip installs the lock, as the
+        # unit job in tests.yml does.
+        run: |
+          pip install --require-hashes -r requirements-dev.lock
+          pip install --no-deps -e .
+
+      - name: Install Chromium
+        # No --with-deps: runner user has no sudo. Chromium system libs
+        # (libnss3, libatk1.0-0, ...) are pre-installed in the runner image.
+        # Only the browser download runs here. It is not a pip install and
+        # sits outside pip's hash model; the punch-511 pin names it in
+        # _NON_PIP_FETCHES with that reason (punch 622).
+        run: python -m playwright install chromium
+
+      - name: Run e2e specs
+        run: python -m pytest tests/e2e --browser chromium --no-header -q
+
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ github.sha }}
+          path: |
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore

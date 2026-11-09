@@ -12,6 +12,7 @@ in the normal log format.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import logging
 import sqlite3
@@ -35,7 +36,7 @@ def _make_record(msg: str = "shutdown ping") -> logging.LogRecord:
 
 def test_emit_swallows_closed_db_error_no_traceback(capsys):
     """Closed connection → no traceback escapes to stderr."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     # First emit primes the cache.
     handler.emit(_make_record("first"))
@@ -56,7 +57,7 @@ def test_emit_swallows_closed_db_error_no_traceback(capsys):
 def test_emit_resets_last_row_hash_on_closed_db():
     """The in-memory tail must be cleared so any subsequent emit
     re-syncs from a fresh connection."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     handler.emit(_make_record("first"))
     # Cache should be primed.
@@ -71,7 +72,7 @@ def test_emit_resets_last_row_hash_on_closed_db():
 def test_emit_falls_through_to_last_resort(monkeypatch):
     """When the DB is closed, the record is handed to
     ``logging.lastResort`` so it still surfaces somewhere."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     handler.emit(_make_record("first"))
 
@@ -89,7 +90,7 @@ def test_emit_falls_through_to_last_resort(monkeypatch):
 
 def test_emit_handles_lastresort_failure_gracefully(monkeypatch):
     """If even lastResort fails (stderr closed), nothing escapes."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     handler.emit(_make_record("first"))
 
@@ -105,7 +106,7 @@ def test_emit_handles_lastresort_failure_gracefully(monkeypatch):
 def test_emit_with_none_lastresort_is_safe(monkeypatch):
     """If ``logging.lastResort`` is None (some test isolations clear
     it), the closed-DB path still doesn't raise."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     handler.emit(_make_record("first"))
 
@@ -119,7 +120,7 @@ def test_emit_other_db_errors_still_use_handle_error(monkeypatch):
     """Non-ProgrammingError sqlite3 errors should still go through
     the existing ``handleError`` path — only the closed-DB shape is
     suppressed."""
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     handler.emit(_make_record("first"))
 
@@ -188,7 +189,7 @@ def test_emit_takes_write_lock_when_shares_app_connection_true():
     """Shared-connection path (in-memory test fallback) MUST hold
     ``get_write_lock()`` for the duration of each DB touch in emit().
     """
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(
         conn, flush_interval=1, shares_app_connection=True,
     )
@@ -229,7 +230,7 @@ def test_emit_skips_write_lock_when_shares_app_connection_false():
     would couple isolated audit-log writes to every other writer on
     the request path — the exact coupling  isolated against.
     """
-    conn = init_db(":memory:")
+    conn = track(init_db(":memory:"))
     handler = SQLiteLogHandler(
         conn, flush_interval=1, shares_app_connection=False,
     )
@@ -259,7 +260,7 @@ def test_emit_skips_write_lock_when_shares_app_connection_false():
     assert not any(observed), (
         "dedicated-connection emit MUST NOT hold get_write_lock() — "
         "_maybe_lock() leaked a lock acquire on shares_app_connection=False, "
-        "breaking the  isolation property"
+        "breaking the #211 isolation property"
     )
 
 
@@ -276,7 +277,7 @@ def test_add_sqlite_handler_sets_flag_from_db_path():
     root = logging.getLogger("email_triage")
     pre_existing = list(root.handlers)
     try:
-        conn = init_db(":memory:")
+        conn = track(init_db(":memory:"))
         add_sqlite_handler(conn)
         added = [h for h in root.handlers if h not in pre_existing]
         sqlite_handlers = [h for h in added if isinstance(h, SQLiteLogHandler)]

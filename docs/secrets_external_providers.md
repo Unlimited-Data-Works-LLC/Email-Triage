@@ -16,7 +16,7 @@ The bootstrap layer supports plugin-registered backends via `backend: "external:
      master_key_name: ET_MASTER_KEY
      external:
        database: /mnt/nas/vault.kdbx
-       keyfile: /home/bob/.kp_keyfile
+       keyfile: /home/alice/.kp_keyfile
    ```
 3. At startup, `bootstrap_secrets_from_config` calls `KeepassSecrets(**external)` to fetch the master key, then wraps the DB in `DbSecrets` as usual. User-managed secrets still live in the encrypted SQLite table.
 

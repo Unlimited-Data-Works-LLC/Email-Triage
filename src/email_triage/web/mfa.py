@@ -47,13 +47,16 @@ Read-only by default at the lookup layer; writes guarded by
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from email_triage._isotime import now_utc_iso, to_utc_iso
 from typing import Any
 
+from email_triage.triage_logging import get_logger
 from email_triage.web.db_writelock import db_write
+
+log = get_logger("web.mfa")
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +73,7 @@ RECOVERY_CODE_BYTES = 6
 """Per-code entropy. 6 bytes = 48 bits = 281T candidates. Encoded as
 12 hex characters ≈ "a3f9b2c8e1d4" shape. Single-use + rate-limited
 at consume time, so brute-force cost is bounded by the consume-path
-rate limiter."""
+rate limiter (#92 login_guard precedent extends here)."""
 
 OPERATOR_RECOVERY_TOKEN_BYTES = 16
 """Operator-key recovery tokens. 16 bytes = 128 bits = 2^128 candidates.
@@ -106,11 +109,13 @@ with the printable recovery codes (long-lived until used)."""
 def _hash_code(code: str) -> str:
     """SHA-256 hex of a recovery code or operator-recovery token.
 
-    Identical mechanism to ``email_triage.web.auth._hash_code`` —
-    duplicated by-name to keep the import surface narrow + because
-    H-05 is the only caller of this hash today.
+    Routes through the credential-hash SSOT
+    (``email_triage.web._credhash.hash_credential``) — was a by-name duplicate
+    of ``auth._hash_code``; census run14 #1 collapsed both onto the one
+    definition so a future KDF migration can't desync hash from verify.
     """
-    return hashlib.sha256(code.encode()).hexdigest()
+    from email_triage.web._credhash import hash_credential
+    return hash_credential(code)
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +133,81 @@ def _generate_recovery_code() -> str:
     return secrets.token_hex(RECOVERY_CODE_BYTES)
 
 
+class RecoveryIssueError(RuntimeError):
+    """A recovery-code set or an operator-recovery token was NOT issued: its
+    insert or its audit witness failed and was rolled back, so no secret exists.
+    A caller catches this type and never prints a code or a token (fail closed,
+    punch 668, the ``ApiKeyGrantError`` shape of punch 627)."""
+
+
+def _witness_lost(
+    conn: sqlite3.Connection,
+    exc: BaseException,
+    *,
+    helper_name: str,
+) -> RecoveryIssueError:
+    """Roll back an issue whose audit WITNESS failed; return the typed error to
+    raise. The grant is refused and its audit row is lost, so one
+    ``audit_gap_events`` row is left (panel P F4). A refused INSERT is a refused
+    business write with no witness due, so the writers roll that one back inline
+    and leave no gap row; this helper commits the gap row, so it is only ever
+    called AFTER the witness (the N-520 commit-before-witness ratchet). The
+    caller holds the write lock (``@db_write``). Best effort: a failed gap write
+    is logged and never masks ``exc``. Nothing here reads a code or a token."""
+    conn.rollback()
+    err = RecoveryIssueError(str(exc))
+    try:
+        from email_triage.db.audit import mark_audit_gap_recorded, record_audit_write_loss
+        record_audit_write_loss(
+            conn, loss_class="failed_unrecorded", table="auth_events",
+            helper_name=helper_name,
+        )
+        mark_audit_gap_recorded(err)
+    except Exception as gap_exc:
+        log.error(
+            "recovery issue witness failed AND its gap row failed",
+            helper=helper_name,
+            witness_error=type(exc).__name__,
+            gap_error=type(gap_exc).__name__,
+        )
+    return err
+
+
+def _require_attributed_transactional_grant(
+    conn: sqlite3.Connection, actor_email: str, *, helper_name: str,
+) -> None:
+    """Refuse a grant BEFORE any INSERT unless it can be witnessed whole (punch
+    668, panel R). Two preconditions, each fail CLOSED (PD#8):
+
+    * ``actor_email`` is non-blank: the witness's ``email`` is the ACTOR, and an
+      unattributed grant row must never look like a complete record (it used to
+      write ``"unknown"``). ``ValueError``: a caller bug, not a runtime refusal.
+    * ``conn`` is not autocommit (``isolation_level=None``): there every INSERT
+      commits at once and the rollback is a no-op, so a failed witness would
+      leave an unwitnessed credential row (the guard every ``db/audit.py``
+      grant funnel carries). :class:`RecoveryIssueError`: nothing is issued.
+    """
+    if not isinstance(actor_email, str) or not actor_email.strip():
+        raise ValueError(
+            f"{helper_name} requires a non-blank actor_email: the grant "
+            f"witness records WHO issued the credential"
+        )
+    if conn.isolation_level is None:
+        raise RecoveryIssueError(
+            f"{helper_name} requires a transaction-capable (non-autocommit) "
+            f"connection so the credential insert + its chained auth_events "
+            f"witness are atomic; got isolation_level=None (autocommit)"
+        )
+
+
 @db_write
 def issue_recovery_codes(
     conn: sqlite3.Connection,
     *,
     user_id: int,
     count: int = RECOVERY_CODE_COUNT_DEFAULT,
+    actor_email: str,
+    source: str = "unknown",
 ) -> list[str]:
     """Generate + store a new code-set; return the plaintext list ONCE.
 
@@ -156,6 +230,9 @@ def issue_recovery_codes(
     in v1 because the operator-discovery surface is the print-time
     warning, not a database constraint.
     """
+    _require_attributed_transactional_grant(
+        conn, actor_email, helper_name="issue_recovery_codes",
+    )
     if count <= 0:
         raise ValueError(f"count must be > 0; got {count}")
     if count > 100:
@@ -163,17 +240,39 @@ def issue_recovery_codes(
         # in one set, and the upper bound protects against operator-
         # typo at CLI.
         raise ValueError(f"count must be <= 100; got {count}")
-    now = datetime.now(timezone.utc).isoformat()
+    # Punch 668: issuing recovery codes is a credential grant (§164.312(b)). The
+    # code rows and their ``recovery_codes_issued`` witness commit in ONE
+    # transaction (``record_auth_event_txn``, the N-520 shape), so a failed
+    # witness rolls the codes back and raises: no code is returned or shown
+    # (fail CLOSED, PD#8). The event binds the subject (``user_id`` = the target
+    # user) and the count in ``detail``; ``email`` is the actor. It carries NO
+    # code and NO hash: the codes are 48-bit, so a hash would be brute-forceable.
+    now = now_utc_iso()
     plaintexts: list[str] = []
-    for _ in range(count):
-        code = _generate_recovery_code()
-        plaintexts.append(code)
-        conn.execute(
-            "INSERT INTO recovery_codes (user_id, code_hash, created_at) "
-            "VALUES (?, ?, ?)",
-            (user_id, _hash_code(code), now),
+    try:
+        for _ in range(count):
+            code = _generate_recovery_code()
+            plaintexts.append(code)
+            conn.execute(
+                "INSERT INTO recovery_codes (user_id, code_hash, created_at) "
+                "VALUES (?, ?, ?)",
+                (user_id, _hash_code(code), now),
+            )
+    except Exception as exc:
+        # A refused insert: nothing was granted and no witness was due, so no
+        # gap row (and no committing helper before the witness, N-520).
+        conn.rollback()
+        raise RecoveryIssueError(str(exc)) from exc
+    try:
+        from email_triage.db.audit import record_auth_event_txn
+        record_auth_event_txn(
+            conn, event_type="recovery_codes_issued",
+            email=actor_email, user_id=user_id,
+            outcome="success", detail=f"count={count} source={source}",
         )
-    conn.commit()
+        conn.commit()
+    except Exception as exc:
+        raise _witness_lost(conn, exc, helper_name="issue_recovery_codes") from exc
     return plaintexts
 
 
@@ -196,7 +295,7 @@ def consume_recovery_code(
     Caller is responsible for rate-limiting per the  login_guard
     precedent so brute-force is bounded.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     h = _hash_code(code)
     row = conn.execute(
         "SELECT id, used_at FROM recovery_codes "
@@ -213,6 +312,33 @@ def consume_recovery_code(
     )
     conn.commit()
     return True
+
+
+def lookup_recovery_code(
+    conn: sqlite3.Connection, *, user_id: int, code: str,
+) -> int | None:
+    """READ-ONLY half of :func:`consume_recovery_code` (N-520 step 2): the id of
+    the matching UNUSED code, else None. The burn is
+    :func:`burn_recovery_code_txn`, inside the caller's witnessed unit."""
+    row = conn.execute(
+        "SELECT id, used_at FROM recovery_codes "
+        "WHERE user_id = ? AND code_hash = ?",
+        (user_id, _hash_code(code)),
+    ).fetchone()
+    if row is None or row["used_at"] is not None:
+        return None
+    return int(row["id"])
+
+
+def burn_recovery_code_txn(conn: sqlite3.Connection, code_id: int) -> bool:
+    """Stamp one recovery code used; no commit (N-520 step 2). True only when
+    THIS call burned it (``used_at IS NULL`` guard), so two racing consumes
+    cannot both mint a session."""
+    cur = conn.execute(
+        "UPDATE recovery_codes SET used_at = ? WHERE id = ? AND used_at IS NULL",
+        (now_utc_iso(), int(code_id)),
+    )
+    return cur.rowcount > 0
 
 
 def count_active_recovery_codes(
@@ -256,6 +382,8 @@ def issue_operator_recovery_token(
     target_user_id: int,
     operator_user_id: int | None,
     ttl_secs: int = OPERATOR_RECOVERY_TOKEN_TTL_SECS_DEFAULT,
+    actor_email: str,
+    source: str = "unknown",
 ) -> str:
     """Generate + store a one-time operator-recovery token; return the
     plaintext ONCE.
@@ -279,6 +407,9 @@ def issue_operator_recovery_token(
     Raises:
         ValueError: ``ttl_secs`` is non-positive or exceeds the 7d cap.
     """
+    _require_attributed_transactional_grant(
+        conn, actor_email, helper_name="issue_operator_recovery_token",
+    )
     if ttl_secs <= 0:
         raise ValueError(f"ttl_secs must be > 0; got {ttl_secs}")
     if ttl_secs > OPERATOR_RECOVERY_TOKEN_TTL_SECS_CAP:
@@ -289,21 +420,48 @@ def issue_operator_recovery_token(
         )
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_secs)
+    # Punch 668: the break-glass token is a credential grant (§164.312(b)), and
+    # a break-glass credential raises the bar, not lowers it. The key row and its
+    # ``operator_recovery_key_issued`` witness commit in ONE transaction
+    # (``record_auth_event_txn``, the N-520 shape), so a failed witness rolls the
+    # key back and raises: the token is never returned or shown (fail CLOSED,
+    # PD#8). The event binds the new key id (``key_id``) and the target user
+    # (``user_id``); ``email`` is the actor. It carries NO token and NO hash.
     token = _generate_operator_recovery_token()
-    conn.execute(
-        "INSERT INTO operator_recovery_keys "
-        "(target_user_id, operator_user_id, token_hash, "
-        " created_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (
-            target_user_id,
-            operator_user_id,
-            _hash_code(token),
-            now.isoformat(),
-            expires_at.isoformat(),
-        ),
-    )
-    conn.commit()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO operator_recovery_keys "
+            "(target_user_id, operator_user_id, token_hash, "
+            " created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                target_user_id,
+                operator_user_id,
+                _hash_code(token),
+                to_utc_iso(now),
+                to_utc_iso(expires_at),
+            ),
+        )
+        new_id = cursor.lastrowid
+    except Exception as exc:
+        # A refused insert: nothing was granted and no witness was due, so no
+        # gap row (and no committing helper before the witness, N-520).
+        conn.rollback()
+        raise RecoveryIssueError(str(exc)) from exc
+    try:
+        from email_triage.db.audit import record_auth_event_txn
+        record_auth_event_txn(
+            conn, event_type="operator_recovery_key_issued",
+            email=actor_email, user_id=target_user_id,
+            key_id=new_id, outcome="success",
+            detail=(f"operator_user_id={operator_user_id} "
+                    f"ttl_secs={ttl_secs} source={source}"),
+        )
+        conn.commit()
+    except Exception as exc:
+        raise _witness_lost(
+            conn, exc, helper_name="issue_operator_recovery_token",
+        ) from exc
     return token
 
 
@@ -324,7 +482,7 @@ def consume_operator_recovery_token(
     job (or operator-driven cleanup) sweeps the table; for v1 the
     table is small enough that prune cadence is operator-discretionary.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_utc_iso()
     h = _hash_code(token)
     row = conn.execute(
         "SELECT id, target_user_id, expires_at, used_at "
@@ -343,6 +501,44 @@ def consume_operator_recovery_token(
     )
     conn.commit()
     return int(row["target_user_id"])
+
+
+def lookup_operator_recovery_token(
+    conn: sqlite3.Connection, *, token: str,
+) -> tuple[int, int] | None:
+    """READ-ONLY half of :func:`consume_operator_recovery_token` (N-520 step 2):
+    ``(token_row_id, target_user_id)`` for an unused, unexpired token, else
+    None. Same checks, no write."""
+    now = now_utc_iso()
+    row = conn.execute(
+        "SELECT id, target_user_id, expires_at, used_at "
+        "FROM operator_recovery_keys WHERE token_hash = ?",
+        (_hash_code(token),),
+    ).fetchone()
+    if row is None or row["used_at"] is not None or row["expires_at"] < now:
+        return None
+    return int(row["id"]), int(row["target_user_id"])
+
+
+def burn_operator_recovery_token_txn(conn: sqlite3.Connection, row_id: int) -> bool:
+    """Stamp one operator-recovery token used; no commit (N-520 step 2). True
+    only when THIS call burned it (``used_at IS NULL`` guard)."""
+    cur = conn.execute(
+        "UPDATE operator_recovery_keys SET used_at = ? "
+        "WHERE id = ? AND used_at IS NULL",
+        (now_utc_iso(), int(row_id)),
+    )
+    return cur.rowcount > 0
+
+
+@db_write
+def burn_operator_recovery_token(conn: sqlite3.Connection, row_id: int) -> bool:
+    """Own-commit form of :func:`burn_operator_recovery_token_txn`: the
+    TIGHTENING burn of a token that is refused (its user is disabled or gone),
+    which never depends on audit-chain health."""
+    burned = burn_operator_recovery_token_txn(conn, row_id)
+    conn.commit()
+    return burned
 
 
 # ---------------------------------------------------------------------------

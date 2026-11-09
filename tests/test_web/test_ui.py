@@ -3,6 +3,8 @@
 import pytest
 
 from email_triage.web.auth import SESSION_COOKIE_NAME, store_otp
+# Punch 595: the real-SQLiteLogHandler fixture (log_entries reader).
+from test_web.test_punch595_otp_never_persisted import persisted_log  # noqa: F401
 
 
 class TestLoginFlow:
@@ -17,14 +19,66 @@ class TestLoginFlow:
         assert resp.headers["location"] == "/dashboard"
 
     def test_login_email_unknown_user(self, client):
+        # Punch 595: with no SMTP the refusal precedes the lookup; the dev
+        # flag lets this test reach the lookup it is about.
+        client.app.state.config.smtp.dev_console_otp = True
         resp = client.post("/login/email", data={"email": "nobody@test.com"})
         assert resp.status_code == 200
         assert "No account found" in resp.text
 
     def test_login_email_valid_user(self, client, admin_user):
+        # Punch 595: with no SMTP host a code is only issued on a dev
+        # install that opts in (smtp.dev_console_otp, non-HIPAA).
+        client.app.state.config.smtp.dev_console_otp = True
         resp = client.post("/login/email", data={"email": admin_user["email"]})
         assert resp.status_code == 200
         assert "6-digit code" in resp.text
+
+    def test_login_email_dev_mode_never_puts_the_otp_in_log_entries(
+        self, client, admin_user, persisted_log, caplog, capsys,
+    ):
+        """Punch 595: INVERTED from the  test, which asserted the defect
+        (that the dev-mode branch emits ``code=<6 digits>`` into the log, so an
+        operator could grep it; it was inlined into the message to dodge the
+        ``code`` SECRET_TOKEN_KEYS strip, and the sink persists
+        ``record.getMessage()`` raw in BOTH HIPAA modes). Now: the dev path
+        (``smtp.dev_console_otp``, non-HIPAA) prints the code to stderr, and
+        no ``log_entries`` row, written by a real SQLiteLogHandler, and no log
+        record at all, carries those digits."""
+        import logging
+        import re
+        client.app.state.config.smtp.dev_console_otp = True
+        caplog.set_level(logging.DEBUG, logger="email_triage")
+        resp = client.post(
+            "/login/email", data={"email": admin_user["email"]},
+        )
+        assert resp.status_code == 200
+        err = capsys.readouterr().err
+        m = re.search(r"login code for \S+: (\d{6})", err)
+        assert m, f"dev console did not print the code; stderr={err!r}"
+        code = m.group(1)
+        rows = [r for r in persisted_log()
+                if code in (r[0] or "") or code in (r[1] or "")]
+        assert rows == [], rows
+        leaked = [r.getMessage() for r in caplog.records
+                  if code in r.getMessage() or code in str(vars(r))]
+        assert leaked == [], leaked
+
+    def test_login_email_without_smtp_is_refused_and_issues_no_code(
+        self, client, db, admin_user,
+    ):
+        """Punch 595: no SMTP host and no dev flag -> a clean refusal page,
+        and no code is minted (nothing undeliverable sits in otp_codes)."""
+        resp = client.post("/login/email", data={"email": admin_user["email"]})
+        assert resp.status_code == 200
+        assert "Sign-in codes can" in resp.text
+        assert "6-digit code" not in resp.text
+        assert "Traceback" not in resp.text
+        n = db.execute(
+            "SELECT COUNT(*) FROM otp_codes WHERE email = ?",
+            (admin_user["email"],),
+        ).fetchone()[0]
+        assert n == 0
 
     def test_login_verify_wrong_code(self, client, db, admin_user):
         store_otp(db, admin_user["email"], "123456")
@@ -264,8 +318,16 @@ class TestUserManagement:
         )
         assert resp.status_code == 303
 
-        deleted = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-        assert deleted is None
+        # Operator ruling  (N-107): "Remove" SOFT-DISABLES the user — it does
+        # NOT hard-delete. A DELETE FROM users would NULL the audit actor-chain
+        # across the 9 tamper-evident tables AND cascade-wipe each account's
+        # hipaa_access_events (§164.312(b)/(c)(1)). The row is RETAINED with
+        # disabled=1 (the access log stays attributable; §164.316(b)(1) retention).
+        retained = db.execute(
+            "SELECT disabled FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        assert retained is not None, "user row must be RETAINED (never hard-deleted)"
+        assert retained["disabled"] == 1, "user must be soft-disabled, not deleted"
 
     def test_cannot_delete_self(self, client, db, admin_cookies, admin_user):
         row = db.execute(
@@ -393,3 +455,39 @@ class TestClassifyUI:
         # The response will be an error about the classifier connection,
         # not a parse error.
         assert "Parse error" not in resp.text
+
+
+class TestFormLimitsCVE54283:
+    """Starlette 1.3.1 (CVE-2026-54283 fix) enforces a per-field
+    max_part_size=1 MiB on request.form() that 1.2.x ignored. The classify
+    "paste a raw email" box raises that cap via ``web.form_limits.parse_form``;
+    it would 400 on the bare default for a large pasted message. Regression
+    guard for the 2026-06-20 starlette security bump. (CORRECTED 2026-10-30,
+    punch 443: the 2026-06-20 claim that Field COUNT / max_fields is NOT
+    enforced for urlencoded was WRONG. Starlette's default max_fields=1000 IS
+    enforced, so a many-small-field form like folder-prefs 400s above ~500
+    folders on the bare defaults; folder-prefs now goes through ``parse_form``
+    too. ``tests/test_form_limits_measured_pin.py`` measures the limits.)"""
+
+    def test_classify_run_accepts_large_paste(self, client, admin_cookies):
+        # 2 MiB single field — over Starlette's 1 MiB max_part_size default.
+        big_body = "X" * (2 * 1024 * 1024)
+        raw = (
+            "From: sender@example.com\r\n"
+            "To: receiver@example.com\r\n"
+            "Subject: Big\r\n\r\n" + big_body
+        )
+        resp = client.post(
+            "/classify/run", data={"raw_email": raw}, cookies=admin_cookies,
+        )
+        # NOT a 400 from the form-limit; the route handles it (LLM unavailable
+        # in tests -> a classifier-connection error article, still 200).
+        assert resp.status_code == 200, resp.status_code
+        assert "Parse error" not in resp.text
+
+    def test_classify_run_empty_still_rejected(self, client, admin_cookies):
+        # The manual-parse refactor preserves the old required-field 422.
+        resp = client.post(
+            "/classify/run", data={"raw_email": "   "}, cookies=admin_cookies,
+        )
+        assert resp.status_code == 422, resp.status_code

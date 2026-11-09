@@ -3,9 +3,14 @@ name: Release
 # Container release pipeline: build, push, sign, and attest.
 #
 # Triggers:
-#   * push to `main`               -> :edge tag (no GitHub Release)
-#   * push of a `v*` tag (semver)  -> vX.Y.Z + :latest + :stable + Release
+#   * push to `main`               -> test/pin release gates only (NO image build;
+#                                     build-and-push is tag-gated — see its `if:`)
+#   * push of a `v*` tag (semver)  -> vX.Y.Z + :latest + :stable + :edge + Release
 #                                     + air-gap tarball asset
+# NOTE (2026-07-28): the image is built ONLY on v* tags. `:edge`-on-every-main-push
+# was dropped (the self-hosted runner can't build images and the hosted runner is
+# billing-gated — see build-and-push `if:`); `:edge` now tracks the LATEST RELEASE
+# instead, tagged alongside :latest/:stable at v* time (on the public mirror).
 #
 # Two distinct OIDC subjects are emitted across the release pipeline,
 # both keyless (sigstore / Fulcio):
@@ -81,8 +86,76 @@ jobs:
   # `docker buildx build` — verified by the operator's deploy.sh
   # which already uses podman build on the same file).
   # ──────────────────────────────────────────────────────────────────
+  # Release gate: the image is NOT built/tagged unless the full unit + pin
+  # suite is green (pin-system remediation /goal Phase 1 #1 — "no tag on red
+  # pins"). Reusable call to tests.yml; runs on the pushed ref (main or v* tag).
+  unit-tests:
+    name: Unit + Pin Suite (release gate)
+    # Gate to v* tags. This job gates the image BUILD, which only runs on tags now.
+    # On a main push tests.yml ALSO runs standalone (its own `on: push` trigger), so
+    # running it here too double-ran the full ~16-min suite CONCURRENTLY on the 2-CPU
+    # the deploy host runner -> resource contention -> the timing-sensitive audit-drain test
+    # (test_access_audit) starved past its 10s budget and flaked (green standalone,
+    # red as the release gate on the SAME commit, 2026-07-29). Gating to tags = ONE
+    # suite run on main — the branch-protection-required standalone `pytest tests/
+    # (unit + pins)` — with the runner to itself, and halves CI time per main push.
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/tests.yml
+
+  # Release gate: a v* tag REFUSES to release if the divergence census (the only
+  # NEW-drift finder) is stale — enforced on tags only, a no-op on main pushes
+  # (/goal Phase 1 #3). 90-day window = the playbook's quarterly backstop. Run
+  # the census to convergence + commit a fresh report before cutting a release.
+  census-freshness:
+    name: Divergence-census freshness (release gate)
+    # Gate to v* tags too (it already no-ops on non-tags internally; skipping avoids the
+    # runner spin-up + keeps the release chain — unit-tests/census/build — uniformly
+    # tag-only, so main pushes run NOTHING from release.yml).
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Self-hosted by default (feedback_ci_deploy_host_runner_for_non_arm64) — pure
+    # checkout + shell, no hosted-runner capability needed. The publish
+    # sanitize-map rewrites this label to `ubuntu-latest` for the public
+    # mirror, which has no self-hosted runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Latest committed census must be recent (enforced on v* tags)
+        run: |
+          if [[ "${{ github.ref }}" != refs/tags/v* ]]; then
+            echo "not a v* tag — census-freshness is a no-op on this ref"; exit 0
+          fi
+          # [0-9]* so the DATED reports match but the undated
+          # `divergence-census-report.md` (which sorts last) is excluded.
+          latest=$(ls audit-reports/divergence-census-[0-9]*.md 2>/dev/null | sort | tail -1 || true)
+          if [[ -z "$latest" ]]; then
+            echo "::error::no committed divergence-census report in audit-reports/"; exit 1
+          fi
+          d=$(echo "$latest" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+          age=$(( ( $(date +%s) - $(date -d "$d" +%s) ) / 86400 ))
+          echo "latest census: $latest ($d) — $age days old"
+          if (( age > 90 )); then
+            echo "::error::census is $age days old (>90) — run the divergence census to convergence before cutting a release"; exit 1
+          fi
+          echo "census fresh (<=90d) — release gate passes"
+
   build-and-push:
     name: Build and push image
+    needs: [unit-tests, census-freshness]
+    # TAG-GATED (2026-07-28): build the container image ONLY on v* release tags, not
+    # on every main push. Rationale — the self-hosted the deploy host runner CANNOT build images
+    # (it is a hardened rootless podman container with no podman/buildah, by design, to
+    # run the test suites), and the GitHub-hosted runner is billing-gated (spending
+    # limit exhausted -> the job gets no runner and fails in ~4s, reddening every main
+    # push). Gating to tags means this job — and sign-and-attest / release-tarball,
+    # which `need` it — simply SKIP on a main push, so main CI is green without any
+    # hosted-runner image build. The customer release image is still cut at v* tag time
+    # (on the public mirror = ubuntu-latest / buildx multi-arch), and the homelab deploy
+    # builds on the host via deploy.sh. Trade-off (accepted): `:edge` is no longer
+    # produced on every main push, so its dev-tracking + cache-anchor roles refresh only
+    # at release — acceptable for a single-operator private repo. Enabling on-prem
+    # image builds (build-capable runner) is tracked separately if `:edge`-on-main is
+    # ever wanted back.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -122,6 +195,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Stamp commit SHA into COMMIT
+        id: stamp
         # The Containerfile COPYs ``COMMIT`` into ``/app/VERSION``;
         # the runtime ``/health`` endpoint reads that to surface the
         # build's exact commit. The repo ships a placeholder
@@ -139,6 +213,24 @@ jobs:
           sha=$(git rev-parse HEAD)
           printf '%s\n' "${sha}" > COMMIT
           echo "Stamped COMMIT with ${sha}"
+          # Publish it so the build.sha LABEL derives from the SAME value as the
+          # COMMIT file. Passing `${{ github.sha }}` to the label instead would be
+          # a SECOND source: the two coincide on a `v*` tag push but diverge the
+          # moment this is reached via workflow_dispatch, a ref-parameterised
+          # checkout, or a pull_request where github.sha is the merge commit —
+          # shipping an image whose label and /app/VERSION disagree. (DA MF-2.)
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      #  multi-arch: register QEMU emulators so the amd64 runner can
+      # build the linux/arm64 variant (incl. the arm64 source-build of
+      # sqlcipher3 — the emulated leg is slow, ~20-45 min, but is the only
+      # path until native ubuntu-*-arm runners land on the public mirror
+      #). MUST precede setup-buildx so buildx picks up the binfmt
+      # handlers.
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -163,7 +255,12 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},suffix=
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            # :edge now tracks the LATEST RELEASE, not every main push. The image is
+            # only built on v* tags (build-and-push is tag-gated — the self-hosted
+            # runner can't build images and the hosted runner is billing-gated), so
+            # tag :edge alongside :latest/:stable at release time. On the public mirror
+            # this makes :edge = the newest published release for operators tracking it.
+            type=raw,value=edge,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
@@ -193,9 +290,23 @@ jobs:
         with:
           context: .
           file: Containerfile
+          #  multi-arch: build + push a manifest list covering both arches.
+          # buildx fans the Containerfile out per-platform (TARGETARCH drives
+          # the per-arch sqlcipher3 install — prebuilt wheel on amd64, source
+          # build on arm64). A single registry cache (mode=max, below) holds
+          # both platforms' layers in one cache manifest, so the arches do
+          # NOT thrash a shared single-arch cache tag.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Parity with scripts/deploy.sh: stamp the `build.sha` LABEL so a
+          # registry-pulled image is as inspectable as a locally-built one.
+          # Without this a GHCR image would carry an EMPTY build.sha while the
+          # deploy-built image carried a real one — the drift check would then
+          # silently change behaviour depending on where the image came from.
+          build-args: |
+            BUILD_SHA=${{ steps.stamp.outputs.sha }}
           # Layer-cache discipline (see header comment). :edge is the
           # always-present cache anchor; tag builds also pull from
           # :latest to short-circuit common-base layers when a release
@@ -302,6 +413,17 @@ jobs:
     needs: [build-and-push, sign-and-attest]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    #  multi-arch: ONE air-gap tarball PER ARCH (two assets), not a single
+    # manifest-list tarball. Reasons: (1) a `podman save` of the full manifest
+    # list would carry BOTH arches' layers (~2× size) and re-breach the 2 GiB
+    # GH-Release per-asset cap that  fought to get under; (2) an air-gap
+    # operator only needs (and should only download) the tarball for THEIR
+    # arch. ``max-parallel: 1`` serialises the legs so the first creates the
+    # GitHub Release and the second appends its assets (no create-race).
+    strategy:
+      max-parallel: 1
+      matrix:
+        arch: [amd64, arm64]
     permissions:
       contents: write       # create / update GitHub Release
       packages: read        # pull the just-pushed image
@@ -365,7 +487,9 @@ jobs:
         run: |
           ref="${GITHUB_REF#refs/tags/}"
           echo "tag=${ref}" >> "$GITHUB_OUTPUT"
-          echo "filename=email-triage-${ref}.tar.zst" >> "$GITHUB_OUTPUT"
+          # : per-arch asset name so the two matrix legs don't collide
+          # and the air-gap operator can pick their arch explicitly.
+          echo "filename=email-triage-${ref}-${{ matrix.arch }}.tar.zst" >> "$GITHUB_OUTPUT"
 
       - name: Save image to tarball
         # podman is preinstalled on ubuntu-latest. ``podman save``
@@ -377,12 +501,16 @@ jobs:
         # ``-T0`` uses all available threads.
         run: |
           set -euo pipefail
-          podman pull "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+          # : pull + save ONLY this matrix leg's arch from the manifest
+          # list. `--platform` selects the per-arch image out of the list;
+          # pulling needs no QEMU (we download blobs, we don't run them).
+          podman pull --platform "linux/${{ matrix.arch }}" \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
           podman tag \
             "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}" \
-            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}"
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}-${{ matrix.arch }}"
           podman save \
-            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}" \
+            "${{ env.REGISTRY }}/${{ env.GHCR_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}-${{ matrix.arch }}" \
             | zstd --long=27 -19 -T0 > "${{ steps.version.outputs.filename }}"
           ls -lh "${{ steps.version.outputs.filename }}"
 

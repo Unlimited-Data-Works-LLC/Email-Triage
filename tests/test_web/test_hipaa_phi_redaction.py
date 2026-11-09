@@ -42,7 +42,7 @@ def _make_account(db, user_id, *, hipaa, account_id=1):
         "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
         (
             account_id, user_id, "Test IMAP", "imap",
-            json.dumps({"host": "mail.test.com", "username": "u@t.com"}),
+            json.dumps({"host": "mail.test.invalid", "username": "u@t.com"}),
             1 if hipaa else 0, now, now,
         ),
     )

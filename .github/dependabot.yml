@@ -1,0 +1,96 @@
+# Dependabot — weekly dependency freshness sweep + CVE alerts.
+#
+# Layered strategy (see mempalace `feedback_dependency_freshness_audit_at_push`):
+#   - THIS FILE: Dependabot opens grouped PRs for pip / GH Actions / Docker
+#     bumps on a schedule. Each PR runs the full CI matrix (tests.yml,
+#     security.yml, e2e.yml) → catches breaks pre-merge.
+#   - `.github/workflows/security.yml` scheduled trigger: nightly pip-audit
+#     so a NEW CVE lands within 24h even without a push.
+#   - Push-time pre-push hook + security.yml on-push: catches CVEs
+#     introduced by a manual bump.
+#
+# Grouping keeps PR volume manageable — one PR per (ecosystem × update-type)
+# tier per run instead of 50+ per week. Patch bumps get their own group so
+# they can (eventually) auto-merge on green CI once we're comfortable with
+# the pattern. Minor + major stay human-review by default.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 8
+    target-branch: "main"
+    groups:
+      # markdown-it-py is EXCLUDED from every group, so each bump arrives as its own PR.
+      # It is the renderer the N-495 register pin's ratchet ceilings are calibrated against,
+      # and the ceilings are maxima: a renderer change can make the pin over-permit while CI
+      # stays green. Review each bump as a renderer change and never auto-merge it. (Not an
+      # `ignore:` entry — that would stop its version updates altogether.)
+      # A future auto-merge rule must skip it by NAME (fetch-metadata `dependency-names`),
+      # never by label: `labels:` below apply to every PR of this entry, including its own.
+      # Enforced by tests/test_dependabot_renderer_exclusion_pin.py (punch 520).
+      python-patch:
+        # Safe drift-only bumps (tzdata, certifi patches, click x.y.z→x.y.z+1).
+        # Candidates for future auto-merge on green CI.
+        update-types: ["patch"]
+        exclude-patterns: ["markdown-it-py"]
+      python-minor:
+        # Minor bumps — API-stable per semver but occasional regressions;
+        # human review before merge.
+        update-types: ["minor"]
+        exclude-patterns: ["markdown-it-py"]
+      python-major:
+        # Major bumps — breaking-change risk; MUST be human-reviewed
+        # (cryptography 48→49, webauthn 2→3, etc.).
+        update-types: ["major"]
+        exclude-patterns: ["markdown-it-py"]
+    labels:
+      - "dependencies"
+      - "python"
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    reviewers:
+      - "C-Doe"
+    ignore:
+      # torch pin is CPU-only (`torch==2.12.0+cpu`); Dependabot cannot resolve
+      # the `+cpu` local-version identifier. Managed manually.
+      - dependency-name: "torch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:30"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 4
+    target-branch: "main"
+    groups:
+      actions-all:
+        patterns: ["*"]
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 2
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "docker"

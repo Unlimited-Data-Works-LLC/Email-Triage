@@ -27,7 +27,7 @@ def test_initial_state_is_idle():
 def test_start_marks_in_flight():
     acme_job_state.start(
         domains=["a.example.com", "b.example.com"],
-        directory_url="https://acme-staging/",
+        directory_url="https://acme-staging.invalid/",
         max_attempts=3,
     )
     s = acme_job_state.current_state()
@@ -35,7 +35,7 @@ def test_start_marks_in_flight():
     assert s["in_flight"] is True
     assert s["domains"] == ["a.example.com", "b.example.com"]
     assert s["max_attempts"] == 3
-    assert s["directory_url"] == "https://acme-staging/"
+    assert s["directory_url"] == "https://acme-staging.invalid/"
     assert s["started_at"] is not None
     # Visibility map pre-populated.
     assert "a.example.com" in s["visibility"]

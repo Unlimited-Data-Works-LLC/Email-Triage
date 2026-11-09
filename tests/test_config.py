@@ -103,13 +103,13 @@ escalation:
         yaml_file = tmp_path / "config.yaml"
         yaml_file.write_text("""\
 webhooks:
-  - url: http://the agent host:3000/hooks/triage
+  - url: http://agenthost:3000/hooks/triage
     events: [flow.classified, flow.finished]
     secret_key: webhook_hmac_secret
 """)
         cfg = load_config(yaml_file)
         assert len(cfg.webhooks) == 1
-        assert cfg.webhooks[0].url == "http://the agent host:3000/hooks/triage"
+        assert cfg.webhooks[0].url == "http://agenthost:3000/hooks/triage"
         assert "flow.classified" in cfg.webhooks[0].events
 
     def test_missing_explicit_path_raises(self):
@@ -165,6 +165,128 @@ class TestValidation:
         cfg.classifier.categories = {}
         issues = validate_config(cfg)
         assert any("categories" in i for i in issues)
+
+
+class TestAcmeChallengeValidation:
+    """tls.acme.challenge: both dns-01 and http-01 are implemented. Config load
+    must FAIL FAST when ACME is enabled with an UNKNOWN challenge type (a
+    misconfig or typo like ``challenge: tls-alpn-01``) instead of raising a
+    misleading NotImplementedError deep in the renewer's order loop. When the
+    challenge is http-01, the mode-specific required fields (webroot_path for
+    mode=webroot; valid bind_host+bind_port for mode=standalone) must also be
+    present at load time."""
+
+    def test_enabled_acme_http01_loads_clean(self, tmp_path: Path):
+        """HTTP-01 with default standalone mode + default bind is valid."""
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: http-01
+""")
+        cfg = load_config(yaml_file)
+        assert cfg.tls.acme.challenge == "http-01"
+        assert cfg.tls.acme.http01.mode == "standalone"
+        assert cfg.tls.acme.http01.bind_host == "0.0.0.0"
+        assert cfg.tls.acme.http01.bind_port == 80
+
+    def test_enabled_acme_http01_webroot_requires_path(self, tmp_path: Path):
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: http-01
+    http01:
+      mode: webroot
+""")
+        with pytest.raises(ConfigError, match="webroot_path"):
+            load_config(yaml_file)
+
+    def test_enabled_acme_http01_webroot_with_path_loads_clean(
+        self, tmp_path: Path
+    ):
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: http-01
+    http01:
+      mode: webroot
+      webroot_path: /var/www/acme-challenge
+""")
+        cfg = load_config(yaml_file)
+        assert cfg.tls.acme.http01.mode == "webroot"
+        assert cfg.tls.acme.http01.webroot_path == "/var/www/acme-challenge"
+
+    def test_enabled_acme_unknown_challenge_raises_at_load(
+        self, tmp_path: Path
+    ):
+        """Any challenge type OTHER than dns-01 / http-01 rejects fail-fast."""
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: tls-alpn-01
+""")
+        with pytest.raises(ConfigError, match="not supported"):
+            load_config(yaml_file)
+
+    def test_enabled_acme_http01_bad_mode_raises(self, tmp_path: Path):
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: http-01
+    http01:
+      mode: sidecar
+""")
+        with pytest.raises(ConfigError, match="http01.mode"):
+            load_config(yaml_file)
+
+    def test_enabled_acme_http01_bad_port_raises(self, tmp_path: Path):
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: http-01
+    http01:
+      bind_port: 99999
+""")
+        with pytest.raises(ConfigError, match="bind_port"):
+            load_config(yaml_file)
+
+    def test_enabled_acme_dns01_loads_clean(self, tmp_path: Path):
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: true
+    challenge: dns-01
+""")
+        cfg = load_config(yaml_file)
+        assert cfg.tls.acme.challenge == "dns-01"
+
+    def test_disabled_acme_with_stale_challenge_is_left_alone(
+        self, tmp_path: Path
+    ):
+        # A disabled-ACME config carrying a stale unknown challenge must NOT
+        # error — nothing runs, so don't break an upgrade on a dormant field.
+        yaml_file = tmp_path / "config.yaml"
+        yaml_file.write_text("""\
+tls:
+  acme:
+    enabled: false
+    challenge: tls-alpn-01
+""")
+        cfg = load_config(yaml_file)
+        assert cfg.tls.acme.enabled is False
+        assert cfg.tls.acme.challenge == "tls-alpn-01"
 
 
 class TestDevModeRemoved:

@@ -242,9 +242,38 @@ class TestWatchesEditDelete:
         )
         assert resp.status_code == 303
         location = resp.headers["location"]
-        # /profile/watches/<group_id>/edit?saved=1
+        # /profile/watches/<group_id>/edit?msg=<url-encoded confirmation>
         group_id = location.split("/profile/watches/", 1)[1].split("/edit")[0]
         return group_id
+
+    def test_save_surfaces_confirmation_flash(
+        self, client, db, regular_user, user_cookies,
+    ):
+        """REGRESSION (census run14 #7 live-bug): a watch save must carry its
+        confirmation notice through the PRG redirect and the edit GET must render
+        it. Previously the save redirected a bare ``?saved=1`` while the GET
+        hard-coded ``save_msg=None`` — so every save silently showed NO
+        confirmation, and the HIPAA-skip warning (a count of PHI accounts left out
+        of the fan-out) was dropped on the floor."""
+        a = _make_account(db, regular_user["id"], "acct-flash")
+        resp = client.post(
+            "/profile/watches/new/save",
+            cookies=user_cookies,
+            data={
+                "name": "Flash Group", "enabled": "1",
+                "account_ids": [str(a)], "from_addr": "boss@",
+                "escalate_enabled": "1",
+            },
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        loc = resp.headers["location"]
+        # The notice rides the redirect via msg_qs — NOT a bare, message-less flag.
+        assert "?msg=" in loc and "saved=1" not in loc
+        # …and the edit GET now SURFACES it (no longer hard-coded save_msg=None).
+        page = client.get(loc, cookies=user_cookies)
+        assert page.status_code == 200
+        assert "Watch saved" in page.text
 
     def test_edit_page_pre_ticks_existing_accounts(
         self, client, db, regular_user, user_cookies,
@@ -277,6 +306,50 @@ class TestWatchesEditDelete:
             assert "checked" in match.group(0), (
                 f"account {acct_id} should render pre-ticked on edit"
             )
+
+    def test_edit_legacy_watch_without_auto_retire_renders(
+        self, client, db, regular_user, user_cookies,
+    ):
+        """ — a watch stored BEFORE the auto_retire field existed (its
+        ``actions_json`` has no ``auto_retire`` key) must still render its edit
+        page. ``_coerce(AutoRetireAction, None)`` -> ``AutoRetireAction()`` so
+        the template's ``rep.actions.auto_retire.after_n`` read is safe; without
+        that defaulting the page would 500. Tests the rendered VIEW on the one
+        path the create/edit happy-paths don't hit (rule  / the preview-
+        metadata-trap lesson: assert a field that renders unconditionally)."""
+        a = _make_account(db, regular_user["id"], "acct-a")
+        group_id = self._seed_group(
+            client, db, regular_user, user_cookies, [a],
+        )
+        # Rewrite the stored actions_json to a pre-#48 shape: escalate +
+        # webhook only, NO auto_retire key (what a legacy row looks like).
+        legacy = json.dumps({
+            "escalate": {"enabled": True, "notify_email": ""},
+            "webhook": {"enabled": False, "url": ""},
+        })
+        db.execute(
+            "UPDATE email_watches SET actions_json = ? "
+            "WHERE watch_group_id = ?",
+            (legacy, group_id),
+        )
+        db.commit()
+
+        resp = client.get(
+            f"/profile/watches/{group_id}/edit", cookies=user_cookies,
+        )
+        assert resp.status_code == 200, (
+            "legacy watch (no auto_retire key) must not 500 on edit"
+        )
+        # The auto-retire fieldset renders, defaulting to 0 (off).
+        assert 'name="auto_retire_after"' in resp.text
+        import re
+        match = re.search(
+            r'<input[^>]*\bname="auto_retire_after"[^>]*\bvalue="0"[^>]*>',
+            resp.text,
+        )
+        assert match is not None, (
+            "auto_retire_after must default to 0 for a legacy watch"
+        )
 
     def test_save_existing_can_add_and_remove_accounts(
         self, client, db, regular_user, user_cookies,

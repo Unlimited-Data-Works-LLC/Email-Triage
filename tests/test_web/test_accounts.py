@@ -29,7 +29,7 @@ class TestAccountsUI:
             "name": "Test IMAP",
             "provider_type": "imap",
             "user_id": str(admin_user["id"]),
-            "host": "mail.example.com",
+            "host": "mail.example.invalid",
             "port": "993",
             "username": "test@example.com",
             "password": "secret123",
@@ -41,7 +41,7 @@ class TestAccountsUI:
         # Verify it shows up in the list.
         resp2 = client.get("/accounts", cookies=admin_cookies)
         assert "Test IMAP" in resp2.text
-        assert "mail.example.com" in resp2.text
+        assert "mail.example.invalid" in resp2.text
 
     def test_create_gmail_account(self, client, admin_cookies, admin_user):
         resp = client.post("/accounts/create", data={
@@ -72,7 +72,7 @@ class TestAccountsUI:
 
     def test_edit_form_loads(self, client, admin_cookies, db, admin_user):
         from email_triage.web.db import create_email_account
-        aid = create_email_account(db, admin_user["id"], "Edit Me", "imap", {"host": "x.com"})
+        aid = create_email_account(db, admin_user["id"], "Edit Me", "imap", {"host": "x.invalid"})
 
         resp = client.get(f"/accounts/{aid}/edit", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -80,12 +80,12 @@ class TestAccountsUI:
 
     def test_update_account(self, client, admin_cookies, db, admin_user):
         from email_triage.web.db import create_email_account
-        aid = create_email_account(db, admin_user["id"], "Old Name", "imap", {"host": "old.com"})
+        aid = create_email_account(db, admin_user["id"], "Old Name", "imap", {"host": "old.invalid"})
 
         resp = client.put(f"/accounts/{aid}", data={
             "name": "New Name",
             "provider_type": "imap",
-            "host": "new.com",
+            "host": "new.invalid",
             "port": "993",
             "username": "u@new.com",
             "mailbox": "INBOX",
@@ -94,7 +94,7 @@ class TestAccountsUI:
         }, cookies=admin_cookies)
         assert resp.status_code == 200
         assert "New Name" in resp.text
-        assert "new.com" in resp.text
+        assert "new.invalid" in resp.text
 
     def test_edit_gmail_account_does_not_store_client_creds(
         self, client, admin_cookies, db, admin_user,
@@ -131,16 +131,40 @@ class TestAccountsUI:
         assert 'name="client_secret"' not in resp.text
 
     def test_delete_account(self, client, admin_cookies, db, admin_user):
+        """Remove = soft-deactivate, NEVER hard-delete (N-108). A DELETE FROM
+        email_accounts cascade-deletes the account's hipaa_access_events
+        (account_id ON DELETE CASCADE) — wiping the §164.312(b) trail. So the
+        row + audit history are RETAINED; only is_active flips to 0."""
         from email_triage.web.db import create_email_account
-        aid = create_email_account(db, admin_user["id"], "Delete Me", "imap", {"host": "x.com"})
+        from email_triage.db.audit import record_hipaa_access_event
+        aid = create_email_account(db, admin_user["id"], "Delete Me", "imap", {"host": "x.invalid"})
+        record_hipaa_access_event(db, admin_user["id"], aid, "n86_seed")
+        db.commit()
 
         resp = client.delete(f"/accounts/{aid}", cookies=admin_cookies)
         assert resp.status_code == 200
-        assert resp.text == ""
+        # The row re-renders showing the account DISABLED (not removed/blank);
+        # re-enable is via the Edit panel's existing is_active toggle.
+        assert "Disabled" in resp.text
+
+        # Account row RETAINED + deactivated (NEVER hard-deleted).
+        row = db.execute(
+            "SELECT is_active FROM email_accounts WHERE id = ?", (aid,)
+        ).fetchone()
+        assert row is not None, "account row must be RETAINED (never hard-deleted)"
+        assert row["is_active"] == 0, "account must be deactivated, not deleted"
+
+        # THE guarantee: the §164.312(b) PHI-access trail SURVIVES (a hard delete
+        # would have cascade-wiped these rows).
+        seed = db.execute(
+            "SELECT COUNT(*) c FROM hipaa_access_events "
+            "WHERE account_id = ? AND operation = 'n86_seed'", (aid,)
+        ).fetchone()["c"]
+        assert seed == 1, "the seeded PHI-access audit row must SURVIVE the soft-deactivate"
 
     def test_regular_user_cannot_edit_others_account(self, client, user_cookies, db, admin_user):
         from email_triage.web.db import create_email_account
-        aid = create_email_account(db, admin_user["id"], "Admin Account", "imap", {"host": "x.com"})
+        aid = create_email_account(db, admin_user["id"], "Admin Account", "imap", {"host": "x.invalid"})
 
         resp = client.get(f"/accounts/{aid}/edit", cookies=user_cookies)
         assert resp.status_code == 403
@@ -149,7 +173,7 @@ class TestAccountsUI:
         resp = client.post("/accounts/create", data={
             "name": "My IMAP",
             "provider_type": "imap",
-            "host": "mail.me.com",
+            "host": "mail.me.invalid",
             "port": "993",
             "username": "me@me.com",
             "mailbox": "INBOX",
@@ -165,7 +189,7 @@ class TestAccountsUI:
 
     def test_row_cancel(self, client, admin_cookies, db, admin_user):
         from email_triage.web.db import create_email_account
-        aid = create_email_account(db, admin_user["id"], "Row Test", "imap", {"host": "x.com"})
+        aid = create_email_account(db, admin_user["id"], "Row Test", "imap", {"host": "x.invalid"})
 
         resp = client.get(f"/accounts/{aid}/row", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -474,10 +498,10 @@ class TestAccountsOwnerFilter:
     def _make_two_owners(self, db, admin_user, regular_user):
         from email_triage.web.db import create_email_account
         a1 = create_email_account(
-            db, admin_user["id"], "ADMIN_ACCT", "imap", {"host": "a.example.com"},
+            db, admin_user["id"], "ADMIN_ACCT", "imap", {"host": "a.example.invalid"},
         )
         a2 = create_email_account(
-            db, regular_user["id"], "USER_ACCT", "imap", {"host": "u.example.com"},
+            db, regular_user["id"], "USER_ACCT", "imap", {"host": "u.example.invalid"},
         )
         return a1, a2
 
@@ -578,7 +602,7 @@ class TestAccountsCreateStartWatch:
             data={
                 "name": "Watchable", "provider_type": "imap",
                 "user_id": str(admin_user["id"]),
-                "host": "mail.example.com", "port": "993",
+                "host": "mail.example.invalid", "port": "993",
                 "username": "me@x.com", "password": "pw",
                 "mailbox": "INBOX", "use_ssl": "1",
                 "start_watch": "1",
@@ -634,7 +658,7 @@ class TestAccountsCreateStartWatch:
             data={
                 "name": "NoWatch", "provider_type": "imap",
                 "user_id": str(admin_user["id"]),
-                "host": "mail.example.com", "port": "993",
+                "host": "mail.example.invalid", "port": "993",
                 "username": "me@x.com", "password": "pw",
                 "mailbox": "INBOX", "use_ssl": "1",
                 # start_watch deliberately absent.
@@ -671,7 +695,7 @@ class TestAccountsCreateStartWatch:
             data={
                 "name": "BadCreds", "provider_type": "imap",
                 "user_id": str(admin_user["id"]),
-                "host": "mail.example.com", "port": "993",
+                "host": "mail.example.invalid", "port": "993",
                 "username": "me@x.com", "password": "pw",
                 "mailbox": "INBOX", "use_ssl": "1",
                 "start_watch": "1",
@@ -699,7 +723,7 @@ class TestAccountsTestNudge:
         return create_email_account(
             db, admin_user["id"], "N", "imap",
             {
-                "host": "mail.example.com", "port": 993,
+                "host": "mail.example.invalid", "port": 993,
                 "username": "me@x.com", "use_ssl": True, "mailbox": "INBOX",
             },
         )

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from email_triage._isotime import parse_iso
+from email_triage._isotime import parse_iso_aware  # N-357b R31 (was parse_iso)
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +60,35 @@ class UserRole(str, Enum):
     ADMIN = "admin"
     POWER_USER = "power_user"
     USER = "user"
+    # Punch  (operator 2026-09-29 17:15) — a read-only MACHINE monitoring
+    # role. It is NOT a lesser human role: a health_ro principal reaches only
+    # `web/_route_scope.HEALTH_RO_ALLOWED_ROUTES` and may never hold a web
+    # session, both enforced at the one auth seam (`get_current_user`) rather
+    # than per route. Every existing role predicate is allowlist-shaped
+    # (`== "admin"` / `in ("admin","power_user")`), so this member is
+    # least-privileged at all ~40 of them by construction — verified by the
+    # 2026-09-29 role census, not assumed.
+    HEALTH_RO = "health_ro"
 
 
 class RuleType(str, Enum):
     SENDER = "sender"
     SENDER_DOMAIN = "sender_domain"
     SUBJECT = "subject"
+    # 2026-07-17 Drive-B — mailing-list match via RFC 2919 `List-Id` header.
+    # Operator writes the list identifier (e.g. `announce.python.org`); the
+    # matcher parses the RFC 2919 `List-Id` header ("Human Name <list.host>")
+    # from message.headers case-insensitively.
+    LIST_ID = "list_id"
+
+
+# 2026-07-17 Drive-B (DA MF-2 fold) — SSOT for the web-side rule-type
+# membership list. Every rule-type validator in the web/routers/ tree
+# consumes THIS tuple; a hardcoded literal elsewhere fails the pin at
+# `tests/test_rule_types_ssot_pin.py`. Derived from RuleType so adding a
+# new enum member automatically flows to every validator without a
+# 6-site edit (which is the CIDI class Prime Directive #1 targets).
+WEB_ALLOWED_RULE_TYPES: tuple[str, ...] = tuple(rt.value for rt in RuleType)
 
 
 # ---------------------------------------------------------------------------
@@ -130,10 +153,11 @@ class EmailMessage:
     # ground-truth URL set so the LLM can't hallucinate links —
     # headlines are matched to a known-real href by substring.
     links: list[tuple[str, str]] = field(default_factory=list)
-    # Resolved HIPAA state at fetch time (system_hipaa OR account.hipaa).
-    # Providers set this when constructing the message; downstream
-    # actions read it instead of calling is_hipaa_mode() so the right
-    # decision is made per-account rather than globally.
+    # Resolved HIPAA state (system_hipaa OR account.hipaa). Providers do NOT
+    # set it (punch 601): the ingestion path that knows the account stamps it
+    # (web/triage_one.py, web/digest.py, the FlowEngine fetch, the topic
+    # back-scan). A HIPAA decision reads ``account_hipaa_effective(message=)``,
+    # which also honours the system flag when the stamp is missing.
     hipaa: bool = False
 
     def log_repr(self, hipaa: bool = False) -> dict[str, Any]:
@@ -164,6 +188,14 @@ class Classification:
     confidence: float
     reason: str
     source: str = "llm"  # "llm" | "list_rule" | "list_hint"
+    #  — model provenance. ``served_model`` is the model that
+    # actually produced this classification; ``failover_from`` is the
+    # configured PRIMARY model that could not serve, set only when a
+    # backup model served instead (so the dispatch layer can write one
+    # tamper-evident failover-audit row). Both None for list-rule
+    # results and for the normal primary-served path.
+    served_model: str | None = None
+    failover_from: str | None = None
 
     def log_repr(self, hipaa: bool = False) -> dict[str, Any]:
         base: dict[str, Any] = {
@@ -376,10 +408,9 @@ class OutOfOfficeOverride:
         for key in ("start", "end"):
             v = raw.get(key)
             if isinstance(v, str) and v:
-                dt = parse_iso(v)
+                # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+                dt = parse_iso_aware(v)
                 if dt is not None:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
                     setattr(out, key, dt)
         out.note = str(raw.get("note", ""))
         return out
@@ -514,10 +545,9 @@ class MailFilter:
         for key in ("after", "before"):
             v = raw.get(key)
             if isinstance(v, str) and v:
-                dt = parse_iso(v)
+                # N-357b (2026-07-06 baseline shrink): parse_iso_aware SSOT.
+                dt = parse_iso_aware(v)
                 if dt is not None:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
                     setattr(out, key, dt)
             elif isinstance(v, datetime):
                 setattr(out, key, v)

@@ -336,7 +336,7 @@ class TestClassificationCache:
         assert stub._store == {}
 
     def test_round_trip(self, stub):
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         key = "et:cls:abc"
         value = {
             "category": "fyi",
@@ -358,7 +358,7 @@ class TestClassificationCache:
 
     def test_store_ttl_passes_through(self, stub):
         cache = ClassificationCache(
-            url="redis://stub:6379/0", default_ttl_secs=999,
+            url="redis://stub.invalid:6379/0", default_ttl_secs=999,
         )
         cache.store("et:cls:k", {"category": "fyi"})
         assert stub._ttls["et:cls:k"] == 999
@@ -367,7 +367,7 @@ class TestClassificationCache:
         assert stub._ttls["et:cls:k2"] == 42
 
     def test_corrupt_json_treated_as_miss(self, stub):
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         stub._store["et:cls:bad"] = "{not-json"
         assert cache.lookup("et:cls:bad") is None
         # Counts as miss, NOT error (Redis itself is healthy).
@@ -377,7 +377,7 @@ class TestClassificationCache:
     def test_redis_unreachable_falls_through(self, stub):
         """Redis GET error -> lookup returns None + error counter bumps."""
         cache = ClassificationCache(
-            url="redis://stub:6379/0", breaker_ttl_secs=60,
+            url="redis://stub.invalid:6379/0", breaker_ttl_secs=60,
         )
         stub.fail_get = True
         assert cache.lookup("et:cls:k") is None
@@ -389,7 +389,7 @@ class TestClassificationCache:
 
     def test_set_failure_opens_breaker(self, stub):
         cache = ClassificationCache(
-            url="redis://stub:6379/0", breaker_ttl_secs=60,
+            url="redis://stub.invalid:6379/0", breaker_ttl_secs=60,
         )
         stub.fail_set = True
         # Store never raises into the caller.
@@ -401,7 +401,7 @@ class TestClassificationCache:
 
     def test_non_json_value_is_skipped(self, stub):
         """A non-JSON-serialisable value MUST not crash store()."""
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
 
         class _NotJSON:
             pass
@@ -413,7 +413,7 @@ class TestClassificationCache:
     def test_breaker_recovers_after_window(self, stub):
         """After the breaker TTL elapses, lookups try Redis again."""
         cache = ClassificationCache(
-            url="redis://stub:6379/0", breaker_ttl_secs=1,
+            url="redis://stub.invalid:6379/0", breaker_ttl_secs=1,
         )
         stub.fail_get = True
         assert cache.lookup("et:cls:k") is None
@@ -425,7 +425,7 @@ class TestClassificationCache:
         assert cache.lookup("et:cls:k") == {"category": "fyi"}
 
     def test_close_is_idempotent(self, stub):
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         cache.lookup("et:cls:k")  # force lazy client build
         cache.close()
         cache.close()  # second close MUST NOT raise
@@ -448,7 +448,7 @@ class TestHipaaGate:
         from email_triage.engine.models import EmailMessage
 
         # Install a cache that would otherwise hit.
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
 
         msg = EmailMessage(
@@ -509,7 +509,7 @@ class TestHipaaGate:
         from email_triage.classify.ollama import OllamaClassifier
         from email_triage.engine.models import EmailMessage
 
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
 
         msg = EmailMessage(
@@ -574,7 +574,7 @@ class TestBuildCacheFromConfig:
 
     def test_constructs_with_url(self):
         cfg = RedisCacheConfig(
-            url="redis://stub:6379/2", ttl_secs=12345,
+            url="redis://stub.invalid:6379/2", ttl_secs=12345,
         )
         cache = build_cache_from_config(cfg)
         assert cache is not None
@@ -582,7 +582,7 @@ class TestBuildCacheFromConfig:
         assert cache._default_ttl == 12345
 
     def test_install_singleton_round_trip(self):
-        cfg = RedisCacheConfig(url="redis://stub:6379/2")
+        cfg = RedisCacheConfig(url="redis://stub.invalid:6379/2")
         cache = build_cache_from_config(cfg)
         assert get_install_classification_cache() is None
         set_install_classification_cache(cache)
@@ -718,7 +718,7 @@ class TestSharedClassifierHelpers:
         )
         from email_triage.engine.models import Classification
         import json as _json
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         msg = self._msg(hipaa=True)
         # Lookup returns keys (no longer None-on-HIPAA).
@@ -747,7 +747,7 @@ class TestSharedClassifierHelpers:
         from email_triage.cache.classification import (
             cache_lookup_for_message,
         )
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         outer, inner, hit, hint = cache_lookup_for_message(
             self._msg(force=True), "qwen3.5:35b", {"fyi": "info"},
@@ -763,7 +763,7 @@ class TestSharedClassifierHelpers:
             compute_body_hash,
         )
         import json as _json
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         outer = make_outer_cache_key(
             account_id=42, sender="alice@example.com",
@@ -799,7 +799,7 @@ class TestSharedClassifierHelpers:
         )
         import json as _json
         cache = ClassificationCache(
-            url="redis://stub:6379/0",
+            url="redis://stub.invalid:6379/0",
             hint_strategy="top_k_with_freq",
         )
         set_install_classification_cache(cache)
@@ -833,7 +833,7 @@ class TestSharedClassifierHelpers:
         )
         import json as _json
         cache = ClassificationCache(
-            url="redis://stub:6379/0",
+            url="redis://stub.invalid:6379/0",
             hint_strategy="top_1_dominant",
             dominant_threshold_pct=70,
         )
@@ -870,7 +870,7 @@ class TestSharedClassifierHelpers:
         )
         import json as _json
         cache = ClassificationCache(
-            url="redis://stub:6379/0",
+            url="redis://stub.invalid:6379/0",
             hint_strategy="top_1_dominant",
             dominant_threshold_pct=70,
         )
@@ -904,7 +904,7 @@ class TestSharedClassifierHelpers:
         from email_triage.cache.classification import (
             cache_lookup_for_message,
         )
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         _, _, hit, hint = cache_lookup_for_message(
             self._msg(), "qwen3.5:35b", {"fyi": "info"},
@@ -918,7 +918,7 @@ class TestSharedClassifierHelpers:
             cache_store_for_message,
         )
         from email_triage.engine.models import Classification
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         cache_store_for_message(
             "fake-outer", "fake-inner", "qwen3.5:35b",
@@ -933,7 +933,7 @@ class TestSharedClassifierHelpers:
             cache_store_for_message,
         )
         from email_triage.engine.models import Classification
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         set_install_classification_cache(cache)
         cache_store_for_message(
             "real-outer", "real-inner", "qwen3.5:35b",
@@ -959,7 +959,7 @@ class TestHitRateCounters:
     """Counters tick on hits, misses, errors across the typical lifecycle."""
 
     def test_hit_miss_error_increment_in_order(self, stub):
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         # 1. Miss.
         assert cache.lookup("et:cls:a") is None
         assert get_counters().snapshot()["misses"] == 1
@@ -1006,7 +1006,7 @@ class TestFlushAll:
             return removed
         stub.delete = _delete
 
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         deleted = cache.flush_all()
         assert deleted == 2
         assert "et:cls:a" not in stub._store
@@ -1021,7 +1021,7 @@ class TestFlushAll:
         def _scan_fail(cursor, match, count):
             raise ConnectionError("simulated scan failure")
         stub.scan = _scan_fail
-        cache = ClassificationCache(url="redis://stub:6379/0")
+        cache = ClassificationCache(url="redis://stub.invalid:6379/0")
         deleted = cache.flush_all()
         assert deleted == 0
         assert get_counters().snapshot()["errors"] == 1
@@ -1064,49 +1064,10 @@ class TestLazyImport:
 
         # Module imported fine. Building a cache + using it should
         # degrade gracefully (breaker opens, no exception bubbles out).
-        cache = cls_mod.ClassificationCache(url="redis://stub:6379/0")
+        cache = cls_mod.ClassificationCache(url="redis://stub.invalid:6379/0")
         # The first lookup attempts the lazy ``import redis`` and falls
         # back to no-op + breaker-open. MUST NOT raise.
         assert cache.lookup("anything") is None
-
-
-# ---------------------------------------------------------------------------
-# Privacy invariant — no operator identifiers in the cache module
-# ---------------------------------------------------------------------------
-
-def test_privacy_invariant_no_operator_identifiers_in_cache_module():
-    """Pin: the cache module's docstrings, comments, examples MUST NOT
-    name operator-owned hosts (the filter host, the mail host, etc.) or operator personal
-    names (Alex, Doe, the agent, ...). The leak in this exact module
-    on 2026-05-11 is the reason this pin exists.
-    """
-    from pathlib import Path
-    root = Path(__file__).resolve().parents[1].parent
-    paths = [
-        root / "src" / "email_triage" / "cache" / "__init__.py",
-        root / "src" / "email_triage" / "cache" / "classification.py",
-    ]
-    forbidden = [
-        # Hostnames
-        "the filter host", "the mail host", "the DNS host", "the gateway host", "llm-host",
-        "the monitoring host", "the deploy host", "the storage host", "the ML host", "a homelab host", "a homelab host",
-        "examplerealm.com",
-        # Personal names + agent instances
-        "the agent", "the agent",
-    ]
-    offenders: list[str] = []
-    for p in paths:
-        if not p.exists():
-            continue
-        text = p.read_text(encoding="utf-8", errors="replace").lower()
-        for needle in forbidden:
-            if needle.lower() in text:
-                offenders.append(f"{p.name}: {needle}")
-    assert not offenders, (
-        "Operator identifiers found in cache module — replace with "
-        "generic placeholders (e.g. 'your-redis-host.example.local'):\n"
-        + "\n".join(offenders)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1126,22 +1087,40 @@ class TestAdminUI:
     """
 
     def test_template_renders_redis_section(self):
-        """Static template-render smoke: the Classification cache
-        section appears in the integrations admin page template."""
+        """Static source check on the Classification cache section of the
+        integrations admin template.
+
+        Field *rendering* (the actual ``name="redis_cache_url"`` attribute
+        in the HTTP response) is owned by the render test
+        ``test_web/test_integrations_redis_section.py::test_section_present``.
+        This static check owns what static analysis is good at: the section
+        is wired and — the privacy invariant — no operator hostname leaks
+        into the shipped template source.
+        """
         from pathlib import Path
+        # The admin config UI was split into per-tab partials (1cbfe6e); the
+        # integrations tab (with the Classification-cache section) lives under
+        # admin/config_tabs/ now.
         tpl = Path(__file__).resolve().parents[1].parent / (
-            "src/email_triage/web/templates/admin/integrations.html"
+            "src/email_triage/web/templates/admin/config_tabs/integrations.html"
         )
         text = tpl.read_text(encoding="utf-8")
         assert "Classification cache" in text
-        assert 'name="redis_cache_url"' in text
+        # The URL field is wired through the m.combo_input datalist macro
+        #, so the source carries the field name as a
+        # macro argument, not a literal ``name="..."`` attribute (that's in
+        # the rendered HTML — see the render test referenced above).
+        assert '"redis_cache_url"' in text
         assert 'name="redis_cache_ttl_secs"' in text
-        # Flush form present.
+        # Flush form present. The config-tabs refactor (1cbfe6e) dropped this
+        # form, orphaning the still-live /cache/flush route from the UI; it
+        # was restored into this tab next to the cache settings.
         assert "/admin/integrations/cache/flush" in text
-        # Privacy: generic placeholder, NOT an operator host.
-        assert "the filter host" not in text.lower()
-        assert "examplerealm" not in text.lower()
-        assert "your-redis-host.example.local" in text
+        # Privacy: generic placeholder, NOT an operator host. The operator host
+        # names are not spelled here: a negative assertion that names them ships
+        # them to the public mirror (punch 617). The publish sanitizer rewrites
+        # templates wholesale and the publish scrub reports any survivor.
+        assert "your-lan-host" in text
 
 
 # ---------------------------------------------------------------------------
@@ -1156,7 +1135,7 @@ class TestBuildCacheFromConfigClamps:
         from email_triage.cache.classification import (
             MIN_TTL_SECS, build_cache_from_config,
         )
-        cfg = RedisCacheConfig(url="redis://stub:6379/0", ttl_secs=10)
+        cfg = RedisCacheConfig(url="redis://stub.invalid:6379/0", ttl_secs=10)
         cache = build_cache_from_config(cfg)
         assert cache is not None
         assert cache._default_ttl == MIN_TTL_SECS
@@ -1166,7 +1145,7 @@ class TestBuildCacheFromConfigClamps:
             MAX_TTL_SECS, build_cache_from_config,
         )
         cfg = RedisCacheConfig(
-            url="redis://stub:6379/0", ttl_secs=MAX_TTL_SECS + 5,
+            url="redis://stub.invalid:6379/0", ttl_secs=MAX_TTL_SECS + 5,
         )
         cache = build_cache_from_config(cfg)
         assert cache is not None

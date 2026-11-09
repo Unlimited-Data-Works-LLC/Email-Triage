@@ -26,9 +26,15 @@
 
    Required context: ``acct``, ``categories``, ``routes_by_cat``,
    ``folders``, ``all_folder_count``, ``excluded_count``,
-   ``available_actions``. ``folder_msg`` optional (flash from folder
-   prefs save). ``autosave_paused`` optional (operator preference;
-   defaults to False = auto-save mode).
+   ``available_actions``, ``folder_msg`` (flash from folder prefs
+   save; may be empty), ``autosave_paused`` (always False from the
+   server; the page script restores the browser-stored pause).
+
+   ``available_actions`` is the offer SSOT (_shared._AVAILABLE_ROUTE_ACTIONS).
+   This template hardcodes one block per action rather than looping over it,
+   because most actions carry their own config UI. Adding or removing an
+   action block here means changing that tuple too: the punch-596 rendered-view
+   pin fails if the checkboxes on any card differ from it.
 #}
 
 <h3>Routes &mdash; Category {{ "&rarr;" | safe }} Action mappings{{ m.help("Set what happens to each category of email for this account. Categories come from the Classification Categories page (system-wide) plus your personal ones on the Profile page.") }}</h3>
@@ -156,6 +162,8 @@
             move_folder='',
             add_label_internal=[],
             add_label_provider=[],
+            clock_template='',
+            clock_responsibility='unknown',
         ) %}
         {% for a in route_actions %}
             {% set _act = a.action if a.action is defined else a.get('action', '') %}
@@ -178,6 +186,12 @@
                 {% if _provider is iterable and _provider is not string %}
                     {% set ns.add_label_provider = _provider %}
                 {% endif %}
+            {% elif _act == 'clock' %}
+                {# #34 — the chosen regulatory template + responsibility for the
+                   clock route-action, so the selects re-render with the saved
+                   choices. #}
+                {% if _cfg.get('template') %}{% set ns.clock_template = _cfg['template'] %}{% endif %}
+                {% if _cfg.get('responsibility') %}{% set ns.clock_responsibility = _cfg['responsibility'] %}{% endif %}
             {% endif %}
         {% endfor %}
         <article id="route-row-{{ slug }}" class="route-row route-card"
@@ -263,8 +277,20 @@
                     </div>
                     {% else %}
                     <small class="route-action-na">
-                        no label picker — category name
-                        (<code>{{ slug }}</code>) used as the label
+                        {% if acct and acct.provider_type in ('gmail_api', 'office365') %}
+                        {# Label-capable provider but no labels came back — almost
+                           always because the account can't reach the provider
+                           right now (e.g. it needs reconnecting), NOT because it
+                           has no labels. Say so, instead of implying there's no
+                           picker (which sent the operator chasing a picker bug
+                           when the real cause was a Gmail auth failure). #}
+                        couldn't load this account's labels right now — check the
+                        account's connection. Meanwhile the category name
+                        (<code>{{ slug }}</code>) is used as the label.
+                        {% else %}
+                        no label picker — the category name
+                        (<code>{{ slug }}</code>) is used as the label
+                        {% endif %}
                     </small>
                     {% endif %}
                 </div>
@@ -297,6 +323,49 @@
                                {% if 'suggest_meeting_times' in action_names %}checked{% endif %}>
                         <span>suggest_meeting_times{{ m.help("Drafts a calendar-aware reply listing your next free windows in business hours. Reads your meeting preferences (length, count, business hours, timezone) from the Profile → Meeting tab. Fires automatically on category=meeting-request when calendar is enabled, so most setups don't need this box. Tick it to use the calendar-aware draft on a different category, or alongside move / label / notify on meeting-request without producing two drafts.") }}</span>
                     </label>
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="mute"
+                               {% if 'mute' in action_names %}checked{% endif %}>
+                        <span>mute{{ m.help("Silence this category. Tick mute ALONE to skip the other actions on this row — the mail is still classified + audited, but the other actions won't run. Tick mute alongside move or label to compose 'file it, don't page me' (common for newsletters). Nothing is deleted; the message stays in your mailbox.") }}</span>
+                    </label>
+                </div>
+
+                {# clock — start a regulatory-deadline clock. When mail
+                   lands in this category, create a CANDIDATE clock from the
+                   chosen template; you confirm it on the Deadlines page to start
+                   the countdown. Picker hidden + selects disabled when unticked
+                   (mirrors the move pattern). AUDIENCE: end user — plain copy. #}
+                <div class="route-action-row">
+                    <label class="route-action-toggle">
+                        <input type="checkbox" name="actions" value="clock"
+                               {% if 'clock' in action_names %}checked{% endif %}
+                               onclick="var c=this.checked; var d=document.getElementById('clock-cfg-{{ slug }}'); if(d){ d.style.display=c?'block':'none'; d.querySelectorAll('select').forEach(function(s){s.disabled=!c;}); }">
+                        <span>clock{{ m.help("Starts a regulatory-deadline clock for mail in this category. Pick a deadline template (IRB / FDA / EU) and who submits. The clock shows up on the Deadlines page as a candidate — you confirm it there to start the countdown + reminders. Nothing is filed automatically.") }}</span>
+                    </label>
+                    {% if regulatory_clock_templates %}
+                    <div id="clock-cfg-{{ slug }}" class="route-action-config route-clock-cfg"
+                         style="display:{% if 'clock' in action_names %}block{% else %}none{% endif %};">
+                        <select name="clock_template"
+                                {% if 'clock' not in action_names %}disabled{% endif %}>
+                            <option value="">— deadline template —</option>
+                            {% for t in regulatory_clock_templates %}
+                            <option value="{{ t.code }}" {% if t.code == ns.clock_template %}selected{% endif %}>{{ t.title }}</option>
+                            {% endfor %}
+                        </select>
+                        <select name="clock_responsibility"
+                                {% if 'clock' not in action_names %}disabled{% endif %}>
+                            <option value="unknown" {% if ns.clock_responsibility == 'unknown' %}selected{% endif %}>Responsibility: unknown</option>
+                            <option value="i_submit" {% if ns.clock_responsibility == 'i_submit' %}selected{% endif %}>I submit (escalating clock)</option>
+                            <option value="sponsor_submits" {% if ns.clock_responsibility == 'sponsor_submits' %}selected{% endif %}>Sponsor submits (informational)</option>
+                        </select>
+                        <small class="route-action-hint">
+                            Creates a candidate on the Deadlines page — confirm it
+                            there to arm the deadline.
+                        </small>
+                    </div>
+                    {% else %}
+                    <small class="route-action-na">no deadline templates available</small>
+                    {% endif %}
                 </div>
 
                 {# #129 tail — add-label action. Checkbox toggles the

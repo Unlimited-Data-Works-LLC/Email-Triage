@@ -39,7 +39,8 @@ from email_triage.web.db import (
 # ---------------------------------------------------------------------------
 
 def _make_db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection, *, email: str = "u@example.com") -> int:
@@ -379,6 +380,63 @@ class TestDistillHipaaStyle:
         assert status == "not_hipaa"
         classifier.complete.assert_not_awaited()
 
+    async def test_baa_required_for_external_classifier_without_ack(self):
+        """The prompt carries raw sent-mail bodies, so an external classifier
+        with no BAA ack on file is refused BEFORE egress (PD#5): status
+        ``baa_required``, ``complete`` never awaited, no audit row, no row."""
+        conn = _make_db()
+        user_id = _seed_user(conn)
+        acct = _seed_account(conn, user_id=user_id, hipaa=True)
+        set_hipaa_style_distill_enabled(conn, True)
+        set_style_knobs_hipaa_allow(conn, acct["id"], enabled=True)
+
+        classifier = AsyncMock()
+        classifier.model = "openaicompat:x"
+        classifier.is_local = False
+        classifier._base_url = "https://llm.example.invalid/v1"
+        classifier.complete.return_value = json.dumps(_GOOD_DESCRIPTOR_JSON)
+        admin_id = _seed_user(conn, email="admin@example.com")
+
+        descriptor, status = await distill_hipaa_style(
+            conn, acct, classifier,
+            messages=[_msg("real reply")],
+            actor_user_id=admin_id,
+        )
+        assert descriptor is None
+        assert status == "baa_required"
+        classifier.complete.assert_not_awaited()
+        assert get_hipaa_style_descriptor(conn, acct["id"]) is None
+        assert list_hipaa_access_events(conn, account_id=acct["id"]) == []
+
+    async def test_external_classifier_with_baa_ack_proceeds(self):
+        """The inverse edge: a BAA ack on file for the exact (backend, host)
+        lets the distill egress (the gate refuses only the un-acked case)."""
+        from email_triage.classify.baa_gate import (
+            _backend_for_classifier, _vendor_host_for_classifier, set_baa_ack,
+        )
+        conn = _make_db()
+        user_id = _seed_user(conn)
+        acct = _seed_account(conn, user_id=user_id, hipaa=True)
+        set_hipaa_style_distill_enabled(conn, True)
+        set_style_knobs_hipaa_allow(conn, acct["id"], enabled=True)
+
+        classifier = AsyncMock()
+        classifier.model = "openaicompat:x"
+        classifier.is_local = False
+        classifier._base_url = "https://llm.example.invalid/v1"
+        classifier.complete.return_value = json.dumps(_GOOD_DESCRIPTOR_JSON)
+        set_baa_ack(conn, _backend_for_classifier(classifier),
+                    _vendor_host_for_classifier(classifier), user_id)
+
+        descriptor, status = await distill_hipaa_style(
+            conn, acct, classifier,
+            messages=[_msg("Quick note: shipped Tuesday.")],
+            actor_user_id=user_id,
+        )
+        assert status == "ok"
+        assert descriptor is not None
+        classifier.complete.assert_awaited_once()
+
     async def test_happy_path_persists_clean_descriptor(self):
         """All gates pass + LLM returns valid + scrubber clean →
         descriptor persists + audit row carries success outcome."""
@@ -504,10 +562,16 @@ class TestDistillHipaaStyle:
         classifier.complete.assert_not_awaited()
 
     async def test_llm_failure_returns_llm_failed(self):
-        """Classifier raises → llm_failed + audit row final outcome=error."""
+        """Classifier raises → llm_failed + audit row final outcome=error.
+
+        N-80: the §164.312(b) bookend is gated actor≠owner (owner-self exempt),
+        so this drives a NON-owner actor (a manager distilling someone else's
+        HIPAA account) to exercise the recording path. Owner-self exemption is
+        pinned in test_audit_phi_access_pin (phi_access_audit_required)."""
         conn = _make_db()
-        user_id = _seed_user(conn)
-        acct = _seed_account(conn, user_id=user_id, hipaa=True)
+        owner_id = _seed_user(conn)
+        actor_id = _seed_user(conn, email="manager@example.com")  # non-owner
+        acct = _seed_account(conn, user_id=owner_id, hipaa=True)
         set_hipaa_style_distill_enabled(conn, True)
         set_style_knobs_hipaa_allow(conn, acct["id"], enabled=True)
 
@@ -518,12 +582,12 @@ class TestDistillHipaaStyle:
         descriptor, status = await distill_hipaa_style(
             conn, acct, classifier,
             messages=[_msg("real reply")],
-            actor_user_id=user_id,
+            actor_user_id=actor_id,
         )
         assert descriptor is None
         assert status == "llm_failed"
 
-        # Audit row should still close cleanly.
+        # Audit row (non-owner access) records + closes cleanly.
         events = list_hipaa_access_events(conn, account_id=acct["id"])
         assert len(events) == 1
         assert events[0]["outcome"] == "error"
@@ -637,5 +701,5 @@ class TestPhase3IsFlagGated:
             "triage_runner_bulk.py imports hipaa_style_distill — the "
             "phase-3 pipeline should stay flag-gated scaffold until "
             "operator signs off on the LLM-backend posture. See "
-            "the backlog  phase 3."
+            "PUNCH-LIST.md #152 phase 3."
         )

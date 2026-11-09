@@ -8,6 +8,7 @@ clean-chain path, tampered-row path, ``--since`` cutoff filtering,
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import logging
 import sqlite3
@@ -35,7 +36,7 @@ def _seed_chain(db_path: Path, count: int = 3, logger_name: str = "test.audit") 
     log rows via the production SQLiteLogHandler. Closes the connection
     so the file-on-disk chain is fully flushed before verification.
     """
-    conn = init_db(db_path)
+    conn = track(init_db(db_path))
     handler = SQLiteLogHandler(conn, flush_interval=1)
     log = logging.getLogger(logger_name)
     log.addHandler(handler)
@@ -118,10 +119,10 @@ class TestVerifyHappyPath:
 
         captured = capsys.readouterr()
         assert rc == 0
-        # Single line of shape "PASS <N>".
+        # Single line of shape "PASS <N> gap_sentinels=<M>" (panel P G1b).
         out = captured.out.strip()
         assert out.startswith("PASS ")
-        assert out == f"PASS {_row_count(db_path)}"
+        assert out == f"PASS {_row_count(db_path)} gap_sentinels=0"
         assert "\n" not in out  # Single line.
 
 
@@ -393,7 +394,7 @@ def _hipaa_install(tmp_path, *, hipaa: bool = True):
     bootstrap.set(cfg.secrets.master_key_name, DbSecrets.generate_master_key())
 
     # Init the DB schema so log_entries exists for the emitter.
-    conn = init_db(db_path)
+    conn = track(init_db(db_path))
     provider = bootstrap_secrets_from_config(conn, cfg)
     wire_audit_chain_hmac_keys(provider, cfg)
     conn.close()
@@ -452,6 +453,13 @@ secrets:
 
 persistence:
   db_path: {cfg.persistence.db_path}
+  # Declare the plaintext intent EXPLICITLY. The install helper creates this DB
+  # unencrypted, and since 903b9618 the dataclass default is encrypted-at-rest,
+  # so an omitted key now resolves to True and the fixture's own plaintext file
+  # fails to open ("hmac check failed for pgno=1" / "file is not a database").
+  # These tests exercise CLI audit emission, not storage posture — the flip's
+  # own advisory says to state the intent rather than inherit it.
+  encryption_enabled: false
 """
         )
         yield yaml_path, Path(cfg.persistence.db_path), cfg
@@ -638,6 +646,13 @@ secrets:
 
 persistence:
   db_path: {cfg.persistence.db_path}
+  # Declare the plaintext intent EXPLICITLY. The install helper creates this DB
+  # unencrypted, and since 903b9618 the dataclass default is encrypted-at-rest,
+  # so an omitted key now resolves to True and the fixture's own plaintext file
+  # fails to open ("hmac check failed for pgno=1" / "file is not a database").
+  # These tests exercise CLI audit emission, not storage posture — the flip's
+  # own advisory says to state the intent rather than inherit it.
+  encryption_enabled: false
 """
             )
 
@@ -658,21 +673,42 @@ persistence:
             )
 
 
-class TestCliAuditAutoEmitFailSoft:
-    def test_emission_failure_logs_warning_but_does_not_block_handler(
+class TestCliAuditAutoEmitFailLoudGate:
+    """N-157 (2026-07-09) — fail-loud gate default + `--allow-unaudited`
+    recovery flag.  operator-directed close per AskUserQuestion 2026-07-08
+    ("Fail-loud with recovery flag").
+
+    DEFAULT: an emit failure at handler ENTRY (phase='start') raises
+    `CliAuditGateClosed` so the CLI exits non-zero with a specific
+    message naming the recovery lever.  The pre-N-157 fail-SOFT posture
+    is now the opt-in `--allow-unaudited` mode, preserving the
+    procedural H-03 closure (break-glass actions_taken) for legitimate
+    mid-incident break-glass use.
+    """
+
+    @pytest.mark.audit_failure_expected(
+        match='cli_admin_op:user:start',
+        count=1,
+    )
+    def test_emission_failure_default_fail_loud_at_start(
         self, _hipaa_config_file, capsys, caplog, monkeypatch,
     ):
-        """The defense-in-depth audit MUST NOT block the underlying CLI
-        op. The procedural H-03 closure (break-glass actions_taken in
-        INCIDENT_RESPONSE.md) remains the fallback per §164.312(b)'s
-        'and/or procedural' reading."""
-        import logging as _logging
+        """DEFAULT (--allow-unaudited NOT set): a phase='start' emit
+        failure raises ``CliAuditGateClosed`` so the handler NEVER runs
+        + the CLI exits non-zero — operator sees an obvious audit-gate
+        error instead of a silent WARN + successful op (§164.312(b)
+        Audit Controls anchor).
+        """
         from email_triage import cli as cli_mod
+        from email_triage.cli import CliAuditGateClosed
 
         yaml_path, _db_path, _cfg = _hipaa_config_file
 
-        # Sabotage the emit path. Patch insert_log_entry at the import
-        # site the decorator uses (it imports lazily inside the helper).
+        # Sabotage the emit path — `record_cli_admin_op` internally
+        # calls the chain-primitive `insert_log_entry`; patching the
+        # primitive turns every emit into a raise, which
+        # `safe_audit_write` surfaces as a None return, which the
+        # actuator gate turns into `CliAuditGateClosed` at phase='start'.
         from email_triage.db import audit as _audit_mod
 
         def _explode(*a, **kw):
@@ -683,23 +719,163 @@ class TestCliAuditAutoEmitFailSoft:
         args = _parse([
             "--config", str(yaml_path),
             "user", "create",
+            "--email", "loud@example.com",
+        ])
+        # Verify the default state matches the fail-CLOSED contract.
+        assert args.allow_unaudited is False, (
+            "N-157 default MUST be `--allow-unaudited=False` (fail-CLOSED)"
+        )
+
+        # Fail-CLOSED: handler MUST NOT run + exception MUST propagate.
+        with pytest.raises(CliAuditGateClosed) as excinfo:
+            cli_mod.cmd_user(args)
+        capsys.readouterr()
+
+        # The exception message names the recovery lever.
+        assert "--allow-unaudited" in str(excinfo.value), (
+            "N-157 fail-CLOSED exception MUST name --allow-unaudited as "
+            "the recovery lever so the operator sees how to unblock."
+        )
+
+    @pytest.mark.audit_failure_expected(
+        match=(
+            'cli_admin_op:user:end',
+            'cli_admin_op:user:start',
+        ),
+        count=2,
+    )
+    def test_emission_failure_with_allow_unaudited_preserves_fail_soft(
+        self, _hipaa_config_file, capsys, caplog, monkeypatch,
+    ):
+        """`--allow-unaudited` reverts to pre-N-157 fail-SOFT: WARN
+        logged, handler still runs, procedural H-03 break-glass closure
+        remains in force per §164.312(b)'s 'and/or procedural' reading.
+        """
+        import logging as _logging
+        from email_triage import cli as cli_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+
+        from email_triage.db import audit as _audit_mod
+
+        def _explode(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        monkeypatch.setattr(_audit_mod, "insert_log_entry", _explode)
+
+        args = _parse([
+            "--config", str(yaml_path),
+            "--allow-unaudited",
+            "user", "create",
             "--email", "soft@example.com",
         ])
+        assert args.allow_unaudited is True
 
         with caplog.at_level(_logging.WARNING, logger="email_triage.cli"):
             rc = cli_mod.cmd_user(args)
         capsys.readouterr()
 
-        # CLI op succeeded despite emit failure.
+        # Handler still runs to completion under the recovery flag.
         assert rc == 0
-        # WARNING was logged surfacing the auto-emit failure (operator
-        # can investigate; procedural fallback covers compliance posture).
+        # WARNING surfaces the auto-emit failure so the operator can
+        # investigate the audit gap after the break-glass op finishes.
         warn_msgs = [
             r.getMessage() for r in caplog.records
             if r.levelno >= _logging.WARNING
         ]
         assert any("H-03-auto" in m for m in warn_msgs), (
-            f"expected H-03-auto warning, got: {warn_msgs}"
+            f"expected H-03-auto warning under --allow-unaudited, "
+            f"got: {warn_msgs}"
+        )
+
+
+class TestCliMainSurfacesFailLoudGateAsCleanError:
+    """N-157 (2026-07-09) — DA fold Fix #1.  ``main()`` MUST catch
+    ``CliAuditGateClosed`` from a wrapped handler + surface a CLEAN CLI
+    error on stderr — no Python traceback — with a dedicated exit code
+    (3) an operator's shell script can discriminate.  Without this the
+    fail-loud gate reaches the operator as a Python stack trace, which
+    is a break-glass usability defect on the audit-recovery path.
+    """
+
+    @pytest.mark.audit_failure_expected(
+        match='cli_admin_op:user:start',
+        count=1,
+    )
+    def test_main_surfaces_clean_error_and_returns_3(
+        self, _hipaa_config_file, capsys, monkeypatch,
+    ):
+        """Sabotage the emit path + invoke `main()` directly.  The exit
+        code MUST be 3 (dedicated), stderr MUST name the recovery lever
+        `--allow-unaudited` verbatim, and Fix #1's clean-print line
+        MUST appear on stderr.  The Fix #1 contract is "no raw
+        `CliAuditGateClosed` traceback reaches the operator" — verified
+        via absence of the `RuntimeError: CLI audit emit failed` shape
+        that Python's default uncaught-exception handler would write
+        as the FINAL line if `main()` did NOT catch (the fingerprint
+        is scoped to that specific text so stdlib logging's own
+        `--- Logging error ---` self-diagnostic dumps that pytest
+        aggregates from earlier tests do NOT false-fire this check).
+        """
+        import logging as _logging
+        from email_triage import cli as cli_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+
+        from email_triage.db import audit as _audit_mod
+
+        def _explode(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        monkeypatch.setattr(_audit_mod, "insert_log_entry", _explode)
+
+        # Silence the stdlib logging module's own I/O-error self-
+        # diagnostic (the "--- Logging error ---" block) — that fires
+        # when pytest's stderr-capture teardown leaves earlier tests'
+        # StreamHandler pointing at a closed file, and it pollutes
+        # `err` with an unrelated traceback that has nothing to do
+        # with N-157's fail-loud path.  This flag ONLY suppresses the
+        # logging module's meta-diagnostic; real exceptions from our
+        # code still propagate normally.
+        monkeypatch.setattr(_logging, "raiseExceptions", False)
+
+        # Drive `main()` end-to-end so the wrapping `@_cli_audit` +
+        # top-level `try/except CliAuditGateClosed` are BOTH exercised.
+        rc = cli_mod.main([
+            "--config", str(yaml_path),
+            "user", "create",
+            "--email", "clean@example.com",
+        ])
+        _out, err = capsys.readouterr()
+
+        # Dedicated exit code — an operator's shell script MUST be able
+        # to discriminate this class from a generic handler error.
+        assert rc == 3, f"N-157 fail-loud MUST return rc=3; got {rc}"
+
+        # Recovery lever named verbatim on stderr.
+        assert "--allow-unaudited" in err, (
+            f"N-157 fail-loud MUST name --allow-unaudited on stderr; "
+            f"got stderr={err!r}"
+        )
+
+        # Fix #1's clean-print line MUST land — the try/except in main()
+        # produces exactly this shape via `print(f"error: {e}", ...)`.
+        assert "error: CLI audit emit failed" in err, (
+            f"N-157 fail-loud MUST surface the clean 'error: CLI audit "
+            f"emit failed …' line via main()'s try/except; got "
+            f"stderr={err!r}"
+        )
+
+        # NO raw-exception traceback shape — if Fix #1 were missing,
+        # Python's default uncaught-exception handler would write
+        # `RuntimeError: CLI audit emit failed …` as the FINAL stderr
+        # line (that's how base RuntimeError subclasses print).  This
+        # exact shape is what discriminates a clean-caught error from
+        # a bubbled-out exception, independent of any stdlib-logging
+        # noise pytest aggregates from earlier tests.
+        assert "RuntimeError: CLI audit emit failed" not in err, (
+            f"N-157 fail-loud MUST NOT surface the raw exception "
+            f"traceback shape; got stderr={err!r}"
         )
 
 
@@ -733,6 +909,9 @@ class TestCliAuditPattern:
         "cmd_sent_mail_index": "sent-mail-index",
         "cmd_embedding_bits_install": "embedding-bits.install",
         "cmd_embedding_bits_sideload": "embedding-bits.sideload",
+        # N-526 / punch 541 — removal mutates BOTH the data volume and the
+        # install-state row, so it is squarely inside the §164.312(b) surface.
+        "cmd_embedding_bits_remove": "embedding-bits.remove",
         "cmd_tls_bootstrap": "tls.bootstrap",
         "cmd_tls_fetch_tailscale": "tls.fetch-tailscale",
         "cmd_auth_dev_login": "auth.dev-login",
@@ -766,3 +945,282 @@ class TestCliAuditPattern:
                 for h, got, exp in wrong_label
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Punch  — --all-chains: the bake walks every chain, not log_entries only
+# ---------------------------------------------------------------------------
+
+def _seed_gap_rows(db_path: Path, n: int = 3) -> list[int]:
+    import email_triage.db.audit as A
+
+    conn = track(init_db(db_path))
+    try:
+        for i in range(n):
+            A._write_audit_gap_event(
+                conn, helper_name=f"h{i}", args=(), kwargs={"event_type": "x"},
+                exc=RuntimeError("emit failed"),
+            )
+        return [r[0] for r in conn.execute("SELECT id FROM audit_gap_events ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _tamper_gap(db_path: Path, row_id: int) -> None:
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE audit_gap_events SET exc_msg = 'edited' WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+
+
+class TestAllChains:
+    def test_clean_db_passes_and_names_every_chain(self, tmp_path, capsys):
+        import email_triage.db.audit as A
+
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        _seed_gap_rows(db_path)
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        out = capsys.readouterr()
+        assert rc == 0, out.err
+        assert f"{A.GAP_CHAIN_TABLE}: PASS" in out.out
+        assert "FAIL" not in out.err
+
+    def test_a_broken_gap_chain_fails(self, tmp_path, capsys):
+        import email_triage.db.audit as A
+
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        ids = _seed_gap_rows(db_path)
+        _tamper_gap(db_path, ids[1])
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        out = capsys.readouterr()
+        assert rc == 1
+        assert f"FAIL — {A.GAP_CHAIN_TABLE} chain" in out.err
+        assert f"first break id={ids[1]}" in out.err
+
+    def test_quiet_names_the_table(self, tmp_path, capsys):
+        import email_triage.db.audit as A
+
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        ids = _seed_gap_rows(db_path)
+        _tamper_gap(db_path, ids[0])
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains", "--quiet"]))
+        out = capsys.readouterr()
+        assert rc == 1
+        assert f"FAIL {A.GAP_CHAIN_TABLE} {ids[0]}" in out.err
+
+    def test_without_the_flag_only_log_entries_is_walked(self, tmp_path, capsys):
+        """Back-compat: the default still verifies log_entries alone, which is
+        why the bake must pass the flag (pinned in the punch-451 pin file)."""
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        ids = _seed_gap_rows(db_path)
+        _tamper_gap(db_path, ids[1])
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path)]))
+        assert rc == 0, capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Punch  fold (hipaa F-524-A/B/C, db 4/5, da F1-F4, 2026-09-25)
+# ---------------------------------------------------------------------------
+
+def _insert_keyless_registry_row(db_path: Path) -> int:
+    """A user_status_events row hashed with the public sha256 form: no
+    current writer of that table produces one (N-507)."""
+    import email_triage.db.audit as A
+
+    conn = track(init_db(db_path))
+    try:
+        vals = ("2026-09-25T00:00:00+00:00", 1, None, "disabled", "")
+        h = A.compute_audit_row_hash("", vals, hash_alg="sha256")
+        cur = conn.execute(
+            "INSERT INTO user_status_events (ts, target_user_id, actor_user_id, "
+            "event, reason, prev_hash, row_hash, hash_alg, master_key_version) "
+            "VALUES (?, ?, ?, ?, ?, '', ?, 'sha256', NULL)",
+            (*vals, h),
+        )
+        conn.commit()
+        res = A.verify_audit_chain(conn, "user_status_events")
+        assert res["intact"] and res["keyless_count"] == 1, res
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+class TestAllChainsFold:
+    def test_a_keyless_registry_row_fails(self, tmp_path, capsys):
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        _insert_keyless_registry_row(db_path)
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        out = capsys.readouterr()
+        assert rc == 1, out
+        assert "FAIL — user_status_events chain: 1 keyless" in out.err
+        assert "user_status_events: PASS" not in out.out
+
+    def test_a_keyless_registry_row_fails_quiet(self, tmp_path, capsys):
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        _insert_keyless_registry_row(db_path)
+        rc = cmd_audit_verify(_parse(
+            ["audit", "verify", "--db", str(db_path), "--all-chains", "--quiet"]))
+        assert rc == 1
+        assert "FAIL user_status_events keyless=1" in capsys.readouterr().err
+
+    def test_a_keyless_gap_row_passes_counted(self, tmp_path, capsys):
+        """The gap writer degrades to a keyless row when no key is wired
+        (N-467), so there it is counted, not failed."""
+        import email_triage.db.audit as A
+
+        assert A.GAP_CHAIN_TABLE in A.KEYLESS_PERMITTED_TABLES
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        _seed_gap_rows(db_path)
+        conn = track(init_db(db_path))
+        try:
+            gap = A.verify_gap_chain(conn)
+        finally:
+            conn.close()
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        out = capsys.readouterr()
+        assert rc == 0, out.err
+        if gap["keyless_count"]:
+            assert f"{gap['keyless_count']} keyless" in out.out
+
+    def test_only_the_gap_table_may_hold_keyless_rows(self):
+        """Count-agnostic over the registry: every _chain_insert table is
+        outside the permitted set, so a new chained table fails keyless by
+        default."""
+        import email_triage.db.audit as A
+
+        assert A.KEYLESS_PERMITTED_TABLES == frozenset({A.GAP_CHAIN_TABLE})
+        assert not set(A._AUDIT_CHAIN_CANONICAL_FIELDS) & A.KEYLESS_PERMITTED_TABLES
+
+    def test_a_missing_registry_table_is_a_named_fail_not_a_traceback(self, tmp_path, capsys):
+        import email_triage.db.audit as A
+
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        _seed_gap_rows(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE user_status_events")
+        conn.commit()
+        conn.close()
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        out = capsys.readouterr()
+        assert rc == 1
+        assert "FAIL — user_status_events chain: table missing" in out.err
+        # table-level: no row to point at, and no measured count to print
+        assert "first break id=None" not in out.err
+        assert "0 rows do not verify" not in out.err
+        # the walk continued past the missing table
+        assert f"{A.GAP_CHAIN_TABLE}: PASS" in out.out
+
+    def test_quiet_table_level_fail_names_no_row(self, tmp_path, capsys):
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE user_status_events")
+        conn.commit()
+        conn.close()
+        rc = cmd_audit_verify(_parse(
+            ["audit", "verify", "--db", str(db_path), "--all-chains", "--quiet"]))
+        assert rc == 1
+        assert "FAIL user_status_events table" in capsys.readouterr().err
+
+    def test_break_count_clause_is_omitted_when_not_measured(self, tmp_path, capsys, monkeypatch):
+        """hipaa F-524-B: a verifier result without break_count (an older
+        image) must not print a fabricated 0."""
+        import email_triage.web.db as W
+
+        def fake_all(conn):
+            return {"user_status_events": {
+                "table": "user_status_events", "chain_length": 3, "rows_checked": 3,
+                "valid_through_id": 1, "first_break_id": 2,
+                "first_break_reason": "row_hash mismatch", "prechain_count": 0,
+                "keyless_count": 0, "intact": False,
+            }}
+
+        monkeypatch.setattr(W, "verify_all_audit_chains", fake_all)
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        rc = cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "(first break id=2)" in err
+        assert "rows do not verify" not in err
+
+    def test_break_count_is_printed_when_measured(self, tmp_path, capsys):
+        import email_triage.db.audit as A
+
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        ids = _seed_gap_rows(db_path)
+        _tamper_gap(db_path, ids[1])
+        cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        err = capsys.readouterr().err
+        assert f"FAIL — {A.GAP_CHAIN_TABLE} chain" in err
+        assert "rows do not verify)" in err
+
+    def test_db_with_all_chains_says_keyed_rows_cannot_be_verified(self, tmp_path, capsys):
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        ids = _seed_gap_rows(db_path)
+        _tamper_gap(db_path, ids[1])
+        cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        err = capsys.readouterr().err
+        assert "--db wires no master key" in err
+        assert err.index("--db wires no master key") < err.index("FAIL")
+
+    def test_db_without_all_chains_also_prints_the_note(self, tmp_path, capsys):
+        """da NEW-A: keyed log_entries rows read as failures on --db too."""
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=3)
+        conn = sqlite3.connect(str(db_path))
+        rid = conn.execute(
+            "SELECT id FROM log_entries WHERE row_hash != '' ORDER BY id").fetchall()[1][0]
+        conn.close()
+        _tamper_row_message(db_path, rid)
+        cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path)]))
+        assert "--db wires no master key" in capsys.readouterr().err
+
+    def test_a_clean_or_quiet_db_run_prints_no_note(self, tmp_path, capsys):
+        db_path = tmp_path / "triage.db"
+        _seed_chain(db_path, count=2)
+        cmd_audit_verify(_parse(["audit", "verify", "--db", str(db_path), "--all-chains"]))
+        assert "--db wires no master key" not in capsys.readouterr().err
+
+
+class TestCliApikeyCreateRefusal:
+    """Panel P F5 (punch 627): when store_api_key refuses (its witness failed
+    and rolled back), ``apikey create`` exits 1 with a clean message, no
+    traceback, and never prints the raw key."""
+
+    def test_a_refused_grant_exits_1_without_the_key(
+        self, _hipaa_config_file, capsys, monkeypatch,
+    ):
+        from email_triage import cli as cli_mod
+        import email_triage.db.audit as audit_mod
+
+        yaml_path, _db_path, _cfg = _hipaa_config_file
+        assert cli_mod.cmd_user(_parse([
+            "--config", str(yaml_path), "user", "create", "--email", "k@example.com",
+        ])) == 0
+        capsys.readouterr()
+
+        def boom(*a, **kw):
+            raise RuntimeError("audit storage exploded")
+
+        monkeypatch.setattr(audit_mod, "record_api_key_event_txn", boom)
+        with pytest.raises(SystemExit) as exited:
+            cli_mod.cmd_apikey(_parse([
+                "--config", str(yaml_path), "apikey", "create",
+                "--name", "ci-key", "--user", "k@example.com",
+            ]))
+        cap = capsys.readouterr()
+        assert exited.value.code == 1
+        assert "API key NOT created" in cap.err
+        assert "Traceback" not in cap.err + cap.out
+        assert "Key:" not in cap.out and "et_" not in cap.out + cap.err

@@ -12,6 +12,7 @@ Covers:
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import logging
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ from email_triage.web.db import (
 def _make_db_with_account(*, config=None) -> tuple:
     """Create an in-memory DB + a single owned account."""
     cfg = TriageConfig()
-    db = init_db(":memory:")
+    db = track(init_db(":memory:"))
     seed_categories(db, cfg.classifier.categories)
     now = datetime.now(timezone.utc).isoformat()
     db.execute(

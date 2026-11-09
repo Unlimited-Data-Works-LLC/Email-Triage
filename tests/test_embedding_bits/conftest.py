@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from email_triage import embedding_bits as _eb_module
 from email_triage.web.db import init_db
 
 
@@ -120,7 +123,7 @@ def url_to_bytes(
 
 
 @pytest.fixture
-def test_db(tmp_path: Path) -> sqlite3.Connection:
+def test_db(tmp_path: Path) -> "Iterator[sqlite3.Connection]":
     """Migrated DB for install_state row writes.
 
     init_db creates the canonical settings/email_accounts/etc tables
@@ -142,7 +145,39 @@ def test_db(tmp_path: Path) -> sqlite3.Connection:
         (1, "test@example.com", "Test User", "admin", now),
     )
     conn.commit()
-    return conn
+    #  (ResourceWarning bucket 1): yield + close so the fixture doesn't leak
+    # the SQLite connection (a bare ``return conn`` left GC to close it later
+    # and warn). pytest finalizes the generator on teardown.
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# Captured BEFORE any fixture can replace it. ``_stub_pip_install`` (autouse)
+# monkeypatches the module attribute ``is_runtime_ready`` to ``lambda: True``, so
+# a test that calls ``eb.is_runtime_ready()`` measures the STUB, not the code —
+# exactly the "prove the input is in the set the control acts on" trap. A test
+# whose SUBJECT is the real gate takes the ``real_runtime_probes`` fixture below.
+_REAL_IS_RUNTIME_READY = _eb_module.is_runtime_ready
+_REAL_RUNTIME_IMPORTS_CLEANLY = _eb_module.runtime_imports_cleanly
+
+
+@pytest.fixture
+def real_runtime_probes(monkeypatch):
+    """Put the REAL ``is_runtime_ready`` / ``runtime_imports_cleanly`` back.
+
+    Ordered after the autouse stub (an explicitly-requested fixture is finalised
+    inside it), so this re-patch wins for the duration of the test.
+    """
+    monkeypatch.setattr(
+        "email_triage.embedding_bits.is_runtime_ready",
+        _REAL_IS_RUNTIME_READY,
+    )
+    monkeypatch.setattr(
+        "email_triage.embedding_bits.runtime_imports_cleanly",
+        _REAL_RUNTIME_IMPORTS_CLEANLY,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -166,11 +201,53 @@ def _stub_pip_install(monkeypatch):
     def _fake_pip(*, wheels_dir, target_dir, wheel_names):
         # Create an empty marker so pip-install-step tests can assert
         # it ran without actually invoking pip.
-        marker = Path(target_dir) / ".pip-installed-marker"
+        # Inside wheels/, not the prefix root: a real pip run leaves nothing at
+        # the root outside the installer's layout, and the installer now refuses
+        # a target that holds a foreign top-level entry (N-549).
+        marker = Path(wheels_dir) / ".pip-installed-marker"
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(
             ",".join(wheel_names), encoding="utf-8",
         )
+        # N-524: emulate the ONE pip output the installer now reads back — a
+        # ``<name>-<version>.dist-info/`` per installed wheel under the prefix's
+        # site-packages. Pre-N-524 the stub wrote nothing pip-shaped, so the
+        # post-install "does the installed set match the manifest" check would
+        # have found an EMPTY prefix and failed every success-path test. That is
+        # not a reason to soften the check: it is the fake-pip coverage gap the
+        # panel named, and the fix is for the stub to produce what pip produces.
+        # Versions come from the staged wheel FILENAMES, exactly as pip resolves
+        # a bare requirement name through ``--find-links``.
+        import re as _re
+
+        def _canon(n):
+            return _re.sub(r"[-_.]+", "-", n.strip()).lower()
+
+        wanted = {_canon(n) for n in wheel_names}
+        # pip's --prefix layout: Lib/site-packages on Windows, else
+        # lib/pythonX.Y/site-packages.
+        if os.name == "nt":
+            site = Path(target_dir) / "Lib" / "site-packages"
+        else:
+            site = (
+                Path(target_dir)
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+        for whl in sorted(Path(wheels_dir).glob("*.whl")):
+            raw_name, _, rest = whl.stem.partition("-")
+            version = rest.split("-")[0] if rest else ""
+            if _canon(raw_name) not in wanted:
+                continue
+            dist_info = site / f"{raw_name}-{version}.dist-info"
+            dist_info.mkdir(parents=True, exist_ok=True)
+            (dist_info / "METADATA").write_text(
+                "Metadata-Version: 2.1\n"
+                f"Name: {raw_name}\n"
+                f"Version: {version}\n",
+                encoding="utf-8",
+            )
 
     monkeypatch.setattr(
         "email_triage.embedding_bits._run_pip_install", _fake_pip,

@@ -112,7 +112,7 @@ def test_migration_checksum_method_delegates_to_normalized_path():
     assert "_legacy_raw_checksum" not in calls, (
         "Migration.checksum must not invoke _legacy_raw_checksum — the "
         "legacy SHA is fenced to the dual-check in run_migrations only "
-        "."
+        "(#286)."
     )
 
 

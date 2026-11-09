@@ -27,7 +27,7 @@ from email_triage.engine.models import (
 )
 from email_triage.engine.store import FlowStore
 from email_triage.providers.base import EmailProvider
-from email_triage.triage_logging import get_logger
+from email_triage.triage_logging import account_hipaa_effective, get_logger
 
 log = get_logger("engine.flow")
 
@@ -72,6 +72,33 @@ class FlowEngine:
         self._lists = list(classification_lists or [])
         self._rules = rules_by_list or {}
 
+    async def aclose(self) -> None:
+        """Close the engine's owned async clients (provider + classifier) in the
+        CURRENT event loop.
+
+        N-132: the CLI ``cmd_run`` / polling ``cmd_watch`` / ``_cmd_watch_push``
+        build an engine and never closed it, leaking the provider's AND the
+        classifier's lazily-created ``httpx.AsyncClient`` (the  leak family —
+        the engine-owned sibling of N-131's CLI-direct provider close). MUST be
+        awaited INSIDE the work ``asyncio.run`` (the clients are created there).
+        Best-effort + log-not-raise per  (never masks the caller's result);
+        each close is guarded so one failure can't block the other. Idempotent
+        for the httpx-backed providers (their ``close`` nulls the client).
+        """
+        for resource, obj in (
+            ("provider", self._provider),
+            ("classifier", self._classifier),
+        ):
+            close = getattr(obj, "close", None)
+            if not callable(close):
+                continue
+            try:
+                await close()
+            except Exception as e:  # : log the WHY, never raise out of teardown
+                log.warning(
+                    "engine resource close failed", resource=resource, error=repr(e),
+                )
+
     # -- Pipeline stages ------------------------------------------------------
 
     async def ingest(self, query: str, limit: int = 50) -> list[FlowState]:
@@ -93,9 +120,22 @@ class FlowEngine:
         log.info("Ingested new flows", count=len(flows))
         return flows
 
+    async def _fetch_message(self, message_id: str) -> EmailMessage:
+        """Fetch one message and stamp its effective HIPAA state (punch 601).
+
+        No provider sets ``EmailMessage.hipaa``; it defaults to False. The
+        engine's HIPAA decisions (the N-113 BAA gate, the at-rest ``reason``
+        redaction via ``state_bag["account_hipaa"]``) and the action layer read
+        it, so an unstamped message made every one of them fail OPEN on a
+        system-HIPAA install. Every fetch in this class routes through here.
+        """
+        message = await self._provider.fetch_message(message_id)
+        message.hipaa = account_hipaa_effective(message=message)
+        return message
+
     async def fetch(self, flow: FlowState) -> tuple[FlowState, EmailMessage]:
         """Fetch the message content and advance the flow to FETCHED."""
-        message = await self._provider.fetch_message(flow.message_id)
+        message = await self._fetch_message(flow.message_id)
 
         flow.status = FlowStatus.FETCHED
         flow = self._store.update_flow(flow, expected_revision=flow.revision)
@@ -106,6 +146,25 @@ class FlowEngine:
         self, flow: FlowState, message: EmailMessage
     ) -> tuple[FlowState, Classification]:
         """Classify the message and advance the flow to CLASSIFIED."""
+        # N-74 (L8-4) — stamp the per-account-resolved HIPAA flag onto
+        # state_bag BEFORE any update_flow serializes classification_json.
+        # The value comes from the effective-HIPAA SSOT (system flag OR the
+        # message stamp), never the raw stamp: providers do not set it
+        # (punch 601; the old comment here said they did). ``_cls_to_json``
+        # (via _capture_baseline) reads ``state_bag["account_hipaa"]`` to
+        # decide whether ``Classification.reason`` (PHI free-text) is
+        # redacted at rest. classify() is the ONLY method that writes
+        # classification_json (line below sets flow.classification), and it
+        # always holds the fetched message — so this is the precise,
+        # resume-safe point: a flow re-entering here at FETCHED on
+        # crash-recovery re-fetches the message and re-stamps. Stamping it
+        # here also persists the flag into state_bag_json, so a later
+        # reload carries it. Without this set, the per-account gate was
+        # vacuous on the FlowEngine DB-write path — nothing else ever set
+        # this key (the web triage_one path uses a different dict and does
+        # NOT write classification_json).
+        flow.state_bag["account_hipaa"] = account_hipaa_effective(message=message)
+
         flow.status = FlowStatus.CLASSIFYING
         flow = self._store.update_flow(flow, expected_revision=flow.revision)
 
@@ -127,6 +186,28 @@ class FlowEngine:
                 category=classification.category,
             )
         else:
+            # N-113 — HIPAA + BAA egress gate (shared SSOT, §164.308(b)(1)). The
+            # CLI FlowEngine (`email-triage run`/`watch`) classifies via the
+            # global-config classifier with NO run-level gate (unlike the web
+            # run_triage), so a HIPAA message on an external non-BAA'd classifier
+            # would egress PHI at the classify below. Fail CLOSED first — raise the
+            # established BackendBAARequiredError (the except handler marks the flow
+            # FAILED, persists the reason, no PHI egress, no retry). No-op for the
+            # common local / BAA-acked classifier (baa_block_status → None).
+            if account_hipaa_effective(message=message):  # punch 601: not the raw stamp
+                from email_triage.classify.baa_gate import baa_block_status
+                from email_triage.ai_backends.base import BackendBAARequiredError
+                # N-113: CLI FlowEngine is single-threaded with a sync FlowStore
+                # (no web event loop) — same property the sibling
+                # self._store.update_flow touches in this method already rely on.
+                _blk = baa_block_status(self._store._conn, self._classifier, True)  # async-db-ok (N-113): CLI single-thread, sync store
+                if _blk is not None:
+                    raise BackendBAARequiredError(
+                        f"HIPAA account: classifier {_blk.get('backend')} @ "
+                        f"{_blk.get('host') or '?'} is not BAA-acked — refusing to "
+                        "classify (no PHI egress, N-113). Acknowledge a BAA on "
+                        "/config or switch to a local Ollama."
+                    )
             start = time.monotonic()
             classification = await self._classifier.classify(
                 message,
@@ -141,11 +222,50 @@ class FlowEngine:
                 confidence=classification.confidence,
                 elapsed_ms=round(elapsed * 1000),
             )
+            #  — a backup model served because the configured primary
+            # could not: write ONE tamper-evident failover-audit row.
+            # Only fires on the rare failover path.
+            if classification.failover_from and classification.served_model:
+                self._record_model_failover_audit(flow, classification)
 
         flow.status = FlowStatus.CLASSIFIED
         flow.classification = classification
         flow = self._store.update_flow(flow, expected_revision=flow.revision)
         return flow, classification
+
+    def _record_model_failover_audit(
+        self,
+        flow: FlowState,
+        classification: Classification,
+    ) -> None:
+        """ — emit a tamper-evident failover-audit row.
+
+        Emitted through the STANDARD logging path so the
+        ``SQLiteLogHandler`` persists it to the ``log_entries`` HMAC
+        chain WITH its cached chain-tail intact. Writing ``log_entries``
+        out-of-band (e.g. ``insert_log_entry`` on a foreign connection)
+        would FORK the chain — the handler caches the last row hash on
+        its instance and would not see the out-of-band row. The handler
+        owns the DB write + write-lock (same path as the "Classified via
+        LLM" line above). Best-effort — never breaks classification.
+        Carries model names + flow/message ids only — NO email content
+        (PHI). Only fires on the rare failover path.
+        """
+        try:
+            log.warning(
+                "Classification model failover",
+                event="model_failover",
+                failed_model=classification.failover_from,
+                served_model=classification.served_model,
+                flow_id=flow.flow_id,
+                message_id=flow.message_id,
+            )
+        except Exception as e:  # pragma: no cover - audit is best-effort
+            log.warning(
+                "model-failover audit emit failed",
+                flow_id=flow.flow_id,
+                error=str(e),
+            )
 
     async def route_and_act(
         self,
@@ -210,7 +330,14 @@ class FlowEngine:
 
             if output.result == ActionResult.FAILED:
                 flow.status = FlowStatus.FAILED
-                flow.error = f"Action '{action.name}' failed: {output.error}"
+                # census run13 #2 — output.error is the action's raw str(e),
+                # which on a mail/IMAP action can echo a recipient address or
+                # mailbox path (PHI) / a token (secret). flows.error is a
+                # persisted, operator-facing column → scrub BOTH legs.
+                from email_triage._errfmt import scrub_error_for_persist
+                flow.error = scrub_error_for_persist(
+                    f"Action '{action.name}' failed: {output.error}"
+                )
                 flow = self._store.update_flow(flow, expected_revision=flow.revision)
                 log.error(
                     "Action failed",
@@ -241,14 +368,14 @@ class FlowEngine:
 
             if flow.status == FlowStatus.FETCHED:
                 if message is None:
-                    message = await self._provider.fetch_message(flow.message_id)
+                    message = await self._fetch_message(flow.message_id)
                 flow, classification = await self.classify(flow, message)
             else:
                 classification = flow.classification
 
             if flow.status == FlowStatus.CLASSIFIED and classification:
                 if message is None:
-                    message = await self._provider.fetch_message(flow.message_id)
+                    message = await self._fetch_message(flow.message_id)
                 flow = await self.route_and_act(flow, message, classification)
 
             return flow
@@ -260,11 +387,20 @@ class FlowEngine:
                 exc_info=True,
             )
             flow.status = FlowStatus.FAILED
-            flow.error = str(e)
+            # N-42: flow.error persists into the `flows` PHI table; e wraps
+            # mail/IMAP ops whose text can carry an address/mailbox path.
+            from email_triage._errfmt import scrub_error_for_persist
+            flow.error = scrub_error_for_persist(e)
             try:
                 flow = self._store.update_flow(flow, expected_revision=flow.revision)
-            except Exception:
-                pass  # Best-effort persistence of failure state.
+            except Exception as persist_exc:
+                # Best-effort persistence of failure state; a lost FAILED
+                # status leaves the flow looking unresolved.
+                log.error(
+                    "Could not persist FAILED flow state",
+                    flow_id=flow.flow_id,
+                    exc_info=persist_exc,
+                )
             return flow
 
     async def run_cycle(

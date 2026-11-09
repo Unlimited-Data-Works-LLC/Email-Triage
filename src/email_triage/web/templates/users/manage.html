@@ -117,8 +117,8 @@
                         </form>
                         {% endif %}
                         <form method="post" action="/users/{{ u.id }}/delete"
-                              onsubmit="return confirm('Delete user {{ u.email }}?')">
-                            <button type="submit" class="secondary">Delete</button>
+                              onsubmit="return confirm('Remove {{ u.email }}? Their stored credentials are purged and their accounts are deactivated, and they are permanently disabled. The user record itself is RETAINED (never hard-deleted) so the tamper-evident audit trail stays intact.')">
+                            <button type="submit" class="secondary">Remove</button>
                         </form>
                         {% endif %}
                     </details>

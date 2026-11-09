@@ -3,22 +3,23 @@
 Uses the Gemini REST API (``/v1beta/models/{model}:generateContent``)
 via httpx.  Requires an API key from Google AI Studio or Vertex AI.
 
-Install with::
-
-    pip install email-triage[gemini]
-
-Note: The ``google-generativeai`` package is listed as an optional
-dependency but this implementation uses httpx directly against the
-REST API for consistency with the other backends and to avoid the
-heavy SDK dependency.
+No extra to install: this implementation uses httpx directly against the
+REST API for consistency with the other backends and to avoid the heavy
+``google-generativeai`` SDK, which is not a dependency (the unused
+``gemini`` extra that declared it was removed 2026-10-17).
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from email_triage._http_client import LazyHttpClient
+from email_triage._http_client import Intent, LazyHttpClient
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage.classify.base import JsonChatClassifier
+from email_triage.llm_truncation import warn_if_llm_truncated
+
+logger = get_logger("email_triage.classify.gemini")  # N-196b R21_4
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -65,7 +66,7 @@ class GeminiClassifier(JsonChatClassifier):
         # The classifier is rebuilt per triage batch and reused for
         # every message in that batch, so pooling collapses N
         # per-message TLS handshakes into one. Mirrors OllamaClassifier.
-        self._http = LazyHttpClient(timeout=timeout)
+        self._http = LazyHttpClient(intent=Intent.LLM_PHI, timeout=timeout)
         # Gemini is always external — Google's hosted endpoint, no
         # local mode. is_local stays False, gating BAA-required for
         # HIPAA accounts at classify time.
@@ -125,6 +126,11 @@ class GeminiClassifier(JsonChatClassifier):
             resp.raise_for_status()
 
         body = resp.json()
+        #  silent-truncation guard (shared SSOT) — finishReason==MAX_TOKENS.
+        warn_if_llm_truncated(
+            body, family="gemini", model=str(getattr(self, "_model", "") or ""),
+            context="classify", logger=logger,
+        )
         return self._extract_text(body)
 
     async def complete(self, prompt: str) -> str:
@@ -174,6 +180,10 @@ class GeminiClassifier(JsonChatClassifier):
             resp.raise_for_status()
 
         body = resp.json()
+        warn_if_llm_truncated(
+            body, family="gemini", model=str(getattr(self, "_model", "") or ""),
+            context="complete", logger=logger,
+        )
         return self._extract_text(body).strip()
 
     @staticmethod

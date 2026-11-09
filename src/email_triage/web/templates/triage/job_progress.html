@@ -70,35 +70,7 @@
     </a>
 </p>
 
-{# UTC → local conversion for any .local-datetime span the
-   fragment emits. Runs on initial render + after every HTMX swap
-   (the progress fragment re-renders every 2s while the job is
-   non-terminal). The script tolerates both the ISO + "Z" form
-   and the +HH:MM form. #}
-<script>
-(function() {
-    function convert(root) {
-        var scope = root && root.querySelectorAll
-            ? root : document;
-        scope.querySelectorAll('.local-datetime').forEach(function(el) {
-            var utc = el.getAttribute('data-utc');
-            if (!utc) return;
-            try {
-                var hastz = utc.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(utc);
-                var d = new Date(hastz ? utc : utc + 'Z');
-                el.textContent = d.toLocaleString(undefined, {
-                    month: 'short', day: 'numeric',
-                    hour: 'numeric', minute: '2-digit',
-                });
-            } catch (e) { /* leave the original UTC string */ }
-        });
-    }
-    convert();
-    if (document.body) {
-        document.body.addEventListener('htmx:afterSwap', function(ev) {
-            convert(ev.target || document);
-        });
-    }
-})();
-</script>
+{# US-datetime rendering for [data-us-datetime] elements the
+   fragment emits is handled by the SSOT JS walker in base.html,
+   which re-runs after every HTMX swap. No per-file script needed. #}
 {% endblock %}

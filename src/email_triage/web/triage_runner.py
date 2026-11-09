@@ -1,7 +1,7 @@
 """Reusable triage-pipeline runner for one account.
 
 Extracted out of the ``/triage/run`` HTML route in ``ui.py`` so the
-same pipeline can be invoked from the UI, the OpenClaw API, scheduled
+same pipeline can be invoked from the UI, the outbound-webhook API, scheduled
 jobs, and (eventually) anything else that wants to fire a one-shot
 classify-and-route on an account.
 
@@ -12,6 +12,7 @@ dict back and decide how to render it.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
 import time
 from typing import Any
@@ -19,7 +20,7 @@ from typing import Any
 from email_triage.config import TriageConfig
 from email_triage.secrets import SecretsProvider
 from email_triage.triage_logging import get_logger, is_account_hipaa
-from email_triage._errfmt import fmt_exc
+from email_triage._errfmt import fmt_exc, scrub_class_error_for_persist, scrub_error_for_persist
 
 log = get_logger("web.triage_runner")
 
@@ -32,6 +33,80 @@ class TriageRunResult(dict):
     """
 
 
+# N-385 (batched SME panel fold 2026-07-10) — the bounded ``outcome`` vocabulary
+# for ``et_triage_runs_total``. Every ``TriageRunResult(error=<literal>)``
+# construction site in this module MUST use a slug in this set (enforced by
+# ``tests/test_triage_run_outcome_ssot_pin.py``). An unknown value at runtime
+# coerces to ``"error_other"`` in the decorator wrapper — the fail-safe path
+# for a future error slug that lands before the frozenset is updated. Prevents
+# an unbounded label-cardinality bomb on the Prometheus SSOT (Prime Directive
+# 5: an unbounded value flowing into a bounded surface is CIDI drift). Mirrors
+# ``emit_llm_outcome``'s ``transport_error`` fail-safe coercion.
+_TRIAGE_OUTCOMES: frozenset[str] = frozenset({
+    "success",
+    "error",             # top-level catch (fn raised, or shape-error at return)
+    "error_other",       # runtime coerce sentinel — an unknown error slug
+    "user_disabled",     # owner_disabled fail-closed at preamble
+    "no_categories",     # empty categories at preamble
+    "provider_error",    # provider construction / auth failure
+    "classifier_error",  # classifier build failure
+    "baa_required",      # HIPAA account routed to a non-local backend
+})
+
+
+def _emit_triage_run_outcome_metric(fn):
+    """Decorator — bump ``et_triage_runs_total{trigger, outcome}`` on every
+    :func:`run_triage` terminal (N-385, divergence census wf_69674c7e-c67
+    2026-07-10, HIGH).
+
+    Before this wrapper, the core triage-runner hot path emitted ZERO counters
+    of any kind — a ``grep metrics|counter|Counter|inc\\(`` returned 0 hits
+    across the file, so every message triaged was invisible to every counter
+    registry (and specifically to the operator-facing Prometheus ``/metrics``
+    surface, which was the divergence census's canonical). Wrapping here so a
+    new terminal exit (a future ``return TriageRunResult(...)`` for a fresh
+    error class) cannot silently escape the count — the decorator anchors the
+    emit at the ONE function-return seam.
+
+    ``outcome`` reads from the ``TriageRunResult.error`` field: an empty /
+    absent ``error`` = ``"success"``; a literal error slug matching
+    :data:`_TRIAGE_OUTCOMES` passes through; ANY OTHER value coerces to
+    ``"error_other"`` (fail-safe: never let an unbounded string flow onto a
+    Prometheus label). A non-dict / ``.get``-less return classifies as
+    ``"error"`` (a shape-defect is a bug, not a healthy run — fail-CLOSED per
+    ``feedback_just_be_honest``). ``trigger`` mirrors the kwarg the caller
+    passed (``"manual"`` / ``"api"`` / ``"watch"`` / ``"push"`` /
+    ``"scheduled"``). Fail-open on the metrics side: a registry hiccup MUST
+    NOT take down a triage run.
+    """
+    @functools.wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        trigger = kwargs.get("trigger", "manual")
+        outcome = "error"
+        try:
+            result = await fn(*args, **kwargs)
+            try:
+                outcome = result.get("error") or "success"
+            except Exception:
+                outcome = "error"
+            # Bound the label vocabulary — an unrecognized slug becomes
+            # ``error_other`` on its way to the Prometheus counter (mirrors
+            # ``emit_llm_outcome``'s ``transport_error`` fail-safe coercion).
+            if outcome not in _TRIAGE_OUTCOMES:
+                outcome = "error_other"
+            return result
+        finally:
+            #  (Census v3 re-run) — delegate to the shared SSOT so a
+            # future emit-shape change lands once, not twice.
+            from email_triage.web._triage_metrics import (
+                emit_triage_run_outcome_metric,
+            )
+            emit_triage_run_outcome_metric(trigger=trigger, outcome=outcome)
+
+    return _wrapped
+
+
+@_emit_triage_run_outcome_metric
 async def run_triage(
     db: sqlite3.Connection,
     config: TriageConfig,
@@ -69,6 +144,7 @@ async def run_triage(
         update_hipaa_access_event,
     )
     from email_triage.web.db_threadpool import db_call
+    from email_triage.web._audit import safe_audit_write_async
     from email_triage.web.routers.ui import (
         _create_provider_from_account, _build_classifier_from_config,
         _get_categories_from_db,
@@ -103,7 +179,7 @@ async def run_triage(
     )
 
     # Fail-closed: if the account owner is disabled, refuse to run.
-    # Covers every call site (UI, OpenClaw API, scheduled, push, watch).
+    # Covers every call site (UI, outbound-webhook API, scheduled, push, watch).
     if owner_disabled:
         log.warning(
             "Triage refused: owner disabled",
@@ -147,19 +223,26 @@ async def run_triage(
     # gets the §164.312(b) audit row.
     audit_event_id: int | None = None
     owner_id_for_audit = acct.get("user_id")
-    if (
-        actor_user_id is not None
-        and is_account_hipaa(acct)
-        and actor_user_id != owner_id_for_audit
+    # N-79: gate through the PD#14 predicate SSOT — a system-initiated
+    # (actor_user_id=None) triage of a HIPAA mailbox is a non-owner PHI read
+    # and MUST audit. The old `actor_user_id is not None` clause silently
+    # dropped that case (the N-72 bug, un-root-cause-scoped to this sibling).
+    from email_triage.db.audit import phi_access_audit_required
+    if phi_access_audit_required(
+        account_hipaa=is_account_hipaa(acct),
+        actor_user_id=actor_user_id,
+        owner_id=owner_id_for_audit,
     ):
-        try:
-            audit_event_id = await db_call(
+        audit_event_id = await safe_audit_write_async(
+            lambda: db_call(
                 record_hipaa_access_event,
                 db, actor_user_id, account_id, "manual_triage",
                 outcome="in_progress",
-            )
-        except Exception as e:
-            log.warning("Failed to record HIPAA access event", error=fmt_exc(e))
+            ),
+            description=f"manual_triage account={account_id} actor={actor_user_id} outcome=in_progress",
+            table="hipaa_access_events",
+            emitter="record_hipaa_access_event",
+        )
 
     # Provider + classifier — fail fast and finalise the audit row.
     provider = None
@@ -167,14 +250,22 @@ async def run_triage(
         provider = _create_provider_from_account(acct, secrets)
     except Exception as e:
         if audit_event_id is not None:
-            try:
-                await db_call(
+            # Allow-list step 2 (B1): the finalise routes through the SSOT so a
+            # failure is WARNING-logged, /health-counted and gap-ledgered.
+            _err_class = type(e).__name__
+            await safe_audit_write_async(
+                lambda: db_call(
                     update_hipaa_access_event,
                     db, audit_event_id, "error",
-                    f"provider: {type(e).__name__}",
-                )
-            except Exception:
-                pass
+                    f"provider: {_err_class}",
+                ),
+                description=(
+                    f"manual_triage_finalise account={account_id} "
+                    f"audit_event_id={audit_event_id} outcome=error"
+                ),
+                table="hipaa_access_events",
+                emitter="update_hipaa_access_event",
+            )
         return TriageRunResult(
             run_id="",
             account_id=account_id,
@@ -182,7 +273,7 @@ async def run_triage(
             query=query,
             total_messages=0,
             results=[],
-            errors=[f"Provider error: {e}"],
+            errors=[scrub_error_for_persist(f"Provider error: {e}")],
             elapsed_secs=0.0,
             error="provider_error",
         )
@@ -201,7 +292,7 @@ async def run_triage(
             query=query,
             total_messages=0,
             results=[],
-            errors=[f"Classifier error: {e}"],
+            errors=[scrub_error_for_persist(f"Classifier error: {e}")],
             elapsed_secs=0.0,
             error="classifier_error",
         )
@@ -224,14 +315,19 @@ async def run_triage(
                 pass
             status = await db_call(classifier_baa_status, db, classifier)
             if audit_event_id is not None:
-                try:
-                    await db_call(
+                await safe_audit_write_async(
+                    lambda: db_call(
                         update_hipaa_access_event,
                         db, audit_event_id, "blocked",
                         f"baa_gate: backend={status['backend']} host={status['host']}",
-                    )
-                except Exception:
-                    pass
+                    ),
+                    description=(
+                        f"manual_triage_finalise account={account_id} "
+                        f"audit_event_id={audit_event_id} outcome=blocked"
+                    ),
+                    table="hipaa_access_events",
+                    emitter="update_hipaa_access_event",
+                )
             return TriageRunResult(
                 run_id="",
                 account_id=account_id,
@@ -293,7 +389,7 @@ async def run_triage(
     try:
         message_ids = await provider.search(effective_query, limit)
     except Exception as e:
-        errors.append(f"search: {e}")
+        errors.append(scrub_error_for_persist(f"search: {e}"))
         message_ids = []
 
     # Calendar provider + meeting prefs are stashed on each flow's
@@ -427,9 +523,16 @@ async def run_triage(
                     if isinstance(getattr(message, "raw_metadata", None), dict):
                         message.raw_metadata["force_reclassify"] = True
             except Exception as e:
+                #  tail — the results-entry ``entry["error"]`` lands
+                # in the batch return (agent API caller, triage-completed
+                # webhook / UI) AND in ``triage_runs.results_json``. Punch
+                # 603: the persisted-error SSOT, same as the triage branch
+                # below and the bulk sibling. ``scrub_exc`` (the flash
+                # funnel used here before) has no ``key=value`` token leg
+                # and kept ``access_token=...`` verbatim.
                 entry: dict[str, Any] = {"message_id": msg_id}
                 entry["status"] = "error"
-                entry["error"] = str(e)
+                entry["error"] = scrub_class_error_for_persist(e)
                 log.error(
                     "Triage error for message",
                     message_id=msg_id, error=fmt_exc(e),
@@ -445,8 +548,14 @@ async def run_triage(
                 # their retry queues). run_triage has no retry queue —
                 # record it as a per-message error, matching the
                 # pre-#199 inline path's broad per-message ``except``.
+                # 2026-07-09 post-drive-full-census discovered class: raw
+                # `str(e)` leaked PHI-adjacent exception text. Punch 603:
+                # `fmt_exc` (PHI leg only, no cap) was still the weaker
+                # variant; the entry is returned AND persisted, so it takes
+                # the persisted-error SSOT (PHI + secret legs + 500 cap),
+                # as `triage_runner_bulk` already did.
                 entry = {"message_id": msg_id, "status": "error",
-                         "error": str(e)}
+                         "error": scrub_class_error_for_persist(e)}
                 log.error(
                     "Triage error for message",
                     message_id=msg_id, error=fmt_exc(e),
@@ -478,15 +587,21 @@ async def run_triage(
         detail = f"messages={len(results)}"
         if errors:
             detail += f"; errors={len(errors)}"
-        try:
-            await db_call(
+        await safe_audit_write_async(
+            lambda: db_call(
                 update_hipaa_access_event,
                 db, audit_event_id, outcome, detail,
-            )
-        except Exception as e:
-            log.warning("Failed to finalize HIPAA access event", error=fmt_exc(e))
+            ),
+            description=(
+                f"manual_triage_finalise account={account_id} "
+                f"audit_event_id={audit_event_id} outcome={outcome}"
+            ),
+            table="hipaa_access_events",
+            emitter="update_hipaa_access_event",
+        )
 
-    run_id = f"{trigger}_{account_id}_{int(time.time())}"
+    from email_triage._ids import new_run_id
+    run_id = new_run_id(trigger, account_id)
     try:
         await db_call(
             record_triage_run,

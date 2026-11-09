@@ -21,14 +21,19 @@ import collections
 import email
 import email.policy
 import email.utils
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from email_triage.engine.models import EmailMessage
 from email_triage.providers.base import EmailProvider, PushCapable
+from email_triage.providers.imap_fetch_transport import (
+    aioimaplib_connect, aioimaplib_discard, aioimaplib_wait_hello,
+)
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c/12 R23
 
 log = get_logger("providers.imap")
 
@@ -38,6 +43,45 @@ log = get_logger("providers.imap")
 # resolves the wait well within this window; a longer silence means the
 # TCP connection died (NAT/firewall idle eviction) and must be rebuilt.
 _IDLE_PUSH_GRACE_SECS = 60
+
+# -d (2026-07-11) — CONFIG-DRIVEN IDLE cleanup wait budget for the
+# post-idle_done task drain in ``ImapProvider.watch()``. Pre-fix:
+# hardcoded ``asyncio.wait_for(idle_task, timeout=10)`` at :2092. This
+# is a compute-bound in-process wait for the aioimaplib IDLE task to
+# finish cleanup, NOT a network timeout — 10s is a safety ceiling to
+# avoid a hung watch loop if the library task deadlocks on close.
+# Module-level SSOT with a boot-wired setter.
+_IDLE_TASK_DRAIN_TIMEOUT_SECS: float = 10.0
+
+
+def configure_idle_task_drain_timeout(timeout_secs: float) -> None:
+    """-d — set the IDLE-task drain wait budget.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    the resolved ``config.ingestion.idle_task_drain_timeout_secs``
+    value. Rejects non-positive values.
+    """
+    global _IDLE_TASK_DRAIN_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _IDLE_TASK_DRAIN_TIMEOUT_SECS = float(timeout_secs)
+
+
+# DA-F4 (2026-07-11) — IMAP logout shutdown wait budget. Was hardcoded
+# ``timeout=2.0`` at close(). Shorter than IDLE drain because logout is
+# a normal shutdown handshake (LOGOUT/BYE), not a mid-op cancel; some
+# Dovecot deployments reliably TimeoutError here on mid-IDLE close.
+_IMAP_LOGOUT_TIMEOUT_SECS: float = 2.0
+
+
+def configure_imap_logout_timeout(timeout_secs: float) -> None:
+    """DA-F4 — set the IMAP client.logout() shutdown wait budget.
+
+    Called at boot from ``load_config._wire_module_singletons`` with
+    ``config.ingestion.imap_logout_timeout_secs``. Rejects non-positive.
+    """
+    global _IMAP_LOGOUT_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _IMAP_LOGOUT_TIMEOUT_SECS = float(timeout_secs)
 
 
 def _seen_uids_remember(
@@ -293,6 +337,8 @@ class ImapProvider(EmailProvider, PushCapable):
         idle_timeout: int = 1680,
         email_address: str = "",
         drafts_folder: str = "",
+        cert_check: Any = None,
+        cert_enforce: Any = None,
     ):
         if not HAS_AIOIMAPLIB:
             raise ImportError(
@@ -304,6 +350,11 @@ class ImapProvider(EmailProvider, PushCapable):
         self._username = username
         self._password = password
         self._use_ssl = use_ssl
+        # Operator certificate-check modes (2026-10-21): this account's
+        # cert_check / cert_enforce override (None = inherit the global
+        # outbound_tls setting), resolved per connection so a saved global
+        # change applies without rebuilding the provider.
+        self._cert_overrides = {"cert_check": cert_check, "cert_enforce": cert_enforce}
         self._mailbox = mailbox
         self._idle_timeout = idle_timeout
         # 2026-05-13 — separate "Your email address" field
@@ -311,7 +362,7 @@ class ImapProvider(EmailProvider, PushCapable):
         # legacy accounts whose IMAP LOGIN already includes the
         # @domain). Used as the default From: in create_draft so
         # drafts don't ship with the bare LOGIN username
-        # (``exampleuser``) as the From header.
+        # (the account local-part) as the From header.
         self._email_address = email_address
         # 2026-05-13 — operator override for the Drafts folder name.
         # When non-empty, create_draft APPENDs straight to this folder
@@ -331,32 +382,50 @@ class ImapProvider(EmailProvider, PushCapable):
     def name(self) -> str:
         return "imap"
 
+    def _cert_policy(self) -> Any:
+        from email_triage.tls import resolve_cert_policy
+        return resolve_cert_policy(self._cert_overrides)
+
     async def _connect(self) -> Any:
-        """Connect and authenticate if not already connected."""
+        """Connect and authenticate if not already connected.
+
+        The new client is cached on ``self._client`` only once the whole
+        sequence (greeting, LOGIN, SELECT) has finished (panel X DA-X1-1). A
+        failure or a cancellation before that (a render-probe bound, a greeting
+        timeout) closes the client and re-raises, so the next call opens a fresh
+        connection instead of reusing one that never logged in, and no half-open
+        connection is left for the server to reap."""
         if self._client is not None:
             return self._client
 
-        if self._use_ssl:
-            self._client = aioimaplib.IMAP4_SSL(
-                host=self._host,
-                port=self._port,
-            )
-        else:
-            self._client = aioimaplib.IMAP4(
-                host=self._host,
-                port=self._port,
-            )
-
-        await self._client.wait_hello_from_server()
-        await self._client.login(self._username, self._password)
+        # One budget covers the connect and the greeting, and a failed connect
+        # raises its own error at once (t20; ``aioimaplib_wait_hello``).
+        started = asyncio.get_running_loop().time()
+        client = await aioimaplib_connect(
+            self._host, self._port, use_ssl=self._use_ssl,
+            cert_policy=self._cert_policy(),
+        )
+        try:
+            await self._open_session(client, started)
+        except BaseException:
+            aioimaplib_discard(client)
+            raise
         # Stamp the client with its birth-time so ``_capture_imap_state``
         # can report connection age on the next -shaped error. The
         # custom attribute is namespaced (``_et_*``) to avoid colliding
         # with anything aioimaplib might add in a future release.
         try:
-            self._client._et_connect_ts = time.monotonic()
+            client._et_connect_ts = time.monotonic()
         except Exception:
             pass
+        self._client = client
+        log.info("IMAP connected", host=self._host, mailbox=self._mailbox)
+        return client
+
+    async def _open_session(self, client: Any, started: float) -> None:
+        """Greeting, LOGIN and SELECT on a client from :meth:`_connect`."""
+        await aioimaplib_wait_hello(client, started=started)
+        await client.login(self._username, self._password)
         # aioimaplib's select() forwards the mailbox name to the server
         # as-is — it does NOT quote names containing spaces / non-atom
         # chars. A Dovecot install with mailboxes like "Sent Items"
@@ -367,12 +436,10 @@ class ImapProvider(EmailProvider, PushCapable):
         # whose IMAP server had both ``Sent`` AND ``Sent Items`` — the
         # mis-SELECT returned UIDs from the wrong folder, downstream
         # fetches against the correctly-quoted name found nothing.
-        _sel_result, _sel_data = await self._client.select(
+        _sel_result, _sel_data = await client.select(
             self._quote_mailbox(self._mailbox)
         )
         self._uidvalidity = self._parse_uidvalidity(_sel_data)
-        log.info("IMAP connected", host=self._host, mailbox=self._mailbox)
-        return self._client
 
     async def _ensure_authenticated(self) -> str:
         """Bound wrapper around the module-level ``_ensure_authenticated``.
@@ -537,10 +604,57 @@ class ImapProvider(EmailProvider, PushCapable):
                 # calls in this connection don't drift.
                 try:
                     await client.select(self._quote_mailbox(self._mailbox))
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    log.warning(
+                        "IMAP mailbox restore after multi-folder search failed",
+                        error=fmt_exc(_swallow_exc),
+                    )
 
         return await self._search_in_current_mailbox(client, query, limit, filter)
+
+    async def uid_exists(self, uid: str) -> bool | None:
+        """Confirm a specific UID is present in the selected mailbox.
+
+        Returns ``True`` if the UID is in the mailbox, ``False`` if it is
+        confirmed ABSENT (expunged), and ``None`` if it could not be verified
+        (connection / protocol error — the caller should fail conservative).
+
+        Per RFC 3501, ``SEARCH UID <uid>`` returns the matching message iff the
+        UID exists. The retry-recovery path uses this to distinguish a GENUINE
+        expunge (a 0-byte fetch whose UID is really gone — a benign
+        ``message_expunged``) from a fetch that returned empty for a UID that is
+        STILL present (a real fetch degradation the ``message_gone`` spike
+        fail-safe must keep watching). Uses the plain ``client.search`` UID
+        criterion, NOT ``client.uid("search", ...)`` (restricted by aioimaplib
+        2.0 — see ``_search_in_current_mailbox``).
+        """
+        try:
+            client = await self._connect()
+            try:
+                await self._ensure_authenticated()
+            except IMAPClientLogoutError:
+                client = await self._connect()
+            result, data = await client.search(f"UID {uid}")
+            if result != "OK":
+                return None
+            # aioimaplib 2.0 includes a trailing status line (e.g.
+            # "Search completed (...).") in ``data`` EVEN on a zero-match
+            # search — a non-empty line is NOT proof of a hit. Mirror the
+            # proven numeric-token discipline in ``_search_in_current_mailbox``
+            # (the SSOT SEARCH parser in this file): the UID is present iff a
+            # numeric SEARCH token appears.
+            for line in data:
+                if isinstance(line, bytes):
+                    line = line.decode(errors="replace")
+                if any(tok.isdigit() for tok in str(line).strip().split()):
+                    return True
+            return False
+        except Exception as exc:
+            log.warning(
+                "uid_exists verification failed (treating as unverifiable)",
+                uid=str(uid), error_type=type(exc).__name__,
+            )
+            return None
 
     async def search_iter(
         self,
@@ -593,16 +707,15 @@ class ImapProvider(EmailProvider, PushCapable):
         # criterion that AND-combines with everything else.
         effective_query = query.strip() if query else ""
         if resume_cursor:
-            try:
-                cursor_uid = int(str(resume_cursor).strip())
+            # N-219c/26 R23: parse_int_or_none SSOT; bad cursor → fall
+            # through to a fresh walk (dedup table catches already-processed
+            # UIDs).
+            cursor_uid = parse_int_or_none(str(resume_cursor).strip())
+            if cursor_uid is not None:
                 cursor_clause = f"UID {cursor_uid + 1}:*"
                 effective_query = (
                     f"{cursor_clause} {effective_query}".strip()
                 )
-            except (TypeError, ValueError):
-                # Bad cursor — fall through to a fresh walk; the
-                # dedup table will catch already-processed UIDs.
-                pass
 
         client = await self._connect()
         all_uids = await self._search_in_current_mailbox(
@@ -634,6 +747,7 @@ class ImapProvider(EmailProvider, PushCapable):
         limit: int = 50,
         *,
         filter=None,  # MailFilter | None
+        exclude_special_use: bool = False,
     ) -> list[tuple[str, str]]:
         """Cross-folder variant of :meth:`search`.
 
@@ -688,11 +802,17 @@ class ImapProvider(EmailProvider, PushCapable):
                 host=self._host,
                 port=self._port,
                 use_ssl=self._use_ssl,
+                cert_policy=self._cert_policy(),
                 username=self._username,
                 password=self._password,
                 criteria=criteria,
                 limit=limit,
+                exclude_special_use=exclude_special_use,
             )
+        except ssl.SSLCertVerificationError:
+            # A trust failure is not a search failure: surface it rather than
+            # narrow the search to INBOX under a misleading warning (punch 651).
+            raise
         except Exception as e:
             log.warning(
                 "IMAP cross-folder search failed; falling back to "
@@ -720,7 +840,25 @@ class ImapProvider(EmailProvider, PushCapable):
         # so we can't do uid("search", ...).
         result, data = await client.search(imap_query)
         if result != "OK":
-            log.warning("IMAP search failed", result=result)
+            #  fold — hipaa-sme MUST-FOLD 2026-07-11 batched panel:
+            # ``imap_query`` and the raw server ``data`` can carry PHI
+            # from a HIPAA-flagged account's MailFilter (SUBJECT / FROM /
+            # TO strings the researcher configured for their own
+            # searches). Fail-CLOSED unconditionally (per iron rule 8):
+            # log the leading IMAP verb (SINCE / UNSEEN / FROM …) as a
+            # shape hint + the query + response byte-lengths. Enough to
+            # distinguish a malformed multi-clause query from a
+            # single-word charset issue without embedding user strings.
+            import re as _re
+            _verb_match = _re.match(r"^\s*([A-Z]+)", imap_query)
+            log.warning(
+                "IMAP search failed",
+                result=result,
+                mailbox=self._mailbox,
+                imap_verb=_verb_match.group(1) if _verb_match else None,
+                imap_query_len=len(imap_query),
+                detail_len=len(str(data)),
+            )
             return []
 
         # Parse sequence numbers from SEARCH response.
@@ -745,7 +883,16 @@ class ImapProvider(EmailProvider, PushCapable):
         seq_set = ",".join(seq_nums)
         result, uid_data = await client.fetch(seq_set, "(UID)")
         if result != "OK":
-            log.warning("IMAP FETCH UIDs failed", result=result)
+            #  fold — see the parallel HIPAA-fail-CLOSED note on the
+            # SEARCH branch above. FETCH response body has the same PHI
+            # posture; log the response byte-length as shape only.
+            log.warning(
+                "IMAP FETCH UIDs failed",
+                result=result,
+                mailbox=self._mailbox,
+                seq_count=len(seq_nums),
+                detail_len=len(str(uid_data)),
+            )
             return []
 
         # Parse UIDs from FETCH response lines like "1 FETCH (UID 12345)".
@@ -837,6 +984,7 @@ class ImapProvider(EmailProvider, PushCapable):
                 host=self._host,
                 port=self._port,
                 use_ssl=self._use_ssl,
+                cert_policy=self._cert_policy(),
                 username=self._username,
                 password=self._password,
                 mailbox=target_mailbox,
@@ -1006,6 +1154,7 @@ class ImapProvider(EmailProvider, PushCapable):
                 host=self._host,
                 port=self._port,
                 use_ssl=self._use_ssl,
+                cert_policy=self._cert_policy(),
                 username=self._username,
                 password=self._password,
                 mailbox=target_mailbox,
@@ -1029,6 +1178,7 @@ class ImapProvider(EmailProvider, PushCapable):
                 host=self._host,
                 port=self._port,
                 use_ssl=self._use_ssl,
+                cert_policy=self._cert_policy(),
                 username=self._username,
                 password=self._password,
                 mailbox=target_mailbox,
@@ -1239,6 +1389,62 @@ class ImapProvider(EmailProvider, PushCapable):
         folders.sort()
         return folders
 
+    async def discover_special_use_folder(
+        self,
+        flag: str,
+        fallbacks: list[str] | tuple[str, ...] = (),
+    ) -> tuple[str, str] | None:
+        """N-273 R28 — RFC 6154 SPECIAL-USE-aware folder discovery.
+
+        Args:
+            flag: The SPECIAL-USE flag to look for (e.g. ``"\\Sent"``,
+                ``"\\Drafts"``, ``"\\Trash"``). Case-insensitive.
+            fallbacks: Ordered list of folder-name candidates to try
+                if the server doesn't emit SPECIAL-USE flags.
+
+        Returns:
+            ``(folder_name, method)`` where method is ``"special-use"``
+            or ``"name-match"``, or ``None`` if nothing matched. The
+            caller decides the ultimate default.
+
+        Refactored from `providers/sent_folder.py::_discover_imap_sent`
+        (row 78 in the punch list). The public `list_folders` method
+        discards RFC 6154 flags — it maps LIST response lines to bare
+        folder names — so any SPECIAL-USE-aware caller previously had
+        to `getattr(provider, "_connect")` + drive the raw LIST
+        response themselves (fragile, tied to the private
+        connect-coroutine shape). This method routes the LIST via the
+        SAME `_connect` seam but keeps that inside the provider —
+        callers no longer touch the private surface, and the pin's
+        allow-list on `_discover_imap_sent`'s bypass can be removed
+        once its caller migrates.
+        """
+        import re
+        client = await self._connect()
+        result, data = await client.list('""', "*")
+        if result != "OK":
+            log.warning("IMAP LIST failed (SPECIAL-USE discovery)", result=result)
+            return None
+        flag_l = flag.lower()
+        decoded: list[str] = []
+        for line in data:
+            if isinstance(line, bytes):
+                line = line.decode(errors="replace")
+            decoded.append(line)
+        # Pass 1 — SPECIAL-USE flag match.
+        for line in decoded:
+            if flag_l in line.lower():
+                match = re.search(r'"([^"]*)"\s*$', line.rstrip())
+                if match and match.group(1):
+                    return match.group(1), "special-use"
+        # Pass 2 — name fallback.
+        for candidate in fallbacks:
+            for line in decoded:
+                match = re.search(r'"([^"]*)"\s*$', line.rstrip())
+                if match and match.group(1) == candidate:
+                    return candidate, "name-match"
+        return None
+
     async def create_folder(self, folder: str) -> None:
         """Create an IMAP mailbox/folder."""
         client = await self._connect()
@@ -1431,39 +1637,28 @@ class ImapProvider(EmailProvider, PushCapable):
         import email.mime.multipart
         import email.mime.text
 
-        msg = email.mime.multipart.MIMEMultipart("alternative")
-        if from_addr:
-            if from_name:
-                safe = from_name.replace("\\", "\\\\").replace('"', '\\"')
-                msg["From"] = f'"{safe}" <{from_addr}>'
-            else:
-                msg["From"] = from_addr
-        else:
-            # 2026-05-13 — prefer the configured email_address field
-            # over IMAP LOGIN username for the default From header.
-            # Falls back to username for legacy accounts whose IMAP
-            # username already carries the @domain. Pre-fix drafts
-            # shipped with bare LOGIN (e.g. ``exampleuser``), which mail
-            # servers reject or rewrite.
-            msg["From"] = self._email_address or self._username
-        msg["To"] = ", ".join(to)
-        msg["Subject"] = subject
-        msg["Date"] = email.utils.formatdate(localtime=True)
+        # N-272c R28: route through the MIME envelope SSOT. Fallback
+        # From-address logic (email_address or username) resolved
+        # here + passed as from_addr to the SSOT.
+        from email_triage.engine.html_text import strip_tags
+        from email_triage.web._mime_builder import build_alternative_message
+        _resolved_from = from_addr or (self._email_address or self._username)
+        _hdrs = dict(extra_headers) if extra_headers else {}
         if reply_to:
-            msg["Reply-To"] = reply_to
+            _hdrs["Reply-To"] = reply_to
         if in_reply_to:
-            msg["In-Reply-To"] = in_reply_to
-        if extra_headers:
-            for key, value in extra_headers.items():
-                msg[key] = value
-
-        # Plain text fallback.
-        import re
-        plain = re.sub(r"<[^>]+>", "", body)
-        plain = re.sub(r"\s+", " ", plain).strip()
-        msg.attach(email.mime.text.MIMEText(plain, "plain", "utf-8"))
-        # HTML version.
-        msg.attach(email.mime.text.MIMEText(body, "html", "utf-8"))
+            _hdrs["In-Reply-To"] = in_reply_to
+        plain = strip_tags(body)
+        msg = build_alternative_message(
+            subject=subject,
+            from_addr=_resolved_from,
+            from_name=from_name or "",
+            to=", ".join(to),
+            plain_body=plain,
+            html_body=body,
+            source_tag="imap_draft",
+            extra_headers=_hdrs or None,
+        )
 
         client = await self._connect()
 
@@ -1585,8 +1780,11 @@ class ImapProvider(EmailProvider, PushCapable):
                 )
                 try:
                     await client.create(self._quote_mailbox(alt))
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    log.debug(
+                        "IMAP alternate drafts folder create failed (may already exist)",
+                        alt=alt, error=fmt_exc(_swallow_exc),
+                    )
                 result, _ = await client.append(
                     msg.as_bytes(),
                     mailbox=self._quote_mailbox(alt),
@@ -1627,31 +1825,29 @@ class ImapProvider(EmailProvider, PushCapable):
         import email.mime.text
         import re
 
-        msg = email.mime.multipart.MIMEMultipart("alternative")
-        if from_addr:
-            if from_name:
-                safe = from_name.replace("\\", "\\\\").replace('"', '\\"')
-                msg["From"] = f'"{safe}" <{from_addr}>'
-            else:
-                msg["From"] = from_addr
-        else:
-            # 2026-05-13 — same email_address fallback as create_draft.
-            msg["From"] = self._email_address or self._username
-        msg["To"] = ", ".join(to) if to else (
+        # N-272c R28: route through the MIME envelope SSOT. Fallback
+        # From-address logic (email_address or username) resolved
+        # here + passed as from_addr to the SSOT.
+        from email_triage.engine.html_text import strip_tags
+        from email_triage.web._mime_builder import build_alternative_message
+        _resolved_from = from_addr or (self._email_address or self._username)
+        _resolved_to = ", ".join(to) if to else (
             self._email_address or self._username
         )
-        msg["Subject"] = subject
-        msg["Date"] = email.utils.formatdate(localtime=True)
+        _hdrs = dict(extra_headers) if extra_headers else {}
         if reply_to:
-            msg["Reply-To"] = reply_to
-        if extra_headers:
-            for key, value in extra_headers.items():
-                msg[key] = value
-
-        plain = re.sub(r"<[^>]+>", "", body)
-        plain = re.sub(r"\s+", " ", plain).strip()
-        msg.attach(email.mime.text.MIMEText(plain, "plain", "utf-8"))
-        msg.attach(email.mime.text.MIMEText(body, "html", "utf-8"))
+            _hdrs["Reply-To"] = reply_to
+        plain = strip_tags(body)
+        msg = build_alternative_message(
+            subject=subject,
+            from_addr=_resolved_from,
+            from_name=from_name or "",
+            to=_resolved_to,
+            plain_body=plain,
+            html_body=body,
+            source_tag="imap_send",
+            extra_headers=_hdrs or None,
+        )
 
         client = await self._connect()
         # aioimaplib 2.0: append(message_bytes, mailbox, flags, date).
@@ -1833,11 +2029,9 @@ class ImapProvider(EmailProvider, PushCapable):
             if uid_match:
                 token = uid_match.group(1)
                 # Filter anchor-UID echo some servers include.
-                try:
-                    if int(token) > since_uid:
-                        uids.append(token)
-                except ValueError:
-                    continue
+                _iv = parse_int_or_none(token)  # N-219c/12 R23: SSOT
+                if _iv is not None and _iv > since_uid:
+                    uids.append(token)
 
         if not uids:
             return []
@@ -1980,7 +2174,7 @@ class ImapProvider(EmailProvider, PushCapable):
                 )
 
             client.idle_done()
-            await asyncio.wait_for(idle_task, timeout=10)
+            await asyncio.wait_for(idle_task, timeout=_IDLE_TASK_DRAIN_TIMEOUT_SECS)
 
             # Check if we got an EXISTS notification (new mail).
             has_new = False
@@ -2044,10 +2238,9 @@ class ImapProvider(EmailProvider, PushCapable):
             # so the next IDLE cycle's UID-range search stays bounded
             # rather than re-scanning from the original floor forever.
             for _u in new_uids:
-                try:
-                    floor = max(floor, int(_u))
-                except ValueError:
-                    pass
+                _iv = parse_int_or_none(_u)  # N-219c/20 R23: SSOT
+                if _iv is not None:
+                    floor = max(floor, _iv)
 
             # No manual prune needed — the deque's ``maxlen`` handles
             # FIFO eviction inside ``_remember_uid``.
@@ -2062,13 +2255,19 @@ class ImapProvider(EmailProvider, PushCapable):
         SIGTERM-driven shutdown, and podman's default stop-timeout is
         only 10 s — a hung logout per account would push us past that
         and force a SIGKILL with stale state.
+
+        This 2 s cap (``_IMAP_LOGOUT_TIMEOUT_SECS``) is the only bound on
+        the close: ``render_probe.close_provider`` awaits it with no bound
+        of its own, so a render probe that hit its own 3 s bound
+        (``RENDER_PROBE_TIMEOUT_S``) costs at most 3 s + 2 s before the
+        transport is ripped (cycle P db P1 NOTE 2).
         """
         if self._client is None:
             return
         client = self._client
         self._client = None
         try:
-            await asyncio.wait_for(client.logout(), timeout=2.0)
+            await asyncio.wait_for(client.logout(), timeout=_IMAP_LOGOUT_TIMEOUT_SECS)
         except asyncio.TimeoutError:
             # Expected on shutdown for servers that don't ACK LOGOUT
             # fast — some Dovecot deployments reliably time out here

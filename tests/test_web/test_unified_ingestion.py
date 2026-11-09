@@ -42,7 +42,7 @@ TEST_SECRET = "test-session-secret-for-signing"
 def _make_imap_account(db, user_id: int, config: dict | None = None) -> int:
     now = datetime.now(timezone.utc).isoformat()
     cfg = config if config is not None else {
-        "host": "mail.test.com", "port": 993,
+        "host": "mail.test.invalid", "port": 993,
         "username": "u", "use_ssl": True, "mailbox": "INBOX",
     }
     cur = db.execute(
@@ -80,7 +80,7 @@ class TestDefaults:
         self, db, admin_user,
     ):
         acct_id = _make_imap_account(db, admin_user["id"], config={
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
         })
         acct = get_email_account(db, acct_id)
         assert acct["config"]["push_enabled"] is True
@@ -122,7 +122,7 @@ class TestBackCompat:
         acct_id = _make_imap_account(db, admin_user["id"])
         set_setting(db, f"watch:{acct_id}", {"enabled": False})
         acct = get_email_account(db, acct_id)
-        # Alex's decision: previously-dormant accounts come back as
+        # Operator decision: previously-dormant accounts come back as
         # poll-only. Operators opt out explicitly via the edit form.
         assert acct["config"]["push_enabled"] is False
         assert acct["config"]["poll_enabled"] is True
@@ -278,7 +278,7 @@ class TestUnifiedPollLoop:
         from email_triage.web.app import _run_unified_poll_tick
 
         aid = _make_imap_account(db, admin_user["id"], config={
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
         })
         set_setting(db, f"poll_state:{aid}",
                     {"last_poll_at": "2020-01-01T00:00:00+00:00"})
@@ -317,7 +317,7 @@ class TestUnifiedPollLoop:
         from email_triage.engine.models import EmailMessage
 
         aid = _make_imap_account(db, admin_user["id"], config={
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
         })
         set_mailbox_hwm(db, aid, "INBOX", {"uid": 0, "updated_at": "x"})
 
@@ -372,6 +372,50 @@ class TestUnifiedPollLoop:
         assert int(hwm.get("uid", 0)) == 1
 
     @pytest.mark.asyncio
+    async def test_uidvalidity_chip_survives_the_next_successful_poll(
+        self, client, db, admin_user,
+    ):
+        """Punch 854 — a UIDVALIDITY reseed chips mail it never walked. The
+        NEXT successful poll walks only UIDs past the reseed, so it must not
+        clear the chip. Before the fix the post-poll_once clear erased the
+        only notice of the gap within one poll interval."""
+        from email_triage.web.app import _poll_once_imap
+        from email_triage.web.db import (
+            get_email_account, make_hwm_value, set_mailbox_hwm,
+        )
+        from email_triage.web._backfill_chip import get_backfill_capped
+
+        aid = _make_imap_account(db, admin_user["id"], config={
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
+        })
+        # A stored cursor in epoch 55; the server now reports epoch 77.
+        set_mailbox_hwm(db, aid, "INBOX", make_hwm_value(10, 55))
+
+        fake_provider = MagicMock()
+        fake_provider.poll_once = AsyncMock(return_value=[])
+        fake_provider.get_uidvalidity = AsyncMock(return_value=77)
+        fake_provider.get_latest_uid = AsyncMock(return_value=40)
+        fake_provider.close = AsyncMock(return_value=None)
+
+        from unittest.mock import patch as _patch
+        with _patch(
+            "email_triage.web.routers.ui._create_provider_from_account",
+            return_value=fake_provider,
+        ):
+            # Tick 1: the epoch changed, so the poll reseeds and chips.
+            await _poll_once_imap(client.app, get_email_account(db, aid))
+            chip = get_backfill_capped(db, aid)
+            assert chip is not None and chip["kind"] == "imap_uidvalidity"
+            fake_provider.poll_once.assert_not_awaited()
+            # Tick 2: the stored epoch now matches, so the poll succeeds.
+            await _poll_once_imap(client.app, get_email_account(db, aid))
+
+        fake_provider.poll_once.assert_awaited_once()
+        chip = get_backfill_capped(db, aid)
+        assert chip is not None, "a routine poll erased the gap chip"
+        assert chip["source_mailbox"] == "INBOX"
+
+    @pytest.mark.asyncio
     async def test_poll_hwm_advances_when_retry_enqueued(
         self, client, db, admin_user,
     ):
@@ -385,7 +429,7 @@ class TestUnifiedPollLoop:
         from email_triage.engine.models import EmailMessage
 
         aid = _make_imap_account(db, admin_user["id"], config={
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
         })
         set_mailbox_hwm(db, aid, "INBOX", {"uid": 0, "updated_at": "x"})
 
@@ -495,7 +539,7 @@ class TestImapPollOnce:
         # return a MagicMock and fall through to the NONAUTH branch.
         client_mock.get_state.return_value = "AUTH"
         p = imap_mod.ImapProvider(
-            host="m", username="u", password="p", mailbox="INBOX",
+            host="m.invalid", username="u", password="p", mailbox="INBOX",
         )
         p._client = client_mock
         return p
@@ -605,7 +649,7 @@ class TestWatcherStart:
         from email_triage.web.db import update_email_account_config
         aid = _make_imap_account(db, admin_user["id"])
         update_email_account_config(db, aid, {
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
             "push_enabled": False, "poll_enabled": True,
             "poll_interval_minutes": 60,
         })
@@ -626,7 +670,7 @@ class TestWatcherStart:
         from email_triage.web.db import update_email_account_config
         aid = _make_imap_account(db, admin_user["id"])
         update_email_account_config(db, aid, {
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
             "push_enabled": False, "poll_enabled": False,
             "poll_interval_minutes": 60,
         })
@@ -671,7 +715,7 @@ class TestAccountUpdateBounce:
         from email_triage.web.db import update_email_account_config
         aid = _make_imap_account(db, admin_user["id"])
         update_email_account_config(db, aid, {
-            "host": "m", "username": "u", "mailboxes": ["INBOX"],
+            "host": "m.invalid", "username": "u", "mailboxes": ["INBOX"],
             "push_enabled": True, "poll_enabled": True,
             "poll_interval_minutes": 60,
         })
@@ -689,7 +733,7 @@ class TestAccountUpdateBounce:
                 data={
                     "name": "Imap", "provider_type": "imap",
                     "is_active": "1",
-                    "host": "m", "port": "993", "username": "u",
+                    "host": "m.invalid", "port": "993", "username": "u",
                     "use_ssl": "1", "mailboxes": ["INBOX"],
                     # Flip push off.
                     "__ingestion_fields_present": "1",
@@ -712,7 +756,7 @@ class TestAccountUpdateBounce:
             data={
                 "name": "Imap", "provider_type": "imap",
                 "is_active": "1",
-                "host": "m", "port": "993", "username": "u",
+                "host": "m.invalid", "port": "993", "username": "u",
                 "use_ssl": "1", "mailboxes": ["INBOX"],
                 "__ingestion_fields_present": "1",
                 "push_enabled": "1", "poll_enabled": "1",
@@ -733,7 +777,7 @@ class TestAccountUpdateBounce:
             data={
                 "name": "Imap", "provider_type": "imap",
                 "is_active": "1",
-                "host": "m", "port": "993", "username": "u",
+                "host": "m.invalid", "port": "993", "username": "u",
                 "use_ssl": "1", "mailboxes": ["INBOX"],
                 "__ingestion_fields_present": "1",
                 "push_enabled": "1", "poll_enabled": "1",

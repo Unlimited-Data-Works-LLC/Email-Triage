@@ -26,6 +26,8 @@ from fastapi import FastAPI
 
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import parse_int_or_none  # N-219c/46 R23
+from email_triage._isotime import parse_iso, parse_iso_aware, to_utc_iso  # N-316 R30 (same-hunk satellite completeness fix on N-305) + N-357 R31 (parse_iso_aware SSOT)
 
 # #277d / PIN A — bind the SAME logger name as web/app.py and the sibling
 # carves (watcher.py / ingestion_push.py / digest.py all use "web.app").
@@ -64,7 +66,7 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
     from email_triage.web.app import _acct_log_extras
     from email_triage.web.db import (
         get_email_account, get_setting, set_setting, record_triage_run,
-        effective_routes_by_cat, account_addresses as _aa,
+        effective_routes_by_cat, account_addresses as _aa, account_email,
     )
     from email_triage.web.settings_keys import (
         office365_poll_cursor as _o365_poll_cursor_key,
@@ -81,11 +83,8 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
     from email_triage.providers.office365 import (
         Office365Provider, GraphDeltaResyncRequiredError, GraphError,
     )
-    from email_triage.triage_logging import is_account_hipaa, is_hipaa_mode
-    from email_triage.web.triage_inflight import (
-        mark_inflight as _mark_inflight,
-        release_inflight as _release_inflight,
-    )
+    from email_triage.triage_logging import account_hipaa_effective
+    from email_triage.web.triage_inflight import claim as _inflight_claim
     # -residual — this ``async def`` poll runs on the event loop;
     # a sync DB helper called inline races ``db_call`` workers on the
     # shared ``sqlite3.Connection``. Route every shared-connection DB
@@ -121,17 +120,45 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
         # Walk the delta feed. Resync (410 / "resyncRequired") falls
         # back to a bounded backfill — same shape as the push consumer.
         next_delta_link: str = ""
+        resync_walk_complete = False
         try:
             message_ids, next_delta_link = await provider.poll_delta(
                 stored_delta_link,
             )
         except GraphDeltaResyncRequiredError:
+            from email_triage.web._backfill_chip import (
+                BACKFILL_CAP, mark_backfill_capped, probe_resync_walk,
+            )
             log.warning(
                 "Office365 poll: delta cursor expired, recovering via "
                 "bounded backfill",
                 **_acct_log_extras(acct),
             )
-            message_ids = await provider.search("ALL", limit=200)
+            #  — CAP+1 probe, following nextLink (punch 854): only
+            # >CAP is real saturation. Process at most CAP; the probe id
+            # is covered by the chip + the operator's full backfill.
+            message_ids, saturated = await probe_resync_walk(provider)
+            # Saturated cap ⇒ older mail in the gap is never enumerated
+            # and the cursor reseeds past it. Distinct warning + operator
+            # chip. A non-saturated "ALL" walk enumerated the whole mailbox,
+            # so it covers any earlier gap; the chip is cleared after the walked
+            # messages are processed, below (punch 854).
+            if saturated:
+                log.warning(
+                    "Office365 poll: resync backfill CAPPED — older mail "
+                    "in the gap may be un-triaged "
+                    "(resync_backfill_capped)",
+                    **_acct_log_extras(acct),
+                    recovered_count=len(message_ids), cap=BACKFILL_CAP,
+                )
+                await db_call(
+                    mark_backfill_capped, db, account_id,
+                    kind="o365_resync", window="most recent",
+                    recovered=BACKFILL_CAP,
+                    source_mailbox="INBOX",  # N-211c R23: O365 delta-poll = INBOX-scope
+                )
+            else:
+                resync_walk_complete = True
             try:
                 _, next_delta_link = await provider.poll_delta(None)
             except Exception as e:
@@ -196,7 +223,8 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
             _mp = await db_call(_gmp, db, acct.get("user_id"))
         except Exception:
             _mp = None
-        _self_email = acct.get("email_address", "")
+        # census run17  — account_email SSOT, not the open-coded key.
+        _self_email = account_email(acct)
         # ``account_addresses`` only parses the in-memory acct dict —
         # no DB — so it stays a plain call.
         _self_email_addresses = _aa(acct)
@@ -228,7 +256,7 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
             account_addrs=list(_self_email_addresses),
             self_from_addr=_self_from_addr,
             dry_run=_dry_run,
-            account_hipaa=is_hipaa_mode() or is_account_hipaa(acct),
+            account_hipaa=account_hipaa_effective(account=acct),
             actor_user_id=None,
             durable_dedup=True,
             mark_triaged_on_success=True,
@@ -244,141 +272,139 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
         for mid in message_ids:
             # In-flight dedup gate — the poll loop and the push
             # consumer can race on the same Graph message id.
-            if not _mark_inflight(app.state, account_id, mid):
-                log.info(
-                    "Skipping concurrent triage cycle (in_flight)",
-                    message_id=mid, account_id=account_id,
-                    skip_reason="in_flight",
-                )
-                continue
-            try:
-                try:
-                    message = await provider.fetch_message(mid)
-                except GraphError as ge:
-                    if ge.status == 404:
-                        log.info(
-                            "Office365 poll: message vanished before "
-                            "fetch (404)",
-                            **_acct_log_extras(acct), message_id=mid,
-                        )
-                        continue
-                    raise
-                _res = await triage_single_message(_poll_ctx, message, mid)
-                if _res.status == "e":
-                    raise RuntimeError(
-                        _res.entry.get("error", "triage error")
+            with _inflight_claim(app.state, account_id, mid) as _won:
+                if not _won:
+                    log.info(
+                        "Skipping concurrent triage cycle (in_flight)",
+                        message_id=mid, account_id=account_id,
+                        skip_reason="in_flight",
                     )
-                #  — O365 poll site watch-fire delivery retry.
-                if _res.unretried_watch_failures > 0:
+                    continue
+                try:
+                    try:
+                        message = await provider.fetch_message(mid)
+                    except GraphError as ge:
+                        if ge.status == 404:
+                            log.info(
+                                "Office365 poll: message vanished before "
+                                "fetch (404)",
+                                **_acct_log_extras(acct), message_id=mid,
+                            )
+                            continue
+                        raise
+                    _res = await triage_single_message(_poll_ctx, message, mid)
+                    if _res.status == "e":
+                        raise RuntimeError(
+                            _res.entry.get("error", "triage error")
+                        )
+                    #  — O365 poll site watch-fire delivery retry.
+                    if _res.unretried_watch_failures > 0:
+                        try:
+                            from email_triage.web.watcher_retry import (
+                                enqueue_watch_delivery_retry as _wdr,
+                            )
+                            await db_call(
+                                _wdr,
+                                app.state.db,
+                                account_id=int(account_id),
+                                provider_type=acct.get(
+                                    "provider_type", "office365",
+                                ),
+                                failed_count=_res.unretried_watch_failures,
+                                total_count=len(
+                                    _res.entry.get("watches_fired") or []
+                                ),
+                                o365_msg_id=str(mid),
+                            )
+                        except Exception as exc:
+                            # #8: a failed enqueue means the
+                            # undelivered watch is NOT queued for re-fire — surface
+                            # it (fail VISIBLE, PD#8) rather than silently swallow.
+                            log.warning(
+                                "watch-delivery retry enqueue FAILED (o365 poll) "
+                                "— the undelivered watch is NOT queued for re-fire",
+                                o365_msg_id=str(mid),
+                                error=fmt_exc(exc),
+                            )
+                    results.append(_res.entry)
+                except Exception as e:
+                    errors.append({"message_id": mid, "error": fmt_exc(e)})
+                    log.error(
+                        "Office365 poll: per-message error",
+                        **_acct_log_extras(acct),
+                        message_id=mid, error=fmt_exc(e),
+                    )
+                    #  — stamp ``failure_kind='llm_unreachable'`` on an
+                    # LLM-unreachable failure so the retry drainer's
+                    # LLM-breaker gate engages. triage_single_message
+                    # re-raises LLMBackendUnreachableError unchanged.
+                    from email_triage.llm_health import (
+                        LLMBackendUnreachableError,
+                    )
+                    _is_llm_down = isinstance(e, LLMBackendUnreachableError)
+                    _enqueued_o = False
                     try:
                         from email_triage.web.watcher_retry import (
-                            enqueue_watch_delivery_retry as _wdr,
+                            enqueue_watcher_retry as _wr_enqueue_o,
                         )
-                        await db_call(
-                            _wdr,
+                        # -residual — enqueue_watcher_retry wraps the
+                        # @db_write enqueue_retry; route it off the loop.
+                        _rid_o = await db_call(
+                            _wr_enqueue_o,
                             app.state.db,
                             account_id=int(account_id),
                             provider_type=acct.get(
                                 "provider_type", "office365",
                             ),
-                            failed_count=_res.unretried_watch_failures,
-                            total_count=len(
-                                _res.entry.get("watches_fired") or []
-                            ),
                             o365_msg_id=str(mid),
+                            error=e,
+                            failure_kind=(
+                                "llm_unreachable" if _is_llm_down else None
+                            ),
                         )
+                        _enqueued_o = _rid_o is not None
                     except Exception:
-                        pass
-                results.append(_res.entry)
-            except Exception as e:
-                errors.append({"message_id": mid, "error": fmt_exc(e)})
-                log.error(
-                    "Office365 poll: per-message error",
-                    **_acct_log_extras(acct),
-                    message_id=mid, error=fmt_exc(e),
-                )
-                #  — stamp ``failure_kind='llm_unreachable'`` on an
-                # LLM-unreachable failure so the retry drainer's
-                # LLM-breaker gate engages. triage_single_message
-                # re-raises LLMBackendUnreachableError unchanged.
-                from email_triage.llm_health import (
-                    LLMBackendUnreachableError,
-                )
-                _is_llm_down = isinstance(e, LLMBackendUnreachableError)
-                _enqueued_o = False
-                try:
-                    from email_triage.web.watcher_retry import (
-                        enqueue_watcher_retry as _wr_enqueue_o,
-                    )
-                    # -residual — enqueue_watcher_retry wraps the
-                    # @db_write enqueue_retry; route it off the loop.
-                    _rid_o = await db_call(
-                        _wr_enqueue_o,
-                        app.state.db,
-                        account_id=int(account_id),
-                        provider_type=acct.get(
-                            "provider_type", "office365",
-                        ),
-                        o365_msg_id=str(mid),
-                        error=e,
-                        failure_kind=(
-                            "llm_unreachable" if _is_llm_down else None
-                        ),
-                    )
-                    _enqueued_o = _rid_o is not None
-                except Exception:
-                    _enqueued_o = False
-                if not _enqueued_o:
-                    retry_enqueue_failed = True
-                    log.warning(
-                        "Office365 poll: retry enqueue failed — poll "
-                        "cursor will not advance this delta",
-                        **_acct_log_extras(acct), message_id=mid,
-                    )
-            finally:
-                _release_inflight(app.state, account_id, mid)
+                        _enqueued_o = False
+                    if not _enqueued_o:
+                        retry_enqueue_failed = True
+                        log.warning(
+                            "Office365 poll: retry enqueue failed — poll "
+                            "cursor will not advance this delta",
+                            **_acct_log_extras(acct), message_id=mid,
+                        )
 
         elapsed = time.time() - t0
+        #  tail (DA F6 fold, 2026-07-11 batched-panel) — route through
+        # the `complete_triage_run` SSOT so this O365-poll terminal
+        # RECORDS the run row AND EMITS the `et_triage_runs_total{
+        # trigger,outcome}` counter AND fires the outbound webhook in one
+        # call. Pre-fix, `record_triage_run` + `fire_triage_completed`
+        # were called separately here (sibling IMAP-poll at :1187 was
+        # already converted per run18 census #7); the O365-poll silence
+        # meant `trigger="poll"` counter under-reported for O365-poll
+        # installs — analog of the pre-fix IMAP-watch / Gmail / O365
+        # push silences the same drive closed. `trigger="poll"`
+        # distinguishes poll-driven from push-driven completions
+        # (`_poll_state_key` observability + integration compatibility).
+        dispatcher = getattr(app.state, "event_dispatcher", None)
+        from email_triage.web.events import complete_triage_run
+        from email_triage._ids import new_run_id
         try:
-            await db_call(
-                record_triage_run,
-                db,
-                account_id=account_id,
-                account_name=acct.get("name", ""),
+            await complete_triage_run(
+                dispatcher, db, config, acct,
+                run_id=new_run_id("o365_poll", account_id),
                 query="office365_poll",
+                trigger="poll",
                 total_messages=len(message_ids),
                 results=results,
                 errors=errors,
                 elapsed_secs=elapsed,
             )
-        except Exception:
-            pass
-
-        # Outbound webhook — trigger="poll" so integrations can tell a
-        # poll-driven completion from a push-driven one.
-        dispatcher = getattr(app.state, "event_dispatcher", None)
-        if dispatcher is not None:
-            from email_triage.web.events import fire_triage_completed
-            try:
-                await fire_triage_completed(
-                    dispatcher, db, config, acct,
-                    {
-                        "run_id": (
-                            f"o365_poll_{account_id}_{int(time.time())}"
-                        ),
-                        "query": "office365_poll",
-                        "total_messages": len(message_ids),
-                        "results": results,
-                        "errors": errors,
-                        "elapsed_secs": elapsed,
-                    },
-                    trigger="poll",
-                )
-            except Exception as _e:
-                log.warning(
-                    "o365 poll: triage.completed dispatch failed",
-                    error=str(_e),
-                )
+        except Exception as _e:
+            log.warning(
+                "o365 poll: complete_triage_run outer (webhook/emit) failed",
+                error=str(_e),
+            )
 
         # Advance the cursor only after the whole delta processed and
         # every failure was durably enqueued.
@@ -393,6 +419,15 @@ async def _poll_once_office365(app: FastAPI, acct: dict) -> None:
                 "enqueue failed this delta; next tick re-walks",
                 **_acct_log_extras(acct),
             )
+
+        # Punch 854: a non-saturated resync walk covers the gap only once its
+        # messages were processed and every failure was durably queued.
+        walk_covered = resync_walk_complete and not retry_enqueue_failed
+        if walk_covered:
+            from email_triage.web._backfill_chip import clear_backfill_capped
+            await db_call(clear_backfill_capped, db, account_id,
+                          source_mailbox="INBOX",  # N-211c R23
+                          walk_kind="o365_resync")
 
         log.info(
             "Office365 poll: processed delta",
@@ -483,7 +518,7 @@ async def _run_unified_poll_tick(app: FastAPI) -> None:
     # #277d late import (cycle-break): these shared ingestion helpers
     # STAY in web/app.py (used across watcher + poll + push); a module-top
     # import would cycle (app.py re-exports the names defined here).
-    from email_triage.web.app import _acct_log_extras, _clear_auth_stale, _maybe_mark_auth_stale
+    from email_triage.web.app import _acct_log_extras, record_provider_outcome
     from email_triage.web.db import (
         list_email_accounts, disabled_user_ids, get_setting, set_setting,
     )
@@ -522,12 +557,13 @@ async def _run_unified_poll_tick(app: FastAPI) -> None:
         # Has enough time elapsed?
         state = await db_call(get_setting, db, _poll_state_key(account_id)) or {}
         last_poll_iso = state.get("last_poll_at")
-        last_poll = None
-        if last_poll_iso:
-            try:
-                last_poll = datetime.fromisoformat(last_poll_iso)
-            except (TypeError, ValueError):
-                last_poll = None
+        # N-357 R31 (2026-07-05 SSOT collapse of the N-305 assume-UTC-
+        # on-naive shim — sibling site to `web/auth.py` at ~L169 + ~L595).
+        # Was 5 lines of inline parse + None-guard + tzinfo-assume; now
+        # one `parse_iso_aware` call with the None-preservation contract
+        # documented in `_isotime.parse_iso_aware`. Elapsed math on the
+        # aware `now` stays valid on legacy naive `last_poll_at` rows.
+        last_poll = parse_iso_aware(last_poll_iso) if last_poll_iso else None
         if last_poll is not None:
             elapsed_s = (now - last_poll).total_seconds()
             if elapsed_s < interval_min * 60:
@@ -556,10 +592,12 @@ async def _run_unified_poll_tick(app: FastAPI) -> None:
                 )
             else:
                 await disp.poll_once(app, acct)
-            # Successful dispatch — clear any prior stale-auth flag.
-            #  — _clear_auth_stale writes the settings table; route
-            # it through db_call so the delete is lock-serialised.
-            await db_call(_clear_auth_stale, db, account_id)
+            # Successful dispatch — the credential is alive; clear any prior
+            # stale-auth flag via the lifecycle SSOT funnel (census 2026-06-09
+            # #1; idempotent-cheap, no write when already clear).
+            #  — writes the settings table; route through db_call so the
+            # delete is lock-serialised.
+            await db_call(record_provider_outcome, db, acct, None)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -567,25 +605,49 @@ async def _run_unified_poll_tick(app: FastAPI) -> None:
                 "Unified poll: dispatch failed",
                 **_acct_log_extras(acct), provider=ptype, error=fmt_exc(e),
             )
-            # Detect Gmail OAuth refresh-token death and persist a
-            # stale-auth flag so the UI can surface a re-auth chip
-            # and the daily health email can call it out.
-            #  — _maybe_mark_auth_stale writes the settings table;
-            # route it through db_call.
-            await db_call(_maybe_mark_auth_stale, db, acct, e)
+            # Detect OAuth/IMAP auth-revoked death and persist a stale-auth
+            # flag (needle-filtered inside the funnel) so the UI surfaces a
+            # re-auth chip and the daily health email calls it out.
+            #  — writes the settings table; route through db_call.
+            await db_call(record_provider_outcome, db, acct, e)
+            # Census run23 #1 (borderline site — verifier flagged
+            # SME-scope): the poll-mode gmail_watches / office365_subscriptions
+            # rows are cursor placeholders (topic_name='') rather than live
+            # push watches, but the same lifecycle status flag is the store,
+            # so mirror the SET half. Both funnels no-op on a missing row
+            # (SSOT docstring line 3337-3340 / O365 sibling), so
+            # unconditional dispatch is safe for accounts that never had a
+            # push watch or subscription registered.
+            try:
+                from email_triage.web.db import (
+                    record_gmail_watch_outcome,
+                    record_o365_subscription_outcome,
+                )
+                if ptype == "gmail_api":
+                    await db_call(
+                        record_gmail_watch_outcome, db,
+                        account_id=account_id, error_text=fmt_exc(e),
+                    )
+                elif ptype == "office365":
+                    await db_call(
+                        record_o365_subscription_outcome, db,
+                        account_id=account_id, error_text=fmt_exc(e),
+                    )
+            except Exception as record_exc:
+                log.error("poll: provider outcome record failed; watch health may be stale", exc_info=record_exc)
 
         # Record the tick regardless of dispatch outcome — a failing
         # provider shouldn't cause every tick to retry it within the
         # interval window (that would amplify a bad cred or network
         # blip into a retry storm).
-        state["last_poll_at"] = now.isoformat()
+        state["last_poll_at"] = to_utc_iso(now)
         #  — set_setting writes the shared connection; lock-serialise.
         await db_call(set_setting, db, _poll_state_key(account_id), state)
         if watcher_mgr is not None:
             try:
-                watcher_mgr._mark_poll_tick(account_id, now.isoformat())
-            except Exception:
-                pass
+                watcher_mgr._mark_poll_tick(account_id, to_utc_iso(now))
+            except Exception as tick_exc:
+                log.warning("poll: mark poll tick failed", account_id=account_id, error=fmt_exc(tick_exc))
 
 # Back-compat alias for tests and any external caller that imported the
 # old name.
@@ -685,8 +747,8 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
     # import would cycle (app.py re-exports the names defined here).
     from email_triage.web.app import _acct_log_extras, _resolve_hwm_with_uidvalidity
     from email_triage.web.db import (
-        _account_mailboxes, get_mailbox_hwm, set_mailbox_hwm,
-        list_account_routes, record_triage_run,
+        _account_mailboxes, get_mailbox_hwm, set_mailbox_hwm, make_hwm_value,
+        list_account_routes,
     )
     from email_triage.web.routers.ui import (
         _create_provider_from_account, _build_classifier_from_config,
@@ -696,7 +758,7 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
         TriageContext, build_default_registry, triage_single_message,
         _build_rule_labels_map, _build_rule_provider_labels_map,
     )
-    from email_triage.triage_logging import is_account_hipaa, is_hipaa_mode
+    from email_triage.triage_logging import account_hipaa_effective
     # -residual — this ``async def`` poll runs on the event loop;
     # a sync DB helper called inline races ``db_call`` workers on the
     # shared ``sqlite3.Connection``. Route every shared-connection DB
@@ -739,13 +801,30 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
                     _latest = await provider.get_latest_uid()
                 except Exception:
                     _latest = 0
-                await db_call(set_mailbox_hwm, db, account_id, mb, {
-                    "uid": int(_latest),
-                    "uidvalidity": _live_uidvalidity,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                })
+                await db_call(set_mailbox_hwm, db, account_id, mb,
+                              make_hwm_value(_latest, _live_uidvalidity))
+                # run18  — a UIDVALIDITY reseed advances the cursor past
+                # every message below the new latest UID WITHOUT enumerating
+                # them, so any mail that arrived in the gap is never triaged —
+                # the same un-triage hazard the cursor-expiry (Gmail history /
+                # O365 delta-resync) recovery path chips. The reseed branch
+                # previously stayed SILENT while the cursor-expiry path raised
+                # the operator chip, so a renumbered mailbox lost its backfill
+                # notice. Emit the same chip here (operator action is identical:
+                # run a whole-mailbox triage, then dismiss). ``recovered=0`` —
+                # the reseed enumerates nothing (vs the bounded backfill that
+                # walks up to BACKFILL_CAP).
+                from email_triage.web._backfill_chip import mark_backfill_capped
+                await db_call(
+                    mark_backfill_capped, db, account_id,
+                    kind="imap_uidvalidity",
+                    window="mailbox renumbered — UIDVALIDITY change; reseeded to latest",
+                    recovered=0,
+                    source_mailbox=mb,  # N-211 R23: mailbox-scope
+                )
                 continue
 
+            wm = getattr(app.state, "watcher_manager", None)
             try:
                 new_messages = await provider.poll_once(mb, since_uid)
             except ProviderTransientError as e:
@@ -753,16 +832,35 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
                 # Bump the watcher state so /health surfaces it after
                 # 15 min of consecutive failure (matches the C1 plumbing
                 # used by IDLE watchers). Do NOT update HWM, do NOT
-                # record a triage_run with zero messages.
-                wm = getattr(app.state, "watcher_manager", None)
+                # record a triage_run with zero messages. Via the
+                # lifecycle funnel (census #7) so set/clear stay symmetric.
                 if wm is not None:
-                    wm._mark_failing(account_id, mb, error=fmt_exc(e))
+                    wm.record_mailbox_outcome(
+                        account_id, mb, sticky_error=e,
+                    )
                 log.warning(
                     "Unified poll: provider transient error",
                     **_acct_log_extras(acct), mailbox=mb,
                     error=fmt_exc(e),
                 )
                 continue
+            # poll_once succeeded → the mailbox connection + credential are
+            # alive. Clear any prior failing_since via the SAME lifecycle
+            # funnel (census #7): the poll path previously SET on a transient
+            # error but never CLEARED on success, so a recovered poll-only
+            # mailbox stayed "failing" on /health (past the 15-min threshold)
+            # until a process restart. Both edges are now symmetric.
+            if wm is not None:
+                wm.record_mailbox_outcome(
+                    account_id, mb, sticky_error=None,
+                )
+
+            # Punch 854: NO backfill-chip clear here. The UIDVALIDITY reseed
+            # above chips mail it never enumerated; a later successful poll
+            # walks only UIDs past the reseed, so the gap stays un-triaged and
+            # the chip (a loss record, see web/_backfill_chip.py) stays until
+            # the operator's dismiss. N-198 had added a clear here, which
+            # erased the chip on the next poll.
 
             if not new_messages:
                 # Cheap no-op case — no new mail. Seed HWM on first poll
@@ -773,13 +871,8 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
                         latest = await provider.get_latest_uid()
                         if latest > 0:
                             await db_call(
-                                set_mailbox_hwm, db, account_id, mb, {
-                                    "uid": int(latest),
-                                    "uidvalidity": _live_uidvalidity,
-                                    "updated_at": datetime.now(
-                                        timezone.utc
-                                    ).isoformat(),
-                                },
+                                set_mailbox_hwm, db, account_id, mb,
+                                make_hwm_value(latest, _live_uidvalidity),
                             )
                     except Exception:
                         pass
@@ -850,7 +943,7 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
             _self_from_addr = getattr(
                 getattr(app.state.config, "smtp", None), "from_addr", "",
             )
-            _acct_hipaa = is_hipaa_mode() or is_account_hipaa(acct)
+            _acct_hipaa = account_hipaa_effective(account=acct)
 
             #  - per-mailbox calendar context. The pre-#199 poll
             # path registered no calendar actions, so the meeting
@@ -915,10 +1008,7 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
             try:
                 for message in new_messages:
                     uid = str(message.message_id)
-                    try:
-                        uid_int: int | None = int(uid)
-                    except (TypeError, ValueError):
-                        uid_int = None
+                    uid_int: int | None = parse_int_or_none(uid)  # N-219c/46 R23: SSOT
                     # In-flight dedup gate. A concurrent cycle
                     # owns this UID; it is neither this poll's success
                     # nor failure. The next safe UID will carry the HWM
@@ -979,14 +1069,56 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
                                     uid=str(uid),
                                     uidvalidity=_live_uidvalidity,
                                 )
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                # #8: a failed enqueue means
+                                # the undelivered watch is NOT queued for
+                                # re-fire — surface it (fail VISIBLE, PD#8)
+                                # rather than silently swallow.
+                                log.warning(
+                                    "watch-delivery retry enqueue FAILED "
+                                    "(imap poll) — the undelivered watch is "
+                                    "NOT queued for re-fire",
+                                    mailbox=mb,
+                                    uid=str(uid),
+                                    error=fmt_exc(exc),
+                                )
                         results.append(_res.entry)
                         uid_safe = True
+                        # N-213d R23 (2026-07-02): success telemetry to the
+                        # watch-status recorder SSOT — /watch/status previously
+                        # reported processed=0 for every poll-consumer account
+                        # (only IMAP-IDLE watcher wrote counters). Fail-open.
+                        try:
+                            from email_triage.web._watch_status_recorder import (
+                                record_message_result,
+                            )
+                            _src = (acct.get("provider_type") or "imap") + "-poll"
+                            _mgr = getattr(app.state, "watcher_manager", None)
+                            record_message_result(
+                                _mgr, account_id, mb, _src,
+                                success=True, message_id=uid,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     except Exception as e:
                         errors.append(
                             {"message_id": uid, "error": fmt_exc(e)}
                         )
+                        # N-213d R23: error telemetry — same SSOT, opposite
+                        # branch. Fail-open on any telemetry-side error so
+                        # the original error path is unchanged.
+                        try:
+                            from email_triage.web._watch_status_recorder import (
+                                record_message_result,
+                            )
+                            _src = (acct.get("provider_type") or "imap") + "-poll"
+                            _mgr = getattr(app.state, "watcher_manager", None)
+                            record_message_result(
+                                _mgr, account_id, mb, _src,
+                                success=False, error=e,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                         log.error(
                             "Unified poll: per-message error",
                             **_acct_log_extras(acct), mailbox=mb,
@@ -1056,20 +1188,28 @@ async def _poll_once_imap(app: FastAPI, acct: dict) -> None:
                     except Exception:
                         pass
             if hwm_safe_uid > since_uid:
-                await db_call(set_mailbox_hwm, db, account_id, mb, {
-                    "uid": hwm_safe_uid,
-                    "uidvalidity": _live_uidvalidity,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                })
+                await db_call(set_mailbox_hwm, db, account_id, mb,
+                              make_hwm_value(hwm_safe_uid, _live_uidvalidity))
 
             if results or errors:
+                # run18 census #7 — record the run AND emit triage.completed
+                # through the complete_triage_run SSOT. The pre-fix code here
+                # called record_triage_run but never fired the outbound webhook,
+                # while the same-file O365 poll sibling (_poll_once_office365)
+                # did — a silent divergence for IMAP-poll-only installs. Emitting
+                # right where the record happens (per-mailbox) mirrors that
+                # sibling's record->emit adjacency. The whole call is best-effort
+                # (try/except: pass) so neither the history row nor the webhook
+                # can break the poll loop.
+                dispatcher = getattr(app.state, "event_dispatcher", None)
                 try:
-                    await db_call(
-                        record_triage_run,
-                        db,
-                        account_id=account_id,
-                        account_name=acct.get("name", ""),
+                    from email_triage.web.events import complete_triage_run
+                    from email_triage._ids import new_run_id
+                    await complete_triage_run(
+                        dispatcher, db, config, acct,
+                        run_id=new_run_id("imap_poll", account_id, mb),
                         query="poll",
+                        trigger="poll",
                         total_messages=len(new_messages),
                         results=results,
                         errors=errors,

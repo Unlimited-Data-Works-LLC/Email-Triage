@@ -297,7 +297,7 @@ async def test_gmail_exchange_code_for_tokens_no_secret_in_sqlite_log(
             client_id="cid",
             client_secret=_FAKE_CLIENT_SECRET,
             code=_FAKE_AUTH_CODE,
-            redirect_uri="https://example.com/cb",
+            redirect_uri="https://example.invalid/cb",
         )
 
     assert result["refresh_token"] == _FAKE_REFRESH_TOKEN

@@ -9,6 +9,7 @@ actions safe to re-run.
 """
 
 from __future__ import annotations
+from _db_tracking import track
 
 import sqlite3
 from datetime import datetime, timezone
@@ -68,7 +69,7 @@ class _FakeClassifier:
 
 @pytest.fixture
 def conn() -> sqlite3.Connection:
-    c = init_db(":memory:")
+    c = track(init_db(":memory:"))
     yield c
     c.close()
 

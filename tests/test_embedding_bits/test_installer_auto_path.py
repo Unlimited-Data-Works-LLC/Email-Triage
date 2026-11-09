@@ -33,7 +33,7 @@ async def test_install_auto_happy_path(
     assert (target / "hf-cache" / "sentence-transformers_all-MiniLM-L6-v2"
             / "config.json").exists()
     # pip-install marker (from the conftest stub)
-    assert (target / ".pip-installed-marker").exists()
+    assert (target / "wheels" / ".pip-installed-marker").exists()
 
     # State row
     state = get_install_status(test_db)

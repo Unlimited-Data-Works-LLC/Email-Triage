@@ -147,7 +147,7 @@ class TestSenderDomainMatching:
 
 class TestSubjectMatching:
     def test_substring_match(self):
-        msg = _make_email(subject="RE: Invoice  attached")
+        msg = _make_email(subject="RE: Invoice #1234 attached")
         cl = _make_list(1, "Invoices", "invoices")
         rules = {1: [_make_rule(1, 1, RuleType.SUBJECT, "invoice")]}
         hints = collect_hints(msg, [cl], rules)
@@ -175,6 +175,89 @@ class TestSubjectMatching:
         rules = {1: [_make_rule(1, 1, RuleType.SUBJECT, "invoice")]}
         hints = collect_hints(msg, [cl], rules)
         assert len(hints) == 0
+
+
+class TestListIdMatching:
+    """RFC 2919 `List-Id` header match — the deterministic mailing-list
+    fast path. Operator writes the bracketed identifier (e.g.
+    ``announce.python.org``); the matcher parses whatever's in the
+    ``List-Id`` header (bracketed or bare) and lowercases both sides."""
+
+    def test_bracketed_list_id_match(self):
+        msg = _make_email(headers={
+            "List-Id": "Python Announce List <announce.python.org>",
+        })
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 1
+        assert hints[0].category == "newsletter"
+
+    def test_unbracketed_list_id_match(self):
+        msg = _make_email(headers={"List-Id": "announce.python.org"})
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 1
+
+    def test_case_insensitive_header_key(self):
+        # IMAP headers can arrive with mixed case (`list-id`, `List-ID`, ...).
+        # The matcher normalizes both sides of the compare.
+        msg = _make_email(headers={"list-id": "<announce.python.org>"})
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 1
+
+    def test_case_insensitive_value(self):
+        msg = _make_email(headers={"List-Id": "<ANNOUNCE.PYTHON.ORG>"})
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 1
+
+    def test_operator_pattern_with_brackets_still_matches(self):
+        # Defense-in-depth: an operator who copies the RFC-2919 value verbatim
+        # (with brackets) should still match.
+        msg = _make_email(headers={
+            "List-Id": "Python Announce <announce.python.org>",
+        })
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "<announce.python.org>")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 1
+
+    def test_missing_header_no_match(self):
+        msg = _make_email(headers={})
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 0
+
+    def test_wrong_list_no_match(self):
+        msg = _make_email(headers={
+            "List-Id": "Users <users.python.org>",
+        })
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(1, 1, RuleType.LIST_ID, "announce.python.org")]}
+        hints = collect_hints(msg, [cl], rules)
+        assert len(hints) == 0
+
+    def test_skip_ai_via_list_id(self):
+        """LIST_ID rule with skip_ai=True short-circuits the classifier
+        the same way SENDER_DOMAIN + SENDER + SUBJECT already do."""
+        msg = _make_email(headers={
+            "List-Id": "Announce <announce.python.org>",
+        })
+        cl = _make_list(1, "PyAnnounce", "newsletter")
+        rules = {1: [_make_rule(
+            1, 1, RuleType.LIST_ID, "announce.python.org", skip_ai=True,
+        )]}
+        hints = collect_hints(msg, [cl], rules)
+        hit = find_skip_ai_hint(hints)
+        assert hit is not None
+        assert hit.category == "newsletter"
+        assert hit.rule_type == RuleType.LIST_ID
 
 
 class TestMultipleListsAndRules:

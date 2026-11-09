@@ -34,7 +34,7 @@
     <summary style="font-size:0.9rem;">Folders with results ({{ folders_with_results|length }})</summary>
     <div style="margin-top:0.25rem;columns:2;column-gap:2rem;font-size:0.85rem;">
         {% for f in folders_with_results %}
-        <div><code>{{ f }}</code></div>
+        <div><code>{{ "[redacted]" if effective_hipaa else f }}</code></div>
         {% endfor %}
     </div>
 </details>
@@ -109,8 +109,8 @@
             <tr>
                 {% if folders_scanned and folders_scanned|length > 1 %}
                 <td style="font-size:0.8rem;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                    title="{{ r.folder }}">
-                    {{ r.folder }}
+                    title="{{ '[redacted]' if effective_hipaa else r.folder }}">
+                    {{ "[redacted]" if effective_hipaa else r.folder }}
                 </td>
                 {% endif %}
                 <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">

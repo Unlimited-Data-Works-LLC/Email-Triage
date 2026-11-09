@@ -1,9 +1,8 @@
 """Tests for  — per-account delegation."""
 
-import pytest
-
 from email_triage.web.db import (
     add_account_delegate,
+    can_administer_account,
     can_manage_account,
     create_email_account,
     is_account_delegate,
@@ -16,7 +15,7 @@ from email_triage.web.db import (
 class TestDelegateHelpers:
     def test_add_then_check_returns_true(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ADMIN_OWNS", "imap", {"host": "x"},
+            db, admin_user["id"], "ADMIN_OWNS", "imap", {"host": "x.invalid"},
         )
         assert is_account_delegate(db, a, regular_user["id"]) is False
         added = add_account_delegate(
@@ -27,7 +26,7 @@ class TestDelegateHelpers:
 
     def test_add_idempotent(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         first = add_account_delegate(db, a, regular_user["id"], admin_user["id"])
         second = add_account_delegate(db, a, regular_user["id"], admin_user["id"])
@@ -36,30 +35,33 @@ class TestDelegateHelpers:
 
     def test_owner_cannot_be_own_delegate(self, db, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
-        with pytest.raises(ValueError, match="Owner cannot"):
-            add_account_delegate(db, a, admin_user["id"], admin_user["id"])
+        # Punch 673: a witnessed refusal (falsy GrantRefused), not a raise.
+        from email_triage.db.audit import DELEGATE_IS_OWNER, GrantRefused
+        got = add_account_delegate(db, a, admin_user["id"], admin_user["id"])
+        assert isinstance(got, GrantRefused) and got == DELEGATE_IS_OWNER
+        assert is_account_delegate(db, a, admin_user["id"]) is False
 
     def test_remove(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(db, a, regular_user["id"], admin_user["id"])
-        assert remove_account_delegate(db, a, regular_user["id"]) is True
+        assert remove_account_delegate(db, a, regular_user["id"], revoked_by=admin_user["id"]) is True
         assert is_account_delegate(db, a, regular_user["id"]) is False
 
     def test_remove_returns_false_when_absent(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
-        assert remove_account_delegate(db, a, regular_user["id"]) is False
+        assert remove_account_delegate(db, a, regular_user["id"], revoked_by=admin_user["id"]) is False
 
     def test_list_includes_email_and_grantor(
         self, db, regular_user, admin_user,
     ):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(db, a, regular_user["id"], admin_user["id"])
         rows = list_account_delegates(db, a)
@@ -72,21 +74,21 @@ class TestDelegateHelpers:
 class TestCanManageAccount:
     def test_admin_yes(self, db, admin_user, regular_user):
         a = create_email_account(
-            db, regular_user["id"], "ACCT", "imap", {"host": "x"},
+            db, regular_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         acct = {"id": a, "user_id": regular_user["id"]}
         assert can_manage_account(db, admin_user, acct) is True
 
     def test_owner_yes(self, db, regular_user):
         a = create_email_account(
-            db, regular_user["id"], "ACCT", "imap", {"host": "x"},
+            db, regular_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         acct = {"id": a, "user_id": regular_user["id"]}
         assert can_manage_account(db, regular_user, acct) is True
 
     def test_delegate_yes(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(db, a, regular_user["id"], admin_user["id"])
         acct = {"id": a, "user_id": admin_user["id"]}
@@ -94,17 +96,17 @@ class TestCanManageAccount:
 
     def test_stranger_no(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         acct = {"id": a, "user_id": admin_user["id"]}
         assert can_manage_account(db, regular_user, acct) is False
 
     def test_revoked_delegate_no(self, db, regular_user, admin_user):
         a = create_email_account(
-            db, admin_user["id"], "ACCT", "imap", {"host": "x"},
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(db, a, regular_user["id"], admin_user["id"])
-        remove_account_delegate(db, a, regular_user["id"])
+        remove_account_delegate(db, a, regular_user["id"], revoked_by=admin_user["id"])
         acct = {"id": a, "user_id": admin_user["id"]}
         assert can_manage_account(db, regular_user, acct) is False
 
@@ -115,10 +117,56 @@ class TestCanManageAccount:
         assert can_manage_account(db, regular_user, None) is False
 
 
+class TestCanAdministerAccount:
+    """can_administer_account is STRICTLY STRONGER than can_manage_account:
+    admin/owner YES, but a DELEGATE is NOT an administrator (the no-delegate
+    sensitive-op gate — divergence census 2026-06-11, batch 4). The contrast
+    with TestCanManageAccount::test_delegate_yes is the whole point."""
+
+    def test_admin_yes(self, db, admin_user, regular_user):
+        a = create_email_account(
+            db, regular_user["id"], "ACCT", "imap", {"host": "x.invalid"},
+        )
+        acct = {"id": a, "user_id": regular_user["id"]}
+        assert can_administer_account(db, admin_user, acct) is True
+
+    def test_owner_yes(self, db, regular_user):
+        a = create_email_account(
+            db, regular_user["id"], "ACCT", "imap", {"host": "x.invalid"},
+        )
+        acct = {"id": a, "user_id": regular_user["id"]}
+        assert can_administer_account(db, regular_user, acct) is True
+
+    def test_delegate_NO(self, db, regular_user, admin_user):
+        """The security-critical case: a delegate CAN manage but CANNOT
+        administer — so the SAME (account, delegate) pair that is True for
+        can_manage_account is False here."""
+        a = create_email_account(
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        acct = {"id": a, "user_id": admin_user["id"]}
+        assert can_manage_account(db, regular_user, acct) is True   # contrast
+        assert can_administer_account(db, regular_user, acct) is False
+
+    def test_stranger_no(self, db, regular_user, admin_user):
+        a = create_email_account(
+            db, admin_user["id"], "ACCT", "imap", {"host": "x.invalid"},
+        )
+        acct = {"id": a, "user_id": admin_user["id"]}
+        assert can_administer_account(db, regular_user, acct) is False
+
+    def test_none_user_no(self, db):
+        assert can_administer_account(db, None, {"id": 1, "user_id": 1}) is False
+
+    def test_none_acct_no(self, db, regular_user):
+        assert can_administer_account(db, regular_user, None) is False
+
+
 class TestListAccountsIncludesDelegated:
     def test_owned_only_when_no_delegations(self, db, regular_user):
         a = create_email_account(
-            db, regular_user["id"], "MINE", "imap", {"host": "x"},
+            db, regular_user["id"], "MINE", "imap", {"host": "x.invalid"},
         )
         accts = list_email_accounts(db, user_id=regular_user["id"])
         assert len(accts) == 1
@@ -127,10 +175,10 @@ class TestListAccountsIncludesDelegated:
 
     def test_owned_plus_delegated(self, db, regular_user, admin_user):
         owned = create_email_account(
-            db, regular_user["id"], "MINE", "imap", {"host": "x"},
+            db, regular_user["id"], "MINE", "imap", {"host": "x.invalid"},
         )
         admin_owned = create_email_account(
-            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "y"},
+            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "y.invalid"},
         )
         add_account_delegate(
             db, admin_owned, regular_user["id"], admin_user["id"],
@@ -142,7 +190,7 @@ class TestListAccountsIncludesDelegated:
 
     def test_include_delegated_false_excludes(self, db, regular_user, admin_user):
         admin_owned = create_email_account(
-            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "y"},
+            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "y.invalid"},
         )
         add_account_delegate(
             db, admin_owned, regular_user["id"], admin_user["id"],
@@ -159,7 +207,7 @@ class TestRouteAuthz:
         self, client, user_cookies, db, regular_user, admin_user,
     ):
         a = create_email_account(
-            db, admin_user["id"], "DELEGATED", "imap", {"host": "x"},
+            db, admin_user["id"], "DELEGATED", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(
             db, a, regular_user["id"], admin_user["id"],
@@ -173,7 +221,7 @@ class TestRouteAuthz:
         self, client, user_cookies, db, admin_user,
     ):
         a = create_email_account(
-            db, admin_user["id"], "FOREIGN", "imap", {"host": "x"},
+            db, admin_user["id"], "FOREIGN", "imap", {"host": "x.invalid"},
         )
         resp = client.get(
             f"/accounts/{a}/edit", cookies=user_cookies,
@@ -184,7 +232,7 @@ class TestRouteAuthz:
         self, client, user_cookies, db, regular_user, admin_user,
     ):
         a = create_email_account(
-            db, admin_user["id"], "DELEGATED", "imap", {"host": "x"},
+            db, admin_user["id"], "DELEGATED", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(
             db, a, regular_user["id"], admin_user["id"],
@@ -194,13 +242,69 @@ class TestRouteAuthz:
         )
         assert resp.status_code == 403
 
+    def test_delegate_cannot_revoke_delegate(
+        self, client, user_cookies, db, regular_user, admin_user,
+    ):
+        """batch-4 edge: a delegate must NOT revoke delegation (the revoke
+        route is owner-or-admin only — can_administer_account). A delegate
+        trying to revoke even their OWN delegate row gets 403 and the row
+        survives. (Complements the existing test_delegate_cannot_grant_further;
+        delete is covered by test_delegate_cannot_delete.)"""
+        a = create_email_account(
+            db, admin_user["id"], "DELEGATED", "imap", {"host": "x.invalid"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        resp = client.delete(
+            f"/accounts/{a}/delegates/{regular_user['id']}",
+            cookies=user_cookies,
+        )
+        assert resp.status_code == 403
+        assert is_account_delegate(db, a, regular_user["id"]) is True
+
+    def test_delegate_cannot_flip_hipaa_via_edit_form(
+        self, client, user_cookies, db, regular_user, admin_user,
+    ):
+        """batch-4 edge — the highest-stakes op AND the most fragile: the
+        HIPAA-flag flip is a 200-returning SUB-BLOCK of the edit save (not a
+        dedicated 403 route), so its delegate-denial has no 403 to assert.
+        A delegate FORGING ``hipaa_submitted`` in the PUT must NOT flip the
+        flag — the save still applies for fields a delegate may edit (200),
+        but can_administer_account gates the flag itself. (N-57: the
+        structural reference pin needs this behavioural edge test.)"""
+        from email_triage.web.db import get_email_account
+        a = create_email_account(
+            db, admin_user["id"], "DELEGATED", "imap",
+            {"host": "old.invalid", "username": "u@old.com", "mailbox": "INBOX"},
+        )
+        add_account_delegate(db, a, regular_user["id"], admin_user["id"])
+        assert bool(get_email_account(db, a)["hipaa"]) is False  # starts OFF
+
+        resp = client.put(f"/accounts/{a}", data={
+            "name": "DELEGATED",
+            "provider_type": "imap",
+            "host": "old.invalid",
+            "port": "993",
+            "username": "u@old.com",
+            "mailbox": "INBOX",
+            "use_ssl": "1",
+            "is_active": "1",
+            "hipaa_submitted": "1",
+            "hipaa": "1",          # delegate tries to flip the flag ON
+        }, cookies=user_cookies)
+
+        assert resp.status_code == 200
+        assert bool(get_email_account(db, a)["hipaa"]) is False, (
+            "a delegate must NOT be able to flip the HIPAA flag via the edit "
+            "form (can_administer_account is the no-delegate gate)"
+        )
+
 
 class TestDelegateGrantUI:
     def test_owner_can_add_delegate(
         self, client, admin_cookies, db, admin_user, regular_user,
     ):
         a = create_email_account(
-            db, admin_user["id"], "OWNED", "imap", {"host": "x"},
+            db, admin_user["id"], "OWNED", "imap", {"host": "x.invalid"},
         )
         resp = client.post(
             f"/accounts/{a}/delegates/add",
@@ -215,7 +319,7 @@ class TestDelegateGrantUI:
     ):
         """Admin dropdown posts user_id; server resolves to the user."""
         a = create_email_account(
-            db, admin_user["id"], "OWNED", "imap", {"host": "x"},
+            db, admin_user["id"], "OWNED", "imap", {"host": "x.invalid"},
         )
         resp = client.post(
             f"/accounts/{a}/delegates/add",
@@ -230,7 +334,7 @@ class TestDelegateGrantUI:
     ):
         """The edit page shows a <select name='user_id'> for admins."""
         a = create_email_account(
-            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "x"},
+            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "x.invalid"},
         )
         resp = client.get(f"/accounts/{a}/edit", cookies=admin_cookies)
         assert resp.status_code == 200
@@ -242,7 +346,7 @@ class TestDelegateGrantUI:
     ):
         """Non-admin owner sees the free-text email input, no dropdown."""
         a = create_email_account(
-            db, regular_user["id"], "OWNED", "imap", {"host": "x"},
+            db, regular_user["id"], "OWNED", "imap", {"host": "x.invalid"},
         )
         resp = client.get(f"/accounts/{a}/edit", cookies=user_cookies)
         assert resp.status_code == 200
@@ -255,7 +359,7 @@ class TestDelegateGrantUI:
     ):
         # Set up: regular_user is a delegate of ADMIN_OWNED.
         a = create_email_account(
-            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "x"},
+            db, admin_user["id"], "ADMIN_OWNED", "imap", {"host": "x.invalid"},
         )
         add_account_delegate(
             db, a, regular_user["id"], admin_user["id"],

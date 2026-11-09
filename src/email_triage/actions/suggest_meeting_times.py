@@ -23,6 +23,7 @@ from email_triage.actions.base import (
     check_idempotent_already_done,
     record_idempotent_done,
 )
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 from email_triage._errfmt import fmt_exc
 from email_triage.engine.availability import find_free_slots
 from email_triage.engine.models import (
@@ -39,7 +40,7 @@ from email_triage.providers.calendar_base import (
     CalendarScopeError,
 )
 
-log = logging.getLogger("email_triage.actions.suggest_meeting_times")
+log = get_logger("email_triage.actions.suggest_meeting_times")  # N-196b R21_4
 
 
 def _format_tz_label(local_dt: datetime, tz_name_fallback: str) -> str:
@@ -224,12 +225,13 @@ class SuggestMeetingTimesAction(Action):
         # 2026-05-13 — In-Reply-To must be the RFC 5322 Message-Id
         # header value (``<hash@domain>``), NOT the provider-specific
         # message_id (which is the IMAP UID for IMAP messages).
-        # ``get_rfc_message_id`` extracts the original header from
-        # the parsed mail; falls back to the wire message_id so
-        # Gmail / O365 messages (where the two are the same)
-        # continue working unchanged.
-        from email_triage.mail_headers import get_rfc_message_id
-        _rfc_id = get_rfc_message_id(message.headers) or message.message_id
+        # ``get_message_rfc_id`` extracts the original header from
+        # the parsed mail (all casings); falls back to the wire
+        # message_id so Gmail / O365 messages (where the two are the
+        # same) continue working unchanged. A6 (census 2026-06-09):
+        # this header-then-provider-id shape IS the message-level SSOT.
+        from email_triage.mail_headers import get_message_rfc_id
+        _rfc_id = get_message_rfc_id(message)
         try:
             draft_id = await provider.create_draft(
                 to=[message.sender],
@@ -263,12 +265,10 @@ class SuggestMeetingTimesAction(Action):
 
 def _first_name_from_addr(addr: str) -> str:
     """Extract a human-readable first name from a 'Name <email>' string."""
-    if not addr:
-        return ""
-    if "<" in addr:
-        name = addr.split("<", 1)[0].strip().strip('"').strip("'")
-        if name:
-            return name.split()[0]
+    from email_triage.mail_headers import extract_display_name
+    name = extract_display_name(addr)  # census run13  — shared <…> extraction
+    if name:
+        return name.split()[0]
     return ""
 
 

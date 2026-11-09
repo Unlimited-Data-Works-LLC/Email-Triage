@@ -21,10 +21,10 @@
 <h2>My Settings</h2>
 
 {# Settings cluster shares one tab strip across notifications,
-   meeting prefs, hardware keys, accounts, and api-keys. Personal
-   Categories used to be a profile sub-tab; it moved to the Rules
-   cluster (see _rules_tabs.html) so users find it next to
-   Categories + Discover Categories. #}
+   meeting prefs, security (sign-out / passkeys / API keys),
+   accounts, and more. Personal Categories used to be a profile
+   sub-tab; it moved to the Rules cluster (see _rules_tabs.html) so
+   users find it next to Categories + Discover Categories. #}
 {% set active = active_tab or "notifications" %}
 {% include "_settings_tabs.html" %}
 
@@ -39,21 +39,10 @@
 </article>
 {% endif %}
 
-{# #205 — session revocation. Standalone form: it POSTs to its own
-   action and must sit OUTSIDE the profile-save form below. #}
-<form method="post" action="/profile/sign-out-all"
-      style="margin-bottom:1.25rem;"
-      onsubmit="return confirm('Sign out of every device, including this one? You will be returned to the login page.');">
-    {{ csrf_input(request) }}
-    <button type="submit" class="secondary outline" style="width:auto;">
-        Sign out all sessions
-    </button>
-    <small style="color:var(--pico-muted-color);margin-left:0.5rem;">
-        Revokes every active session for your account — including this
-        one. Use it if you suspect a device or a copied session is
-        compromised; ordinary log-out only clears the current device.
-    </small>
-</form>
+{# #205 — "Sign out all sessions" used to live here, in the page
+   header above the tab panes, so it rendered on EVERY My Settings
+   tab. Consolidated 2026-06-07 into the dedicated "Security" tab
+   (/profile/security) alongside Passkeys + API Keys. #}
 
 <form method="post" action="/profile/save">
     {{ csrf_input(request) }}
@@ -211,6 +200,12 @@
 <div class="tab-pane{% if active == 'writing' %} tab-pane-active{% endif %}">
     {% include "profile/_writing.html" %}
 </div>{# /writing tab-pane — M-1 + M-2 user-stated style knobs #}
+
+<div class="tab-pane{% if active == 'topic-digest' %} tab-pane-active{% endif %}">
+    {% include "profile/_topic_digest.html" %}
+</div>{# /topic-digest tab-pane — #33 master card list; the detail
+        editor (profile/_topic_digest_editor.html) is its own full-page
+        URL reached from the cards, never inlined here. #}
 
 {# Personal Categories tab-pane removed — section now lives at
    /rules/personal-categories under the Rules cluster. #}

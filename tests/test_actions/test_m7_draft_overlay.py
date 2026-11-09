@@ -112,7 +112,8 @@ def _hipaa_descriptor(
 def _make_db() -> sqlite3.Connection:
     """Full init_db so every migration ran (per_contact_style_hipaa v28)."""
     from email_triage.web.db import init_db
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_user(conn: sqlite3.Connection) -> int:

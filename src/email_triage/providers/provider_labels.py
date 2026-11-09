@@ -29,28 +29,35 @@ brief cache spares the provider load on the second tab open. Cache
 is capped at 200 entries to bound memory if an install adds and
 removes a lot of accounts.
 
-HIPAA: returns ``[]`` for HIPAA-flagged accounts. Defense-in-depth
-duplicate of the caller-side check; the picker route already filters
-out HIPAA accounts when building groups, but the per-account-loop
-shape means a future caller could call this helper directly without
-the route-level filter, so the gate stays here too.
+Access control: this helper does NO auth — the CALLER is responsible
+for the access check (see the route handlers' can_manage_account /
+requester-scoped account list). There is intentionally NO HIPAA-flag
+gate (removed 2026-06-06 per SME ruling): surfacing an account's own
+labels to an actor authorized to manage that account is an intra-entity
+§160.103 "use" (the strings never leave the install), NOT a third-party
+disclosure — owner self-access is §164.502(b)(2)-exempt + §164.524-
+favored, delegate/admin access is §164.514(d) role-based use. Gating on
+the HIPAA flag was over-reach: it blocked authorized managers from their
+OWN account's metadata for zero compliance benefit.
 
 Privacy: this module never logs label names (which can carry
 operator-meaningful semantics like a Gmail label named after a
 patient). Only error class + provider type + account id appears in
-log output. Caller is responsible for downstream redaction.
+log output. Caller is responsible for downstream redaction. This
+no-log posture is the retained defense-in-depth for the one real
+worst-case — a PHI-bearing label name landing in logs/cache.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import time
 from typing import Any
 
 from email_triage._errfmt import fmt_exc
 from email_triage.providers.factory import build_provider
-from email_triage.triage_logging import get_logger, is_account_hipaa
+from email_triage.providers.render_probe import close_provider, render_probe
+from email_triage.triage_logging import get_logger
 from email_triage.web.db import list_email_accounts
 
 log = get_logger("providers.provider_labels")
@@ -139,6 +146,23 @@ def _cache_clear() -> None:
     _cache.clear()
 
 
+def invalidate_cache_for_account(account_id: int) -> int:
+    """N-247 R24: PUBLIC — drop every cached label entry for an account.
+
+    Call after `purge_account_local_state` / an account row DELETE / an
+    OAuth re-auth so a subsequent picker render doesn't serve the
+    5-min-TTL stale list from the deleted account.
+
+    Returns the number of cache entries dropped (0 if the account had
+    no cached rows). Race-tolerant: another thread may be repopulating
+    the entry mid-call; we drop what's present at the moment we look.
+    """
+    to_drop = [key for key in _cache if key[0] == int(account_id)]
+    for key in to_drop:
+        _cache.pop(key, None)
+    return len(to_drop)
+
+
 async def list_provider_labels_for_account(
     *,
     db: sqlite3.Connection,
@@ -200,10 +224,17 @@ async def list_provider_labels_for_account(
         )
         return []
 
-    # HIPAA gate (defensive). Returns empty before any provider work.
-    if is_account_hipaa(acct):
-        return []
-
+    # NOTE: no HIPAA-flag gate here (removed 2026-06-06 per SME ruling).
+    # The HIPAA flag is the WRONG axis: surfacing an account's OWN labels
+    # to an actor authorized to manage that account (owner / delegate /
+    # admin — enforced by the CALLER's can_manage_account / requester-
+    # scoped account list) is an intra-entity §160.103 "use" (the strings
+    # never leave the install), NOT a third-party disclosure. Owner
+    # self-access is §164.502(b)(2)-exempt + §164.524-favored; delegate /
+    # admin access is §164.514(d) role-based use. The access boundary
+    # lives in the caller (this helper does no auth — see docstring); a
+    # HIPAA-flag gate here only blocked authorized managers from their own
+    # account's metadata for zero compliance benefit.
     provider_type = acct.get("provider_type", "")
 
     # IMAP technically supports labels via the per-message keywords
@@ -269,7 +300,9 @@ async def list_provider_labels_for_account(
     try:
         if provider_type in ("gmail_api", "office365"):
             try:
-                raw = await provider.list_labels()
+                # Panel X db MUST-1: bounded like every probe a page makes.
+                raw = await render_probe(
+                    provider, "list_labels", account_id=int(account_id))
             except NotImplementedError:
                 raw = []
             for item in raw or []:
@@ -310,7 +343,7 @@ async def list_provider_labels_for_account(
             entries.sort(key=lambda e: e["name"].lower())
         elif provider_type == "imap":
             try:
-                folders = await provider.list_folders()
+                folders = await render_probe(provider, account_id=int(account_id))
             except NotImplementedError:
                 folders = []
             for folder in folders or []:
@@ -359,14 +392,7 @@ async def list_provider_labels_for_account(
         entries = []
     finally:
         # Best-effort close — some providers leak a session otherwise.
-        close = getattr(provider, "close", None)
-        if close is not None:
-            try:
-                result = close()
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:
-                pass
+        await close_provider(provider)
 
     _cache_put(cache_key, entries)
     return entries

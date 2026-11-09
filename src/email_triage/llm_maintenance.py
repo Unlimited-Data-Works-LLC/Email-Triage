@@ -31,13 +31,15 @@ swap of :func:`_cron_match` for ``croniter.match``.
 from __future__ import annotations
 
 import logging
+
+from email_triage.triage_logging import get_logger  # N-196b R21_4
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 
-_log = logging.getLogger("email_triage.llm_maintenance")
+_log = get_logger("email_triage.llm_maintenance")  # N-196b R21_4
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +72,17 @@ def parse_windows(raw: Any) -> list[MaintenanceWindow]:
     if not raw:
         return out
     if not isinstance(raw, list):
-        _log.warning("llm_maintenance_windows: expected list, got %s",
-                     type(raw).__name__)
+        _log.warning(
+            "llm_maintenance_windows: expected list",
+            extra={"error_type": type(raw).__name__},
+        )
         return out
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
-            _log.warning("llm_maintenance_windows[%d]: not a dict, skipping", i)
+            _log.warning(
+                "llm_maintenance_windows entry not a dict, skipping",
+                extra={"n": i},
+            )
             continue
         try:
             cron = str(item.get("cron", "")).strip()
@@ -84,9 +91,9 @@ def parse_windows(raw: Any) -> list[MaintenanceWindow]:
             host = str(item.get("host", "")).strip()
             if not cron or not backend or duration <= 0:
                 _log.warning(
-                    "llm_maintenance_windows[%d]: missing required field "
+                    "llm_maintenance_windows entry missing required field "
                     "(cron / backend / duration_minutes); skipping",
-                    i,
+                    extra={"n": i},
                 )
                 continue
             # Validate parse — a bad expression at config load is a
@@ -96,8 +103,13 @@ def parse_windows(raw: Any) -> list[MaintenanceWindow]:
                 _parse_cron(cron)
             except ValueError as exc:
                 _log.warning(
-                    "llm_maintenance_windows[%d]: invalid cron %r: %s",
-                    i, cron, exc,
+                    "llm_maintenance_windows entry: invalid cron",
+                    extra={
+                        "n": i,
+                        "name": cron,
+                        "error_type": type(exc).__name__,
+                        "error_msg": str(exc),
+                    },
                 )
                 continue
             out.append(MaintenanceWindow(
@@ -106,8 +118,12 @@ def parse_windows(raw: Any) -> list[MaintenanceWindow]:
             ))
         except Exception as exc:
             _log.warning(
-                "llm_maintenance_windows[%d]: skipping due to %s",
-                i, exc,
+                "llm_maintenance_windows entry skipped",
+                extra={
+                    "n": i,
+                    "error_type": type(exc).__name__,
+                    "error_msg": str(exc),
+                },
             )
     return out
 

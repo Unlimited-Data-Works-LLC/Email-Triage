@@ -39,19 +39,26 @@ without running the full lifespan stack.
 from __future__ import annotations
 
 import json as _json
-import smtplib
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from html import escape as _html_escape  # DA R4 CIDI-drift fold (2026-07-10)
 from typing import Any
 
-from email_triage._isotime import parse_iso
+import httpx
+
+from email_triage._egress import EgressBlocked, Intent, egress_client
+from email_triage._int_utils import parse_int_or_none  # N-219c/38 R23
+from email_triage._isotime import parse_iso, to_utc_iso
 from email_triage.config import TriageConfig
+from email_triage.update_check import PUBLIC_REPO_URL
+from email_triage.secrets import SecretsDecryptError, read_secret
 from email_triage.triage_logging import get_logger, is_hipaa_mode
 from email_triage.web.auth import format_from_header
+from email_triage._secret_keys import SMTP_PASSWORD_KEY  # N-231 R22 stored-secret-key SSOT
+from email_triage._dbapi_errors import DB_ERRORS
+from email_triage._errfmt import fmt_exc
 
 log = get_logger("web.daily_health")
 
@@ -102,13 +109,16 @@ def resolve_admin_recipients(config: TriageConfig) -> list[str]:
 # GitHub Releases cache (CR-2c — update-available section)
 # ---------------------------------------------------------------------------
 
-#: ``(fetched_at_monotonic, payload_or_none)`` keyed by URL. 1-hour TTL
-#: by default; tests reset via ``_reset_release_cache``. The cache lives
-#: at module scope because the daily-health email renders once a day in
-#: production but tests / "Send now" can fire repeatedly; caching the
-#: HTTP fetch avoids hammering GitHub during demos and rate-limit
-#: surfaces.
-_release_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+#: ``(fetched_at_monotonic, payload_or_none, failure_or_none)`` keyed by
+#: URL. 1-hour TTL by default; tests reset via ``_reset_release_cache``. The
+#: cache lives at module scope because the daily-health email renders once a
+#: day in production but tests / "Send now" can fire repeatedly; caching the
+#: HTTP fetch avoids hammering GitHub during demos and rate-limit surfaces.
+#: ``failure`` is the :func:`update_check.fetch_failure` detail of a failed
+#: fetch (punch 584), read back by :func:`last_release_fetch_failure`.
+_release_cache: dict[
+    str, tuple[float, dict[str, Any] | None, dict[str, Any] | None]
+] = {}
 _RELEASE_CACHE_TTL_SECONDS = 3600.0
 _RELEASE_FETCH_TIMEOUT_SECONDS = 5.0
 
@@ -132,41 +142,86 @@ def fetch_latest_release(
 
     Pure-ish: the only side effects are the HTTP request and the
     module-level cache; both are dropped via ``_reset_release_cache``
-    in tests. The fetch path is monkeypatched at
-    ``urllib.request.urlopen`` so tests don't touch the network.
+    in tests. The fetch goes through the egress funnel
+    (``egress_client(intent=Intent.PUBLIC_FETCH)``, run17 #5 — was a raw
+    ``urllib.request.urlopen``); tests monkeypatch ``egress_client`` so
+    they don't touch the network.
     """
     now = now_monotonic if now_monotonic is not None else time.monotonic()
     cached = _release_cache.get(url)
     if cached is not None:
-        fetched_at, payload = cached
+        fetched_at, payload, _failure = cached
         if now - fetched_at < _RELEASE_CACHE_TTL_SECONDS:
             return payload
 
+    from email_triage.update_check import FAILURE_BAD_RESPONSE, fetch_failure
+
     payload: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "email-triage-daily-health",
-            },
-        )
-        with urllib.request.urlopen(
-            req, timeout=_RELEASE_FETCH_TIMEOUT_SECONDS,
-        ) as resp:
-            body = resp.read().decode("utf-8")
-        data = _json.loads(body)
+        with egress_client(intent=Intent.PUBLIC_FETCH) as c:
+            resp = c.get(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "email-triage-daily-health",
+                },
+                timeout=_RELEASE_FETCH_TIMEOUT_SECONDS,
+                # urllib.urlopen followed redirects by default — preserve that
+                # (GitHub's API doesn't 302 today, but a future host might); the
+                # funnel's SSRF hook re-runs on each hop.
+                follow_redirects=True,
+            )
+        resp.raise_for_status()
+        data = _json.loads(resp.text)
         if isinstance(data, dict):
             payload = data
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-            ValueError, OSError) as exc:
+        else:
+            failure = fetch_failure(FAILURE_BAD_RESPONSE)
+    except (
+        httpx.HTTPError, TimeoutError, ValueError, OSError, EgressBlocked,
+    ) as exc:
+        # httpx.HTTPError covers both transport failures (RequestError:
+        # connect/timeout) and a non-2xx raise_for_status (HTTPStatusError),
+        # matching the old urllib URLError+HTTPError catch. ValueError = bad JSON.
+        # EgressBlocked (punch 584, panel H584-2/DB584-1/DA584-2): the funnel
+        # refusing the address (a private/reserved destination, also on a
+        # redirect hop) used to escape, so no failure was ever recorded and
+        # the stale notice never fired on an install that had not succeeded.
         log.warning(
             "GitHub Releases fetch failed",
             url=url, error=str(exc),
         )
         payload = None
-    _release_cache[url] = (now, payload)
+        failure = _classify_release_fetch_error(exc)
+    _release_cache[url] = (now, payload, failure)
     return payload
+
+
+def _classify_release_fetch_error(exc: BaseException) -> dict[str, Any]:
+    """Punch 584: how a release fetch failed, so the staleness notice can
+    tell "the server answered with an error" (the network works; the address
+    is suspect) from "no answer at all" (the network is suspect)."""
+    from email_triage.update_check import (
+        FAILURE_BAD_RESPONSE, FAILURE_HTTP_STATUS, FAILURE_REFUSED,
+        FAILURE_TRANSPORT, fetch_failure,
+    )
+
+    if isinstance(exc, EgressBlocked):
+        return fetch_failure(FAILURE_REFUSED)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return fetch_failure(FAILURE_HTTP_STATUS, exc.response.status_code)
+    if isinstance(exc, (ValueError, httpx.DecodingError)):
+        return fetch_failure(FAILURE_BAD_RESPONSE)
+    return fetch_failure(FAILURE_TRANSPORT)
+
+
+def last_release_fetch_failure(url: str) -> dict[str, Any] | None:
+    """The failure detail of the most recent fetch of ``url`` (``None`` when
+    it succeeded, was never made, or the cache was reset). Read by the
+    update-check sweeper right after a fetch returns ``None``."""
+    cached = _release_cache.get(url)
+    return cached[2] if cached is not None else None
 
 
 def gather_update_available_section(
@@ -208,7 +263,7 @@ def gather_update_available_section(
     try:
         from email_triage.version import (
             STATUS_UP_TO_DATE, compute_version_status,
-            read_previous_schema_caps, read_target_schema_caps,
+            read_target_schema_caps,
         )
     except Exception as exc:
         log.warning(
@@ -224,12 +279,14 @@ def gather_update_available_section(
     db_schema = 0
     if db is not None:
         try:
-            row = db.execute(
-                "SELECT MAX(version) FROM schema_migrations"
-            ).fetchone()
-            if row and row[0] is not None:
-                db_schema = int(row[0])
-        except sqlite3.Error:
+            # census run15  — the conn-based, side-effect-free schema-version
+            # SSOT (NOT a raw MAX(version) re-inline, and NOT migrations
+            # .schema_version, which would _ensure_bookkeeping/CREATE on a
+            # read-only banner render). The path-based branch below uses the
+            # sibling read_db_schema_version, its own SSOT entry point.
+            from email_triage.version import read_schema_version
+            db_schema = read_schema_version(db)
+        except DB_ERRORS:
             db_schema = 0
     elif db_path:
         try:
@@ -250,7 +307,11 @@ def gather_update_available_section(
         return None
 
     try:
-        previous_caps = read_previous_schema_caps()
+        # Punch 547: the running app has no :previous image to read; the
+        # rollback-safety compare is the deploy's (version-check
+        # --previous-schema-caps). A booted container has already migrated
+        # the DB to its own target, so no update_available escalation is lost.
+        previous_caps = None
         vs = compute_version_status(
             db_schema_version=db_schema,
             target_schema_caps=target_caps,
@@ -285,8 +346,13 @@ def gather_update_available_section(
     payload = fetch_latest_release(url)
     if payload is None:
         return section
-    section["latest_version"] = payload.get("tag_name") or None
-    section["release_url"] = payload.get("html_url") or None
+    # Round 4 (DA): the tag is printed in the email; admit it only through
+    # the shared rule (a tag with a line break is dropped, not printed).
+    from email_triage.update_check import release_tag
+    section["latest_version"] = release_tag(payload)[0]
+    # db F-O5-2: https only (the link is rendered as an <a href> below).
+    from email_triage.update_check import release_page_url
+    section["release_url"] = release_page_url(payload)
     body = (payload.get("body") or "").strip()
     if body:
         section["release_notes"] = body
@@ -338,10 +404,9 @@ def gather_retry_deads_section(
     if db is None:
         return None
     try:
-        from datetime import datetime, timedelta, timezone
-        since = (
+        since = to_utc_iso(
             datetime.now(timezone.utc) - timedelta(hours=24)
-        ).isoformat()
+        )
 
         # Install-wide total.
         row = db.execute(
@@ -416,8 +481,122 @@ def gather_retry_deads_section(
 # State gathering
 # ---------------------------------------------------------------------------
 
+def gather_embedding_runtime_section(config: Any) -> dict[str, Any] | None:
+    """The punch-569 "embedding runtime update required" section, or ``None``.
+
+    Repeats the admin alert's notice every day until it is fixed (operator
+    decision 2026-10-02). Reads ``embedding_bits.update_notice`` — the SAME
+    funnel the alert, the banner and the card read (PD-5). A failure to read
+    it is a section that says so, never a silent omission: an unreadable
+    runtime state is exactly what the admin must hear about.
+    """
+    from email_triage.embedding_bits import (
+        SECURITY_UNKNOWN, UPDATE_ACTION_PATH, update_notice,
+    )
+
+    try:
+        notice = update_notice()
+    except Exception:  # noqa: BLE001
+        notice = {
+            "kind": "update",
+            "headline": "Embedding runtime: the status check failed",
+            "consequence": (
+                "The app could not read the state of the embedding runtime. "
+                "Open the AI Backends page to see it."
+            ),
+            "security": SECURITY_UNKNOWN,
+            "versions": "",
+            "advisories": [],
+        }
+    if notice is None:
+        return None
+    from email_triage.web.admin_alerts import app_base_url
+
+    base = app_base_url(config)
+    return {
+        **notice,
+        "link": f"{base}{UPDATE_ACTION_PATH}" if base else "",
+    }
+
+
+def gather_embedding_auto_updated_section(
+    db: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    """The "embedding runtime updated automatically" line, or ``None``.
+
+    Reads the automatic updater's durable record through the runner's own
+    accessors (PD-5): the SAME ``recent_auto_update`` window and
+    ``describe_auto_update`` text the after-the-fact email prints.
+    """
+    from email_triage.web.embedding_update_runner import (
+        describe_auto_update, read_auto_state, recent_auto_update,
+    )
+
+    rec = recent_auto_update(read_auto_state(db))
+    return describe_auto_update(rec) if rec else None
+
+
 def _iso_ago(hours: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return to_utc_iso(datetime.now(timezone.utc) - timedelta(hours=hours))
+
+
+def gather_n151_soft_gate(
+    db: sqlite3.Connection,
+    config: TriageConfig,
+) -> dict[str, Any]:
+    """Snapshot the N-151 MSAL master-key SOFT-gate state for the digest.
+
+    Composes Part-0's ``providers._msal_cache_crypto.n151_soft_gate_active``
+    /``n151_soft_gate_reason`` LEVEL predicates with the Part-2
+    ``admin_alert:n151_soft_gate`` settings row that records ``since``
+    (the ISO stamp the gate first went active).  Returns a bag with
+    ``{"active": bool, "reason": str, "since": ISO|None}`` — every field
+    populated on every day, so the render path can decide whether to
+    show the dedicated ``Credential store`` section (active=True → yes).
+
+    Fail-CLOSED (PD #8): any probe/read exception treats the gate as
+    ACTIVE with ``reason == "probe_error"`` and ``since=None`` — the
+    render side then still surfaces the section so the operator is not
+    silently left with a broken credential store.
+    """
+    del config  # accessor is process-scoped, no config knob today
+    try:
+        # DB-SME F1 fold (2026-07-10): route through the atomic
+        # ``n151_soft_gate_state()`` SSOT so ``active`` + ``reason`` are
+        # captured in one probe.  The prior dual-call
+        # (``n151_soft_gate_active()`` + ``n151_soft_gate_reason()``)
+        # torn-read on a rotation / backend-flap tick — the two probes
+        # crossed the transition and disagreed.  Sibling render sites
+        # (admin_alerts, routers/ui/_shared) already use the tuple SSOT.
+        from email_triage.providers._msal_cache_crypto import (
+            n151_soft_gate_state,
+        )
+        _active, _reason = n151_soft_gate_state()
+        active = bool(_active)
+        reason = str(_reason)
+    except Exception:
+        # Fail-CLOSED: an import/probe failure IS a credential-store
+        # problem the operator needs to see.
+        return {"active": True, "reason": "probe_error", "since": None}
+
+    since: str | None = None
+    try:
+        from email_triage.web.db import get_setting
+        row = get_setting(db, "admin_alert:n151_soft_gate")
+        if isinstance(row, dict):
+            _since = row.get("since")
+            if isinstance(_since, str) and _since:
+                since = _since
+    except Exception:
+        # Settings row read failure is non-fatal — the section still
+        # renders with since=None (Part-2 primitive owns the write).
+        since = None
+
+    return {"active": active, "reason": reason, "since": since}
+
+
+#: ``embedding_runtime_section`` default: compute it here (under the caller's lock).
+_COMPUTE_HERE: Any = object()
 
 
 def gather_health_state(
@@ -427,6 +606,7 @@ def gather_health_state(
     *,
     now: datetime | None = None,
     app: Any = None,
+    embedding_runtime_section: Any = _COMPUTE_HERE,
 ) -> dict[str, Any]:
     """Snapshot everything the digest renders from.
 
@@ -439,13 +619,26 @@ def gather_health_state(
     even on a day when nothing else is wrong.
     """
     now = now or datetime.now(timezone.utc)
-    since_24h = (now - timedelta(hours=24)).isoformat()
+    # N-203 R22 (2026-07-02): route through A10 stored-ISO SSOT.
+    since_24h = to_utc_iso(now - timedelta(hours=24))
 
     state: dict[str, Any] = {
         "now": now,
         "hipaa_mode": is_hipaa_mode(),
         "attention_reasons": [],
     }
+
+    # --- N-151 MSAL master-key SOFT-gate ------
+    # Composed via ``gather_n151_soft_gate`` so tests can drive the seam
+    # independently. When active, the digest renders a dedicated
+    # ``Credential store`` section FIRST (above the Status chip row) and
+    # the subject line flips to ``⚠ Attention`` via ``attention_reasons``.
+    state["n151_soft_gate"] = gather_n151_soft_gate(db, config)
+    if state["n151_soft_gate"]["active"]:
+        state["attention_reasons"].append(
+            "MSAL master key unavailable — credential store SOFT-gate "
+            f"active since {state['n151_soft_gate']['since']}"
+        )
 
     # --- Ingestion (per-account, all providers) --------------------------
     # Single source of truth — fold the same per-account verdict the
@@ -459,6 +652,21 @@ def gather_health_state(
         except Exception:
             account_states_list = []
     state["account_states"] = account_states_list
+
+    #  — restore-key freshness (productized reminder, not a verbal nag): the
+    # automated backups are unrecoverable without the operator's key-only
+    # export, so surface when it last happened (None = never on record).
+    try:
+        from pathlib import Path as _P
+
+        from email_triage import backup as _bk
+
+        _dbp = getattr(getattr(config, "persistence", None), "db_path", "")
+        _ddir = _P(_dbp).parent if _dbp else _P("./data")
+        _km = _bk.read_key_export_marker(_ddir)
+        state["last_key_export"] = _km.get("ts") if _km else None
+    except Exception:
+        state["last_key_export"] = None
 
     # Per-provider aggregate (option C — primary mode wins, sums = total).
     providers: dict[str, dict] = {}
@@ -492,16 +700,16 @@ def gather_health_state(
     if watcher_manager is not None:
         try:
             poll_registered, poll_fresh = watcher_manager.poll_counts()
-        except Exception:
-            pass
+        except Exception as e:
+            log.error("health: poll counts unavailable; reporting 0", exc_info=e)
     state["poll"] = {"registered": poll_registered, "fresh": poll_fresh}
     mb_total = 0
     mb_watching = 0
     if watcher_manager is not None:
         try:
             mb_total, mb_watching = watcher_manager.mailbox_counts()
-        except Exception:
-            pass
+        except Exception as e:
+            log.error("health: mailbox counts unavailable; reporting 0", exc_info=e)
     state["mailboxes"] = {"total": mb_total, "watching": mb_watching}
 
     # --- Log errors -------------------------------------------------------
@@ -517,15 +725,19 @@ def gather_health_state(
             "SELECT COUNT(*) FROM log_entries WHERE level = 'WARNING' AND ts >= ?",
             (since_24h,),
         ).fetchone()[0]
+        # ERROR rows first, then the newest WARNINGs. Newest-first alone let
+        # ten routine WARNINGs push every ERROR out of the tail, so the
+        # 2026-10-10 email said "10 ERROR log entries" and showed none.
         rows = db.execute(
             "SELECT ts, level, logger, message FROM log_entries "
             "WHERE level IN ('ERROR', 'WARNING') AND ts >= ? "
-            "ORDER BY id DESC LIMIT 10",
+            "ORDER BY CASE level WHEN 'ERROR' THEN 0 ELSE 1 END, id DESC "
+            "LIMIT 10",
             (since_24h,),
         ).fetchall()
         error_rows = [dict(r) for r in rows]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: log_entries error counts unavailable", exc_info=e)
     state["error_count_24h"] = error_count_24h
     state["warning_count_24h"] = warning_count_24h
     state["error_rows"] = error_rows
@@ -567,8 +779,8 @@ def gather_health_state(
         ).fetchone()
         if counts and counts["runs"]:
             triage_error_rate = (counts["err_runs"] or 0) * 100.0 / counts["runs"]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: triage error-rate unavailable; reporting 0", exc_info=e)
     state["triage_total"] = triage_total
     state["triage_accounts"] = triage_accounts
     state["triage_error_rate"] = round(triage_error_rate, 2)
@@ -579,9 +791,13 @@ def gather_health_state(
 
     # --- Stale-auth accounts ---------------------------------------------
     # Surface accounts whose OAuth refresh / IMAP password is no longer
-    # valid. Set by _maybe_mark_auth_stale on a "Token has been expired
-    # or revoked" / "AUTHENTICATIONFAILED" exception. Cleared
-    # automatically on the next successful provider call.
+    # valid. The auth_stale flag is maintained by the lifecycle SSOT
+    # ``record_provider_outcome`` (web/app.py): SET (needle-filtered via
+    # web/_auth_revoked) on an auth-revoked failure, CLEARED on the next
+    # successful credentialed provider call — across ALL ingestion surfaces
+    # (poll / Gmail+O365 push / IMAP IDLE / watch+subscription renewers /
+    # sent-mail capture / the Test action), not just the poll path. Census
+    # 2026-06-09 #1.
     stale_auth_accounts: list[dict[str, Any]] = []
     try:
         rows = db.execute(
@@ -591,12 +807,9 @@ def gather_health_state(
             "  ON ea.id = CAST(SUBSTR(s.key, length('auth_stale:') + 1) AS INTEGER) "
             "WHERE s.key LIKE 'auth_stale:%'"
         ).fetchall()
-        import json as _json
+        from email_triage.db._helpers import load_json_col
         for r in rows:
-            try:
-                payload = _json.loads(r["value_json"]) if r["value_json"] else {}
-            except (ValueError, TypeError):
-                payload = {}
+            payload = load_json_col(r["value_json"], default={})  # census 
             if not payload.get("at"):
                 continue
             stale_auth_accounts.append({
@@ -605,8 +818,8 @@ def gather_health_state(
                 "at": payload.get("at"),
                 "reason": (payload.get("reason") or "")[:200],
             })
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: stale-auth accounts unavailable", exc_info=e)
     state["stale_auth_accounts"] = stale_auth_accounts
     if stale_auth_accounts:
         names = ", ".join(a["account_name"] for a in stale_auth_accounts[:3])
@@ -619,7 +832,9 @@ def gather_health_state(
         )
 
     # --- HIPAA events -----------------------------------------------------
-    hipaa_events_count = 0
+    # None = the count could not be read. Never report a failed query as 0:
+    # "no HIPAA access events" is a claim the digest cannot make then.
+    hipaa_events_count: int | None = 0
     hipaa_recent_actors: list[str] = []
     try:
         hipaa_events_count = db.execute(
@@ -633,8 +848,13 @@ def gather_health_state(
             (since_24h,),
         ).fetchall()
         hipaa_recent_actors = [r[0] for r in actor_rows if r[0]]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: HIPAA access-event counts unavailable", exc_info=e)
+        hipaa_events_count = None
+        hipaa_recent_actors = []
+        state["attention_reasons"].append(
+            "HIPAA access-event count unavailable (query failed; see log)"
+        )
     state["hipaa_events_count"] = hipaa_events_count
     state["hipaa_recent_actors"] = hipaa_recent_actors
 
@@ -678,6 +898,65 @@ def gather_health_state(
                 + state["update_available"].get("explanation", _u_status)
             )
 
+    # --- Security update (punch 553, operator decision 553-2) ------------
+    # Deliberately NOT gated by ``include_update_available``: the admin UI
+    # will not let an admin dismiss this notice, so the email cannot
+    # suppress it either. Reads the update check's persisted FACTS (no
+    # request here); pending-ness is derived against the running version.
+    # A read failure leaves the section out and logs (the admin banner is
+    # computed independently on every page).
+    state["security_update"] = None
+    try:
+        from email_triage import __version__ as _running_version
+        from email_triage.update_check import (
+            load_release_facts, security_update_pending,
+        )
+        _facts = getattr(
+            getattr(app, "state", None), "update_check_facts", None,
+        )
+        if _facts is None:
+            _facts = load_release_facts(db)
+        state["security_update"] = security_update_pending(
+            _facts, _running_version,
+        )
+    except Exception as exc:
+        log.warning(
+            "daily health: security-update facts unreadable", error=str(exc),
+        )
+    if state["security_update"]:
+        _sec = state["security_update"]
+        state["attention_reasons"].append(
+            "Security update required: running "
+            f"{_sec['running_version']}, update to "
+            f"{_sec.get('target_version') or _sec.get('latest_tag') or 'the newest release'}"
+            f" (severity {_sec['severity']})"
+        )
+
+    # --- Update check health (db F-O5-1) ----------------------------------
+    # A check that keeps failing must not be silent: a security release
+    # published meanwhile would go unannounced.
+    state["update_check_stale"] = None
+    try:
+        from email_triage.update_check import (
+            load_check_health, update_check_stale,
+        )
+        _url = getattr(config.admin_email, "release_check_url", "") or ""
+        state["update_check_stale"] = update_check_stale(
+            load_check_health(db), _url,
+            now=(now or datetime.now(timezone.utc)),
+        )
+    except Exception as exc:
+        log.warning("daily health: update-check health unreadable",
+                    error=str(exc))
+    if state["update_check_stale"]:
+        _st = state["update_check_stale"]
+        state["attention_reasons"].append(
+            f"{_st['title']}: no successful check of "
+            f"{_st['host']} since {_st['since'] or 'it was turned on'} "
+            f"({_st['cause']}); security updates cannot be announced until "
+            "a check succeeds"
+        )
+
     # --- Retry-queue dead-pattern section ---------------------
     # Surface accounts piling up abandoned retries, or an install-wide
     # spike. Returns ``None`` on a clean day so the email body doesn't
@@ -686,6 +965,38 @@ def gather_health_state(
         state["retry_deads"] = gather_retry_deads_section(db)
     except Exception:
         state["retry_deads"] = None
+
+    # --- Embedding runtime update required (punch 569 D5) ----------------
+    # The admin alert emails this ONCE per transition; this section repeats
+    # it daily until it is fixed, and it flips the subject to Attention.
+    # Panel B3 db F569-5: the section scans the runtime prefix (filesystem,
+    # no DB). The daily tick computes it before taking the DB lock and passes
+    # it in; only a caller that did not (the admin "send now") scans here.
+    state["embedding_runtime"] = (
+        gather_embedding_runtime_section(config)
+        if embedding_runtime_section is _COMPUTE_HERE
+        else embedding_runtime_section
+    )
+    # A non-security update that WAITS for the next restart (operator ruling R1) is
+    # shown, never silent, but it is not an attention item: the old runtime is
+    # serving and the app applies the update itself at the next start.
+    if state["embedding_runtime"] and (
+        state["embedding_runtime"].get("kind") != "auto_deferred"
+        # Panel T DA SHOULD-A1b: a deferral that recurred 3 starts or lasted 7 days is
+        # no longer "waiting for the next restart": the operator's no-intervention goal
+        # is failing quietly, so it flips the subject to Attention.
+        or state["embedding_runtime"].get("escalated")
+    ):
+        state["attention_reasons"].append(
+            state["embedding_runtime"]["headline"]
+        )
+    # Operator decision 2026-10-25: the app updates the runtime itself. News,
+    # not a request, so it does NOT flip the subject to Attention; it is shown
+    # while the update is inside the notice window (one daily email).
+    try:
+        state["embedding_runtime_updated"] = gather_embedding_auto_updated_section(db)
+    except Exception:
+        state["embedding_runtime_updated"] = None
     if state.get("retry_deads"):
         rd = state["retry_deads"]
         if rd.get("install_wide"):
@@ -708,8 +1019,12 @@ def gather_health_state(
             (since_24h,),
         ).fetchone()[0]
         rows = db.execute(
+            # Panel AB MUST (C2-display): hashed-derived address first, the
+            # unhashed stored copy beside it when they differ.
             "SELECT ake.ts, ake.event, ake.name, ake.source, "
-            "       au.email AS actor_email, tu.email AS target_email "
+            "       COALESCE(au.email, ake.actor_email) AS actor_email, "
+            "       ake.actor_email AS recorded_actor_email, "
+            "       tu.email AS target_email "
             "FROM api_key_events ake "
             "LEFT JOIN users au ON au.id = ake.actor_user_id "
             "LEFT JOIN users tu ON tu.id = ake.target_user_id "
@@ -717,8 +1032,8 @@ def gather_health_state(
             (since_24h,),
         ).fetchall()
         api_key_events_recent = [dict(r) for r in rows]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: API-key event counts unavailable", exc_info=e)
     state["api_key_events_count"] = api_key_events_count
     state["api_key_events_recent"] = api_key_events_recent
 
@@ -726,8 +1041,8 @@ def gather_health_state(
     log_row_count = 0
     try:
         log_row_count = db.execute("SELECT COUNT(*) FROM log_entries").fetchone()[0]
-    except sqlite3.Error:
-        pass
+    except DB_ERRORS as e:
+        log.error("health: log_entries row count unavailable", exc_info=e)
     state["log_row_count"] = log_row_count
 
     # --- Pub/Sub (gated on #1 shipping) -----------------------------------
@@ -757,21 +1072,20 @@ def gather_health_state(
         # attention_reasons + row_dicts surface the operator-set
         # name; numeric id rides along as a tiebreaker only.
         _name_by_id: dict[int, str] = {}
+        # census run17  — account_email SSOT, not the open-coded key.
+        from email_triage.db.accounts import account_email
         try:
             for a in list_email_accounts(db) or []:
                 aid = a.get("id")
                 if aid is not None:
                     _name_by_id[int(aid)] = (
-                        a.get("name") or a.get("email_address") or ""
+                        a.get("name") or account_email(a) or ""
                     )
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("health: account name lookup failed; using ids", error=fmt_exc(e))
 
         def _label(account_id) -> str:
-            try:
-                aid_int = int(account_id) if account_id is not None else None
-            except (TypeError, ValueError):
-                aid_int = None
+            aid_int = parse_int_or_none(account_id)  # N-219c/38 R23: SSOT
             name = (
                 _name_by_id.get(aid_int)
                 if aid_int is not None else ""
@@ -818,9 +1132,12 @@ def gather_health_state(
                 if exp <= soon:
                     o365_block["expiring_in_24h"] += 1
             o365_block["rows"].append(row_dict)
-    except (sqlite3.Error, Exception):
-        # Read failure shouldn't kill the digest.
-        pass
+    except Exception as e:
+        # Read failure shouldn't kill the digest. Exception already covers
+        # both drivers' Error (each derives from it); never nest a funnel
+        # tuple inside an except tuple -- Python raises TypeError at match
+        # time (punch 560 panel, db-sme F1).
+        log.error("health: office365 push block unavailable", exc_info=e)
     state["office365_push"] = o365_block
 
     # --- Gateway / container health placeholder ---------------------------
@@ -846,9 +1163,28 @@ def gather_health_state(
         warn = cert_expiry_warning(cert_dir)
         if warn:
             state["cert_expiry_warning"] = warn
-    except Exception:
+    except Exception as e:
         # Cert read failures shouldn't fail the health email build.
-        pass
+        log.error("health: cert expiry check failed", exc_info=e)
+
+    # --- Restore witness markers pending (punch 711, panel AB) -----------
+    # Derived from the data dir on every build (no flag to set or clear,
+    # PD-18): a marker stays on disk until its restore is recorded, so one
+    # that pends (no swap yet, or failing to ingest) is never log-only.
+    try:
+        from pathlib import Path as _Path
+        from email_triage.backup import pending_restore_witness_markers
+        _pending = pending_restore_witness_markers(
+            _Path(config.persistence.db_path).parent)
+        state["restore_witness_pending"] = len(_pending)
+        if _pending:
+            state["attention_reasons"].append(
+                f"{len(_pending)} restore witness marker(s) pending in the data "
+                "dir: a restore was extracted but is not yet in the audit chain "
+                "(swap not done, or the record failed; see the startup log)"
+            )
+    except Exception:
+        state["restore_witness_pending"] = 0
 
     # --- Listener-mode restart pending ------------------------------
     # When ``app`` is supplied (live process), compare the boot-time
@@ -867,11 +1203,20 @@ def gather_health_state(
                     "Listener mode change pending — restart "
                     "email-triage to take effect"
                 )
-        except Exception:
+        except Exception as e:
             # Defensive: a bad import / state shouldn't kill the digest.
-            pass
+            log.warning("health: listener-restart check failed", error=fmt_exc(e))
 
     return state
+
+
+def _hipaa_count_text(state: dict[str, Any]) -> str:
+    """The HIPAA access-event count as shown in both digest bodies.
+
+    ``None`` means the query failed: render "unavailable", never 0.
+    """
+    n = state["hipaa_events_count"]
+    return "unavailable (query failed; see log)" if n is None else str(n)
 
 
 def is_interesting(state: dict[str, Any]) -> bool:
@@ -882,13 +1227,20 @@ def is_interesting(state: dict[str, Any]) -> bool:
     """
     if state["attention_reasons"]:
         return True
+    #  Part 3 — N-151 credential-store SOFT-gate active is a
+    # first-class quiet-mode wake-up: the operator MUST see it even
+    # when nothing else is off.  (Kept as its own arm so a future
+    # refactor of ``attention_reasons`` doesn't accidentally hide it.)
+    if state.get("n151_soft_gate", {}).get("active"):
+        return True
     if state.get("error_count_24h", 0) > 0:
         return True
     if state.get("warning_count_24h", 0) > 0:
         return True
     if state.get("triage_total", 0) > 0:
         return True
-    if state.get("hipaa_events_count", 0) > 0:
+    _hipaa_n = state.get("hipaa_events_count", 0)
+    if _hipaa_n is None or _hipaa_n > 0:  # None = unavailable: interesting
         return True
     if state.get("api_key_events_count", 0) > 0:
         return True
@@ -904,6 +1256,38 @@ def is_interesting(state: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+
+def _security_update_sentence(sec: dict[str, Any]) -> str:
+    """The one plain-English sentence both email bodies use (punch 553)."""
+    latest = sec.get("latest_tag") or "the newest release"
+    if sec.get("reason") == "marker_absent":
+        return (
+            f"The newest release ({latest}) does not say whether it fixes a "
+            "security problem, so treat it as one and update."
+        )
+    if sec.get("reason") == "marker_unparseable":
+        return (
+            f"The newest release ({latest}) carries security information "
+            "this install could not read, so treat it as a security update "
+            "and update."
+        )
+    target = sec.get("target_version") or latest
+    return (
+        f"Update to {target} or later: it fixes a security problem rated "
+        f"{sec.get('severity')}."
+    )
+
+
+def _api_key_actor_display(e: dict[str, Any]) -> str:
+    """WHO for one api_key_events row (punch 710, panel AB MUST C2-display): the
+    address resolved from the hashed ``actor_user_id`` (or, for a CLI row, the
+    stored copy), plus the stored copy beside it when the two differ."""
+    actor = e.get("actor_email") or "(unknown)"
+    recorded = e.get("recorded_actor_email")
+    if recorded and recorded != e.get("actor_email"):
+        actor += f" (recorded as {recorded})"
+    return actor
+
 
 def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
     parts: list[str] = []
@@ -945,6 +1329,49 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             '<strong>All green</strong></div>'
         )
 
+    # 0.5. Credential store (N-151 SOFT-gate) —  REDESIGNED v3 Part 3.
+    # Renders as the FIRST content section (above the Status chip row)
+    # ONLY when the SOFT-gate is active — the operator's eye lands on
+    # it right after the ⚠ Attention banner because a broken MSAL
+    # master key means Office 365 accounts silently stop fetching mail.
+    # Silent on a healthy day so the digest doesn't grow a permanent
+    # "credentials OK" line.
+    _n151 = state.get("n151_soft_gate") or {}
+    if _n151.get("active"):
+        parts.append("<h3>Credential store</h3>")
+        parts.append(
+            '<div style="padding: 0.5rem 1rem; background: #fff4e5; '
+            'border-left: 3px solid #d17b00; margin: 0.5rem 0;">'
+        )
+        # DA R4 CIDI-drift fold (2026-07-10): escape the reason + since
+        # before interpolating.  The sibling render site
+        # ``_assemble_n151_soft_gate_alert`` in ``web/admin_alerts.py``
+        # already ``html.escape``s both fields; mirroring the escape
+        # here converges the two render sites (Prime Directive #5).
+        _reason_raw = _n151.get("reason", "unavailable")
+        parts.append(
+            "<p><strong>MSAL master key unavailable.</strong> "
+            f"Reason: <code>{_html_escape(str(_reason_raw))}</code>.</p>"
+        )
+        _since = _n151.get("since")
+        if _since:
+            parts.append(
+                f"<p>SOFT-gate active since <code>{_html_escape(str(_since))}</code>.</p>"
+            )
+        else:
+            parts.append(
+                "<p>SOFT-gate active (start time not recorded).</p>"
+            )
+        parts.append(
+            '<p style="font-size:0.9em;color:#555;">'
+            'Office 365 accounts cannot decrypt cached refresh tokens '
+            'until the master key is restored — new mail will not be '
+            'ingested.  Restore the key or re-authenticate the affected '
+            'account(s) from Admin → Accounts.'
+            '</p>'
+        )
+        parts.append("</div>")
+
     # 1. Status chip row.
     if config.health_email.include_health:
         parts.append("<h3>Status</h3><ul>")
@@ -985,12 +1412,19 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
 
     # 3. Error tail.
     if config.health_email.include_errors and state["error_rows"]:
-        parts.append("<h3>Error tail</h3><ul>")
+        parts.append(
+            "<h3>Error tail</h3><p>Errors first, then warnings, newest first "
+            f"within each: showing {len(state['error_rows'])} of "
+            f"{state.get('error_count_24h', 0) + state.get('warning_count_24h', 0)} "
+            f"entries ({state.get('error_count_24h', 0)} error(s), "
+            f"{state.get('warning_count_24h', 0)} warning(s)) in the last 24h.</p><ul>"
+        )
         for row in state["error_rows"]:
             parts.append(
-                f"<li><code>{row['ts']}</code> "
-                f"<strong>{row['level']}</strong> "
-                f"{row['logger']} — {row['message']}</li>"
+                f"<li><code>{_html_escape(str(row['ts']))}</code> "
+                f"<strong>{_html_escape(str(row['level']))}</strong> "
+                f"{_html_escape(str(row['logger']))} — "
+                f"{_html_escape(str(row['message']))}</li>"
             )
         parts.append("</ul>")
 
@@ -1001,7 +1435,7 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
     ):
         parts.append("<h3>HIPAA access events</h3>")
         parts.append(
-            f"<p>Count last 24h: <strong>{state['hipaa_events_count']}</strong></p>"
+            f"<p>Count last 24h: <strong>{_hipaa_count_text(state)}</strong></p>"
         )
         if state["hipaa_recent_actors"]:
             parts.append("<p>Recent actors: ")
@@ -1017,7 +1451,8 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
         if state["api_key_events_recent"]:
             parts.append("<ul>")
             for e in state["api_key_events_recent"]:
-                actor = e.get("actor_email") or "(unknown)"
+                # The stored address is unhashed DB text: escape it.
+                actor = _html_escape(_api_key_actor_display(e))
                 parts.append(
                     f"<li><code>{e['ts']}</code> "
                     f"{e['event']} key '{e['name']}' by {actor} "
@@ -1107,6 +1542,103 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             '</p>'
         )
 
+    # 4c'. Security update (punch 553). Renders whenever the update check's
+    # facts say the running version is missing a security fix; ignores
+    # include_update_available (see gather_health_state). Every dynamic
+    # value is escaped (R18).
+    sec = state.get("security_update")
+    if sec:
+        _e = _html_escape
+        parts.append(
+            '<h3 style="color:#b42318;">Security update required</h3>'
+        )
+        parts.append(
+            "<p>This install runs version "
+            f"<strong>{_e(str(sec['running_version']))}</strong>. "
+            f"{_e(_security_update_sentence(sec))}</p>"
+        )
+        if sec.get("advisories"):
+            parts.append(
+                "<p><strong>Advisories:</strong> "
+                + ", ".join(_e(str(a)) for a in sec["advisories"])
+                + "</p>"
+            )
+        if sec.get("release_url"):
+            parts.append(
+                f'<p><a href="{_e(str(sec["release_url"]))}">Read the '
+                "release notes</a></p>"
+            )
+        parts.append(
+            "<p><em>This notice repeats every day until the install is "
+            "updated.</em></p>"
+        )
+
+    # 4c''. Update check failing (db F-O5-1) — escaped (R18).
+    st = state.get("update_check_stale")
+    if st:
+        parts.append(
+            '<h3 style="color:#b42318;">'
+            f"{_html_escape(str(st['title']))}</h3>"
+        )
+        parts.append(
+            "<p>No successful check of "
+            f"<strong>{_html_escape(str(st['host']))}</strong> since "
+            f"{_html_escape(str(st['since'] or 'it was turned on'))} "
+            f"({_html_escape(str(st['cause']))}). "
+            "Until a check succeeds this install cannot be told about "
+            f"security updates. {_html_escape(str(st['advice']))}</p>"
+        )
+
+    # 4c-ter. Embedding runtime update required (punch 569 D5). Silent when
+    # the runtime is current, absent, or not in use.
+    er = state.get("embedding_runtime")
+    if er:
+        import html as _html
+
+        parts.append(f"<h3>{_html.escape(er['headline'])}</h3>")
+        parts.append(f"<p>{_html.escape(er['consequence'])}</p>")
+        if er.get("advisories"):
+            parts.append(
+                "<p>Advisories: "
+                + ", ".join(
+                    f"<code>{_html.escape(str(a))}</code>" for a in er["advisories"]
+                )
+                + "</p>"
+            )
+        if er.get("kind") == "update":
+            if er.get("link"):
+                parts.append(
+                    '<p>Click <strong>Update embedding runtime</strong> on '
+                    f'<a href="{_html.escape(er["link"])}">the AI Backends page</a>.</p>'
+                )
+            else:
+                parts.append(
+                    "<p>Click <strong>Update embedding runtime</strong> on the "
+                    "AI Backends tab of the admin settings.</p>"
+                )
+
+    # 4c-quater. Embedding runtime updated automatically (operator decision
+    # 2026-10-25). After-the-fact news; silent outside the notice window.
+    eu = state.get("embedding_runtime_updated")
+    if eu:
+        import html as _html
+
+        parts.append(f"<h3>{_html.escape(eu['headline'])}</h3>")
+        parts.append(
+            f"<p>Manifest {_html.escape(eu['versions'])}; security fix: "
+            f"{_html.escape(eu['security_label'])}"
+            + (f"; {_html.escape(eu['at'])}" if eu["at"] else "")
+            + ".</p>"
+        )
+        if eu["advisories"]:
+            parts.append(
+                "<p>Advisories: "
+                + ", ".join(f"<code>{_html.escape(a)}</code>" for a in eu["advisories"])
+                + "</p>"
+            )
+        if eu["restart_message"]:
+            parts.append(f"<p><strong>{_html.escape(eu['restart_message'])}</strong></p>")
+
     # 4d. Update available (CR-2c). Renders only when state["update_available"]
     # is non-None — gather suppresses the section on an up-to-date install
     # so the email doesn't grow a daily "you're current" line.
@@ -1151,8 +1683,8 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             )
         if upd.get("release_url"):
             parts.append(
-                f'<p><a href="{upd["release_url"]}">View release on '
-                'GitHub</a></p>'
+                f'<p><a href="{_html_escape(str(upd["release_url"]))}">'
+                'View release on GitHub</a></p>'
             )
         latest = upd.get("latest_version") or "<latest>"
         parts.append(
@@ -1264,6 +1796,22 @@ def _render_html(state: dict[str, Any], config: TriageConfig) -> str:
             f"<p>IMAP folders: {m['watching']}/{m['total']} watching.</p>"
         )
 
+    #  — restore-key freshness: the automated backups can't be restored
+    # without the operator's key-only export.
+    _lke = state.get("last_key_export")
+    if _lke:
+        parts.append(
+            f"<p>Last key export: <strong>{_lke[:10]}</strong> "
+            "<small>(keep your key-only backup current — it's the restore key)"
+            "</small></p>"
+        )
+    else:
+        parts.append(
+            "<p style='color:#c00'><strong>No restore-key export on record</strong>"
+            " — export the key-only backup (Admin → Backup); the automated "
+            "backups cannot be restored without it.</p>"
+        )
+
     parts.append("</div>")
     return "".join(parts)
 
@@ -1281,6 +1829,27 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
     else:
         lines.append("All green.")
     lines.append("")
+
+    # Credential store (N-151 SOFT-gate) — text twin of the HTML block.
+    # Silent on a healthy day; when active it sits ABOVE the Status
+    # block so the operator sees it first.
+    _n151 = state.get("n151_soft_gate") or {}
+    if _n151.get("active"):
+        lines.append("Credential store:")
+        lines.append(
+            f"  MSAL master key unavailable "
+            f"(reason: {_n151.get('reason', 'unavailable')})."
+        )
+        _since = _n151.get("since")
+        if _since:
+            lines.append(f"  SOFT-gate active since {_since}.")
+        else:
+            lines.append("  SOFT-gate active (start time not recorded).")
+        lines.append(
+            "  Office 365 accounts cannot decrypt cached refresh tokens "
+            "until the master key is restored."
+        )
+        lines.append("")
 
     if config.health_email.include_health:
         lines.append("Status:")
@@ -1303,7 +1872,13 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         lines.append("")
 
     if config.health_email.include_errors and state["error_rows"]:
-        lines.append("Error tail:")
+        lines.append(
+            "Error tail (errors first, then warnings; showing "
+            f"{len(state['error_rows'])} of "
+            f"{state.get('error_count_24h', 0) + state.get('warning_count_24h', 0)} "
+            f"entries: {state.get('error_count_24h', 0)} error(s), "
+            f"{state.get('warning_count_24h', 0)} warning(s) in 24h):"
+        )
         for row in state["error_rows"]:
             lines.append(
                 f"  [{row['ts']}] {row['level']} {row['logger']} — {row['message']}"
@@ -1315,7 +1890,7 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         and not state["hipaa_mode"]
     ):
         lines.append("HIPAA access events:")
-        lines.append(f"  Count last 24h: {state['hipaa_events_count']}")
+        lines.append(f"  Count last 24h: {_hipaa_count_text(state)}")
         if state["hipaa_recent_actors"]:
             lines.append(f"  Recent actors: {', '.join(state['hipaa_recent_actors'])}")
         lines.append("")
@@ -1324,12 +1899,46 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         lines.append("API key events:")
         lines.append(f"  Count last 24h: {state['api_key_events_count']}")
         for e in state["api_key_events_recent"]:
-            actor = e.get("actor_email") or "(unknown)"
+            actor = _api_key_actor_display(e)
             lines.append(
                 f"  [{e['ts']}] {e['event']} key '{e['name']}' "
                 f"by {actor} via {e['source']}"
             )
         lines.append("")
+
+    # Embedding runtime update required (punch 569 D5). Sibling to the
+    # HTML block; silent when nothing is needed.
+    er = state.get("embedding_runtime")
+    if er:
+        lines.append("")
+        lines.append(er["headline"])
+        lines.append("-" * len(er["headline"]))
+        lines.append(er["consequence"])
+        if er.get("advisories"):
+            lines.append("Advisories: " + ", ".join(str(a) for a in er["advisories"]))
+        if er.get("kind") == "update":
+            lines.append(
+                "Click [Update embedding runtime] on "
+                + (er["link"] if er.get("link") else
+                   "the AI Backends tab of the admin settings")
+                + "."
+            )
+
+    # Embedding runtime updated automatically (operator decision 2026-10-25).
+    eu = state.get("embedding_runtime_updated")
+    if eu:
+        lines.append("")
+        lines.append(eu["headline"])
+        lines.append("-" * len(eu["headline"]))
+        lines.append(
+            f"Manifest {eu['versions']}; security fix: {eu['security_label']}"
+            + (f"; {eu['at']}" if eu["at"] else "")
+            + "."
+        )
+        if eu["advisories"]:
+            lines.append("Advisories: " + ", ".join(eu["advisories"]))
+        if eu["restart_message"]:
+            lines.append(eu["restart_message"])
 
     # Retry queue dead-pattern section. Sibling to the
     # HTML block above; silent on a clean day.
@@ -1358,6 +1967,42 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         lines.append(
             "Review the retry queue in the admin UI to retry-now or "
             "abandon individual rows."
+        )
+        lines.append("")
+
+    # Security update (punch 553) — sibling of the HTML block above.
+    sec = state.get("security_update")
+    if sec:
+        lines.append("")
+        lines.append("SECURITY UPDATE REQUIRED")
+        lines.append("-" * 24)
+        lines.append(f"This install runs version {sec['running_version']}.")
+        lines.append(_security_update_sentence(sec))
+        if sec.get("advisories"):
+            lines.append("Advisories: " + ", ".join(
+                str(a) for a in sec["advisories"]
+            ))
+        if sec.get("release_url"):
+            lines.append(f"Release notes: {sec['release_url']}")
+        lines.append(
+            "This notice repeats every day until the install is updated."
+        )
+        lines.append("")
+
+    # Update check failing (db F-O5-1) — sibling of the HTML block above.
+    st = state.get("update_check_stale")
+    if st:
+        lines.append("")
+        _title = str(st["title"]).upper()
+        lines.append(_title)
+        lines.append("-" * len(_title))
+        lines.append(
+            f"No successful check of {st['host']} since "
+            f"{st['since'] or 'it was turned on'} ({st['cause']})."
+        )
+        lines.append(
+            "Until a check succeeds this install cannot be told about "
+            f"security updates. {st['advice']}"
         )
         lines.append("")
 
@@ -1465,6 +2110,21 @@ def _render_text(state: dict[str, Any], config: TriageConfig) -> str:
         m = state["mailboxes"]
         lines.append(f"IMAP folders: {m['watching']}/{m['total']} watching.")
 
+    #  — restore-key freshness (the automated backups need this key).
+    _lke = state.get("last_key_export")
+    lines.append("")
+    if _lke:
+        lines.append(
+            f"Last key export: {_lke[:10]} "
+            "(keep your key-only backup current -- it's the restore key)."
+        )
+    else:
+        lines.append(
+            "WARNING: no restore-key export on record -- export the key-only "
+            "backup (Admin -> Backup); the automated backups cannot be restored "
+            "without it."
+        )
+
     return "\n".join(lines)
 
 
@@ -1479,10 +2139,17 @@ def assemble_daily_health_email(
     from email_triage.mail_headers import (
         X_EMAIL_TRIAGE_HEADER, build_triage_header,
     )
+    from email_triage.web.smtp_send import stamp_default_message_headers
+
     msg = EmailMessage()
     date_str = state["now"].strftime("%Y-%m-%d")
     flag = "⚠ Attention" if state["attention_reasons"] else "OK"
     msg["Subject"] = f"[email-triage] Daily health {date_str} — {flag}"
+    # N-272b R28 SSOT — RFC-preferred GMT Date + Message-Id at build time.
+    # Punch 599: the Message-Id domain is the configured sender's.
+    stamp_default_message_headers(
+        msg, from_addr=getattr(getattr(config, "smtp", None), "from_addr", ""),
+    )
     # Loop-prevention stamp: the daily-health recipients are often
     # operator inboxes, some of which are watched by triage. If a
     # health email is ever re-ingested the pipeline entry check on
@@ -1505,6 +2172,7 @@ def send_daily_health_email(
     *,
     force: bool = False,
     app: Any = None,
+    embedding_runtime_section: Any = _COMPUTE_HERE,
 ) -> tuple[bool, str]:
     """Send the digest now. Returns ``(sent, reason)``.
 
@@ -1535,7 +2203,10 @@ def send_daily_health_email(
     # caller is already inside db_call.)
     from email_triage.web.db_writelock import get_write_lock
     with get_write_lock():
-        state = gather_health_state(db, config, watcher_manager, app=app)
+        state = gather_health_state(
+            db, config, watcher_manager, app=app,
+            embedding_runtime_section=embedding_runtime_section,
+        )
     if cfg.quiet_mode and not force and not is_interesting(state):
         return False, "quiet_mode: nothing interesting"
 
@@ -1546,17 +2217,20 @@ def send_daily_health_email(
     password = ""
     if secrets is not None:
         try:
-            password = secrets.get("SMTP_PASSWORD") or ""
-        except Exception:
-            password = ""
+            password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            # A5 — fail closed + diagnose distinctly: unreadable secret
+            # store (master-key mismatch) is not "no password set".
+            log.error("Daily health email aborted — SMTP password "
+                      "unreadable (corrupt secret row or master-key mismatch)")
+            return False, "secret store unreadable: SMTP_PASSWORD"
 
     try:
-        with smtplib.SMTP(smtp.host, smtp.port) as server:
-            if smtp.use_tls:
-                server.starttls()
-            if smtp.username:
-                server.login(smtp.username, password)
-            server.send_message(msg)
+        from email_triage.web.smtp_send import send_smtp_message
+        send_smtp_message(
+            msg, smtp_host=smtp.host, smtp_port=smtp.port,
+            smtp_user=smtp.username, smtp_password=password, use_tls=smtp.use_tls,
+        )
     except Exception as exc:
         log.error("Daily health email send failed", error=str(exc))
         return False, f"send failed: {exc}"
@@ -1580,7 +2254,7 @@ def _assemble_update_failed_email(
     failure_reason: str,
     restored_from_snapshot: str | None,
     now: datetime | None = None,
-    repo_url: str = "https://github.com/unlimited-data-works-llc/email-triage",
+    repo_url: str = PUBLIC_REPO_URL,
 ) -> EmailMessage:
     """Build the multipart message for the update-failed alert.
 
@@ -1620,8 +2294,14 @@ def _assemble_update_failed_email(
         "  - On the deploy host: `journalctl -u email-triage`",
         f"  - On the deploy host: `scripts/deploy.sh` output for {attempted_tag}",
         "",
+        # Punch 585, panel B5 hipaa B-1: the issue tracker is PUBLIC (no BAA), and
+        # journal output can carry PHI-adjacent fields, so the product must never
+        # ask for it there.
         f"If this keeps happening, open an issue at {repo_url}/issues",
-        "with the journal tail attached.",
+        "describing the failure and the version. Do not attach logs, journal",
+        "output or screenshots: they can contain protected health information.",
+        "If maintainers need logs, share them only through a channel your BAA",
+        "covers.",
     ])
     text = "\n".join(text_lines)
 
@@ -1658,16 +2338,22 @@ def _assemble_update_failed_email(
         f'for <code>{attempted_tag}</code></li>'
         '</ul>'
         f'<p>If this keeps happening, '
-        f'<a href="{repo_url}/issues">open an issue</a> with the journal '
-        'tail attached.</p>'
+        f'<a href="{repo_url}/issues">open an issue</a> describing the failure '
+        'and the version. Do not attach logs, journal output or screenshots: '
+        'they can contain protected health information. If maintainers need '
+        'logs, share them only through a channel your BAA covers.</p>'
         '</div>'
     )
 
     from email_triage.mail_headers import (
         X_EMAIL_TRIAGE_HEADER, build_triage_header,
     )
+    from email_triage.web.smtp_send import stamp_default_message_headers
+
     msg = EmailMessage()
     msg["Subject"] = subject
+    # N-272b R28 SSOT — RFC-preferred GMT Date + Message-Id at build time.
+    stamp_default_message_headers(msg)
     # Loop-prevention stamp — same rationale as the daily-health email:
     # admin recipients are often operator inboxes that are themselves
     # watched by triage.
@@ -1741,17 +2427,19 @@ def send_update_failed_email(
     password = ""
     if secrets is not None:
         try:
-            password = secrets.get("SMTP_PASSWORD") or ""
-        except Exception:
-            password = ""
+            password = read_secret(secrets, SMTP_PASSWORD_KEY) or ""
+        except SecretsDecryptError:
+            # A5 — fail closed + diagnose distinctly (see sibling sender).
+            log.error("Update-failed email aborted — SMTP password "
+                      "unreadable (corrupt secret row or master-key mismatch)")
+            return False, "secret store unreadable: SMTP_PASSWORD"
 
     try:
-        with smtplib.SMTP(smtp.host, smtp.port) as server:
-            if smtp.use_tls:
-                server.starttls()
-            if smtp.username:
-                server.login(smtp.username, password)
-            server.send_message(msg)
+        from email_triage.web.smtp_send import send_smtp_message
+        send_smtp_message(
+            msg, smtp_host=smtp.host, smtp_port=smtp.port,
+            smtp_user=smtp.username, smtp_password=password, use_tls=smtp.use_tls,
+        )
     except Exception as exc:
         log.error(
             "Update-failed email send failed",

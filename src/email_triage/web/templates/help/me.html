@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user (account owner / medical-researcher persona),
+                signed-in. NOT developers, NOT admins doing operator work.
+   TECH-SKILL:  computer-literate professional (clinician, researcher,
+                exec, lawyer). Not terminal users; not protocol readers.
+   COPY RULES (same as help/tasks.html):
+     - No admin-only paths (/config, /admin/*, log-file paths).
+       See feedback_no_admin_path_in_user_copy.md — the AI prompt is
+       role-scoped so a standard user is never sent to admin settings.
+     - No protocol jargon. "AI" not "language model"; "alert" not
+       "IMAP IDLE"; "folder" not "mailbox"; "category" not "label".
+     - The AI answer is generated server-side (action_guide), grounded
+       in the user's OWN structural setup — never message contents.
+     - No dev-mode references; this is a user-facing artifact.
+   ─────────────────────────────────────────────────────────── #}
+{% block title %}Help — Guide me{% endblock %}
+{% block content %}
+
+<h2>Guide me</h2>
+
+<p>
+    Not sure what to do next? Ask in plain words — the built-in AI gives
+    you step-by-step directions that match the buttons and field labels in
+    the app, tailored to how your account is set up right now. For a fixed
+    list of common how-tos, see
+    <a href="/help/tasks">Help — Common Tasks</a>.
+</p>
+
+{% if guide_state %}
+<p style="color:var(--pico-muted-color);font-size:0.95em;">
+    Your setup:
+    {%- set acct = guide_state.get('accounts_connected') %}
+    {%- if acct is not none %} {{ acct }} email account{{ '' if acct == 1 else 's' }} connected{% endif %}
+    {%- if guide_state.get('hipaa_mode') is not none %} · privacy mode {{ 'on' if guide_state.get('hipaa_mode') else 'off' }}{% endif %}
+    {%- set w = guide_state.get('watches_count') %}
+    {%- if w is not none %} · {{ w }} alert{{ '' if w == 1 else 's' }}{% endif %}
+</p>
+{% endif %}
+
+<form hx-post="/help/me/ask"
+      hx-target="#guide-result"
+      hx-swap="innerHTML"
+      hx-disabled-elt="find button[type=submit]"
+      style="margin:1rem 0;">
+    {# The page hint is the only client-supplied value that reaches the AI;
+       it is fenced server-side. Everything else (account count, role,
+       privacy mode) is computed server-side and never trusted from here. #}
+    <input type="hidden" name="page" value="Help — Guide me">
+    <label for="guide-question">
+        What are you trying to do?
+    </label>
+    <textarea id="guide-question" name="question" rows="3"
+              placeholder="e.g. How do I set up a daily digest?"
+              style="width:100%;"></textarea>
+    <button type="submit">Ask the AI guide</button>
+    <span class="htmx-indicator" aria-hidden="true"
+          style="margin-left:0.6rem;color:var(--pico-muted-color);">
+        Thinking…
+    </span>
+</form>
+
+{% if starters %}
+<p style="color:var(--pico-muted-color);font-size:0.95em;margin-bottom:0.3rem;">
+    Or pick a common question:
+</p>
+<div style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1rem;">
+    {% for s in starters %}
+    <button type="button"
+            class="secondary outline"
+            hx-post="/help/me/ask"
+            hx-target="#guide-result"
+            hx-swap="innerHTML"
+            hx-vals='{{ {"question": s, "page": "Help — Guide me"} | tojson }}'
+            style="font-size:0.9em;padding:0.3rem 0.7rem;">
+        {{ s }}
+    </button>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div id="guide-result" aria-live="polite"></div>
+
+<p style="color:var(--pico-muted-color);font-size:0.85em;margin-top:1.5rem;">
+    The AI gives general directions based on how your account is set up. It
+    never sees the contents of your email. If something looks off, the
+    <a href="/help/tasks">Common Tasks</a> page has exact step-by-step
+    recipes.
+</p>
+
+{% endblock %}

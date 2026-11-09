@@ -63,20 +63,20 @@ def test_matches_at_nightly():
 
 def test_parse_windows_accepts_well_formed_list():
     raw = [
-        {"host": "llm-host", "cron": "0 1 * * *",
+        {"host": "llm-host.invalid", "cron": "0 1 * * *",
          "duration_minutes": 30, "backend": "ollama"},
     ]
     windows = parse_windows(raw)
     assert len(windows) == 1
-    assert windows[0].host == "llm-host"
+    assert windows[0].host == "llm-host.invalid"
     assert windows[0].duration_minutes == 30
 
 
 def test_parse_windows_skips_malformed_entry():
     raw = [
-        {"host": "llm-host", "cron": "garbage",
+        {"host": "llm-host.invalid", "cron": "garbage",
          "duration_minutes": 30, "backend": "ollama"},
-        {"host": "llm-host", "cron": "0 1 * * *",
+        {"host": "llm-host.invalid", "cron": "0 1 * * *",
          "duration_minutes": 30, "backend": "ollama"},
     ]
     windows = parse_windows(raw)
@@ -96,13 +96,13 @@ def test_parse_windows_returns_empty_for_none():
 def test_active_window_inside_window():
     """01:15 falls inside a 30-min window starting at 01:00."""
     windows = [MaintenanceWindow(
-        host="llm-host", cron="0 1 * * *",
+        host="llm-host.invalid", cron="0 1 * * *",
         duration_minutes=30, backend="ollama",
     )]
     now = datetime(2026, 5, 10, 1, 15, tzinfo=timezone.utc)
     active = active_window_for("ollama", windows, now=now)
     assert active is not None
-    assert active.window.host == "llm-host"
+    assert active.window.host == "llm-host.invalid"
     assert active.started_at == datetime(2026, 5, 10, 1, 0, tzinfo=timezone.utc)
     assert active.ends_at == datetime(2026, 5, 10, 1, 30, tzinfo=timezone.utc)
 
@@ -110,7 +110,7 @@ def test_active_window_inside_window():
 def test_active_window_outside_window():
     """02:00 is outside a 30-min window starting at 01:00."""
     windows = [MaintenanceWindow(
-        host="llm-host", cron="0 1 * * *",
+        host="llm-host.invalid", cron="0 1 * * *",
         duration_minutes=30, backend="ollama",
     )]
     now = datetime(2026, 5, 10, 2, 0, tzinfo=timezone.utc)
@@ -120,7 +120,7 @@ def test_active_window_outside_window():
 def test_active_window_filters_by_backend():
     """A window for a different backend doesn't match."""
     windows = [MaintenanceWindow(
-        host="llm-host", cron="* * * * *",
+        host="llm-host.invalid", cron="* * * * *",
         duration_minutes=30, backend="openai",
     )]
     now = datetime(2026, 5, 10, 1, 15, tzinfo=timezone.utc)
@@ -139,7 +139,7 @@ def test_inside_window_log_uses_info_severity_indirectly():
     severity itself is set in app.py based on whether the matcher
     returns non-None."""
     windows = [MaintenanceWindow(
-        host="llm-host", cron="0 1 * * *",
+        host="llm-host.invalid", cron="0 1 * * *",
         duration_minutes=30, backend="ollama",
     )]
     now = datetime(2026, 5, 10, 1, 5, tzinfo=timezone.utc)

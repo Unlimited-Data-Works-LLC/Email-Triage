@@ -8,7 +8,7 @@ After=network-online.target podman.socket
 # Pinned release image from GHCR. Pull the tag you want to run; the unit
 # does not build. To upgrade: change the tag and `systemctl restart
 # email-triage.service`.
-Image=ghcr.io/unlimited-data-works-llc/email-triage:0.1.2
+Image=ghcr.io/unlimited-data-works-llc/email-triage:0.2.0
 ContainerName=email-triage
 
 # Host:container port mapping. The app listens on 8080 inside the
@@ -33,7 +33,8 @@ Secret=ET_MASTER_KEY
 
 # Graceful shutdown cap. A clean drain (watcher stop + IMAP logout + any
 # push flush) finishes well inside 30s; systemd SIGKILLs after this.
-StopTimeout=30
+# 60, not 30 (punch 582 / N-576): the L6 sentinel lands ~2 s before a 30 s SIGKILL on the wedge path.
+StopTimeout=60
 
 [Service]
 # Restart on transient crashes, but back off so a broken config does not

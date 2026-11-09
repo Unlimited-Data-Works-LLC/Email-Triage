@@ -100,9 +100,53 @@ def test_is_unreachable_does_not_match_decode_error():
     assert is_unreachable_error(exc) is False
 
 
+def test_is_unreachable_recognises_503_502_504():
+    """A 503/502/504 from the LLM endpoint is a WHOLE-BACKEND 'service
+    unavailable' signal (Ollama 503 = overloaded / OOM / queue-full), so it
+    SHOULD trip the breaker + be tagged llm_unreachable — unlike a 500/4xx."""
+    req = httpx.Request("POST", "http://llm-host.example.invalid:11434/api/chat")
+    for code in (502, 503, 504):
+        try:
+            httpx.Response(code, request=req).raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            assert is_unreachable_error(exc) is True, code
+
+
+def test_is_unreachable_does_not_match_500():
+    """A 500 stays a PER-MESSAGE error (the specific request misbehaved),
+    NOT 'unreachable' — must not trip the breaker."""
+    req = httpx.Request("POST", "http://llm-host.example.invalid:11434/api/chat")
+    try:
+        httpx.Response(500, request=req).raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        assert is_unreachable_error(exc) is False
+
+
+def test_is_unreachable_503_substring_in_wrapped_runtime_error():
+    """Safety net at the real prod shape: the 503 that enqueued the
+    message_gone retries arrived re-wrapped as RuntimeError("Server error
+    '503 Service Unavailable' for url ...") — still recognised."""
+    exc = RuntimeError(
+        "Server error '503 Service Unavailable' for url "
+        "'http://llm-host.example.invalid:11434/api/chat'"
+    )
+    assert is_unreachable_error(exc) is True
+
+
+def test_is_unreachable_httpstatus_with_none_response_is_safe():
+    """getattr-safety (db-sme NICE-TO-HAVE): an HTTPStatusError whose
+    ``.response`` is None must NOT crash the status_code extraction — the
+    nested getattr yields None, None not in (502,503,504), returns False."""
+    exc = httpx.HTTPStatusError(
+        "boom", request=httpx.Request("POST", "http://x.invalid:11434/api/chat"),
+        response=None,
+    )
+    assert is_unreachable_error(exc) is False
+
+
 def test_host_port_parsing():
-    h, p = host_port_from_url("http://llm-host.home:11434/api/chat")
-    assert h == "llm-host.home"
+    h, p = host_port_from_url("http://llm-host.example.invalid:11434/api/chat")
+    assert h == "llm-host.example.invalid"
     assert p == 11434
 
     h, p = host_port_from_url("")
@@ -120,7 +164,7 @@ async def test_classify_raises_typed_error_and_trips_breaker(monkeypatch):
     LLMBackendUnreachableError carrying host + port."""
     classifier = OllamaClassifier(
         model="qwen3.5:35b",
-        base_url="http://llm-host:11434",
+        base_url="http://llm-host.invalid:11434",
         prefer_loaded=False,
     )
 
@@ -156,12 +200,12 @@ async def test_classify_raises_typed_error_and_trips_breaker(monkeypatch):
 
     err = exc_info.value
     assert err.backend == "ollama"
-    assert err.host == "llm-host"
+    assert err.host == "llm-host.invalid"
     assert err.port == 11434
     # Message follows the spec format. Backend is lowercase ("ollama")
     # in the canonical id; the dashboard banner template capitalises
     # for display.
-    assert str(err) == "ollama unreachable: llm-host:11434"
+    assert str(err) == "ollama unreachable: llm-host.invalid:11434"
 
     # Breaker is now open.
     assert is_healthy("ollama") is False
@@ -172,7 +216,7 @@ async def test_classify_does_not_trip_breaker_on_decode_error(monkeypatch):
     """Backend returns 200 but bad JSON → does NOT trip breaker."""
     classifier = OllamaClassifier(
         model="qwen3.5:35b",
-        base_url="http://llm-host:11434",
+        base_url="http://llm-host.invalid:11434",
         prefer_loaded=False,
     )
 
@@ -224,12 +268,12 @@ class TestTranslateUnreachable:
     def test_connect_error_trips_breaker_and_raises_typed(self):
         with pytest.raises(LLMBackendUnreachableError) as ei:
             with translate_unreachable(
-                "openai", "https://api.openai.com/v1", default_port=443,
+                "openai", "https://api.openai.invalid/v1", default_port=443,
             ):
                 raise httpx.ConnectError("All connection attempts failed")
         err = ei.value
         assert err.backend == "openai"
-        assert err.host == "api.openai.com"
+        assert err.host == "api.openai.invalid"
         assert err.port == 443
         assert is_healthy("openai") is False
 
@@ -238,14 +282,14 @@ class TestTranslateUnreachable:
         does NOT trip the breaker."""
         with pytest.raises(ValueError):
             with translate_unreachable(
-                "gemini", "https://x/v1beta", default_port=443,
+                "gemini", "https://x.invalid/v1beta", default_port=443,
             ):
                 raise ValueError("could not parse JSON")
         assert is_healthy("gemini") is True
 
     def test_success_path_no_breaker_change(self):
         with translate_unreachable(
-            "openai", "https://api.openai.com/v1", default_port=443,
+            "openai", "https://api.openai.invalid/v1", default_port=443,
         ):
             pass
         assert is_healthy("openai") is True
@@ -253,10 +297,34 @@ class TestTranslateUnreachable:
     def test_connection_refused_substring_trips_breaker(self):
         with pytest.raises(LLMBackendUnreachableError):
             with translate_unreachable(
-                "gemini", "https://x/v1beta", default_port=443,
+                "gemini", "https://x.invalid/v1beta", default_port=443,
             ):
                 raise RuntimeError("Connection refused")
         assert is_healthy("gemini") is False
+
+    def test_503_trips_breaker_and_raises_typed(self):
+        """A 503 from the LLM endpoint inside translate_unreachable trips the
+        breaker + raises the typed error, so the message is PARKED as
+        llm_unreachable rather than retried per-message into a message_gone
+        tail (the prod bug fixed 2026-06-19)."""
+        req = httpx.Request("POST", "http://llm-host.example.invalid:11434/api/chat")
+        with pytest.raises(LLMBackendUnreachableError):
+            with translate_unreachable(
+                "ollama", "http://llm-host.example.invalid:11434", default_port=11434,
+            ):
+                httpx.Response(503, request=req).raise_for_status()
+        assert is_healthy("ollama") is False
+
+    def test_500_passes_through_breaker_closed(self):
+        """A 500 stays per-message: it propagates unchanged and leaves the
+        breaker closed (only 503/502/504 are whole-backend signals)."""
+        req = httpx.Request("POST", "http://x.invalid:11434/api/chat")
+        with pytest.raises(httpx.HTTPStatusError):
+            with translate_unreachable(
+                "openai", "https://api.openai.invalid/v1", default_port=443,
+            ):
+                httpx.Response(500, request=req).raise_for_status()
+        assert is_healthy("openai") is True
 
 
 def _stub_http_bomb(classifier):
@@ -290,7 +358,7 @@ class TestCloudClassifierBreaker:
 
     async def test_openai_compat_classify_trips_openai_breaker(self):
         classifier = OpenAICompatClassifier(
-            base_url="https://api.openai.com/v1",
+            base_url="https://api.openai.invalid/v1",
             model="gpt-4o",
             api_key="sk-test",
         )
@@ -305,7 +373,7 @@ class TestCloudClassifierBreaker:
 
     async def test_openai_compat_complete_trips_openai_breaker(self):
         classifier = OpenAICompatClassifier(
-            base_url="https://api.openai.com/v1",
+            base_url="https://api.openai.invalid/v1",
             model="gpt-4o",
             api_key="sk-test",
         )
@@ -328,7 +396,7 @@ class TestCloudClassifierBreaker:
     async def test_openai_compat_decode_error_does_not_trip_breaker(self):
         """A 200 with unparseable JSON must NOT trip the breaker."""
         classifier = OpenAICompatClassifier(
-            base_url="https://api.openai.com/v1",
+            base_url="https://api.openai.invalid/v1",
             model="gpt-4o",
             api_key="sk-test",
         )

@@ -82,7 +82,7 @@ class TestPageRender:
         self, client, admin_cookies, app, tmp_path,
     ):
         cd = _set_cert_dir(app, tmp_path)
-        tls_csr.make_csr(cd, hostname="x.example.com")
+        tls_csr.make_csr(cd, hostname="x.example.invalid")
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.get("/admin/tls/csr")
         assert resp.status_code == 200
@@ -95,13 +95,13 @@ class TestPageRender:
         self, client, admin_cookies, app, tmp_path,
     ):
         cd = _set_cert_dir(app, tmp_path)
-        tls_csr.self_sign_now(cd, hostname="active.example.com")
+        tls_csr.self_sign_now(cd, hostname="active.example.invalid")
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.get("/admin/tls/csr")
         assert resp.status_code == 200
         body = resp.text
         assert "Active certificate" in body
-        assert "active.example.com" in body
+        assert "active.example.invalid" in body
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ class TestMake:
     def test_anonymous_blocked(self, client):
         resp = client.post(
             "/admin/tls/csr/make",
-            data={"hostname": "x"},
+            data={"hostname": "x.invalid"},
             follow_redirects=False,
         )
         assert resp.status_code in (302, 303)
@@ -121,7 +121,7 @@ class TestMake:
         client.cookies.set(SESSION_COOKIE_NAME, user_cookies[SESSION_COOKIE_NAME])
         resp = client.post(
             "/admin/tls/csr/make",
-            data={"hostname": "x"},
+            data={"hostname": "x.invalid"},
             follow_redirects=False,
         )
         assert resp.status_code == 403
@@ -134,7 +134,7 @@ class TestMake:
         resp = client.post(
             "/admin/tls/csr/make",
             data={
-                "hostname": "triage.example.com",
+                "hostname": "triage.example.invalid",
                 "extra_sans": "alt.example.com,10.0.0.5",
                 "organization": "TestOrg",
             },
@@ -149,11 +149,11 @@ class TestMake:
         self, client, admin_cookies, app, tmp_path,
     ):
         cd = _set_cert_dir(app, tmp_path)
-        tls_csr.make_csr(cd, hostname="first.example.com")
+        tls_csr.make_csr(cd, hostname="first.example.invalid")
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.post(
             "/admin/tls/csr/make",
-            data={"hostname": "second.example.com"},
+            data={"hostname": "second.example.invalid"},
             follow_redirects=False,
         )
         assert resp.status_code == 303
@@ -166,7 +166,7 @@ class TestMake:
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         client.post(
             "/admin/tls/csr/make",
-            data={"hostname": "audit.example.com"},
+            data={"hostname": "audit.example.invalid"},
             follow_redirects=False,
         )
         rows = db.execute(
@@ -185,7 +185,7 @@ class TestMake:
 class TestImport:
     def test_round_trip_paste(self, client, admin_cookies, app, tmp_path):
         cd = _set_cert_dir(app, tmp_path)
-        _, _, csr_pem = tls_csr.make_csr(cd, hostname="rt.example.com")
+        _, _, csr_pem = tls_csr.make_csr(cd, hostname="rt.example.invalid")
         signed = _sign_with_test_ca(csr_pem)
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.post(
@@ -205,7 +205,7 @@ class TestImport:
         self, client, admin_cookies, app, tmp_path,
     ):
         cd = _set_cert_dir(app, tmp_path)
-        tls_csr.make_csr(cd, hostname="x.example.com")
+        tls_csr.make_csr(cd, hostname="x.example.invalid")
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.post(
             "/admin/tls/csr/import",
@@ -238,7 +238,7 @@ class TestImport:
 class TestCancel:
     def test_clears_pending(self, client, admin_cookies, app, tmp_path):
         cd = _set_cert_dir(app, tmp_path)
-        tls_csr.make_csr(cd, hostname="x.example.com")
+        tls_csr.make_csr(cd, hostname="x.example.invalid")
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         resp = client.post(
             "/admin/tls/csr/cancel", follow_redirects=False,
@@ -261,7 +261,7 @@ class TestSelfSign:
         resp = client.post(
             "/admin/tls/csr/self-sign",
             data={
-                "hostname": "ss.example.com",
+                "hostname": "ss.example.invalid",
                 "valid_days": "30",
             },
             follow_redirects=False,
@@ -281,7 +281,7 @@ class TestSelfSign:
         client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
         client.post(
             "/admin/tls/csr/self-sign",
-            data={"hostname": "ss.example.com", "valid_days": "365"},
+            data={"hostname": "ss.example.invalid", "valid_days": "365"},
             follow_redirects=False,
         )
         rows = db.execute(
@@ -291,3 +291,102 @@ class TestSelfSign:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0]["outcome"] == "success"
+
+
+
+# ---------------------------------------------------------------------------
+# N-550: witness-first (punch 539 fold-check round 3)
+# ---------------------------------------------------------------------------
+
+def _tls_rows(db, event_type: str, outcome: str) -> int:
+    return db.execute(
+        "SELECT COUNT(*) FROM auth_events WHERE event_type = ? AND outcome = ?",
+        (event_type, outcome),
+    ).fetchone()[0]
+
+
+class TestWitnessFirst:
+    """N-550. Every TLS-material change writes a fail-closed INTENT row before
+    any file write or unlink (the N-157 shape N-543 uses), then an outcome row.
+    Import is the sharpest case: it writes the ACTIVE certificate the service
+    presents."""
+
+    def test_import_writes_the_intent_row_before_the_active_cert(
+        self, client, admin_cookies, app, db, tmp_path, monkeypatch,
+    ):
+        from email_triage.web.routers import tls_csr as router_mod
+
+        cd = _set_cert_dir(app, tmp_path)
+        _k, _c, csr_pem = tls_csr.make_csr(cd, hostname="order.example.invalid")
+        signed = _sign_with_test_ca(csr_pem)
+        calls: list[str] = []
+        real_audit, real_import = router_mod._audit, tls_csr.import_signed_cert
+
+        async def spy_audit(db_, **kw):
+            calls.append("audit:" + kw["outcome"])
+            return await real_audit(db_, **kw)
+
+        def spy_import(cert_dir, raw):
+            calls.append("import")
+            assert _tls_rows(db, "tls_csr_import", "attempt") == 1, (
+                "the intent row must be durable before the active cert is written"
+            )
+            return real_import(cert_dir, raw)
+
+        monkeypatch.setattr(router_mod, "_audit", spy_audit)
+        monkeypatch.setattr(tls_csr, "import_signed_cert", spy_import)
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        resp = client.post(
+            "/admin/tls/csr/import", data={"cert_pem": signed.decode()},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303, resp.text
+        assert calls == ["audit:attempt", "import", "audit:success"], calls
+        assert (cd / tls_csr.CERT_FILENAME).is_file()
+
+    @pytest.mark.parametrize("route", ["make", "cancel", "import", "self-sign"])
+    @pytest.mark.audit_failure_expected(
+        match=(
+            'tls_csr:tls_csr_cancel:attempt',
+            'tls_csr:tls_csr_import:attempt',
+            'tls_csr:tls_csr_make:attempt',
+            'tls_csr:tls_csr_self_sign:attempt',
+        ),
+        count=1,
+    )
+    def test_a_failed_intent_write_changes_no_tls_file(
+        self, client, admin_cookies, app, db, tmp_path, monkeypatch, route,
+    ):
+        """The intent write is planted to fail: no TLS file may be written,
+        replaced or deleted, and the admin is told why."""
+        from email_triage.web.routers import tls_csr as router_mod
+
+        cd = _set_cert_dir(app, tmp_path)
+        signed = b""
+        if route in ("cancel", "import"):
+            # these act on a PENDING CSR; make and self-sign start from idle, or
+            # make_csr would refuse on its own (CsrAlreadyPendingError) and the
+            # probe would sit outside the set the intent gate acts on
+            _k, _c, csr_pem = tls_csr.make_csr(cd, hostname="refuse.example.invalid")
+            signed = _sign_with_test_ca(csr_pem)
+        before = {p.name: p.read_bytes() for p in cd.iterdir()}
+        real_emit = router_mod.record_auth_event
+
+        def failing_intent(conn, **kw):
+            if kw.get("outcome") == "attempt":
+                raise RuntimeError("audit store unavailable")
+            return real_emit(conn, **kw)
+
+        monkeypatch.setattr(router_mod, "record_auth_event", failing_intent)
+        client.cookies.set(SESSION_COOKIE_NAME, admin_cookies[SESSION_COOKIE_NAME])
+        form = {
+            "make": {"hostname": "new.example.invalid"},
+            "cancel": {},
+            "import": {"cert_pem": signed.decode()},
+            "self-sign": {"hostname": "self.example.invalid"},
+        }[route]
+        resp = client.post(f"/admin/tls/csr/{route}", data=form, follow_redirects=False)
+        assert resp.status_code == 303, resp.text
+        assert "err=" in resp.headers.get("location", ""), resp.headers
+        after = {p.name: p.read_bytes() for p in cd.iterdir()}
+        assert after == before, f"{route} changed TLS files without an intent row"

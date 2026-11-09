@@ -71,7 +71,7 @@ class TestOpenAICompatClassifier:
     @pytest.fixture
     def classifier(self):
         return OpenAICompatClassifier(
-            base_url="https://api.example.com/v1",
+            base_url="https://api.example.invalid/v1",
             model="gpt-4o",
             api_key="sk-test-key",
         )
@@ -110,11 +110,11 @@ class TestOpenAICompatClassifier:
 
         call_args = mock_client.post.call_args
         url = call_args[0][0] if call_args[0] else call_args.kwargs.get("url", "")
-        assert url == "https://api.example.com/v1/chat/completions"
+        assert url == "https://api.example.invalid/v1/chat/completions"
 
     async def test_extra_headers(self):
         classifier = OpenAICompatClassifier(
-            base_url="https://my-resource.openai.azure.com",
+            base_url="https://my-resource.openai.azure.invalid",
             model="my-deployment",
             api_key="azure-key",
             extra_headers={"api-version": "2024-02-15"},

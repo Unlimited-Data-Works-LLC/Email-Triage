@@ -51,35 +51,21 @@ from typing import Any
 from email_triage._errfmt import fmt_exc
 
 
-_log = logging.getLogger("email_triage.web.watcher_retry")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.watcher_retry")  # N-196b R21_4
 
 
-# String-match needle list for auth-revoked detection. Mirrors the
-# needles in ``web/app.py::_maybe_mark_auth_stale`` so the two
-# auth-failure surfaces agree on what counts as "no point retrying".
-_AUTH_REVOKED_NEEDLES: tuple[str, ...] = (
-    "Token has been expired or revoked",
-    "invalid_grant",
-    "AUTHENTICATIONFAILED",
-    "InvalidAuthenticationToken",
-    "Invalid Credentials",
-    "OAuthRefreshFailed",
-    "IMAPAuthError",
+# Auth-revoked detection is the SSOT in ``web/_auth_revoked.py``. Before
+# 2026-06-09 the needle list was duplicated here AND in
+# ``web/app.py::_maybe_mark_auth_stale`` and the two had already DRIFTED (this
+# never-retry copy carried OAuthRefreshFailed/IMAPAuthError and scanned the
+# class name; the SET copy did not) — the divergence census surfaced it as
+# finding #1. Re-export the SSOT under the historical private names so existing
+# imports (and ``__all__``) keep working; these are thin aliases, not a copy.
+from email_triage.web._auth_revoked import (  # noqa: E402
+    AUTH_REVOKED_NEEDLES as _AUTH_REVOKED_NEEDLES,
+    is_auth_revoked as _is_auth_revoked,
 )
-
-
-def _is_auth_revoked(error_class: str, error_msg: str) -> bool:
-    """Return True when the error is auth-revoked (never-retry).
-
-    Both ``error_class`` (the exception class name) and ``error_msg``
-    (str(exc) text) get scanned. We match on substrings to catch
-    both the bare exception class name and the wrapped/formatted
-    error string that bubbles out of Google / Microsoft / Dovecot.
-    """
-    for needle in _AUTH_REVOKED_NEEDLES:
-        if needle in error_class or needle in error_msg:
-            return True
-    return False
 
 
 # Provider-type normalisation. Account records carry the
@@ -187,9 +173,13 @@ def enqueue_watcher_retry(
                 mark_retry_dead,
             )
             mark_retry_dead(db, retry_id, reason="auth_revoked")
-        except ImportError:
+        except ImportError as import_exc:
             # Same fallback as above — R-A not yet merged.
-            pass
+            _log.warning(
+                "watcher_retry.mark_dead: mark_retry_dead unavailable; auth_revoked row left live",
+                retry_id=retry_id,
+                error=fmt_exc(import_exc),
+            )
         except Exception as exc:  # pragma: no cover - DB failure
             _log.warning(
                 "watcher_retry.mark_dead: failed for auth_revoked row",

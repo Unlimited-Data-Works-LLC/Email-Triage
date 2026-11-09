@@ -49,6 +49,7 @@ from email_triage.ai_backends.azure_openai import (
 )
 from email_triage.ai_backends.base import (
     BackendAdapter,
+    BackendBAARequiredError,
     BackendDisabledError,
     BackendError,
     BackendNotFoundError,

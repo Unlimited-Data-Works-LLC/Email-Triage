@@ -9,7 +9,6 @@ in which case the hint short-circuits classification entirely.
 from __future__ import annotations
 
 import re
-from email.utils import parseaddr
 from typing import Sequence
 
 # PyPI ``regex`` package — used only at the SUBJECT-rule match site
@@ -28,45 +27,60 @@ from email_triage.engine.models import (
 )
 
 
+# -c (2026-07-11) — CONFIG-DRIVEN ReDoS safety budget, per
+# feedback_dynamic_over_hardcoding. This is a per-match compute-bound
+# safety timeout on operator-authored SUBJECT regex patterns (not a
+# network timeout). Default 1.0 s preserves prior behavior; raising it
+# accommodates slow / complex operator patterns at the cost of a
+# longer worker stall on an evil regex.
+_HINT_REGEX_TIMEOUT_SECS: float = 1.0
+
+
+def configure_hint_regex_timeout(timeout_secs: float) -> None:
+    """-c — set the process-wide ReDoS safety budget for the SUBJECT
+    rule-match site. Called at boot from ``load_config`` with
+    ``classifier.hint_regex_timeout_secs``. Rejects non-positive values.
+    """
+    global _HINT_REGEX_TIMEOUT_SECS
+    if isinstance(timeout_secs, (int, float)) and timeout_secs > 0:
+        _HINT_REGEX_TIMEOUT_SECS = float(timeout_secs)
+
+
+def get_hint_regex_timeout_secs() -> float:
+    return _HINT_REGEX_TIMEOUT_SECS
+
+
 def _extract_address(sender: str) -> str:
     """Pull the bare address out of a From-header value.
 
     ``EmailMessage.sender`` carries the raw ``From:`` header which is
-    typically ``"Display Name" <user@domain.tld>`` — display name +
-    angle brackets surrounding the address. Without parsing, the
-    naive ``rsplit("@", 1)[-1]`` form leaves the closing ``>`` and
-    every sender match silently fails (operator caught a CTOx rule
-    that never fired in production — sender was
-    ``"CTOx" <news@email.ctox.com>``, the matcher saw
-    ``email.ctox.com>`` and the equality check missed).
+    typically ``"Display Name" <user@domain.tld>``. A naive
+    ``rsplit("@", 1)[-1]`` leaves the closing ``>`` so every sender
+    match silently fails (the production CTOx rule that never fired:
+    ``"CTOx" <news@email.ctox.com>`` → the matcher saw
+    ``email.ctox.com>``).
 
-    ``email.utils.parseaddr`` handles the display-name form, RFC 5321
-    address syntax, and quoted display names. Falls back to the raw
-    string if parsing returns nothing usable.
+    A7 (census 2026-06-09): delegates to the bare-address SSOT
+    ``mail_headers.extract_bare_address`` (the ``<([^>]+)>`` regex
+    resolves the CTOx case identically), replacing the local
+    ``parseaddr``-based variant so all sender-match sites share one
+    extractor.
     """
-    if not sender:
-        return ""
-    _name, addr = parseaddr(sender)
-    if addr:
-        return addr.lower()
-    # parseaddr returns empty when input is unparseable. Best-effort
-    # fallback: strip surrounding whitespace + angle brackets so a
-    # bare ``user@domain`` (no display name, no brackets) still works.
-    return sender.strip().strip("<>").lower()
+    from email_triage.mail_headers import extract_bare_address
+    return extract_bare_address(sender)
 
 
 def _extract_domain(sender: str) -> str:
     """Return the lowercased domain portion of the sender's address.
 
-    Empty string when the sender has no ``@`` (which is malformed but
-    appears occasionally in the wild). The address is extracted via
-    ``_extract_address`` first so display-name form doesn't corrupt
-    the rsplit.
+    Empty string when the sender has no ``@``. Delegates to the
+    ``mail_headers.extract_domain`` SSOT (N-71, divergence census
+    2026-06-09) which composes on ``extract_bare_address`` and
+    applies ``rsplit("@", 1)[-1]`` — the security-correct split
+    that resolves double-@ spoof addresses to the REAL (last) domain.
     """
-    addr = _extract_address(sender)
-    if "@" not in addr:
-        return ""
-    return addr.rsplit("@", 1)[-1]
+    from email_triage.mail_headers import extract_domain as _ed
+    return _ed(sender)
 
 
 def _rule_matches(rule: ListRule, message: EmailMessage) -> bool:
@@ -107,6 +121,30 @@ def _rule_matches(rule: ListRule, message: EmailMessage) -> bool:
             return True
         return sender_domain.endswith("." + domain)
 
+    if rule.rule_type == RuleType.LIST_ID:
+        # RFC 2919: `List-Id: "Human name" <list.host.tld>`. Match on the
+        # bracketed identifier (or full value if unbracketed). Case-
+        # insensitive on the header key AND value per common IMAP shape;
+        # operator's pattern is lowercased for the compare. List-Id is NOT
+        # an email address (no `@`), so extract_bare_address does not
+        # apply; partition-based slicing avoids the A7-flagged
+        # `<(...)>` regex + `.index("<")` slice idioms.
+        raw = ""
+        for k, v in (message.headers or {}).items():
+            if k.lower() == "list-id":
+                raw = v or ""
+                break
+        # Preserve the old `<([^>]+)>` regex's failure mode: only the
+        # FIRST fully-bracketed segment counts; a malformed `<value` (no
+        # closing `>`) falls back to the raw value, same as the regex's
+        # `search` returning None (DA NTH-1 fold, 2026-07-18).
+        _, open_sep, rest = raw.partition("<")
+        inner_candidate, close_sep, _ = rest.partition(">")
+        inner = inner_candidate if (open_sep and close_sep) else raw
+        haystack = inner.strip().lower()
+        needle = rule.pattern.strip().lstrip("<").rstrip(">").lower()
+        return bool(haystack) and haystack == needle
+
     if rule.rule_type == RuleType.SUBJECT:
         # Substring match first; if the pattern looks like a regex, try that.
         pattern = rule.pattern
@@ -115,14 +153,16 @@ def _rule_matches(rule: ListRule, message: EmailMessage) -> bool:
         # Bounded ReDoS surface: operator-authored ``pattern`` against
         # message.subject. Stdlib ``re`` has no per-call timeout, so a
         # pathological backtracker pegs the worker. ``regex.search`` with
-        # ``timeout=1.0`` raises TimeoutError after one second — we treat
-        # that exactly like a non-match, same as a malformed pattern.
+        # a module-level timeout budget (-c: config-driven via
+        # classifier.hint_regex_timeout_secs) raises TimeoutError after
+        # that many seconds — we treat that exactly like a non-match,
+        # same as a malformed pattern.
         try:
             return bool(_bounded_regex.search(
                 pattern,
                 message.subject or "",
                 flags=_bounded_regex.IGNORECASE,
-                timeout=1.0,
+                timeout=_HINT_REGEX_TIMEOUT_SECS,
             ))
         except (_bounded_regex.error, TimeoutError):
             return False

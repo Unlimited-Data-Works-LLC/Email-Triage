@@ -37,7 +37,7 @@ async def test_imap_poll_raises_on_search_failure(force_imap):
     from email_triage.providers.imap import ImapProvider
 
     provider = ImapProvider(
-        host="example", port=993, username="u", password="p",
+        host="example.invalid", port=993, username="u", password="p",
         mailbox="INBOX",
     )
 
@@ -56,7 +56,7 @@ async def test_imap_poll_raises_on_fetch_failure(force_imap):
     from email_triage.providers.imap import ImapProvider
 
     provider = ImapProvider(
-        host="example", port=993, username="u", password="p",
+        host="example.invalid", port=993, username="u", password="p",
         mailbox="INBOX",
     )
 
@@ -77,7 +77,7 @@ async def test_imap_poll_empty_result_returns_empty_list(force_imap):
     from email_triage.providers.imap import ImapProvider
 
     provider = ImapProvider(
-        host="example", port=993, username="u", password="p",
+        host="example.invalid", port=993, username="u", password="p",
         mailbox="INBOX",
     )
 
@@ -99,7 +99,9 @@ def store_db():
     """A FlowStore-shaped SQLite DB with one fixture row."""
     from email_triage.engine.store import FlowStore
 
-    store = FlowStore(":memory:")
+    from _db_tracking import track
+
+    store = track(FlowStore(":memory:"))
     yield store
 
 

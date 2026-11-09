@@ -46,14 +46,20 @@
 <aside id="baa" style="border-left:3px solid var(--pico-muted-border-color);padding:0.4rem 0.8rem;margin:0.5rem 0 1rem 0;">
     <strong>Classifier BAA</strong>
     <small style="color:var(--pico-muted-color);">&nbsp;— read-only</small><br>
-    {% if baa_status %}
+    {% if baa_status and baa_status.get('unavailable') %}
+    <small data-baa-status="unavailable">
+        <strong style="color:var(--pico-del-color);">Unavailable</strong> —
+        the BAA status could not be read. Treat the acknowledgment as NOT on
+        file and check the application log.
+    </small>
+    {% elif baa_status %}
     <small>
         Backend: <code>{{ baa_status.backend }}</code> • Vendor host:
         <code>{{ baa_status.host or '(local)' }}</code> • Acknowledged:
         {% if baa_status.acked %}
             <strong style="color:var(--pico-ins-color);">yes</strong>
             ({{ baa_status.acked_by_email or '?' }} •
-            {{ baa_status.acked_at or '?' }})
+            {% if baa_status.acked_at %}<time datetime="{{ baa_status.acked_at }}" data-us-datetime>{{ baa_status.acked_at | us_datetime }}</time>{% else %}?{% endif %})
         {% else %}
             <strong style="color:var(--pico-del-color);">no</strong>
         {% endif %}
@@ -166,10 +172,11 @@
     Enforce CSRF token on state-changing requests
 </label>
 <p><small style="color:var(--pico-muted-color);">
-    Off (default, soft-launch): violations log + bump
-    <code>csrf_rejects</code> counter on <code>/health</code>;
-    requests proceed. On: violations return HTTP 403. Override via
-    <code>EMAIL_TRIAGE_CSRF_ENFORCE</code> env var when debugging.
+    On (the default): violations return HTTP 403. Off: violations log
+    + bump the <code>csrf_rejects</code> counter on
+    <code>/health</code> and the request proceeds. This checkbox is the
+    only place the value lives &mdash; the YAML field
+    <code>tls.csrf_enforce</code> is the same store, persisted on save.
     Current cumulative rejects:
     <code>{{ csrf_rejects }}</code>; audit-write failures:
     <code>{{ audit_failures }}</code>.

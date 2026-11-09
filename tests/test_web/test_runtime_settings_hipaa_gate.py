@@ -37,6 +37,7 @@ gated function for HIPAA.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 
@@ -44,6 +45,14 @@ import pytest
 
 from email_triage import triage_logging
 from email_triage.web.routers.ui._shared import _apply_runtime_settings
+
+from _pin_harness import (
+    annotate_parents,
+    enclosing_fn,
+    iter_src_files,
+    parse_module,  # N-178a
+    relpath,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +99,7 @@ class TestRuntimeSettingsHipaaGate:
                 f"RuntimeError must name the kwarg the caller missed; "
                 f"got: {msg!r}"
             )
-            assert "Bundle E5 " in msg, (
+            assert "Bundle E5 #20" in msg, (
                 f"RuntimeError must reference the ticket so the next "
                 f"reader has a breadcrumb; got: {msg!r}"
             )
@@ -152,15 +161,6 @@ class TestRuntimeSettingsHipaaGate:
 # ---------------------------------------------------------------------------
 
 
-def _src_root() -> pathlib.Path:
-    """Locate ``src/email_triage`` regardless of pytest invocation cwd."""
-    here = pathlib.Path(__file__).resolve()
-    # tests/test_web/<file> → repo root is parents[2]
-    root = here.parents[2] / "src" / "email_triage"
-    assert root.is_dir(), f"src tree not found at {root}"
-    return root
-
-
 def _find_call_sites_passing_kwarg() -> list[tuple[pathlib.Path, int, str]]:
     """Walk every ``.py`` under ``src/email_triage`` and return every
     line that calls ``_apply_runtime_settings(...)`` with the
@@ -188,9 +188,7 @@ def _find_call_sites_passing_kwarg() -> list[tuple[pathlib.Path, int, str]]:
         r"_apply_runtime_settings\([^\n]*allow_hipaa_change=True"
     )
     matches: list[tuple[pathlib.Path, int, str]] = []
-    for path in sorted(_src_root().rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
+    for path in iter_src_files():
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
@@ -224,7 +222,7 @@ class TestExactlyOneAllowHipaaChangeCallSite:
                 f"  {p}:{n}  {line}" for p, n, line in sites
             ) + (
                 "\n\nIf a new caller legitimately needs to flip HIPAA "
-                "mode, update this test AND the Bundle E5  "
+                "mode, update this test AND the Bundle E5 #20 "
                 "documentation block in "
                 "src/email_triage/web/routers/ui/_shared.py "
                 "(_apply_runtime_settings) explaining why a second "
@@ -250,3 +248,130 @@ class TestExactlyOneAllowHipaaChangeCallSite:
             f"The single privileged call site must be in admin.py "
             f"(canonical HIPAA off-ramp); got: {rel_str}:{lineno}  {line}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sub-check E (2026-06-11, drift-prevention batch 5 — config store-boundary)
+#
+# The in-memory ``triage_logging._hipaa_mode`` global is a CACHE of the
+# authoritative store ``runtime_settings.hipaa`` (DB). Sub-check D pins the
+# DB-WRITE gate (the privileged ``allow_hipaa_change=True`` kwarg, exactly one
+# caller). This pins the OTHER leg of the one-authoritative-store boundary (R7):
+# the GLOBAL-WRITE. ``_hipaa_mode`` is written at exactly FOUR authorized sites —
+# its module-level definition, ``setup_logging`` (boot config),
+# ``web/app.py:lifespan`` (boot sync from the DB), and ``_apply_runtime_settings``
+# (the admin-change funnel, itself gated by Sub-check D). A NEW handler that does
+# ``triage_logging._hipaa_mode = X`` directly bypasses the funnel → the cache
+# DIVERGES from the DB (reverts on the next boot/sync, or drives a per-account
+# PHI decision off a stale in-memory flag). Count-agnostic (ast.walk over all of
+# src); FUNCTION-keyed allow-list (R38 — line-stable, never (path, lineno)).
+#
+# RESIDUAL (documented, like every AST pin): catches an ASSIGNMENT target
+# (``tl._hipaa_mode = X`` / a bare ``_hipaa_mode = X``). It does NOT catch a
+# reflective write — ``setattr(triage_logging, "_hipaa_mode", X)`` — nor a write
+# through an alias bound to the module object via a non-obvious path. No such
+# reflective write exists in src today; a future one would need its own guard.
+# The underlying _hipaa_mode funnel was SME-reviewed in Bundle E5  (the
+# allow_hipaa_change gate); this pin adds CI enforcement of its global-write leg.
+# ---------------------------------------------------------------------------
+
+# (rel_path, enclosing_fn) — the ONLY sites authorized to write the _hipaa_mode
+# global. Line-stable (R38). Verified against HEAD 2026-06-11 by an AST scan of
+# the real write sites (not hand-guessed).
+_HIPAA_MODE_WRITE_ALLOW = {
+    ("triage_logging.py", "<module>"),       # the global's definition
+    ("triage_logging.py", "setup_logging"),  # boot: _hipaa_mode = config.hipaa
+    ("web/app.py", "lifespan"),              # boot sync from runtime_settings DB
+    # the admin-change funnel — itself gated by Sub-check D (allow_hipaa_change):
+    ("web/routers/ui/_shared.py", "_apply_runtime_settings"),
+}
+
+
+def _scan_hipaa_mode_writes(tree: ast.AST, rel: str) -> list[tuple[str, int, str]]:
+    """Every assignment whose target writes ``_hipaa_mode`` (a bare ``Name`` in
+    triage_logging.py, or an ``Attribute`` like ``triage_logging._hipaa_mode``),
+    as (rel, lineno, enclosing_fn)."""
+    annotate_parents(tree)
+    out: list[tuple[str, int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        else:
+            continue
+        for t in targets:
+            nm = (
+                t.attr if isinstance(t, ast.Attribute)
+                else t.id if isinstance(t, ast.Name)
+                else None
+            )
+            if nm == "_hipaa_mode":
+                out.append((rel, node.lineno, enclosing_fn(node)))
+    return out
+
+
+def _hipaa_mode_write_violations() -> list[str]:
+    violations: list[str] = []
+    for path in iter_src_files():
+        tree = parse_module(path)
+        if tree is None:  # pragma: no cover
+            continue
+        rel = relpath(path)
+        for rel_, lineno, fn in _scan_hipaa_mode_writes(tree, rel):
+            if (rel_, fn) not in _HIPAA_MODE_WRITE_ALLOW:
+                violations.append(f"{rel_}:{lineno} [{fn}]")
+    return violations
+
+
+def test_no_direct_hipaa_mode_write_outside_funnel():
+    violations = _hipaa_mode_write_violations()
+    assert violations == [], (
+        "Direct write to the triage_logging._hipaa_mode global OUTSIDE the "
+        "authorized sync funnel (the in-memory cache would diverge from the "
+        "authoritative runtime_settings.hipaa DB store):\n  "
+        + "\n  ".join(violations)
+        + "\nRoute an admin HIPAA-flip through _apply_runtime_settings "
+        "(gated by allow_hipaa_change — Sub-check D); never assign "
+        "triage_logging._hipaa_mode directly. If a NEW authorized sync site is "
+        "genuinely needed, add its (rel, fn) to _HIPAA_MODE_WRITE_ALLOW with a "
+        "justification (and explain why the cache stays consistent with the DB)."
+    )
+
+
+def test_hipaa_mode_write_pin_has_teeth():
+    # A new handler writing the global directly (qualified attr) is flagged...
+    bad = ast.parse(
+        "import email_triage.triage_logging as tl\n"
+        "def evil_handler():\n"
+        "    tl._hipaa_mode = True\n"
+    )
+    hits = [
+        (ln, fn) for _, ln, fn in _scan_hipaa_mode_writes(bad, "x.py")
+        if ("x.py", fn) not in _HIPAA_MODE_WRITE_ALLOW
+    ]
+    assert hits, "pin missed a direct _hipaa_mode global write"
+
+    # ...and a bare-Name write in a non-authorized function is flagged...
+    bad_bare = ast.parse(
+        "def sneaky():\n"
+        "    global _hipaa_mode\n"
+        "    _hipaa_mode = True\n"
+    )
+    hits_bare = [
+        (ln, fn) for _, ln, fn in _scan_hipaa_mode_writes(bad_bare, "triage_logging.py")
+        if ("triage_logging.py", fn) not in _HIPAA_MODE_WRITE_ALLOW
+    ]
+    assert hits_bare, "pin missed a bare-Name _hipaa_mode write in a stray fn"
+
+    # ...but an authorized site (setup_logging) is NOT flagged.
+    ok = ast.parse(
+        "def setup_logging(config):\n"
+        "    global _hipaa_mode\n"
+        "    _hipaa_mode = config.hipaa\n"
+    )
+    ok_hits = [
+        (ln, fn) for _, ln, fn in _scan_hipaa_mode_writes(ok, "triage_logging.py")
+        if ("triage_logging.py", fn) not in _HIPAA_MODE_WRITE_ALLOW
+    ]
+    assert not ok_hits, "an authorized _hipaa_mode write must NOT be flagged"

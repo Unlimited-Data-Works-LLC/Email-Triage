@@ -1,0 +1,24 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    admin (system operator). ``_shared._render`` sets
+                ``debug_capture_banner`` only for an admin render.
+   TECH-SKILL:  runs the install; troubleshooting the AI classifier.
+   COPY RULES:  plain words: what is on, what it keeps, how to turn it off.
+                Not dismissable: it goes away when the setting does.
+
+   Operator ruling A4 (2026-10-21): the classify debug capture
+   (``classifier.debug_capture_raw_head``) is never refused, HIPAA included,
+   and is loud while on: this banner plus a "DEBUG CAPTURE ON" log line at
+   start and on every capture.
+#}
+{% if debug_capture_banner is defined and debug_capture_banner %}
+<aside class="debug-capture-banner" role="alert" data-banner="debug-capture"
+       style="margin:0 0 1rem 0;padding:0.6rem 0.8rem;
+              border-left:4px solid var(--pico-del-color);
+              background:var(--pico-card-background-color);">
+    <strong>Troubleshooting capture is on.</strong>
+    When the AI's answer about a message cannot be read, the log keeps a cleaned-up
+    excerpt (up to 400 characters) of that answer, which can include text from the
+    email itself. Turn off <code>classifier.debug_capture_raw_head</code> in the
+    config file when you have finished troubleshooting. Excerpts are written to the application log, which is kept with the audit trail; turning the capture off does not remove them. On a HIPAA install an excerpt may contain PHI.
+</aside>
+{% endif %}

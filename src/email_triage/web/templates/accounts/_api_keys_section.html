@@ -1,0 +1,162 @@
+{# ─── AUDIENCE ────────────────────────────────────────────────
+   AUDIENCE:    end-user. API Keys (access tokens) self-service.
+   Included by profile/security.html (the consolidated Security tab).
+   Expects in context: keys, all_users, is_admin, new_key_open, user.
+   Variable names are scoped by the including page via {% with %} so
+   the `keys` here doesn't collide with the Passkeys section.
+   No protocol jargon (no "/api/openclaw", no "bearer token").
+   ─────────────────────────────────────────────────────────── #}
+<section id="api-keys" style="margin-top:2rem;">
+<h3>API Keys (Access Tokens)</h3>
+<p>
+    Tokens let an external tool — for example, an AI assistant — read your
+    mail and manage your calendar on your behalf. Each token is a long,
+    random code. Keep it secret like a password. If a token is lost or
+    shared by mistake, revoke it here and create a new one.
+    {% if is_admin %}
+    <small style="color:var(--pico-muted-color);">
+        Admin view — showing every user's tokens.
+    </small>
+    {% else %}
+    <small style="color:var(--pico-muted-color);">
+        Showing only your tokens.
+    </small>
+    {% endif %}
+</p>
+{# Panel AA MUST-A4: a refused create or revoke shows its reason here (see the
+   script at the end of this section). Hidden until a request in #api-keys fails. #}
+<p id="api-keys-error" role="alert" hidden
+   style="color:var(--pico-del-color);border-left:3px solid var(--pico-del-color);padding:0.5rem 0.75rem;"></p>
+
+{# ── Create new token ─────────────────────────────────────────────── #}
+<section>
+    <details {% if new_key_open %}open{% endif %}>
+        <summary role="button" class="outline">Create a token</summary>
+        <form hx-post="/accounts/api-keys" hx-target="#new-key-result" hx-swap="innerHTML">
+            <div class="grid">
+                <label>
+                    Name this token
+                    <input type="text" name="name" required
+                           placeholder="e.g. &quot;My AI assistant&quot; or &quot;Work laptop&quot;">
+                    <small style="color:var(--pico-muted-color);">
+                        Just a label for you — helps you remember which tool uses which token.
+                    </small>
+                </label>
+                <label>
+                    Your alias
+                    <input type="text" name="alias"
+                           value="{{ user.email.split('@')[0] | lower }}"
+                           pattern="[a-zA-Z0-9_-]+"
+                           placeholder="{{ user.email.split('@')[0] | lower }}">
+                    <small style="color:var(--pico-muted-color);">
+                        The short name your AI assistant calls you by. Usually
+                        your first name or email prefix. If your administrator
+                        told you a specific alias to use, type that.
+                    </small>
+                </label>
+                {% if is_admin %}
+                <label>
+                    Owner
+                    <select name="user_email">
+                        {% for u in all_users %}
+                        <option value="{{ u.email }}" {% if u.id == user.id %}selected{% endif %}>{{ u.name if u.name else u.email }}{% if u.name %} ({{ u.email }}){% endif %}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                {% else %}
+                <input type="hidden" name="user_email" value="{{ user.email }}">
+                {% endif %}
+                <label>
+                    Expires
+                    <select name="expires">
+                        <option value="never" selected>Never</option>
+                        <option value="30d">30 days</option>
+                        <option value="90d">90 days</option>
+                        <option value="365d">1 year</option>
+                    </select>
+                </label>
+            </div>
+            <button type="submit">Create token</button>
+        </form>
+        <div id="new-key-result" style="margin-top:0.75rem;"></div>
+    </details>
+</section>
+
+{# ── Existing tokens ──────────────────────────────────────────────── #}
+<section style="margin-top:1.5rem;">
+    <h4>Your tokens</h4>
+    {% if keys %}
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                {% if is_admin %}<th>Owner</th>{% endif %}
+                <th>Created</th>
+                <th>Last used</th>
+                <th>Expires</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody id="api-keys-tbody">
+            {% for k in keys %}
+            <tr id="api-key-row-{{ k.id }}">
+                <td>{{ k.name }}</td>
+                {% if is_admin %}<td><small title="{{ k.email }}">{{ k.user_name if k.user_name else k.email }}</small></td>{% endif %}
+                <td><small>{% if k.created_at %}<time datetime="{{ k.created_at }}" data-us-datetime>{{ k.created_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
+                <td><small>{% if k.last_used_at %}<time datetime="{{ k.last_used_at }}" data-us-datetime>{{ k.last_used_at | us_datetime }}</time>{% else %}—{% endif %}</small></td>
+                <td><small>{% if k.expires_at %}<time datetime="{{ k.expires_at }}" data-us-datetime>{{ k.expires_at | us_datetime }}</time>{% else %}Never{% endif %}</small></td>
+                <td>
+                    <button class="outline secondary"
+                            style="padding:0.1rem 0.5rem;font-size:0.85rem;color:var(--pico-del-color);"
+                            hx-delete="/accounts/api-keys/{{ k.id }}"
+                            hx-target="#api-key-row-{{ k.id }}"
+                            hx-swap="outerHTML"
+                            hx-confirm="Revoke token '{{ k.name }}'? Whatever tool is using this token will immediately lose access.">
+                        Revoke
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p><em>You don't have any tokens yet. Create one above when you want to connect an outside tool to your mail or calendar.</em></p>
+    {% endif %}
+</section>
+{# Panel AA MUST-A4 (PD-17): HTMX does not swap a 4xx/5xx response, so a refused
+   create (503, JSON {"detail": ...}) or revoke (503, plain text) showed nothing:
+   after a failed revoke the row simply stayed listed. One listener, scoped to
+   #api-keys, writes the server's refusal into #api-keys-error (textContent, never
+   innerHTML) and clears it on the next successful request (PD-18: both edges in
+   one funnel). An HTML body (an auth error page) gets the generic line instead. #}
+<script>
+(function () {
+    var section = document.getElementById('api-keys');
+    if (!section || section.dataset.errorSlotWired) { return; }
+    section.dataset.errorSlotWired = '1';
+    section.addEventListener('htmx:afterRequest', function (ev) {
+        var slot = document.getElementById('api-keys-error');
+        var detail = ev.detail || {};
+        if (!slot) { return; }
+        if (detail.successful) {
+            slot.textContent = '';
+            slot.hidden = true;
+            return;
+        }
+        var xhr = detail.xhr;
+        var msg = (xhr && xhr.responseText) || '';
+        try {
+            var body = JSON.parse(msg);
+            if (body && typeof body.detail === 'string') { msg = body.detail; }
+        } catch (e) { /* a plain-text body is shown as it is */ }
+        if (!msg || /<[a-z!\/]/i.test(msg)) {
+            msg = 'The request failed' +
+                (xhr && xhr.status ? ' (HTTP ' + xhr.status + ')' : '') +
+                '. Nothing on this page changed. Reload the page to see the current state.';
+        }
+        slot.textContent = msg;
+        slot.hidden = false;
+    });
+})();
+</script>
+</section>

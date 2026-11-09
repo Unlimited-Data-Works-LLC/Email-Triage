@@ -13,9 +13,27 @@
    PARTIAL CONTRACT:
                 Can render standalone via the HTMX poll endpoint
                 (hx-get=".../embedding-install-status") or embedded
-                in ai_backends.html via {% include %}. Both contexts
-                expect ``install_state`` (dict) + ``install_manifest_sha_short``
-                (str) + ``install_runtime_ready`` (bool) in scope.
+                in ai_backends.html via {% include %}. Every context
+                comes from ONE builder —
+                ``embedding_install.build_install_card_context`` — so
+                the sites cannot drift: ``install_state`` (dict),
+                ``install_manifest_sha_short`` (str),
+                ``install_runtime_ready`` (bool, a NON-mutating probe),
+                ``install_verified`` (bool, the marker-vs-manifest
+                drift gate), ``install_verify_reason`` (str),
+                ``install_runtime_present`` (bool),
+                ``install_image_manifest_sha_short`` (str),
+                ``install_action_error`` (str, "" unless the action
+                that rendered this card was REFUSED — a static
+                message, never exception text).
+   COPY HONESTY (N-525 / punch 540):
+                "verified against the pinned manifest" may appear ONLY
+                under ``install_verified``. It used to be printed
+                unconditionally in the installed state, where it
+                described the staged wheels at install time and was
+                read by the operator as a statement about the packages
+                actually installed — which nothing had checked. A
+                stale install said "verified".
    ─────────────────────────────────────────────────────────── #}
 
 {% set _st = install_state.status %}
@@ -51,12 +69,19 @@
         <small class="et-card-desc">
             The heavy embedding stack (torch + sentence-transformers
             + the all-MiniLM-L6-v2 model, ~600 MB total) ships as a
-            lazy install so the runtime image stays slim. Files are
-            verified against the pinned manifest baked into this
-            image — operator cannot bypass hash-check.
+            lazy install so the runtime image stays slim. Every
+            downloaded file is hash-checked against the pinned
+            manifest baked into this image before it is installed —
+            you cannot bypass the hash check.
         </small>
     </header>
     <div class="et-card-body">
+
+    {% if install_action_error %}
+    <p role="alert" style="margin:0.25rem 0;color:var(--pico-del-color);">
+        <strong>{{ install_action_error }}</strong>
+    </p>
+    {% endif %}
 
     {# ── not_installed: idle, offer Install + Sideload ─────────── #}
     {% if _st == "not_installed" %}
@@ -142,7 +167,7 @@
                 Typically a few seconds.
             {% elif _st == "installing" %}
                 Unpacking ~1.5 GiB of wheels into
-                <code>/app/data/runtime-deps/lib/python3.12/site-packages/</code>.
+                <code>{{ install_site_packages }}/</code>.
                 Typically 30-60 seconds. pip doesn't emit per-package
                 progress, so this step looks paused — the card will
                 update automatically when pip exits.
@@ -209,7 +234,7 @@
             <strong style="color:var(--pico-ins-color);">✓ Installed</strong>
             {% if install_state.installed_at %}
             <small style="color:var(--pico-muted-color);">
-                ({{ install_state.installed_at[:19] }})
+                (<time datetime="{{ install_state.installed_at }}" data-us-datetime>{{ install_state.installed_at | us_datetime }}</time>)
             </small>
             {% endif %}
             {% if install_state.install_method %}
@@ -224,20 +249,102 @@
             {% endif %}
         </p>
         {% endif %}
-        {% if install_runtime_ready %}
+        {% if install_restart_pending %}
+        <p style="margin:0.25rem 0;padding:0.5rem 0.75rem;
+                  border-left:3px solid var(--pico-mark-color, orange);
+                  background:var(--pico-card-background-color);">
+            <strong>The embedding runtime was updated. Embedding is paused
+                until you {{ install_restart_message }}.</strong>
+        </p>
+        {% elif install_runtime_state == "stale_ok" %}
+        <p id="embedding-runtime-update" style="margin:0.25rem 0;padding:0.5rem 0.75rem;
+                  border-left:3px solid var(--pico-mark-color, orange);
+                  background:var(--pico-card-background-color);">
+            {% if install_auto_update %}
+            <strong>An embedding runtime update is being applied
+                automatically. The installed runtime keeps serving until it
+                is replaced; there is nothing to click.</strong>
+            {% else %}
+            <strong>An embedding runtime update is required. The installed
+                runtime keeps serving until you update it.</strong>
+            {% endif %}
+            <br><small>{{ install_verify_reason }}</small>
+            {% if install_auto_update and install_auto_failure %}
+            <br><small>The last automatic update failed
+                ({{ install_auto_failure.error_class or "unknown error" }});
+                the app tries again by itself.</small>
+            {% endif %}
+            {% if install_update_pause_note %}
+            <br><small><strong>{{ install_update_pause_note }}</strong></small>
+            {% endif %}
+        </p>
+        {% if not install_auto_update or install_auto_failure %}
+        <form hx-post="/config/ai-backends/embedding-update" hx-target="#embedding-install-card" hx-swap="outerHTML">
+            {{ csrf_input(request) }}
+            <button type="submit">{% if install_auto_update %}Retry the update now{% else %}Update embedding runtime{% endif %}</button>
+        </form>
+        {% endif %}
+        {% elif not install_verified %}
+        <p id="embedding-runtime-update" style="margin:0.25rem 0;padding:0.5rem 0.75rem;
+                  border-left:3px solid var(--pico-del-color);
+                  background:var(--pico-card-background-color);">
+            <strong>This install is NOT verified against the manifest
+                in the current image, so it will not be loaded.</strong>
+            <br><small>{{ install_verify_reason }}</small>
+            <br><small style="color:var(--pico-muted-color);">
+                The packages on the data volume survive an image
+                rebuild, so an install made against an older manifest
+                stays behind until it is replaced or removed. The app
+                refuses to put an unverified runtime on its import
+                path — {% if install_auto_update and not install_integrity_wait %}the app replaces it
+                with this image's manifest by itself; remove it instead
+                if you are not using the local embedding backend.{% else %}update
+                it to bring it up to this image's manifest, or remove it
+                if you are not using the local embedding backend.{% endif %}
+            </small>
+            {% if install_integrity_wait %}
+            <br><small><strong>The app does not replace this runtime by
+                itself: its files changed after they were verified, which
+                may mean they were changed outside the app. Check the
+                application log, then update it. The replaced files are
+                kept for inspection.</strong></small>
+            {% endif %}
+            {% if install_auto_update and install_auto_failure and not install_integrity_wait %}
+            <br><small>The last automatic update failed
+                ({{ install_auto_failure.error_class or "unknown error" }});
+                the app tries again by itself.</small>
+            {% endif %}
+            {% if install_update_pause_note %}
+            <br><small><strong>{{ install_update_pause_note }}</strong></small>
+            {% endif %}
+        </p>
+        {% if not install_auto_update or install_auto_failure or install_integrity_wait %}
+        <form hx-post="/config/ai-backends/embedding-update" hx-target="#embedding-install-card" hx-swap="outerHTML">
+            {{ csrf_input(request) }}
+            <button type="submit">{% if install_auto_update and not install_integrity_wait %}Retry the update now{% else %}Update embedding runtime{% endif %}</button>
+        </form>
+        {% endif %}
+        {% elif install_runtime_ready %}
         <p style="margin:0.25rem 0;font-size:0.9em;color:var(--pico-muted-color);">
-            <small>Files verified against the pinned manifest baked
-                into this image. The sentence_transformers package
-                imports successfully.</small>
+            <small>The installed packages match this image's pinned
+                manifest exactly (one version of each, recorded at
+                install time), and the sentence_transformers package
+                imports from them.</small>
         </p>
         {% else %}
         <p style="margin:0.25rem 0;padding:0.5rem 0.75rem;
                   border-left:3px solid var(--pico-del-color);
                   background:var(--pico-card-background-color);">
-            <strong>Install state says "installed" but the package
-                does not import.</strong> Restart the container to
-            pick up the runtime path, or re-verify + re-install if
-            files are missing.
+            <strong>The installed set matches the manifest, but
+                sentence_transformers does not import from it.</strong>
+            <small style="color:var(--pico-muted-color);">
+                Usually a missing transitive dependency in a
+                half-written install. Re-install to rewrite the
+                runtime; [Remove] then re-install if that does not
+                clear it. A container restart alone will not fix this
+                — the runtime path is added when the backend loads,
+                not at startup.
+            </small>
         </p>
         {% endif %}
         <details style="margin-top:0.5rem;">
@@ -257,7 +364,56 @@
                     </button>
                 </form>
             </div>
+            {# Punch 569: the atomic update from an air-gap bundle (same route as
+               the banner button, with source_dir set). Hidden while a restart is
+               pending: the swapped runtime is already this image's. #}
+            {% if not install_restart_pending %}
+            <form hx-post="/config/ai-backends/embedding-update" hx-target="#embedding-install-card" hx-swap="outerHTML"
+                  style="margin-top:0.5rem;">
+                {{ csrf_input(request) }}
+                <label style="margin:0;"><small>Update from an air-gap bundle directory</small>
+                    <input type="text" name="source_dir" value="/app/data/runtime-deps/sideload"
+                           style="margin:0.25rem 0;">
+                </label>
+                <button type="submit" class="outline">
+                    Update from bundle{{ m.help("Installs the bundle beside the current runtime, checks every file against this image's manifest, then swaps it in. The current runtime stays if anything fails.") }}
+                </button>
+            </form>
+            {% endif %}
         </details>
+    {% endif %}
+
+    {# ── Remove: shown whenever a runtime prefix EXISTS on the data volume,
+          in every state except mid-install. Deliberately keyed on the disk
+          (``install_runtime_present``) and NOT on the row's status: the case
+          that needed this most is a volume still holding packages while the
+          row says something else, which is precisely what had no supported
+          fix before (N-526 / punch 541). #}
+    {% if install_runtime_present and not _in_flight %}
+    <details style="margin-top:0.5rem;">
+        <summary><small>Remove the installed runtime</small></summary>
+        <p style="margin:0.5rem 0;font-size:0.9em;color:var(--pico-muted-color);">
+            <small>Deletes the downloaded packages and model files from
+                the data volume and resets this card to "not installed".
+                Your AI-backends configuration is untouched, so
+                [Install now] reproduces the runtime from the pinned
+                manifest. Use this when you are not using the local
+                embedding backend, or to clear an install that no longer
+                matches this image.
+                {% if install_runtime_ready %}
+                Anything already loaded from the old runtime stays
+                loaded until the container restarts.
+                {% endif %}
+            </small>
+        </p>
+        <form hx-post="/config/ai-backends/embedding-remove" hx-target="#embedding-install-card" hx-swap="outerHTML">
+            {{ csrf_input(request) }}
+            <button type="submit" class="secondary outline"
+                    hx-confirm="Remove the installed embedding runtime? This deletes ~600 MB of packages and model files from the data volume. Your configuration is kept, and [Install now] downloads and hash-verifies them again from the pinned manifest.">
+                Remove
+            </button>
+        </form>
+    </details>
     {% endif %}
 
     </div>

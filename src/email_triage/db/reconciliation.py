@@ -24,11 +24,24 @@ divergence detectable here.
 Design Q resolution (per dispatch §"Design Q for you"): option (a) —
 parse ``log_entries.extra_json`` for the row PK. Justification:
 
-  - ``flow_id`` is consistently emitted in every flow-lifecycle log
-    (engine/flow.py:79-240: Created, Fetched, Classifying, Classified,
-    Routing, Acting, Waiting, Failed, Finished — 7+ emit sites). The
-    SQLiteLogHandler at triage_logging.py:360 hoists caller kwargs to
-    top-level ``extra_json`` keys.
+  - ``flow_id`` is consistently emitted in every PER-FLOW log in
+    ``engine/flow.py`` (the batch/teardown emits have no flow in hand),
+    spanning the ``FlowStatus`` lifecycle — note those are STATES, not
+    message strings, and some (``CLASSIFYING``, ``ROUTING``) are status
+    transitions with no dedicated emit of their own. Caller kwargs reach
+    ``extra_json`` as TOP-LEVEL keys by TWO INDEPENDENT routes, either
+    of which alone suffices:
+    (1) ``TriageLogger._log`` stores the sanitised kwargs as the dict
+        ``record._extra``, and ``SQLiteLogHandler.emit`` hoists that
+        dict's inner keys to top level — this is also the N-42
+        value-scrub sink, so do NOT delete that branch believing route
+        (2) covers it;
+    (2) ``_log`` ALSO promotes non-reserved kwargs onto
+        ``record.__dict__``, and ``emit``'s ``vars(record)`` walk copies
+        them across.
+    Route (2) is skipped for LogRecord built-in names (``_reserved`` in
+    ``_log``, ``_STANDARD_LOG_KEYS`` in ``emit``), so for a key named
+    like ``module`` route (1) is the ONLY path.
   - Option (b) ``phi_table_audit`` view would duplicate writes — adds
     hot-path cost and a second key-management surface (rejected for the
     same reasons EQM-04 rationale (b) rejects per-row PHI-table HMAC).
@@ -53,11 +66,13 @@ mechanism's investigator-workflow latency floor disappear.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime
+from email_triage._isotime import now_utc_iso
 from typing import Any
+
+from email_triage.db._helpers import load_json_col
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +244,20 @@ def verify_phi_table_against_audit_log(
         conn,
         since=since.isoformat() if since is not None else None,
     )
-    chain_passed = chain_result["first_break_id"] is None
-    chain_break_reason = (
-        chain_result["first_break_reason"] if not chain_passed else None
-    )
+    # Panel P G2: the gate reads verify_log_chain's one verdict field, so a
+    # sha256 rewrite, an unverifiable prefix or a downgrade cannot read as a
+    # passed chain here while `audit verify` refuses it.
+    chain_passed = chain_result["verdict"] == "pass"
+    chain_break_reason = None
+    if not chain_passed:
+        chain_break_reason = chain_result["first_break_reason"] or (
+            f"verify_log_chain verdict={chain_result['verdict']}: "
+            f"{chain_result['post_boundary_keyless_count']} keyless row(s) after "
+            f"the first keyed row, {chain_result['unverifiable_keyless_count']} "
+            f"sha256 and {chain_result['unverifiable_blank_count']} blank row(s) "
+            f"not authenticated by the key, {chain_result['downgrade_count']} "
+            f"downgraded row(s) (N-507, N-609)"
+        )
 
     since_iso = since.isoformat() if since is not None else None
 
@@ -253,7 +278,7 @@ def verify_phi_table_against_audit_log(
         )
 
     return ReconciliationReport(
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=now_utc_iso(),
         chain_verify_passed=chain_passed,
         chain_break_reason=chain_break_reason,
         chain_length=int(chain_result["chain_length"] or 0),
@@ -339,11 +364,11 @@ def _fetch_audit_pks_from_log(
     params: list[Any] = []
     clauses: list[str] = ["row_hash != ''"]
     # Hint the planner with a LIKE on extra_json so non-flow rows don't
-    # pay the json.loads cost. ``%"flow_id"%`` is a literal-substring
-    # LIKE on the canonical JSON encoding — flow_id is always quoted as
-    # a JSON key. False positives (a row whose extra_json mentions the
-    # literal string ``flow_id`` without a value) will fall out at the
-    # json.loads + .get() step below.
+    # pay the decode cost. ``%"flow_id"%`` is a literal-substring LIKE on
+    # the canonical JSON encoding — flow_id is always quoted as a JSON
+    # key. False positives (a row whose extra_json mentions the literal
+    # string ``flow_id`` without a value) fall out at the decode + .get()
+    # step below.
     clauses.append("extra_json LIKE ?")
     params.append(f'%"{spec.extra_key}"%')
     if since_iso is not None:
@@ -356,17 +381,11 @@ def _fetch_audit_pks_from_log(
     rows = conn.execute(sql, params).fetchall()
     for r in rows:
         raw = r["extra_json"]
-        if not raw:
-            continue
-        try:
-            extras = json.loads(raw)
-        except (ValueError, TypeError):
-            # Malformed extras don't poison the walk — the chain
-            # verifier is the authoritative integrity check; reconcile
-            # is a downstream consumer.
-            continue
-        if not isinstance(extras, dict):
-            continue
+        # census  SSOT — a malformed/NULL extra_json degrades to {} →
+        # pk None → row skipped below. The chain verifier is the
+        # authoritative integrity check; reconcile is a downstream
+        # consumer, so a corrupt row doesn't poison the walk.
+        extras = load_json_col(raw, default={})
         pk = extras.get(spec.extra_key)
         if pk is None:
             continue

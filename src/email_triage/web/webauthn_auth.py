@@ -48,21 +48,31 @@ from webauthn.helpers.structs import (
     ResidentKeyRequirement,
     UserVerificationRequirement,
 )
-from webauthn.helpers.exceptions import (
-    InvalidRegistrationResponse,
-    InvalidAuthenticationResponse,
-)
+# Punch 484: the verify sites catch the library's BASE exception. py_webauthn
+# 3.0.0 rejects CBOR with duplicate map keys (InvalidCBORData). It wraps the
+# client-supplied CBOR in Invalid*Response itself, but decodes the STORED
+# credential public key in verify_authentication_response outside that wrap
+# (only InvalidSignature is caught there), so a bare InvalidCBORData reached
+# our narrower (Invalid*Response, ValueError, KeyError) catch, escaped it, and
+# became a 500 with no login-failure row. ValueError/KeyError stay listed: the
+# library's dict coercion raises them for a malformed credential dict.
+from webauthn.helpers.exceptions import InvalidAuthenticationResponse, WebAuthnException
 
+from email_triage.db.audit import record_hardware_key_registration
+from email_triage.web.db_writelock import db_write
+from email_triage.db.users import (
+    consume_webauthn_challenge_txn,
+    update_hardware_key_sign_count_txn,
+)
 from email_triage.web.db_auth_helpers import (
-    add_hardware_key,
     consume_webauthn_challenge,
     find_hardware_key_by_credential_id,
     find_user_by_webauthn_handle,
     get_or_create_webauthn_user_handle,
     list_hardware_keys,
     store_webauthn_challenge,
-    update_hardware_key_sign_count,
     user_has_active_hardware_key as _user_has_active_hardware_key,
+    WebAuthnChallenge,
 )
 
 
@@ -95,6 +105,34 @@ class WebAuthnAuthError(RuntimeError):
     """
 
 
+class WebAuthnSignCountError(WebAuthnAuthError):
+    """The assertion's signature counter did not advance past the stored one.
+
+    Punch 444: a correctly signed assertion with a counter at or below the stored
+    count is a cloned authenticator or a replay. It is a subclass so every caller of
+    :class:`WebAuthnAuthError` is unchanged, and a caller (or a test) can tell it
+    from a malformed payload or a bad signature. The library skips this check when
+    both counters are 0 (synced passkeys report 0); replay of those rests on the
+    single-use server-side challenge, not on this error.
+    """
+
+
+# The library words a counter refusal "Response sign count of N was not greater than
+# current count of M" (py_webauthn 2.7.1 and 3.0.0; read from both wheels). The real-library
+# test (tests/test_webauthn_real_library_counter_replay.py) fails if a bump rewords it.
+_SIGN_COUNT_MARKER = "sign count"
+
+
+def _assertion_verify_error(exc: BaseException) -> WebAuthnAuthError:
+    """The single mapping from a failed ``verify_authentication_response`` to our
+    error type: :class:`WebAuthnSignCountError` for a counter refusal, the generic
+    :class:`WebAuthnAuthError` for everything else."""
+    text = f"Assertion verify failed: {exc}"
+    if isinstance(exc, InvalidAuthenticationResponse) and _SIGN_COUNT_MARKER in str(exc).lower():
+        return WebAuthnSignCountError(text)
+    return WebAuthnAuthError(text)
+
+
 def _require_config(rp_id: str, origin: str | list[str]) -> None:
     has_origin = bool(origin) and (
         any(origin) if isinstance(origin, list) else True
@@ -109,6 +147,70 @@ def _require_config(rp_id: str, origin: str | list[str]) -> None:
 # ---------------------------------------------------------------------------
 # Public API used by the web routes
 # ---------------------------------------------------------------------------
+
+class WebAuthnStaleChallengeError(WebAuthnAuthError):
+    """A challenge written by a pre-v53 image: no stored UV requirement.
+
+    Raised ONLY from :func:`_stored_uv_requirement`'s NULL branch. Routes catch
+    it ahead of the generic handler and do NOT count it as a failed login: no
+    client can author such a row, and it exists for at most one challenge TTL
+    after the v53 upgrade. An absent or expired challenge is NOT this class —
+    that is attacker-reachable and keeps counting toward the login guard.
+    """
+
+
+class WebAuthnNoChallengeError(WebAuthnAuthError):
+    """No server-side challenge row could be consumed: it expired, or an
+    earlier presentation already consumed it (punch ).
+
+    A REPLAY of a previously-used assertion lands here, which is why this is
+    a named class: it lets a route record the refusal under its own reason
+    slug instead of the generic verify failure. Unlike
+    :class:`WebAuthnStaleChallengeError` it IS attacker-reachable, so a route
+    that distinguishes it must still COUNT it toward the login guard.
+
+    SCOPE: the class (and so the audit row) cannot tell a replay from an
+    expiry -- both are 'the row is not there'. Distinguishing them would need
+    a consumed-challenge tombstone, i.e. a schema change.
+    """
+
+
+# The ``webauthn_challenges.kind`` value for the discoverable-credential
+# (passkey) login ceremony. ONE spelling, shared by begin + finish, so the
+# kind guard in ``consume_webauthn_challenge`` cannot drift between them.
+_PASSKEY_CHALLENGE_KIND = "passkey"
+
+
+def _require_user_verified(verified: Any, require_uv: bool) -> None:
+    """Refuse a response whose authenticator did not verify the user when UV
+    was required (punch  panel).
+
+    py_webauthn already enforces this when passed ``require_user_verification``;
+    this is the layer that does not depend on the library's internals, and the
+    one the suite can observe (its tests replace the library call). A result
+    with no ``user_verified`` attribute is refused, not waved through.
+    """
+    if require_uv and not getattr(verified, "user_verified", False):
+        raise WebAuthnAuthError(
+            "User verification was required and was not performed."
+        )
+
+
+def _stored_uv_requirement(stored: WebAuthnChallenge) -> bool:
+    """The user-verification requirement to ENFORCE at a finish step: the one
+    its begin step stored with the challenge (punch ).
+
+    A None comes from a challenge written before migration v53. Refuse it:
+    reading it as "not required" would re-open the gap for the one ceremony
+    that straddles the deploy, and the user only has to start again.
+    """
+    if stored.require_user_verification is None:
+        raise WebAuthnStaleChallengeError(
+            "This sign-in challenge predates a server update. "
+            "Start the ceremony again."
+        )
+    return stored.require_user_verification
+
 
 def user_has_active_hardware_key(
     conn: sqlite3.Connection, user_id: int,
@@ -182,6 +284,7 @@ def begin_registration(
         email=None,
         kind="register",
         challenge=opts.challenge,
+        require_user_verification=require_user_verification,
     )
     return options_to_json(opts)
 
@@ -194,6 +297,8 @@ def finish_registration(
     origin: str | list[str],
     response_json: str | dict,
     nickname: str,
+    ip: str | None = None,
+    user_agent: str | None = None,
 ) -> int:
     """Verify the browser's attestation response and insert a
     ``hardware_keys`` row.
@@ -204,18 +309,24 @@ def finish_registration(
     ``nickname`` is the operator-supplied label (e.g.
     "YubiKey blue").
 
+    Punch : the insert goes through
+    ``db.audit.record_hardware_key_registration``, which writes the key AND its
+    ``hardware_key_registered`` audit row in one transaction. ``ip`` /
+    ``user_agent`` are the request's audit context for that row.
+
     Returns the new ``hardware_keys.id``. Raises
     ``WebAuthnAuthError`` on any verify failure.
     """
     _require_config(rp_id, origin)
-    challenge = consume_webauthn_challenge(
+    stored = consume_webauthn_challenge(
         conn, user_id=user["id"], email=None, kind="register",
     )
-    if challenge is None:
-        raise WebAuthnAuthError(
+    if stored is None:
+        raise WebAuthnNoChallengeError(
             "No active registration challenge for this user "
             "(expired or already consumed)."
         )
+    require_uv = _stored_uv_requirement(stored)
     if isinstance(response_json, str):
         try:
             response_data = json.loads(response_json)
@@ -226,12 +337,16 @@ def finish_registration(
     try:
         verified = verify_registration_response(
             credential=response_data,
-            expected_challenge=challenge,
+            expected_challenge=stored.challenge,
             expected_origin=origin,
             expected_rp_id=rp_id,
+            # Punch : enforce what begin_registration asked for. The
+            # library's default is False, so omitting this enforced nothing.
+            require_user_verification=require_uv,
         )
-    except (InvalidRegistrationResponse, ValueError, KeyError) as e:
+    except (WebAuthnException, ValueError, KeyError) as e:
         raise WebAuthnAuthError(f"Registration verify failed: {e}") from e
+    _require_user_verified(verified, require_uv)
 
     transports_raw = response_data.get("response", {}).get("transports") or []
     if not isinstance(transports_raw, list):
@@ -255,7 +370,7 @@ def finish_registration(
         except (ValueError, AttributeError):
             aaguid_b = None
 
-    return add_hardware_key(
+    return record_hardware_key_registration(
         conn,
         user_id=user["id"],
         credential_id=verified.credential_id,
@@ -264,6 +379,9 @@ def finish_registration(
         transports=[str(t) for t in transports_raw],
         aaguid=aaguid_b,
         nickname=nickname,
+        email=user.get("email") or "",
+        ip=ip,
+        user_agent=user_agent,
     )
 
 
@@ -287,7 +405,7 @@ def begin_authentication(
     keys = list_hardware_keys(conn, user_id)
     if not keys:
         raise WebAuthnAuthError(
-            "User has no active hardware keys; OTP path applies."
+            "User has no active passkeys; OTP path applies."
         )
     descriptors = []
     for k in keys:
@@ -320,11 +438,38 @@ def begin_authentication(
         email=email,
         kind="authenticate",
         challenge=opts.challenge,
+        require_user_verification=require_user_verification,
     )
     return options_to_json(opts)
 
 
+@db_write
 def finish_authentication(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    rp_id: str,
+    origin: str | list[str],
+    response_json: str | dict,
+) -> int:
+    """Committing form of :func:`finish_authentication_txn`. Returns the
+    ``hardware_keys.id`` that authenticated.
+
+    Commits in ``finally``: the challenge burn is durable on EVERY edge (a
+    refused ceremony stays burned, punch 449), and the sign_count bump with it
+    on success. The commit runs before ``@db_write`` sees a raise, so its
+    rollback has nothing left to undo.
+    """
+    try:
+        return finish_authentication_txn(
+            conn, user_id=user_id, rp_id=rp_id, origin=origin,
+            response_json=response_json,
+        )
+    finally:
+        conn.commit()
+
+
+def finish_authentication_txn(
     conn: sqlite3.Connection,
     *,
     user_id: int,
@@ -338,16 +483,24 @@ def finish_authentication(
     mints the session with that id stamped into the cookie payload
     so the access_log shows ``auth_source='webauthn',
     auth_key_id=<n>`` per request.
+
+    Does NOT commit (N-520 step 2, s2 panel credential-burn ruling): the
+    caller owns the transaction. The login route runs this inside
+    ``record_witnessed_state_change`` so the challenge burn, the sign_count
+    bump, the last_login stamp and the success row commit together; on a
+    refusal the route commits the TIGHTENING burn with no success row. The
+    committing form wraps this one, so the two cannot drift.
     """
     _require_config(rp_id, origin)
-    challenge = consume_webauthn_challenge(
+    stored = consume_webauthn_challenge_txn(
         conn, user_id=user_id, email=None, kind="authenticate",
     )
-    if challenge is None:
-        raise WebAuthnAuthError(
+    if stored is None:
+        raise WebAuthnNoChallengeError(
             "No active authentication challenge for this user "
             "(expired or already consumed)."
         )
+    require_uv = _stored_uv_requirement(stored)
     if isinstance(response_json, str):
         try:
             response_data = json.loads(response_json)
@@ -381,16 +534,19 @@ def finish_authentication(
     try:
         verified = verify_authentication_response(
             credential=response_data,
-            expected_challenge=challenge,
+            expected_challenge=stored.challenge,
             expected_origin=origin,
             expected_rp_id=rp_id,
             credential_public_key=bytes(row["public_key"]),
             credential_current_sign_count=int(row["sign_count"]),
+            # Punch : enforce what begin_authentication asked for.
+            require_user_verification=require_uv,
         )
-    except (InvalidAuthenticationResponse, ValueError, KeyError) as e:
-        raise WebAuthnAuthError(f"Assertion verify failed: {e}") from e
+    except (WebAuthnException, ValueError, KeyError) as e:
+        raise _assertion_verify_error(e) from e
+    _require_user_verified(verified, require_uv)
 
-    update_hardware_key_sign_count(conn, row["id"], verified.new_sign_count)
+    update_hardware_key_sign_count_txn(conn, row["id"], verified.new_sign_count)
     return int(row["id"])
 
 
@@ -410,36 +566,46 @@ def finish_authentication(
 #
 # These two helpers are an additional path alongside the existing
 # begin_authentication / finish_authentication. The original "email -> touch"
-# flow stays for hardware keys that aren't discoverable.
+# flow stays for passkeys that aren't discoverable.
 #
-# Challenge storage: we don't have a user_id at begin time. The caller
-# (login route) holds the challenge bytes in a short-lived signed cookie
-# (same shape as the existing dev-keypair challenge cookie); finish reads
-# it back. No DB row needed -- a single-use challenge that lives only for
-# the duration of one login attempt.
+# Challenge storage (punch ): server-side, single-use, exactly as the
+# hardware-key path does it. We don't have a user_id at begin time, so the
+# row is owned by neither user_id nor email and is named by its primary key;
+# begin returns that id and finish consumes the row by it (delete-on-read).
+#
+# This used to be a signed cookie holding the challenge BYTES, with nothing
+# consumed anywhere: the finish step took the challenge as a parameter and
+# deleted the cookie only on the success path. Neither the cookie's
+# ``max_age`` nor ``delete_cookie`` binds an attacker replaying with a script
+# -- both are instructions to a compliant browser -- and the library's
+# sign_count guard is skipped entirely at 0/0, which is what every synced
+# passkey (iCloud Keychain, Google Password Manager) reports. So a captured
+# assertion + cookie pair was replayable for as long as the signature held.
+# The server-side row is the control: the second presentation finds nothing
+# to consume and is refused before the library runs, regardless of signature
+# validity and regardless of sign_count.
 
 
 def begin_passkey_authentication(
-    rp_id: str,
-    *,
-    require_user_verification: bool = True,
-) -> tuple[str, bytes]:
+    conn: sqlite3.Connection, *, rp_id: str,
+) -> tuple[str, int]:
     """Generate authentication options for a discoverable-credential
-    (passkey) login. Returns ``(options_json, challenge_bytes)``.
+    (passkey) login. Returns ``(options_json, challenge_id)``.
 
-    The caller is responsible for stashing ``challenge_bytes`` so
-    ``finish_passkey_authentication`` can verify (typically a
-    short-lived signed cookie). No user_id / email needed at begin
-    time -- the browser surfaces a credential picker via conditional
-    UI; the picked credential's ``userHandle`` resolves the user at
-    finish time.
+    Punch : the challenge is STORED server-side here and deleted on read
+    at finish, so the caller carries only ``challenge_id`` -- an opaque handle
+    to a single-use row -- and never the challenge bytes. No user_id / email
+    is needed at begin time: the browser surfaces a credential picker via
+    conditional UI, and the picked credential's ``userHandle`` resolves the
+    user at finish time.
+
+    Passkeys always require user verification, and
+    ``finish_passkey_authentication`` enforces what is stored here. There used
+    to be a parameter here that could ask for less; nothing passed it, and
+    finish ignored it (punch  panel).
     """
     _require_config(rp_id, "any")
-    uv = (
-        UserVerificationRequirement.REQUIRED
-        if require_user_verification
-        else UserVerificationRequirement.PREFERRED
-    )
+    uv = UserVerificationRequirement.REQUIRED
     opts = generate_authentication_options(
         rp_id=rp_id,
         # Empty allow_credentials => discoverable. Browser shows
@@ -448,28 +614,95 @@ def begin_passkey_authentication(
         allow_credentials=[],
         user_verification=uv,
     )
-    return options_to_json(opts), opts.challenge
+    challenge_id = store_webauthn_challenge(
+        conn,
+        user_id=None,
+        email=None,
+        kind=_PASSKEY_CHALLENGE_KIND,
+        challenge=opts.challenge,
+        # Punch : the finish step enforces what begin asked for, and
+        # begin asked for REQUIRED two statements above.
+        require_user_verification=True,
+    )
+    return options_to_json(opts), int(challenge_id)
 
 
+@db_write
 def finish_passkey_authentication(
     conn: sqlite3.Connection,
     *,
     rp_id: str,
     origin: str | list[str],
     response_json: str | dict,
-    challenge: bytes,
+    challenge_id: int,
+) -> tuple[int, int]:
+    """Committing form of :func:`finish_passkey_authentication_txn`. Returns
+    ``(user_id, hardware_key_id)``. Commits in ``finally`` for the same reason
+    as :func:`finish_authentication`: a refused ceremony burns its challenge.
+    """
+    try:
+        return finish_passkey_authentication_txn(
+            conn, rp_id=rp_id, origin=origin, response_json=response_json,
+            challenge_id=challenge_id,
+        )
+    finally:
+        conn.commit()
+
+
+def finish_passkey_authentication_txn(
+    conn: sqlite3.Connection,
+    *,
+    rp_id: str,
+    origin: str | list[str],
+    response_json: str | dict,
+    challenge_id: int,
 ) -> tuple[int, int]:
     """Verify the assertion + resolve the user from the credential's
     ``userHandle``. Returns ``(user_id, hardware_key_id)``.
 
-    Caller hands ``challenge`` back from wherever it stashed it at
-    begin time (signed cookie, etc.). The credential's ``userHandle``
-    is the server-issued ``users.webauthn_user_handle`` -- the
-    browser echoes it back in the assertion for discoverable
-    credentials. We use it to look up the user without trusting any
-    client-supplied email.
+    ``challenge_id`` is the handle ``begin_passkey_authentication`` returned.
+    The challenge itself is read out of the server-side row and the row is
+    DELETED in the same call (punch ), so a second presentation of the
+    same assertion finds nothing to consume and is refused before the library
+    runs -- regardless of signature validity and regardless of ``sign_count``,
+    which the library skips entirely when both counters are 0 (every synced
+    passkey reports 0). The consume happens FIRST: a refused ceremony burns
+    its challenge, so a failed attempt must begin again rather than retry.
+
+    The credential's ``userHandle`` is the server-issued
+    ``users.webauthn_user_handle`` -- the browser echoes it back in the
+    assertion for discoverable credentials. We use it to look up the user
+    without trusting any client-supplied email.
+
+    Does NOT commit (N-520 step 2, s2 panel credential-burn ruling): the
+    caller owns the transaction. The login route runs this inside
+    ``record_witnessed_state_change`` so the challenge burn, the sign_count
+    bump, the last_login stamp and the success row commit together; on a
+    refusal the route commits the TIGHTENING burn with no success row. The
+    committing form wraps this one, so the two cannot drift.
     """
     _require_config(rp_id, origin)
+    stored = consume_webauthn_challenge_txn(
+        conn,
+        user_id=None,
+        email=None,
+        kind=_PASSKEY_CHALLENGE_KIND,
+        challenge_id=challenge_id,
+    )
+    if stored is None:
+        raise WebAuthnNoChallengeError(
+            "No active passkey challenge for this handle (expired, or "
+            "already consumed by an earlier attempt)."
+        )
+    require_uv = _stored_uv_requirement(stored)
+    if not require_uv:
+        # Fail CLOSED rather than enforce less than a passkey ceremony means:
+        # begin stores True unconditionally, so a False here could only come
+        # from a future begin that asked for less than this finish enforces.
+        raise WebAuthnAuthError(
+            "Passkey login requires user verification; the stored challenge "
+            "does not."
+        )
 
     if isinstance(response_json, str):
         try:
@@ -517,15 +750,17 @@ def finish_passkey_authentication(
     try:
         verified = verify_authentication_response(
             credential=response_data,
-            expected_challenge=challenge,
+            expected_challenge=stored.challenge,
             expected_origin=origin,
             expected_rp_id=rp_id,
             credential_public_key=bytes(row["public_key"]),
             credential_current_sign_count=int(row["sign_count"]),
-            require_user_verification=True,  # passkeys carry UV
+            # Punch : what the begin step stored (always True here).
+            require_user_verification=require_uv,
         )
-    except (InvalidAuthenticationResponse, ValueError, KeyError) as e:
-        raise WebAuthnAuthError(f"Assertion verify failed: {e}") from e
+    except (WebAuthnException, ValueError, KeyError) as e:
+        raise _assertion_verify_error(e) from e
+    _require_user_verified(verified, require_uv)
 
-    update_hardware_key_sign_count(conn, row["id"], verified.new_sign_count)
+    update_hardware_key_sign_count_txn(conn, row["id"], verified.new_sign_count)
     return int(row["user_id"]), int(row["id"])

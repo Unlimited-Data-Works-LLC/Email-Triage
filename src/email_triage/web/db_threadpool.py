@@ -27,10 +27,15 @@ to::
 
 The sync helper keeps its sync signature; the wrap lives at the call
 site. This was a deliberate choice — see ``feedback_root_cause_scope.md``
-for the partial-conversion rationale: this commit converts the highest-
-traffic handlers (``/health``, ``/health/detail``, ``/dashboard``) plus
-the access-audit middleware. Other handlers are flagged with
-``# TODO  async-DB migration`` so future passes know what's left.
+for the partial-conversion rationale: the initial pass converted the
+highest-traffic handlers (``/health``, ``/health/detail``, ``/dashboard``)
+plus the access-audit middleware; the remainder of the handlers were
+flagged in-code with ``# TODO  async-DB migration`` as the working
+the backlog. **#200 (2026-05-20) closed the async-DB migration** — the
+final tranche of 13 ``routers/ui/*.py`` modules was converted via the
+same ``db_call`` pattern and the ``# TODO `` markers were removed.
+This note is retained as design-history: the same wrap-at-snapshot
+pattern applies to any handler introduced from here on.
 
 Concurrency note
 ----------------
@@ -79,7 +84,8 @@ from typing import Any, Callable, TypeVar
 
 from email_triage.web.db_writelock import get_write_lock
 
-_log = logging.getLogger("email_triage.web.db_threadpool")
+from email_triage.triage_logging import get_logger  # N-196b R21_4
+_log = get_logger("email_triage.web.db_threadpool")  # N-196b R21_4
 
 T = TypeVar("T")
 
@@ -140,7 +146,7 @@ async def db_call(
         if writer is not None:
             try:
                 return await writer.submit_write(sync_fn, *args, **kwargs)
-            except WriterQueueFull:
+            except WriterQueueFull as shed_exc:
                 #  DEFECT-B (§164.312(b)) — a shed write never runs
                 # ``sync_fn``, so the ``@db_write`` gap-event sentinel
                 # (which fires only when the body RAISES) never fires.
@@ -151,7 +157,9 @@ async def db_call(
                 # mapping in web/app.py turns the re-raise into a
                 # fast-loud 503 for the caller).
                 if getattr(sync_fn, "_is_audit_emitter", False):
-                    await _record_shed_audit_write(sync_fn, args, kwargs)
+                    await _record_shed_audit_write(
+                        sync_fn, args, kwargs, shed_exc=shed_exc,
+                    )
                 raise
 
     _lock = get_write_lock()
@@ -165,6 +173,7 @@ async def db_call(
 
 async def _record_shed_audit_write(
     sync_fn: Callable[..., Any], args: tuple, kwargs: dict,
+    shed_exc: BaseException | None = None,
 ) -> None:
     """Make a queue-shed audit-emitter write VISIBLE.
 
@@ -194,7 +203,7 @@ async def _record_shed_audit_write(
          ``logging.lastResort`` (which strips ``extra`` fields), mirroring
          the  HOTFIX-4 convention in ``db_writelock``.
     """
-    from email_triage.db._writer import WriterQueueFull
+    from email_triage.db._writer import WriterQueueFull, WriterStopped
 
     helper_name = getattr(sync_fn, "__name__", "<unknown>")
     conn = args[0] if args else None
@@ -215,13 +224,19 @@ async def _record_shed_audit_write(
                     helper_name=helper_name,
                     args=args,
                     kwargs=kwargs,
-                    exc=WriterQueueFull(
+                    # Punch 582 (L5): a write refused because the writer is
+                    # stopping is recorded as itself, not as a full queue.
+                    exc=shed_exc if isinstance(shed_exc, WriterStopped)
+                    else WriterQueueFull(
                         "audit-emitter write shed at writer-queue boundary "
                         "(queue saturated; body never ran)"
                     ),
                 )
         try:
             await asyncio.to_thread(_write_gap)
+            if shed_exc is not None:
+                from email_triage.db.audit import mark_audit_gap_recorded
+                mark_audit_gap_recorded(shed_exc)
         except Exception as gap_exc:  # noqa: BLE001 — must never bury the shed
             _log.error(
                 "db_call shed audit-emitter write AND the gap-event row "

@@ -41,7 +41,7 @@ from email_triage.web.db import (
 
 def _make_acct(db, owner_id: int, name: str = "Acct") -> int:
     return create_email_account(
-        db, owner_id, name, "imap", {"host": "mail.example.com"},
+        db, owner_id, name, "imap", {"host": "mail.example.invalid"},
     )
 
 
@@ -118,6 +118,11 @@ class _FakeClassifier:
     """
 
     model = "fake-style-classifier-v1"
+    # N-114: a "style-mine/preview runs" scenario implies a SAFE classifier —
+    # local (or BAA-acked). The new baa_block_status egress gate is a no-op for
+    # is_local=True; an external non-BAA classifier is correctly BLOCKED (that
+    # path is covered by tests/test_n114_style_profile_baa_gate.py).
+    is_local = True
 
     async def complete(self, prompt: str) -> str:
         # Pin a sentinel persona so tests can grep for it.

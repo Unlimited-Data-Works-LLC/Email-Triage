@@ -39,6 +39,7 @@ from email_triage.web.auth import (
 )
 from email_triage.web.db_threadpool import db_call
 from email_triage.web.dependencies import (
+    is_admin as _is_admin,  # N-222h R22 SSOT alias (local `is_admin` shadows callable)
     OwnedAccount,
     OwnedAccountOrLogin,
     OwnedGmailApiAccount,
@@ -49,6 +50,7 @@ from email_triage.web.dependencies import (
 )
 from email_triage.triage_logging import get_logger
 from email_triage._errfmt import fmt_exc
+from email_triage._int_utils import bounded_int, parse_int_or_none  # N-219c R23
 
 # async-db: handlers route SQLite through db_call
 _log = get_logger("web.ui.wizard")
@@ -69,25 +71,6 @@ def _wizard_fetch_and_auth(db, user, account_id):
     return acct, can_manage_account(db, user, acct)
 
 
-def __getattr__(name):
-    """Route reads of legacy install-singleton names through the factory.
-
-    The factory module now owns ``_install_google_oauth`` and
-    ``_install_ingestion_config``. Code that did
-    ``from email_triage.web.routers.ui import _install_ingestion_config``
-    (e.g. test fixtures, future plugins) keeps working — PEP 562 lets
-    us proxy module-level reads to the factory's current values.
-    """
-    if name == "_install_google_oauth":
-        from email_triage.providers import factory as _f
-        return _f._install_google_oauth
-    if name == "_install_ingestion_config":
-        from email_triage.providers import factory as _f
-        return _f._install_ingestion_config
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-
 from . import _shared
 # Snapshot every helper from _shared into this module's globals so
 # handler bare-name references resolve. globals().update is used
@@ -98,13 +81,32 @@ globals().update({
     if not _n.startswith('__')
 })
 
-def __getattr__(name):
-    """PEP 562 fallback — late-bound lookup on _shared.
 
-    Catches names added to `_shared` after this module's globals
-    were populated, plus names that the package-level monkeypatch
-    mirror writes onto `_shared` AFTER import.
+def __getattr__(name):
+    """Legacy install-singleton names + PEP-562 fallback to ``_shared``.
+
+    Two roles folded into one module-level ``__getattr__`` (census
+    wf_56d1585d 2026-07-09 D3 — SSOT self-shadowing fix; Python only
+    honours the LAST ``__getattr__`` per module, so previously the
+    install-singleton compat glue was dead code from an unnoticed second
+    override):
+
+    1. Route reads of legacy install-singleton names
+       (``_install_google_oauth`` / ``_install_ingestion_config``) through
+       the factory module. Code that did
+       ``from email_triage.web.routers.ui import _install_ingestion_config``
+       (test fixtures, future plugins) keeps working.
+    2. Late-bound lookup on ``_shared`` — catches names added to
+       ``_shared`` after this module's ``globals().update`` populated, plus
+       names the package-level monkeypatch mirror writes onto ``_shared``
+       after import.
     """
+    if name == "_install_google_oauth":
+        from email_triage.providers import factory as _f
+        return _f._install_google_oauth
+    if name == "_install_ingestion_config":
+        from email_triage.providers import factory as _f
+        return _f._install_ingestion_config
     if hasattr(_shared, name):
         return getattr(_shared, name)
     raise AttributeError(
@@ -123,7 +125,7 @@ async def wizard_step_dispatcher(
     renders the matching template with the right context."""
     db = get_db(request)
     templates = get_templates(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
 
     # Step 1 doesn't need an account_id — it's the entry point.
     if step == 1:
@@ -248,7 +250,9 @@ async def wizard_step_dispatcher(
             """ phase 2 — copy-from candidate accounts in one
             threadpool hop."""
             from email_triage.web.db import list_email_accounts
-            all_accts = list_email_accounts(db)
+            # N-109: copy-from picker (step 4 radios) — a human picks a source
+            # account to clone settings from; a deactivated one is a footgun.
+            all_accts = list_email_accounts(db, active_only=True)
             other_accounts = []
             for a in all_accts:
                 if a["id"] == account_id:
@@ -295,11 +299,17 @@ async def wizard_step_dispatcher(
             }
 
         snap = await db_call(_wizard_step5_snapshot, db, user["id"])
+        # census run17  — alias the SSOT off the "account_email" context key.
+        from email_triage.db.accounts import account_email as account_email_ssot
         return await _render(templates, request, "account_wizard/step5.html", {
             "user": user, "acct": acct,
             "categories": snap["categories"],
             "escalation_categories": snap["escalation_categories"],
-            "account_email": acct.get("email_address", ""),
+            # census run17  — account_email SSOT, not the open-coded key.
+            # (acct here IS loader-built via get_email_account, so the
+            # resolved value is identical; the SSOT call removes the bypass
+            # and is robust if the source ever changes.)
+            "account_email": account_email_ssot(acct),
             "skipped_steps": skipped_steps,
         })
 
@@ -311,7 +321,7 @@ async def wizard_step1_submit(request: Request, user: RequireUser):
     """Create the account row + redirect to step 2."""
     form = await request.form()
     db = get_db(request)
-    is_admin = user["role"] == "admin"
+    is_admin = _is_admin(user)  # N-222h R22 (was: user["role"] == "admin")
     templates = get_templates(request)
 
     name = (form.get("name") or "").strip()
@@ -425,12 +435,18 @@ async def wizard_step2_imap(request: Request, user: RequireUser):
         # preserves any unrelated config keys + emits a structured-log
         # entry of which keys changed. Replaces 7-line dict-patch idiom.
         from email_triage.web.db import update_account_config_keys
+        from email_triage.web.routers._secret_write import set_secret_if_changed
         update_account_config_keys(
             db, account_id,
             host=host, port=port, username=username, use_ssl=use_ssl,
         )
-        if pw:
-            secrets.set(_secret_key_for_account(account_id, "imap"), pw)
+        # Blank preserves (nothing to store yet on a fresh account); routes
+        # through the _secret_write SSOT and pairs with the readonly-until-
+        # focus password field so a password-manager can't autofill the
+        # operator's login password into the IMAP app-password slot.
+        set_secret_if_changed(
+            secrets, _secret_key_for_account(account_id, "imap"), pw,
+        )
         _record_wizard_step(db, account_id, 2)
 
     await db_call(_step2_imap_db_work)
@@ -514,13 +530,10 @@ async def wizard_step3_submit(request: Request, user: RequireUser):
     push_enabled = "push_enabled" in form
     poll_enabled = "poll_enabled" in form
     raw_iv = (form.get("poll_interval_minutes") or "").strip()
-    try:
-        from email_triage.web.db import clamp_poll_interval_minutes
-        poll_interval_minutes = clamp_poll_interval_minutes(
-            int(raw_iv) if raw_iv else 60,
-        )
-    except (TypeError, ValueError):
-        poll_interval_minutes = 60
+    # N-219c/27 R23: parse_int_or_none SSOT; malformed input → 60min default.
+    from email_triage.web.db import clamp_poll_interval_minutes
+    _iv = parse_int_or_none(raw_iv) if raw_iv else 60
+    poll_interval_minutes = clamp_poll_interval_minutes(_iv if _iv is not None else 60)
 
     # Adjacent helper  — atomic read-modify-write per key.
     # / — config write off the loop, before the watcher start.
@@ -575,37 +588,31 @@ async def wizard_step4_submit(request: Request, user: RequireUser):
         """
         from email_triage.web.db import get_email_account
         if route_source.startswith("copy:"):
-            try:
-                source_id = int(route_source.split(":", 1)[1])
-            except (TypeError, ValueError):
-                source_id = 0
+            source_id = bounded_int(  # N-219c R23: SSOT
+                route_source.split(":", 1)[1], default=0,
+            )
             if source_id and source_id != account_id:
                 source_acct = get_email_account(db, source_id)
                 if (
                     source_acct is not None
                     and can_manage_account(db, user, source_acct)
                 ):
-                    # Copy account_routes rows from source → target.
-                    # Best-effort; per-row failure is logged + skipped.
+                    # Copy account_routes rows from source → target through
+                    # the route SSOT (punch 602: a hand-rolled SELECT/INSERT
+                    # named columns the table does not have, so every copy
+                    # failed into the except below). One row per category;
+                    # the actions list is copied verbatim and upsert keeps a
+                    # re-submitted step idempotent. Best-effort; a per-row
+                    # failure is logged + skipped.
+                    from email_triage.web.db import (
+                        list_account_routes, upsert_account_route,
+                    )
                     try:
-                        src_rows = db.execute(
-                            "SELECT category_slug, action_name, "
-                            "       config_json, sort_order "
-                            "FROM account_routes WHERE account_id = ? "
-                            "ORDER BY sort_order",
-                            (source_id,),
-                        ).fetchall()
-                        for r in src_rows:
+                        for r in list_account_routes(db, source_id):
                             try:
-                                db.execute(
-                                    "INSERT INTO account_routes "
-                                    "(account_id, category_slug, "
-                                    " action_name, config_json, "
-                                    " sort_order) "
-                                    "VALUES (?, ?, ?, ?, ?)",
-                                    (account_id, r["category_slug"],
-                                     r["action_name"], r["config_json"],
-                                     r["sort_order"]),
+                                upsert_account_route(
+                                    db, account_id, r["category"],
+                                    r["actions"],
                                 )
                             except Exception as e:
                                 _log.warning(
@@ -613,7 +620,6 @@ async def wizard_step4_submit(request: Request, user: RequireUser):
                                     src=source_id, dst=account_id,
                                     error=fmt_exc(e),
                                 )
-                        db.commit()
                     except Exception as e:
                         _log.warning(
                             "Wizard step 4: route copy failed",
@@ -647,12 +653,12 @@ async def wizard_step5_submit(request: Request, user: RequireUser):
     recipient_digest_enabled = "recipient_digest_enabled" in form
     raw_send_at = (form.get("recipient_digest_send_at") or "").strip()
     if raw_send_at and len(raw_send_at) == 5 and raw_send_at.endswith(":10"):
-        try:
-            h = int(raw_send_at.split(":")[0])
-            recipient_digest_send_at = (
-                f"{h:02d}:10" if 0 <= h <= 23 else "08:10"
-            )
-        except (TypeError, ValueError):
+        # N-219c/47 R23: parse_int_or_none + explicit fallback preserves the
+        # "invalid hour" vs "hour-out-of-range" collapse to "08:10".
+        h = parse_int_or_none(raw_send_at.split(":")[0])
+        if h is not None and 0 <= h <= 23:
+            recipient_digest_send_at = f"{h:02d}:10"
+        else:
             recipient_digest_send_at = "08:10"
     else:
         recipient_digest_send_at = "08:10"
@@ -708,6 +714,26 @@ async def wizard_step5_submit(request: Request, user: RequireUser):
 
     await db_call(_step5_db_work)
 
+    # Loop-5 census: ingestion ACTUATORS (WatcherManager.start, the push
+    # consumers, both renewers) now fail-closed on ``is_active``. Step 3
+    # attempted ``watcher_mgr.start()`` while the row was still
+    # is_active=False (the step-1 stub state), so that start is now
+    # (correctly) refused. Activation is the right moment to start
+    # ingestion — route it through the same funnel the edit-save handler
+    # uses so the account begins watching/polling immediately, without
+    # waiting for restore_from_settings on the next process restart.
+    # Non-fatal: a start failure surfaces on the dashboard chip, same as
+    # the old step-3 try/except.
+    watcher_mgr = getattr(request.app.state, "watcher_manager", None)
+    if watcher_mgr is not None:
+        try:
+            await watcher_mgr.apply_account_active_state(account_id, True)
+        except Exception as e:
+            _log.warning(
+                "Wizard step 5: ingestion start failed (non-fatal)",
+                account_id=account_id, error=fmt_exc(e),
+            )
+
     # Build the success banner. HIPAA-mode installs get a reminder
     # that the per-account HIPAA flag can be flipped on the edit
     # page (the wizard doesn't expose that toggle to keep the flow
@@ -722,9 +748,14 @@ async def wizard_step5_submit(request: Request, user: RequireUser):
             "can adjust the per-account HIPAA flag on the edit page."
         )
 
-    from urllib.parse import quote
+    # N-232b R25 (post-N-232 Arm-A widen): route through the flash-key
+    # SSOT `msg_qs`. Pre-fix, the wizard used `success=` — a bespoke
+    # key with no reader-side decode (`read_flash` handles `msg`/`err`
+    # only), so the destination `/accounts` page silently dropped the
+    # success message.
+    from email_triage.web.routers._redirect import msg_qs
     return RedirectResponse(
-        f"/accounts?success={quote(success_msg)}",
+        f"/accounts?{msg_qs(success_msg)}",
         status_code=303,
     )
 

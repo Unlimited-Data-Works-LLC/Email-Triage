@@ -30,13 +30,16 @@ from email_triage.web.db import (
     pause_style_distill_account,
     record_style_distill_event,
     style_distill_event_counts,
+    unpause_baa_paused_style_distill_accounts,
+    unpause_scrubber_fail_style_distill_accounts,
     unpause_style_distill_account,
 )
 
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    return init_db(":memory:")
+    from _db_tracking import track
+    return track(init_db(":memory:"))
 
 
 def _seed_account(conn: sqlite3.Connection) -> int:
@@ -191,6 +194,138 @@ class TestPauseUnpause:
         assert len(paused) == 1
         assert paused[0]["account_id"] == aid
         assert paused[0]["account_name"] == "Mailbox"
+
+
+# ---------------------------------------------------------------------------
+# the backlog  — bulk BAA-CLEAR helper (Prime Directive )
+# ---------------------------------------------------------------------------
+
+
+def _seed_second_account(conn: sqlite3.Connection) -> int:
+    """A second account for multi-row bulk-unpause behaviour tests."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO email_accounts ("
+        "user_id, name, provider_type, config_json, hipaa, "
+        "created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, 1, ?, ?)",
+        (1, "Mailbox2", "imap", "{}", now, now),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+class TestUnpauseBaaPausedAccounts:
+    def test_clears_baa_rows_only_leaves_scrubber_fail(self, db):
+        """Bulk unpause acts on ``last_error LIKE 'baa_required:%'`` rows
+        only — a scrubber_fail-paused row is UNTOUCHED.
+        """
+        aid_baa = _seed_account(db)
+        aid_scr = _seed_second_account(db)
+        pause_style_distill_account(
+            db, account_id=aid_baa,
+            last_error="baa_required:BackendBAARequiredError",
+        )
+        pause_style_distill_account(
+            db, account_id=aid_scr, last_error="scrubber_fail",
+        )
+
+        rowcount = unpause_baa_paused_style_distill_accounts(db)
+
+        assert rowcount == 1
+        baa_row = get_style_distill_queue_entry(db, account_id=aid_baa)
+        scr_row = get_style_distill_queue_entry(db, account_id=aid_scr)
+        assert baa_row["paused"] == 0
+        assert baa_row["last_error"] is None
+        assert baa_row["attempt_count"] == 0
+        assert scr_row["paused"] == 1
+        assert scr_row["last_error"] == "scrubber_fail"
+
+    def test_no_baa_rows_returns_zero(self, db):
+        """Idempotent zero-op: no BAA-paused rows → rowcount 0."""
+        aid = _seed_account(db)
+        pause_style_distill_account(
+            db, account_id=aid, last_error="scrubber_fail",
+        )
+        assert unpause_baa_paused_style_distill_accounts(db) == 0
+
+    def test_multiple_baa_rows_unpaused_in_one_call(self, db):
+        """One call clears every BAA-paused row across the install."""
+        aid1 = _seed_account(db)
+        aid2 = _seed_second_account(db)
+        pause_style_distill_account(
+            db, account_id=aid1,
+            last_error="baa_required:BackendBAARequiredError",
+        )
+        pause_style_distill_account(
+            db, account_id=aid2,
+            last_error="baa_required:BackendBAARequiredError",
+        )
+        assert unpause_baa_paused_style_distill_accounts(db) == 2
+
+    def test_baa_predicate_rejects_similar_prefix(self, db):
+        """db-sme F2 — the ``substr(last_error,1,13)='baa_required:'``
+        form replaces ``LIKE 'baa_required:%'`` because ``_`` in the
+        LIKE literal is a single-char wildcard. Guard against a
+        pathological ``last_error`` string that would satisfy the LIKE
+        form but MUST NOT match the substr form.
+        """
+        aid = _seed_account(db)
+        # Pathological LIKE-matcher: 'baaXrequired:' (13 chars, matches
+        # ``LIKE 'baa_required:%'`` because ``_`` accepts ``X``, but
+        # NOT ``substr(..,1,13)='baa_required:'``.
+        pause_style_distill_account(
+            db, account_id=aid, last_error="baaXrequired:mismatch",
+        )
+        assert unpause_baa_paused_style_distill_accounts(db) == 0
+        # Row remains paused.
+        row = get_style_distill_queue_entry(db, account_id=aid)
+        assert row["paused"] == 1
+
+
+class TestUnpauseScrubberFailPausedAccounts:
+    """DA panel F2 same-drive closure — scrubber_fail sub-shape PD#18 CLEAR
+    from a classifier-config change at ``config_save``."""
+
+    def test_clears_scrubber_rows_only_leaves_baa(self, db):
+        aid_sf = _seed_account(db)
+        aid_baa = _seed_second_account(db)
+        pause_style_distill_account(
+            db, account_id=aid_sf,
+            last_error="scrubber_fail:structural_leak",
+        )
+        pause_style_distill_account(
+            db, account_id=aid_baa,
+            last_error="baa_required:BackendBAARequiredError",
+        )
+        rowcount = unpause_scrubber_fail_style_distill_accounts(db)
+        assert rowcount == 1
+        sf_row = get_style_distill_queue_entry(db, account_id=aid_sf)
+        baa_row = get_style_distill_queue_entry(db, account_id=aid_baa)
+        assert sf_row["paused"] == 0
+        assert sf_row["last_error"] is None
+        assert baa_row["paused"] == 1
+        assert baa_row["last_error"] == "baa_required:BackendBAARequiredError"
+
+    def test_no_scrubber_rows_returns_zero(self, db):
+        aid = _seed_account(db)
+        pause_style_distill_account(
+            db, account_id=aid,
+            last_error="baa_required:BackendBAARequiredError",
+        )
+        assert unpause_scrubber_fail_style_distill_accounts(db) == 0
+
+    def test_scrubber_predicate_rejects_similar_prefix(self, db):
+        """Sibling of the BAA predicate guard — ``_`` in
+        ``scrubber_fail`` is also a LIKE single-char wildcard, so the
+        substr form must reject 'scrubberXfail:...'.
+        """
+        aid = _seed_account(db)
+        pause_style_distill_account(
+            db, account_id=aid,
+            last_error="scrubberXfail:mismatch",
+        )
+        assert unpause_scrubber_fail_style_distill_accounts(db) == 0
 
 
 # ---------------------------------------------------------------------------
