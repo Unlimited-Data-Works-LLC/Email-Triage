@@ -121,7 +121,7 @@ _NON_PIP_FETCHES: dict[tuple[str, str, str], str] = {
         "a distro package on the GitHub-hosted Ubuntu runner, from Ubuntu's archive, which apt "
         "verifies against the archive's signing keys; not a pip install, so no lock can hash it",
 }
-#: The one fetch F2 names in a workflow that does not ship (operator-attest.yml, an
+#: The one fetch F2 names in operator-attest.yml (shipped since 2026-11-10; an
 #: operator-only gate per scripts/publish-allow.txt). It is not in _NON_PIP_FETCHES,
 #: whose every entry must be live on the public mirror too; it is matched by
 #: _is_the_crane_fallback and held live on the full dev tree by its own test.
@@ -503,8 +503,6 @@ def test_f2_every_non_pip_fetch_is_named_with_a_reason_and_every_entry_is_live()
         "a _NON_PIP_FETCHES command no longer runs; delete its entry")
 
 
-@pytest.mark.skipif(not _FULL_DEV_TREE, reason="operator-attest.yml does not ship; the crane fallback "
-                    "exists on the full dev tree only")
 def test_f2_the_crane_fallback_is_live_and_an_edited_one_is_not_excused() -> None:
     crane = [v for v in _non_pip_fetches(_real_workflows()) if _is_the_crane_fallback(v)]
     assert len(crane) == 1, "the pinned crane fallback no longer runs; delete _CRANE_FETCH"
