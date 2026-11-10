@@ -109,6 +109,12 @@ _REQUIRED_PINS: frozenset[str] = frozenset({
     "test_pin_registry.py",
 })
 
+# Required pins that scripts/publish-strip-paths.txt strips individually (their subject does
+# not ship). Required in the dev tree; skipped only where tests/tooling/ is absent (the mirror).
+_DEV_ONLY_STRIPPED_PINS = frozenset({
+    "test_636_shutdown_envelope_pin.py",
+})
+
 
 def test_all_required_pins_present():
     """Every entry in ``_REQUIRED_PINS`` must exist as a real file under tests/.
@@ -123,11 +129,15 @@ def test_all_required_pins_present():
     # package (scripts/publish-strip-paths.txt `tests/tooling/*`). Its entries are required
     # wherever the package exists; only a tree with NO tests/tooling/__init__.py (the
     # mirror) skips them. Deleting one tooling pin in the dev tree still trips this test.
+    # Same skip for the few required pins stripped ONE BY ONE because their subject
+    # (deploy/, publish/deploy/) does not ship; they stay in tests/ because they also
+    # import the product. 2026-11-09: the v0.2.0 public Release run failed on this.
     tooling_present = (_TESTS_ROOT / "tooling" / "__init__.py").is_file()
     missing = [
         rel for rel in sorted(_REQUIRED_PINS)
         if not (_TESTS_ROOT / rel).is_file()
-        and (tooling_present or not rel.startswith("tooling/"))
+        and (tooling_present
+             or not (rel.startswith("tooling/") or rel in _DEV_ONLY_STRIPPED_PINS))
     ]
     assert not missing, (
         "SB-2 required-pin registry: these pins are listed in _REQUIRED_PINS "
